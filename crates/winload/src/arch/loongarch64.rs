@@ -18,7 +18,7 @@
 //!   * `PGD` / `PGDH` left in whatever state the firmware set;
 //!     paging is off so they are irrelevant.
 
-use nt61::kernel_main::kernel_main;
+use ntoskrnl::kernel_main::kernel_main;
 
 const CRMD_DA: u64 = 1 << 3;
 const CRMD_PG: u64 = 1 << 4;

@@ -18,7 +18,7 @@
 /// `SECTION_ALIGNMENT (0x1000) + 0` because the stub's only section
 /// starts at the image base and the entry point is `export[0]`.
 pub fn install_kernel_handoff() -> u64 {
-    nt61::arch::x86_64::ntoskrnl_handoff::install_handoff_pointer()
+    ntoskrnl::arch::x86_64::ntoskrnl_handoff::install_handoff_pointer()
 }
 
 /// # Safety

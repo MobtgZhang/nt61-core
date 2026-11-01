@@ -21,7 +21,7 @@
 //! Inline assembly uses `sym` to take the address of
 //! `kernel_main`; the linker resolves it during final link.
 
-use nt61::kernel_main::kernel_main;
+use ntoskrnl::kernel_main::kernel_main;
 
 /// # Safety
 ///
@@ -47,7 +47,7 @@ pub unsafe extern "C" fn call_kernel_main(stack_top: u64, bi_ptr: u64) -> ! {
     extern "C" fn km_shim(bi_ptr: u64) -> ! {
         // SAFETY: the caller of `call_kernel_main_from_loader`
         // passes a valid `&BootInfo` pointer.
-        unsafe { kernel_main(&*(bi_ptr as *const nt61::kernel_main::BootInfo)) }
+        unsafe { kernel_main(&*(bi_ptr as *const nt61_boot_types::boot_types::BootInfo)) }
     }
     let km_addr: u64 = km_shim as *const () as usize as u64;
     core::arch::asm!(

@@ -16,7 +16,7 @@
 //!   * `satp` is whatever the firmware left it — the kernel
 //!     re-installs its page table early in `paging::init`.
 
-use nt61::kernel_main::kernel_main;
+use ntoskrnl::kernel_main::kernel_main;
 
 /// # Safety
 ///

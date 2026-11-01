@@ -20,8 +20,8 @@
 //!      little-endian, matching `crypto::rsa::BigUint::from_bytes`.
 
 use crate::pe::PE32PLUS_CHECKSUM_OFFSET;
-use nt61::crypto::hash::sha256;
-use nt61::crypto::rsa::{BigUint, RsaPublicKey};
+use nt61_crypto::crypto::hash::sha256;
+use nt61_crypto::crypto::rsa::{BigUint, RsaPublicKey};
 
 /// Location of the RSA trust anchor on the system partition.
 const TRUST_ANCHOR_PATH: &str = "\\EFI\\nt61\\trust.pub";

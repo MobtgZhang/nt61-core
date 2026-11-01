@@ -7,28 +7,26 @@ authors = ["NT6.1.7601 Team"]
 publish = false
 
 [dependencies]
+nt61-boot-types = { path = "../boot-types" }
+nt61-crypto = { path = "../crypto" }
+nt61-loader = { path = "../loader" }
+ntoskrnl = { path = "../ntoskrnl", features = ["binary_panic"] }
 uefi = { version = "0.37.0", features = ["alloc", "logger"] }
 uefi-raw = "0.14.0"
 nt61-bootfs = { path = "../bootfs" }
 
-# The OS Loader (`winload.efi`) needs the same architecture
-# features as `kernel_main` because the kernel-jump trampolines
-# in `winload/src/arch/` call into the kernel's `kernel_main`
-# symbol. We therefore enable the matching `nt61` feature per
-# target triple. The `alloc` feature is required because
-# `kernel_main` uses `Vec` / `String` for the registry hive /
-# boot-driver descriptors it consumes from `BootInfo`.
+# The OS Loader (`winload.efi`) links against the kernel
+# executive crate (`ntoskrnl`) for the shared kernel heap and the
+# `kernel_main` trampolines in `winload/src/arch/`. Architecture
+# features are forwarded to `nt61-core` so the bare-metal kernel
+# entry keeps its panic handler.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
-nt61 = { path = "../../nt61", default-features = false, features = ["x86_64", "binary_panic", "alloc", "crypto_libs"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-nt61 = { path = "../../nt61", default-features = false, features = ["aarch64", "binary_panic", "alloc", "crypto_libs"] }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-nt61 = { path = "../../nt61", default-features = false, features = ["riscv64", "binary_panic", "alloc", "crypto_libs"] }
 
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
-nt61 = { path = "../../nt61", default-features = false, features = ["loongarch64", "binary_panic", "alloc", "crypto_libs"] }
 
 [[bin]]
 name = "nt61-winload"
@@ -44,6 +42,6 @@ aarch64 = []
 riscv64 = []
 loongarch64 = []
 log_level_warn = []
-log_level_debug = ["log_level_warn", "nt61/log_level_debug"]
+log_level_debug = ["log_level_warn"]
 
 # Profile settings are inherited from the workspace root.

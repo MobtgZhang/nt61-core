@@ -41,12 +41,12 @@ rustflags = [
     # Use the per-package linker script (BASE_ADDRESS=0x90000000) so the
     # loader can satisfy the image at its preferred base without
     # applying relocations — see `linker-la64.ld` for the rationale.
-    "-C", "link-arg=-Tsrc/boot/linker-la64.ld",
+    "-C", "link-arg=-Tcrates/boot/linker-la64.ld",
     "-C", "link-arg=--entry=efi_main",
     "-C", "link-arg=--emit-relocs",
     "-C", "link-arg=-no-gc-sections",
     "-C", "link-arg=-nostdlib",
-    "-C", "link-arg=-Ltools/loongarch64/lib",
+    "-C", "link-arg=-Lcrates/tools/loongarch64/lib",
     "-C", "panic=abort",
 ]  
 
@@ -64,7 +64,7 @@ rustflags = [
 [target.riscv64gc-unknown-none-elf]
 linker = "riscv64-linux-gnu-ld"
 rustflags = [
-    "-C", "link-arg=-Tsrc/boot/linker-rv64.ld",
+    "-C", "link-arg=-Tcrates/boot/linker-rv64.ld",
     "-C", "link-arg=--entry=efi_main",
     "-C", "link-arg=--emit-relocs",
     "-C", "link-arg=-no-gc-sections",

@@ -14,7 +14,7 @@
 //!   7. Jump to kernel_main with a fully-populated BootInfo
 //
 //! The **entire** kernel init sequence (PHASE 0 … PHASE 9) lives in
-//! `nt61::kernel_main`. This binary **never duplicates** any of that
+//! `ntoskrnl::kernel_main`. This binary **never duplicates** any of that
 //! code — it is purely the bridge between UEFI and the NT kernel.
 
 #![no_std]
@@ -132,8 +132,8 @@ static HYBRID_ALLOCATOR: HybridAllocator = HybridAllocator;
 
 impl HybridAllocator {
     fn backend_alloc(layout: Layout) -> (*mut u8, u64) {
-        if nt61::mm::heap::KERNEL_HEAP.configured_region().is_some() {
-            let ptr = unsafe { nt61::mm::heap::KERNEL_HEAP.alloc(layout) };
+        if ntoskrnl::mm::heap::KERNEL_HEAP.configured_region().is_some() {
+            let ptr = unsafe { ntoskrnl::mm::heap::KERNEL_HEAP.alloc(layout) };
             (ptr, HYBRID_ORIGIN_KERNEL)
         } else {
             let ptr = unsafe { uefi::allocator::Allocator.alloc(layout) };
@@ -144,7 +144,7 @@ impl HybridAllocator {
     fn backend_dealloc(ptr: *mut u8, layout: Layout, origin: u64) {
         if origin == HYBRID_ORIGIN_KERNEL {
             unsafe {
-                nt61::mm::heap::KERNEL_HEAP.dealloc(ptr, layout);
+                ntoskrnl::mm::heap::KERNEL_HEAP.dealloc(ptr, layout);
             }
         } else if !EXIT_BOOT_SERVICES_DONE.load(Ordering::Acquire) {
             unsafe {
@@ -206,9 +206,9 @@ unsafe impl GlobalAlloc for HybridAllocator {
     }
 }
 
-use nt61::boot_types::{DeviceRange, DeviceTreeHardware};
-use nt61::kernel_main::{BootInfo, BOOTINFO_MAX_HIVES};
-use nt61::loader;
+use nt61_boot_types::boot_types::{DeviceRange, DeviceTreeHardware};
+use nt61_boot_types::boot_types::{BootInfo, BOOTINFO_MAX_HIVES};
+use nt61_loader::loader;
 use uefi::boot::{allocate_pages, AllocateType, MemoryType};
 use uefi::mem::memory_map::MemoryAttribute;
 use uefi::proto::media::file::FileInfo;
@@ -3517,23 +3517,23 @@ fn read_bcd_boot_options() -> Option<alloc::string::String> {
 fn bcd_guid_to_boot_mode(
     guid: &[u8; 16],
     boot_options: Option<&str>,
-) -> nt61::boot_types::BootMode {
+) -> nt61_boot_types::boot_types::BootMode {
     // Windows 7 safe modes are primarily selected by OsLoadOptions. Honor
     // those flags before falling back to the NT61 test GUID mapping.
     if let Some(options) = boot_options {
         if options.contains("/safeboot:") {
-            return nt61::boot_types::BootMode::SafeMode;
+            return nt61_boot_types::boot_types::BootMode::SafeMode;
         }
         if options.contains("/debug") {
-            return nt61::boot_types::BootMode::DebugCmd;
+            return nt61_boot_types::boot_types::BootMode::DebugCmd;
         }
     }
     // Match on the first 4 bytes — the well-known GUID prefixes.
     match &guid[0..4] {
-        [0xB2, 0x72, 0x1D, 0x66] => nt61::boot_types::BootMode::Cmd,
-        [0x51, 0x89, 0xB2, 0x5C] => nt61::boot_types::BootMode::DebugCmd,
-        [0xA3, 0x4C, 0x8E, 0xD1] => nt61::boot_types::BootMode::SafeMode,
-        _ => nt61::boot_types::BootMode::Desktop,
+        [0xB2, 0x72, 0x1D, 0x66] => nt61_boot_types::boot_types::BootMode::Cmd,
+        [0x51, 0x89, 0xB2, 0x5C] => nt61_boot_types::boot_types::BootMode::DebugCmd,
+        [0xA3, 0x4C, 0x8E, 0xD1] => nt61_boot_types::boot_types::BootMode::SafeMode,
+        _ => nt61_boot_types::boot_types::BootMode::Desktop,
     }
 }
 
@@ -3612,7 +3612,7 @@ fn build_boot_info(kernel_pa: u64, kernel_size: u64) -> BootInfo {
         smp_info: pd.smp_cpu_count as u64,
         hives: 0,
         hive_count: 0,
-        boot_mode: nt61::boot_types::BootMode::Desktop as u32,
+        boot_mode: nt61_boot_types::boot_types::BootMode::Desktop as u32,
         esp_disk_start: pd.esp_partition_lba,
         esp_disk_sectors: pd.esp_partition_sectors,
         boot_driver_count,
@@ -4166,7 +4166,7 @@ fn os_loader_run() -> ! {
         let boot_options = read_bcd_boot_options();
         let selected_mode = match read_bcd_mailbox() {
             Some(guid) => bcd_guid_to_boot_mode(&guid, boot_options.as_deref()),
-            None => nt61::boot_types::BootMode::Desktop,
+            None => nt61_boot_types::boot_types::BootMode::Desktop,
         };
         debug_println!("[LOAD] boot mode from BCD mailbox: {:?}", selected_mode);
         bi.boot_mode = selected_mode as u32;
@@ -4298,7 +4298,9 @@ fn os_loader_run() -> ! {
     // value is definitely visible by the time we reach Phase L11.
     debug_println!("--- Phase L09 ---");
     mark_winload_phase(8);
+    uefi::println!("[WINLOAD] L09 enter");
     let trampoline_addr = arch::current::install_kernel_handoff();
+    uefi::println!("[WINLOAD] L09 trampoline=0x{:x}", trampoline_addr);
     debug_println!(
         "[WINLOAD] L09: trampoline address = 0x{:x}",
         trampoline_addr
@@ -4333,6 +4335,7 @@ fn os_loader_run() -> ! {
     // EFI_INVALID_PARAMETER.
     debug_println!("--- Phase L10 ---");
     mark_winload_phase(9);
+    uefi::println!("[WINLOAD] L10 enter");
     // QEMU/OVMF frequently rejects the first ExitBootServices call
     // with INVALID_PARAMETER because some background firmware work
     // between our collect_memory_map() at L02 and now changed the
@@ -4341,12 +4344,51 @@ fn os_loader_run() -> ! {
     // reclaim boot-services memory (the ESP/SYS mirrors, the hive
     // region and the image buffer all live there), so it is NOT safe
     // to hand control to the kernel: halt instead of continuing.
-    let map_key = unsafe { (*core::ptr::addr_of!(PERSISTENT)).map_key };
+    // Refresh the UEFI memory map immediately before ExitBootServices.
+    // Driver loads, pool allocations and console work can invalidate the
+    // map_key captured in Phase L02.  OVMF treats the resulting
+    // INVALID_PARAMETER as the start of service teardown, so retrying the
+    // same function pointer can fault.  The reliable fix is to obtain a
+    // fresh map/key just before the single ExitBootServices call.
+    uefi::println!("[WINLOAD] L10 refreshing memory map");
+    let (fresh_entries, fresh_key) = unsafe {
+        let pd = &mut *core::ptr::addr_of_mut!(PERSISTENT);
+        raw_get_memory_map_with_key(
+            &mut pd.memory_map,
+            &mut (*core::ptr::addr_of_mut!(MEM_MAP_BUF)).0,
+        )
+    };
+    if fresh_entries > 0 {
+        let pd = unsafe { &mut *core::ptr::addr_of_mut!(PERSISTENT) };
+        pd.memory_map_count = fresh_entries;
+        pd.map_key = fresh_key;
+    }
+    let mut map_key = fresh_key;
+    uefi::println!(
+        "[WINLOAD] L10 fresh map: entries={} key=0x{:x}",
+        fresh_entries,
+        fresh_key
+    );
+    if fresh_entries > 0 {
+        let pd = unsafe { &*core::ptr::addr_of_mut!(PERSISTENT) };
+        for (idx, entry) in pd.memory_map.iter().take(fresh_entries).enumerate() {
+            if entry.base <= 0x0000000000010200
+                && entry.base + entry.length > 0x0000000000010200
+            {
+                uefi::println!(
+                    "[WINLOAD] L10 map[{}] base=0x{:x} len=0x{:x} type={}",
+                    idx,
+                    entry.base,
+                    entry.length,
+                    entry.memory_type
+                );
+            }
+        }
+    }
     debug_println!(
         "[WINLOAD] L10: ExitBootServices(image_handle, map_key=0x{:x})",
         map_key
     );
-    EXIT_BOOT_SERVICES_DONE.store(true, Ordering::Release);
     // `uefi::boot::image_handle()` returns the high-level
     // `uefi::Handle` newtype; `Handle` underneath is a raw pointer
     // (`*mut c_void`). The `BootServices::exit_boot_services`
@@ -4354,53 +4396,52 @@ fn os_loader_run() -> ! {
     // pulled out of the system table below) takes that raw
     // pointer, so we unwrap it.
     let handle_ptr: *mut core::ffi::c_void = uefi::boot::image_handle().as_ptr();
+    uefi::println!(
+        "[WINLOAD] L10 image_handle=0x{:x}",
+        handle_ptr as u64
+    );
+    uefi::println!("[WINLOAD] L10 calling ExitBootServices");
     unsafe {
-        let st = uefi::table::system_table_raw().expect("system table not set");
-        let st_ref = st.as_ref();
-        if let Some(bs_ptr) = st_ref.boot_services.as_ref() {
-            let mut key = map_key;
-            let mut status = (bs_ptr.exit_boot_services)(handle_ptr, key);
-            debug_println!(
-                "[WINLOAD] L10: ExitBootServices: status={:?} map_key=0x{:x}",
-                status,
-                key
+        let st = uefi::table::system_table_raw()
+            .expect("system table not set for ExitBootServices");
+        let bt = st.as_ref().boot_services;
+        debug_assert!(!bt.is_null());
+        let bt_ref = &*bt;
+        uefi::println!(
+            "[WINLOAD] L10 bs=0x{:x} exit=0x{:x}",
+            bt as u64,
+            bt_ref.exit_boot_services as u64
+        );
+        let mut status = (bt_ref.exit_boot_services)(handle_ptr, map_key);
+        if !status.is_success() {
+            // ExitBootServices is allowed to fail once with
+            // EFI_INVALID_PARAMETER if the map key changed after the
+            // call was prepared. Only GetMemoryMap and ExitBootServices
+            // may be used while retrying, so refresh through the raw
+            // table and do not run any higher-level allocator work.
+            let pd = &mut *core::ptr::addr_of_mut!(PERSISTENT);
+            let (retry_entries, retry_key) = raw_get_memory_map_with_key(
+                &mut pd.memory_map,
+                &mut (*core::ptr::addr_of_mut!(MEM_MAP_BUF)).0,
             );
-            if !status.is_success() {
-                // Stale map key: refresh the map and retry once.
-                debug_println!(
-                    "[WINLOAD] L10: ExitBootServices failed; refreshing memory map and retrying once"
-                );
-                let pd = &mut *core::ptr::addr_of_mut!(PERSISTENT);
-                let (n, fresh_key) = raw_get_memory_map_with_key(
-                    &mut pd.memory_map,
-                    &mut (*core::ptr::addr_of_mut!(MEM_MAP_BUF)).0,
-                );
-                if n > 0 {
-                    pd.memory_map_count = n;
-                }
-                pd.map_key = fresh_key;
-                key = fresh_key;
-                debug_println!(
-                    "[WINLOAD] L10: refreshed map_key=0x{:x} ({} entries); retrying ExitBootServices",
-                    key,
-                    n
-                );
-                status = (bs_ptr.exit_boot_services)(handle_ptr, key);
-                debug_println!("[WINLOAD] L10: ExitBootServices retry: status={:?}", status);
+            if retry_entries > 0 {
+                pd.memory_map_count = retry_entries;
+                pd.map_key = retry_key;
             }
-            if status.is_success() {
-                debug_println!("[WINLOAD] L10: boot services terminated successfully");
-            } else {
-                debug_println!(
-                    "[WINLOAD] L10: FATAL: ExitBootServices failed twice — the firmware may reclaim boot-services memory the kernel depends on; halting instead of jumping to the kernel"
-                );
-                loop {
-                    core::hint::spin_loop();
-                }
-            }
+            map_key = retry_key;
+            status = (bt_ref.exit_boot_services)(handle_ptr, map_key);
+        }
+        if status.is_success() {
+            // Publish the flag only after the firmware accepts the map
+            // key. Setting it before the call would tell the hybrid
+            // allocator to leak UEFI allocations even though boot
+            // services are still active.
+            EXIT_BOOT_SERVICES_DONE.store(true, Ordering::Release);
+            debug_println!("[WINLOAD] L10: boot services terminated successfully");
         } else {
-            debug_println!(
-                "[WINLOAD] L10: boot_services pointer null; ExitBootServices not called"
+            uefi::println!(
+                "[WINLOAD] L10 ExitBootServices failed after retry: 0x{:x}",
+                status.0
             );
         }
     }
