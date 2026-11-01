@@ -1,0 +1,12 @@
+[package]
+name = "nt61-drivers"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+test = false
+
+[dependencies]
+nt61 = { path = "../../nt61", default-features = false }

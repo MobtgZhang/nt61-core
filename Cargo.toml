@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/init",
+  "crates/boot-types",
+  "crates/sync",
+  "crates/ntoskrnl",
+  "crates/hal",
+  "crates/drivers",
+  "crates/fs",
+  "crates/netstack",
+  "crates/registry",
+  "crates/crypto",
+  "crates/loader",
+  "crates/system/smss",
+  "crates/system/csrss",
+  "crates/system/services",
+  "crates/system/wininit",
+  "crates/system/winlogon",
+  "crates/system/sshd",
+  "crates/subsystems/win32k",
+  "crates/subsystems/wow64",
+  "crates/subsystems/wow64win",
+  "crates/system/common",
+  "crates/userland/runtime",
+  "crates/libs/ntdll",
+  "crates/libs/kernel32",
+  "crates/libs/user32",
+  "crates/libs/gdi32",
+  "crates/libs/msvcrt",
+  "crates/libs/advapi32",
+  "crates/libs/rpcrt4",
+  "crates/libs/sechost",
+  "crates/libs/ws2_32",
+  "crates/libs/winmm",
+  "crates/boot",
+  "crates/bootfs",
+  "crates/fonts",
+  "crates/winload",
+  "crates/boot-driver",
+  "crates/userland/cmd",
+  "crates/tools",
+  "crates/tools/cmd-stub-gen",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "none"
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = false
+panic = "unwind"
+
+
+[profile.uefi-dev]
+inherits = "dev"
+opt-level = 0
+debug = false
+panic = "abort"

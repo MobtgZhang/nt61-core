@@ -1155,13 +1155,13 @@ verify-strict:
 		--features x86_64
 	@echo "=== image matrix smoke: fat32 / ntfs / ext4 / iso ==="
 	cargo build -p nt61-tools --bin build-tool
-	./target/debug/build-tool --build all --build-dir $(VERIFY_DIR)-fat32 \
+	$(SCRIPT_DIR)/../target/debug/build-tool --build all --build-dir $(VERIFY_DIR)-fat32 \
 		--format-flag fat32 --size-mb 64 --arch x86_64
-	./target/debug/build-tool --build all --build-dir $(VERIFY_DIR)-ntfs \
+	$(SCRIPT_DIR)/../target/debug/build-tool --build all --build-dir $(VERIFY_DIR)-ntfs \
 		--format-flag ntfs --size-mb 64 --arch x86_64
-	./target/debug/build-tool --build all --build-dir $(VERIFY_DIR)-ext4 \
+	$(SCRIPT_DIR)/../target/debug/build-tool --build all --build-dir $(VERIFY_DIR)-ext4 \
 		--format-flag ext4 --size-mb 64 --arch x86_64
-	./target/debug/build-tool --build iso --build-dir $(VERIFY_DIR)-iso \
+	$(SCRIPT_DIR)/../target/debug/build-tool --build iso --build-dir $(VERIFY_DIR)-iso \
 		--format-flag iso --size-mb 64 --arch x86_64
 	@echo "=== verify-strict: all green ==="
 

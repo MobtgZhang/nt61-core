@@ -34,3 +34,7 @@ Cargo.lock
 # Mutants testing
 **/mutants.out*/
 reference/
+
+# Generated system roots and images
+sysroot/
+dist/

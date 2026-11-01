@@ -1,0 +1,66 @@
+[package]
+name = "nt61-tools"
+version = "0.1.0"
+edition = "2021"
+description = "NT6.1.7601 build tools - Create disk images without shell dependencies"
+publish = false
+
+[[bin]]
+name = "build-tool"
+path = "src/main.rs"
+
+# build-esp 需要 nt61
+[[bin]]
+name = "build-esp"
+path = "src/build_esp.rs"
+required-features = ["with-nt61"]
+
+# pe-test 需要 nt61
+[[bin]]
+name = "pe-test"
+path = "src/pe_test.rs"
+required-features = ["with-nt61"]
+
+[[bin]]
+name = "load-pe"
+path = "src/bin/load_pe.rs"
+required-features = ["with-nt61"]
+
+# hive-gen 需要 nt61
+[[bin]]
+name = "hive-gen"
+path = "src/hive_gen_bin.rs"
+required-features = ["with-nt61"]
+
+# dump-cmd 需要 nt61
+[[bin]]
+name = "dump-cmd"
+path = "src/bin/dump_cmd.rs"
+required-features = ["with-nt61"]
+
+# mkcmd 不需要 nt61——直接拼接小 PE
+[[bin]]
+name = "mkcmd"
+path = "src/bin/mkcmd.rs"
+
+[lib]
+name = "nt61_tools"
+path = "src/lib.rs"
+
+[dependencies]
+# nt61 is an optional dependency for kernel integration
+nt61 = { path = "../../nt61", optional = true }
+# hive_gen is always available
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+uuid = { version = "1.12", default-features = false }
+tempfile = { version = "3.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[features]
+default = []
+testing = ["tempfile"]
+with-nt61 = ["nt61", "nt61?/binary_panic", "tempfile"]

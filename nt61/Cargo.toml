@@ -1,17 +1,3 @@
-[workspace]
-members = [
-    "src/boot",
-    "src/bootfs",
-    "src/fonts",
-    "src/winload",
-    "src/userland/cmd",
-    "src/boot_driver",
-    "tools",
-    "tools/cmd-stub-gen",
-]
-
-resolver = "2"
-
 [package]
 name = "nt61"
 version = "0.1.0"
@@ -29,121 +15,37 @@ name = "nt61-kernel"
 path = "src/main.rs"
 test = false
 
+[[bin]]
+name = "hal_dll"
+path = "src/bin/hal.rs"
+test = false
+
 [features]
 default = ["x86_64", "binary_panic", "alloc", "crypto_libs"]
 std = []
 uefi_boot = []
 bios_boot = []
-# When building the multiboot/ELF `nt61-kernel` binary, enable this
-# feature so the library crate's `#[panic_handler]` is gated off
-# (the binary's own `#[panic_handler]` in `src/main.rs` takes over).
 binary_panic = []
-x86_64 = ["dep:x86_64", "dep:pic8259"]
-aarch64 = []
-loongarch64 = []
-riscv64 = []
-smp = []
-acpi = ["dep:acpi"]
-debug = []
-alloc = ["dep:linked_list_allocator", "dep:hashbrown"]
-# Binary Translation Layer (BTL) — non-default while the framework
-# stabilises; flipping this on enables the heavy modules under
-# `arch::aarch64::btl::decoder`, `ir`, `codegen`, `state` and
-# `syscall_bridge`.
-btl = []
-# Gate for the LoongArch64 Loongson GPU driver (`drivers::video::loongson`).
-# Disabled by default while the LSDC type mismatches are being sorted
-# out; enable via `--features loongson_gpu` on a loongarch64 build.
-loongson_gpu = []
-# RustCrypto-backed implementation (`crypto::rsa_secure`). On by default so
-# cipher / hash / rsa results are
-# cross-validated against RustCrypto; the pure-Rust equivalents remain available.
-crypto_libs = ["dep:sha2", "dep:aes", "dep:des", "dep:hmac", "dep:rsa", "dep:rand_core"]
-# Per-architecture helper gates (used by `cfgs` in arch-specific
-# code rather than being Cargo features themselves).
-
-# Logging verbosity — mutually exclusive; pick one.
-# In dev builds: log_level_debug (verbose). In release: log_level_warn (quiet).
-# Usage: cargo build --features log_level_debug
-log_level_error = []    # Only ERROR-level messages
-log_level_warn  = ["log_level_error"]   # WARN and ERROR
-log_level_info  = ["log_level_warn"]    # INFO, WARN, ERROR (default in dev)
-log_level_debug = ["log_level_info"]    # DEBUG, INFO, WARN, ERROR
-
-# Profile settings centralised at the workspace level so that
-# nt61-boot / nt61-winload do not produce "profiles for the non
-# root package will be ignored" warnings.
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-strip = "none"
-panic = "abort"
-
-[profile.dev]
-opt-level = 0
-debug = false
-# Disable unwinding in dev too: the kernel binary has no `std`, so
-# unwinding is impossible without `-Zbuild-std`. With
-# `panic = "abort"` our `#[panic_handler]` in `main.rs` is still
-# installed and called; `panic = "abort"` only changes the *strategy*
-# the compiler emits at each `panic!()` site (it emits a direct
-# abort call rather than unwinding).
-panic = "abort"
-
-# UEFI boot build uses a separate profile so that the
-# `panic = "abort"` requirement of the UEFI toolchain (no unwinding
-# without `std`) does not affect the kernel build.
-[profile.uefi-dev]
-inherits = "dev"
-opt-level = 0
-debug = false
-panic = "abort"
-
-# -----------------------------------------------------------------------------
-# Per-target rustflags for cross-compilation. These blocks are only
-# honoured when the matching target triple is actually built (via
-# `cargo build --target=...`); on a host build they are reported as
-# "unused manifest key" warnings because cargo cannot resolve them
-# against the host triple. Commented out by default — uncomment when
-# performing the corresponding cross-build.
-# -----------------------------------------------------------------------------
-
-# [target.aarch64-unknown-none]
-# rustflags = ["-C", "target-cpu=generic"]
-
-# [target.riscv64gc-unknown-none-elf]
-# rustflags = ["-C", "target-cpu=generic"]
-
-# [target.loongarch64-unknown-none]
-# rustflags = ["-C", "target-cpu=generic"]
-
+x86_64 = ["nt61-core/binary_panic", "nt61-core/x86_64"]
+aarch64 = ["nt61-core/binary_panic", "nt61-core/aarch64"]
+loongarch64 = ["nt61-core/binary_panic", "nt61-core/loongarch64"]
+riscv64 = ["nt61-core/binary_panic", "nt61-core/riscv64"]
+smp = ["nt61-core/smp"]
+acpi = ["nt61-core/acpi"]
+debug = ["nt61-core/debug"]
+alloc = ["nt61-core/alloc"]
+btl = ["nt61-core/btl"]
+loongson_gpu = ["nt61-core/loongson_gpu"]
+crypto_libs = ["nt61-core/crypto_libs"]
+log_level_error = ["nt61-core/log_level_error"]
+log_level_warn = ["nt61-core/log_level_warn"]
+log_level_info = ["nt61-core/log_level_info"]
+log_level_debug = ["nt61-core/log_level_debug"]
 
 [dependencies]
-uefi = { version = "0.27", optional = true }
-linked_list_allocator = { version = "0.10", optional = true }
-nt61-fonts = { path = "src/fonts" }
-spin = "0.9"
-bitflags = "2.3"
-x86_64 = { version = "0.15", optional = true, default-features = false }
-acpi = { version = "6.0", optional = true, default-features = false }
-pic8259 = { version = "0.10", optional = true }
-uart_16550 = "0.2"
-hashbrown = { version = "0.14", optional = true }
-talc = { version = "3.0", optional = true }
-sha2 = { version = "0.10", optional = true, default-features = false }
-aes = { version = "0.8", optional = true, default-features = false }
-des = { version = "0.8", optional = true, default-features = false }
-hmac = { version = "0.12", optional = true, default-features = false }
-rsa = { version = "0.9", optional = true, default-features = false, features = ["pem", "sha2"] }
-rand_core = { version = "0.6", optional = true, default-features = false, features = ["alloc"] }
+nt61-core = { path = "../crates/nt61-core", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.8"
 quickcheck = "1.0"
 proptest = "1.2"
-
-[[bin]]
-name = "hal_dll"
-path = "src/bin/hal.rs"
-test = false
