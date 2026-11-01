@@ -327,7 +327,7 @@ pub fn generate_os_volume_files(paths: &EspPaths) -> std::io::Result<()> {
 }
 
 /// Generate PE files (ntoskrnl.exe, hal.dll, ntdll.dll, kernel32.dll, smss.exe)
-/// using the same system_image module that the kernel uses at boot time.
+/// using the same fs::build artifact pipeline that produces the on-disk system images.
 pub fn generate_pe_files(paths: &EspPaths, arch: Arch) -> std::io::Result<()> {
     let system32_dir = &paths.windows_dir;
     generate_pe_files_to(system32_dir.as_path(), arch)
@@ -339,34 +339,37 @@ pub fn generate_pe_files(paths: &EspPaths, arch: Arch) -> std::io::Result<()> {
 pub fn generate_pe_files_to(system32_dir: &Path, arch: Arch) -> std::io::Result<()> {
     fs::create_dir_all(system32_dir)?;
 
-    // Use the kernel's system_image module to generate real PE files
-    // tagged with the architecture-appropriate PE MachineType field
-    // (0x8664 / 0xAA64 / 0xE42C / 0x6232). Without this the kernel's
-    // loader would refuse to load ntoskrnl.exe on a non-x86_64 system.
+    // Generate real PE files through the shared on-disk artifact
+    // pipeline (fs::build): it wraps the freshly built kernel /
+    // userland ELFs and hand-encoded stub PEs into real PE32+ images
+    // tagged with the architecture-appropriate MachineType field.
+    // Without this the kernel's loader would refuse to load
+    // ntoskrnl.exe on a non-x86_64 system.
+    let arch_name = match arch {
+        Arch::X64 => "x86_64",
+        Arch::Arm64 => "aarch64",
+        // The artifact pipeline has no 32-bit ARM artifacts (the
+        // kernel only builds for the 64-bit targets).
+        Arch::Arm => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "32-bit ARM PE generation is not supported by the artifact pipeline",
+            ));
+        }
+        Arch::RiscV64 => "riscv64",
+        Arch::LoongArch64 => "loongarch64",
+    };
+    nt61_tools::fs::build::set_pe_arch(arch_name);
+    let images = nt61_tools::fs::build::build_system_images();
     let machine = arch.pe_machine_type();
-    let images = nt61::system_image::build_all(machine);
 
     let mut total_size: usize = 0;
     for image in &images {
-        // The path uses Windows backslash separators and is rooted at C:\.
-        // We need to strip "C:\" (or just "C:\\Windows" prefix) to get
-        // the path relative to the ESP root.
-        let mut rel = image.path.as_str();
-        // Strip "C:" prefix if present.
-        if rel.starts_with("C:\\") || rel.starts_with("C:/") {
-            if let Some(idx) = rel.find(|c| c == '\\' || c == '/') {
-                // skip the "C:" drive letter and the leading slash
-                rel = &rel[idx + 1..];
-            }
-        }
-        // Convert all backslashes to native separators (Path::join handles it).
-        let rel = rel.replace('\\', "/");
-
-        // For drivers, system_image emits paths like
-        // "Windows/System32/drivers/foo.sys". When joined with
-        // `system32_dir`, that would put foo.sys inside
-        // `<system32>/drivers/foo.sys` (which is what we want).
-        let dest_path = system32_dir.join(rel.trim_start_matches("Windows/System32/"));
+        // Image names are relative to the System32 directory (e.g.
+        // "cmd.exe", "drivers/foo.sys"), so joining with
+        // system32_dir puts drivers inside
+        // <system32>/drivers/foo.sys (which is what we want).
+        let dest_path = system32_dir.join(image.name);
 
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;

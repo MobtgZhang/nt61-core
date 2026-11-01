@@ -12,3 +12,4 @@ path = "src/main.rs"
 # The output is written next to the kernel build tree; no Rust
 # dependencies at runtime.
 [dependencies]
+nt61-boot-types = { path = "../../boot-types" }

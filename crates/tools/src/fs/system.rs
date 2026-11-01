@@ -170,7 +170,7 @@ impl SystemBuilder {
     /// IMPORTANT: this function deliberately does **not** copy
     /// `ntoskrnl.exe` or `hal.dll`. Both files are produced by
     /// `nt61_tools::build_esp::generate_pe_files`, which calls
-    /// `nt61::system_image::build_all` and writes the on-disk PE
+    /// `fs::build::build_system_images` and writes the on-disk PE
     /// images *before* this function runs. Copying the kernel
     /// ELF or the winload EFI binary over those PE files here
     /// would clobber them, which is exactly the failure mode the

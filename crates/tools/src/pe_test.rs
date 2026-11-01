@@ -1,9 +1,9 @@
 //! `pe-test` - host-side smoke test for the pure-Rust PE generator.
 //!
-//! Calls into the same `nt61::pegen` and `nt61::system_image`
-//! modules that the kernel uses at boot time, and writes the
-//! resulting PE files to `build/pe-test/` so we can `file`,
-//! `xxd`, or `pe-parser` them outside the kernel.
+//! Calls into the same `fs::build` artifact pipeline that produces
+//! the on-disk system PE images, and writes the resulting PE files
+//! to `build/pe-test/` so we can `file`, `xxd`, or `pe-parser`
+//! them outside the kernel.
 //!
 //! The point: prove that the system files are real PE32+ images
 //! produced from inside the Rust tree, with no external toolchain
@@ -16,19 +16,20 @@ fn main() {
     let out_dir = PathBuf::from("build/pe-test");
     fs::create_dir_all(&out_dir).expect("mkdir");
 
-    let image = nt61::system_image::build_all(0x8664);
+    nt61_tools::fs::build::set_pe_arch("x86_64");
+    let image = nt61_tools::fs::build::build_system_images();
     let mut total: usize = 0;
     for f in &image {
         // Normalise the in-image "C:\Windows\System32\foo.exe" path
         // to a POSIX path so the smoke test can write the file
         // regardless of the host OS.
-        let posix = f.path.replace('\\', "/");
+        let posix = f.name.replace('\\', "/");
         let path = out_dir.join(&posix);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("mkdir parent");
         }
         fs::write(&path, &f.bytes).expect("write PE");
-        println!("  wrote C:\\{} ({} bytes)", f.path, f.bytes.len());
+        println!("  wrote {} ({} bytes)", f.name, f.bytes.len());
         total += f.bytes.len();
 
         // Quick structural assertions: every file must start with
@@ -46,10 +47,10 @@ fn main() {
     // Loader uses at boot, exercised on the host so we can `assert!`.
     println!("");
     println!("Round-trip test: load each PE with the NT-style loader");
-    let mut db = nt61::loader::ImageDatabase::new();
+    let mut db = nt61_loader::loader::ImageDatabase::new();
     for f in &image {
         // Map path "Windows\System32\hal.dll" -> module name "hal.dll".
-        let short = f.path.rsplit('\\').next().unwrap_or(&f.path);
+        let short = f.name.rsplit('\\').next().unwrap_or(&f.name);
         // Probe the optional header by hand and print it so the
         // diagnostic is reproducible.
         let e_lf = u32::from_le_bytes(f.bytes[0x3C..0x40].try_into().unwrap()) as usize;
@@ -60,13 +61,13 @@ fn main() {
             "  probe {}: opt_off=0x{:x} aep=0x{:x} soi=0x{:x}",
             short, opt, aep, soi
         );
-        let loaded = nt61::loader::load_image_full(short, &f.bytes, &mut db, 0)
+        let loaded = nt61_loader::loader::load_image_full(short, &f.bytes, &mut db, 0)
             .expect("load_image_full must succeed on a generator PE");
         assert!(loaded.entry_point >= loaded.image_base);
         assert!(loaded.entry_point < loaded.image_base + loaded.image_size);
         println!(
-            "  loaded C:\\{} base=0x{:x} ep=0x{:x} sz={}",
-            f.path, loaded.image_base, loaded.entry_point, loaded.image_size
+            "  loaded {} base=0x{:x} ep=0x{:x} sz={}",
+            f.name, loaded.image_base, loaded.entry_point, loaded.image_size
         );
         db.register(&loaded, &f.bytes);
     }
@@ -106,22 +107,22 @@ fn main() {
     println!("");
     println!("Import resolution: ntoskrnl.exe after hal.dll is loaded");
     {
-        let image = nt61::system_image::build_all(0x8664)
+        let image = nt61_tools::fs::build::build_system_images()
             .into_iter()
-            .find(|f| f.path.ends_with("ntoskrnl.exe"))
+            .find(|f| f.name.ends_with("ntoskrnl.exe"))
             .expect("ntoskrnl.exe present");
-        let mut db2 = nt61::loader::ImageDatabase::new();
+        let mut db2 = nt61_loader::loader::ImageDatabase::new();
         // Pre-register hal.dll.
-        let hal = nt61::system_image::build_all(0x8664)
+        let hal = nt61_tools::fs::build::build_system_images()
             .into_iter()
-            .find(|f| f.path.ends_with("hal.dll"))
+            .find(|f| f.name.ends_with("hal.dll"))
             .expect("hal.dll present");
-        let hal_short = hal.path.rsplit('\\').next().unwrap();
-        let hal_loaded = nt61::loader::load_image_full(hal_short, &hal.bytes, &mut db2, 0)
+        let hal_short = hal.name.rsplit('\\').next().unwrap();
+        let hal_loaded = nt61_loader::loader::load_image_full(hal_short, &hal.bytes, &mut db2, 0)
             .expect("load hal.dll");
         db2.register(&hal_loaded, &hal.bytes);
         // Now load ntoskrnl.exe - it should resolve hal.dll imports.
-        let loaded = nt61::loader::load_image_full("ntoskrnl.exe", &image.bytes, &mut db2, 0)
+        let loaded = nt61_loader::loader::load_image_full("ntoskrnl.exe", &image.bytes, &mut db2, 0)
             .expect("load ntoskrnl.exe");
         // The OS Loader registers every image it loads, both
         // so the new image's exports can be resolved by

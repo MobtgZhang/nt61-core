@@ -56,7 +56,7 @@ impl TargetArch {
 
 static PE_ARCH: OnceLock<TargetArch> = OnceLock::new();
 
-fn set_pe_arch(arch: &str) {
+pub fn set_pe_arch(arch: &str) {
     let target = TargetArch::from_name(arch);
     let _ = PE_ARCH.set(target);
 }
@@ -129,6 +129,9 @@ pub fn kernel_features_for(arch: &str) -> String {
     } else {
         features.push_str(",log_level_warn");
     }
+    if std::env::var("DESKTOP_MODE").as_deref() == Ok("1") {
+        features.push_str(",desktop");
+    }
     features
 }
 
@@ -200,7 +203,7 @@ pub fn build_kernel(target: &str) -> Result<PathBuf> {
     cmd.arg("build");
     cmd.arg("--release");
     cmd.arg("--target").arg(target);
-    cmd.arg("-p").arg("nt61");
+    cmd.arg("-p").arg("nt61-init");
     cmd.arg("--no-default-features");
     cmd.arg("--features").arg(kernel_features_for(arch));
 
@@ -211,13 +214,19 @@ pub fn build_kernel(target: &str) -> Result<PathBuf> {
         "riscv64" => {
             cmd.env(
                 "RUSTFLAGS",
-                "-C link-arg=-Tsrc/boot/linker-rv64.ld -C link-arg=-no-gc-sections",
+                format!(
+                    "-C link-arg=-T{}/crates/boot/linker-rv64.ld -C link-arg=-no-gc-sections",
+                    manifest_dir.display()
+                ),
             );
         }
         "loongarch64" => {
             cmd.env(
                 "RUSTFLAGS",
-                "-C link-arg=-Tsrc/boot/linker-la64.ld -C link-arg=-no-gc-sections",
+                format!(
+                    "-C link-arg=-T{}/crates/boot/linker-la64.ld -C link-arg=-no-gc-sections",
+                    manifest_dir.display()
+                ),
             );
         }
         _ => {}
@@ -292,7 +301,7 @@ fn arch_for_kernel_target(target: &str) -> &'static str {
 /// -lgcc` even though Rust's `compiler-builtins` rlib already
 /// covers every CPU helper the EFI image references.
 ///
-/// We pre-populate an empty archive at `tools/loongarch64/lib/`,
+/// We pre-populate an empty archive at `crates/tools/loongarch64/lib/`,
 /// which `src/boot/.cargo/config.toml` and
 /// `src/winload/.cargo/config.toml` point `-L` at. The archive is
 /// checked in to source control and refreshed by this helper if a
@@ -311,7 +320,7 @@ fn ensure_loongarch_libgcc_stub() -> Result<()> {
         return Ok(());
     }
     let workspace_root = get_workspace_root();
-    let dir = workspace_root.join("tools").join("loongarch64").join("lib");
+    let dir = workspace_root.join("crates").join("tools").join("loongarch64").join("lib");
     let archive = dir.join("libgcc.a");
     if archive.exists() {
         return Ok(());
@@ -2808,13 +2817,13 @@ fn copy_tree_to_iso(iso: &mut super::iso9660::IsoImage, src: &Path, prefix: &str
 //
 // The on-disk PE files (`ntoskrnl.exe`, `hal.dll`, `ntdll.dll`,
 // `kernel32.dll`, `smss.exe`, ...) are produced by the
-// `build-esp` binary, which depends on `nt61::system_image`. We
+// `build-esp` binary, which depends on `fs::build::build_system_images`. We
 // invoke it as a subprocess because `fs/build.rs` itself has no
 // direct dependency on the `nt61` crate.
 //
 // The binary must be built first; we run `cargo build
 // --bin build-esp` if it does not exist yet. The tool reads the
-// list of PE images from `nt61::system_image::build_all` and
+// list of PE images from `fs::build::build_system_images` and
 // drops them into the system32 directory.
 pub fn build_userland_images(arch: &str) -> Result<()> {
     let target = uefi_target_for(arch);
@@ -2892,7 +2901,7 @@ fn generate_system_pe_files(arch: &str, system_dir: &Path) -> Result<()> {
 /// In-process call into the `build_esp` library function. Mirrors
 /// what the `build-esp --pe-only` CLI does, but skips the
 /// subprocess entirely so we don't have to deal with the host
-/// link issues of `nt61::system_image`.
+/// link issues of `fs::build::build_system_images`.
 fn generate_pe_files_in_process(system32_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(system32_dir).map_err(BuildError::Io)?;
 
@@ -2938,13 +2947,16 @@ fn generate_pe_files_in_process(system32_dir: &Path) -> Result<()> {
 }
 
 /// A single PE image produced by the in-process generator.
-struct SystemImage {
-    name: &'static str,
-    bytes: Vec<u8>,
+/// A single PE image produced by the in-process generator. The name
+/// is relative to the System32 directory (e.g. `cmd.exe`,
+/// `drivers/acpi.sys`).
+pub struct SystemImage {
+    pub name: &'static str,
+    pub bytes: Vec<u8>,
 }
 
 /// Generate the standard set of system PE images used by
-/// winload.efi at boot. Mirrors `nt61::system_image::build_all`.
+/// winload.efi at boot. Mirrors `fs::build::build_system_images`.
 ///
 /// Drivers are written under `<system32>/drivers/<name>.sys`
 /// (matching the canonical NT 6.1 layout). Without these .sys
@@ -3195,7 +3207,7 @@ fn wrap_elf_to_pe(elf_path: &Path, arch: TargetArch) -> Option<Vec<u8>> {
     std::fs::read(&output_path).ok()
 }
 
-fn build_system_images() -> Vec<SystemImage> {
+pub fn build_system_images() -> Vec<SystemImage> {
     vec![
         SystemImage {
             name: "ntoskrnl.exe",

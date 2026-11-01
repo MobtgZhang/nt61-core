@@ -1,4 +1,9 @@
-//! Dump the cmd.exe image bytes for the kernel to `include_bytes!`.
+//! Dump the cmd.exe image produced by the build pipeline to disk.
+//!
+//! The in-binary `system_image` pipeline is gone: cmd.exe is now
+//! produced from the freshly built `nt61-cmd.efi` artifact by
+//! `nt61_tools::fs::build`. This tool extracts that image so it can
+//! be embedded or inspected.
 use std::fs;
 use std::path::PathBuf;
 
@@ -14,9 +19,19 @@ fn main() {
     } else {
         PathBuf::from("src/resources/pe/cmd_x86_64.exe")
     };
-    let bytes_raw = nt61::system_image::build_cmd_exe_for_machine(machine);
-    // build_cmd_exe_for_machine returns ManuallyDrop<Vec<u8>>, dereference it
-    let bytes: &[u8] = &*bytes_raw;
+    let arch = match machine {
+        0xAA64 => "aarch64",
+        0x5064 => "riscv64",
+        0x6264 => "loongarch64",
+        _ => "x86_64",
+    };
+    nt61_tools::fs::build::set_pe_arch(arch);
+    let images = nt61_tools::fs::build::build_system_images();
+    let img = images
+        .iter()
+        .find(|i| i.name == "cmd.exe")
+        .expect("cmd.exe missing from build_system_images (build nt61-cmd first)");
+    let bytes: &[u8] = &img.bytes;
     eprintln!("dump_cmd: produced {} bytes", bytes.len());
     eprintln!(
         "dump_cmd: first 32 bytes = {:02x?}",

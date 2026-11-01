@@ -1,4 +1,4 @@
-use nt61::loader::{load_image_full, ImageDatabase};
+use nt61_loader::loader::{load_image_full, ImageDatabase};
 
 fn main() {
     let mut args = std::env::args().skip(1);

@@ -9,13 +9,13 @@ publish = false
 name = "build-tool"
 path = "src/main.rs"
 
-# build-esp 需要 nt61
+# build-esp 通过 fs::build 产物管线生成 PE，不再依赖 nt61 门面
 [[bin]]
 name = "build-esp"
 path = "src/build_esp.rs"
 required-features = ["with-nt61"]
 
-# pe-test 需要 nt61
+# pe-test 需要 loader 与 fs::build 产物管线
 [[bin]]
 name = "pe-test"
 path = "src/pe_test.rs"
@@ -26,19 +26,19 @@ name = "load-pe"
 path = "src/bin/load_pe.rs"
 required-features = ["with-nt61"]
 
-# hive-gen 需要 nt61
+# hive-gen 不依赖 nt61 门面
 [[bin]]
 name = "hive-gen"
 path = "src/hive_gen_bin.rs"
 required-features = ["with-nt61"]
 
-# dump-cmd 需要 nt61
+# dump-cmd 读取 fs::build 产物管线中的 cmd.exe
 [[bin]]
 name = "dump-cmd"
 path = "src/bin/dump_cmd.rs"
 required-features = ["with-nt61"]
 
-# mkcmd 不需要 nt61——直接拼接小 PE
+# mkcmd 不依赖 nt61——直接拼接小 PE
 [[bin]]
 name = "mkcmd"
 path = "src/bin/mkcmd.rs"
@@ -48,8 +48,8 @@ name = "nt61_tools"
 path = "src/lib.rs"
 
 [dependencies]
-# nt61 is an optional dependency for kernel integration
-nt61 = { path = "../../nt61", optional = true }
+nt61-boot-types = { path = "../boot-types" }
+nt61-loader = { path = "../loader" }
 # hive_gen is always available
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -63,4 +63,4 @@ tempfile = "3.8"
 [features]
 default = []
 testing = ["tempfile"]
-with-nt61 = ["nt61", "nt61?/binary_panic", "tempfile"]
+with-nt61 = ["tempfile"]
