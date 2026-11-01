@@ -1,0 +1,55 @@
+[package]
+name = "nt61-init"
+version = "0.1.0"
+edition = "2021"
+authors = ["NT6.1.7601 Team"]
+description = "Windows NT 6.1 (Windows 7) compatible operating system kernel written in Rust"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "nt61"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nt61-kernel"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "hal_dll"
+path = "src/bin/hal.rs"
+test = false
+
+[features]
+default = ["x86_64", "binary_panic", "alloc", "crypto_libs"]
+desktop = ["dep:nt61-desktop"]
+std = []
+uefi_boot = []
+bios_boot = []
+binary_panic = ["ntoskrnl/binary_panic"]
+x86_64 = ["ntoskrnl/x86_64"]
+aarch64 = ["ntoskrnl/aarch64"]
+loongarch64 = ["ntoskrnl/loongarch64"]
+riscv64 = ["ntoskrnl/riscv64"]
+smp = ["ntoskrnl/smp"]
+acpi = ["ntoskrnl/acpi"]
+debug = ["ntoskrnl/debug"]
+alloc = ["ntoskrnl/alloc"]
+btl = ["ntoskrnl/btl"]
+loongson_gpu = ["ntoskrnl/loongson_gpu"]
+crypto_libs = ["ntoskrnl/crypto_libs"]
+log_level_error = []
+log_level_warn = []
+log_level_info = ["log_level_warn"]
+log_level_debug = ["log_level_info"]
+
+[dependencies]
+nt61-boot-types = { path = "../boot-types" }
+nt61-sync = { path = "../sync" }
+ntoskrnl = { path = "../ntoskrnl" }
+nt61-desktop = { path = "../../../nt61-desktop", optional = true }
+
+[dev-dependencies]
+tempfile = "3.8"
+quickcheck = "1.0"
+proptest = "1.2"
