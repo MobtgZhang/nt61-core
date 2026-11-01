@@ -10,7 +10,7 @@ pub extern "efiapi" fn DriverEntry(
 ) -> i32 {
     register_driver(
         driver_object,
-        nt61::drivers::video::vga::init,
+        nt61_drivers::drivers::video::vga::init,
         dispatch_success,
         unload_driver,
     )

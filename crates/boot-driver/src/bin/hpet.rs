@@ -10,7 +10,7 @@ pub extern "efiapi" fn DriverEntry(
 ) -> i32 {
     register_driver(
         driver_object,
-        nt61::drivers::timer::init,
+        nt61_drivers::drivers::timer::init,
         dispatch_success,
         unload_driver,
     )

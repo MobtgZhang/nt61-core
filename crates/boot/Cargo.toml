@@ -6,6 +6,7 @@ description = "NT6.1.7601 UEFI Boot Manager"
 authors = ["NT6.1.7601 Team"]
 
 [dependencies]
+nt61-boot-types = { path = "../boot-types" }
 uefi = { version = "0.37.0", features = ["alloc", "logger"] }
 uefi-raw = "0.14.0"
 nt61-bootfs = { path = "../bootfs" }

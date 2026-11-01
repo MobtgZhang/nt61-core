@@ -374,7 +374,7 @@ mod tests {
     fn reads_fat32_system_file_from_built_image() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../nt61/build/x86_64/fat32/images/disk.img"
+            "/../../build/x86_64/fat32/images/disk.img"
         );
         let file = File::open(path).expect("built FAT32 image");
         let reader = FileSectorReader { file };

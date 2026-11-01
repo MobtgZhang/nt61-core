@@ -4,7 +4,7 @@ extern crate alloc;
 
 #[cfg_attr(not(test), global_allocator)]
 #[cfg_attr(test, allow(dead_code))]
-static ALLOCATOR: nt61::mm::heap::KernelHeapAllocator = nt61::mm::heap::KernelHeapAllocator;
+static ALLOCATOR: ntoskrnl::mm::heap::KernelHeapAllocator = ntoskrnl::mm::heap::KernelHeapAllocator;
 
 pub const STATUS_SUCCESS: i32 = 0;
 pub const STATUS_INVALID_PARAMETER: i32 = -1;

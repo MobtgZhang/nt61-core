@@ -1,0 +1,11 @@
+[package]
+name = "nt61-boot-types"
+version = "0.1.0"
+edition = "2021"
+authors = ["NT6.1.7601 Team"]
+description = "Windows NT 6.1 kernel boot handoff types"
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+test = false

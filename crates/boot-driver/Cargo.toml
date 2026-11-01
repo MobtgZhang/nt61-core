@@ -4,17 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-nt61 = { path = "../../nt61", default-features = false, features = ["binary_panic", "alloc"] }
+nt61-boot-types = { path = "../boot-types" }
+nt61-drivers = { path = "../drivers" }
+ntoskrnl = { path = "../ntoskrnl", features = ["binary_panic"] }
 
 [lib]
 test = false
 
 [features]
 default = ["driver-x86_64"]
-driver-x86_64 = ["nt61/x86_64"]
-driver-aarch64 = ["nt61/aarch64"]
-driver-riscv64 = ["nt61/riscv64"]
-driver-loongarch64 = ["nt61/loongarch64"]
+driver-x86_64 = []
+driver-aarch64 = []
+driver-riscv64 = []
+driver-loongarch64 = []
 
 [[bin]]
 name = "nt61-driver"
