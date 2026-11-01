@@ -193,8 +193,18 @@ pub fn init() {
         // that is active when the first exception arrives. Re-check
         // and re-map right before interrupts can be taken; allocator
         // reuse has been observed to wipe the bootstrap mapping.
-        let _ = crate::arch::loongarch64::paging::ensure_vector_page_mapped();
-        crate::arch::loongarch64::paging::vector_page_check("idt_init");
+        let vector_va = vector_page_va();
+        let mapped = crate::arch::loongarch64::paging::page_is_mapped_in_root(
+            crate::arch::loongarch64::paging::read_page_root_pfn(),
+            vector_va,
+        );
+        if !mapped {
+            let _ = crate::arch::loongarch64::paging::map_page(
+                vector_va,
+                vector_va,
+                crate::mm::pte::PTE_P | crate::mm::pte::PTE_RW,
+            );
+        }
     }
 }
 

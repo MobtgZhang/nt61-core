@@ -178,26 +178,15 @@ pub fn init_hardware() {
 
     #[cfg(target_arch = "loongarch64")]
     {
-        crate::arch::boot::early_write_str(b"[LA64] hw_enter\r\n");
         loongarch64::init();
-        crate::arch::boot::early_write_str(b"[LA64] arch_done\r\n");
         loongarch64::paging::init();
-        crate::arch::boot::early_write_str(b"[LA64] paging_done\r\n");
         loongarch64::idt::init();
-        crate::arch::boot::early_write_str(b"[LA64] idt_done\r\n");
         loongarch64::serial::serial_init(0);
-        crate::arch::boot::early_write_str(b"[LA64] serial_done\r\n");
         loongarch64::pit::init(0x1FE0_0000);
-        crate::arch::boot::early_write_str(b"[LA64] pit_done\r\n");
         loongarch64::pic::init(0x1FE0_0000 + 0x1000);
-        crate::arch::boot::early_write_str(b"[LA64] pic_done\r\n");
         crate::hal::common::keyboard_unified::enable_serial_rx_irq();
-        crate::arch::boot::early_write_str(b"[LA64] rxirq_done\r\n");
         loongarch64::syscall::init();
-        crate::arch::boot::early_write_str(b"[LA64] syscall_done\r\n");
         crate::hal::common::init();
-        crate::boot_debug_println!("[LA64] common HAL init done");
-        crate::arch::boot::early_write_str(b"[LA64] common_done\r\n");
     }
 }
 

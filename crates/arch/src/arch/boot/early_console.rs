@@ -57,7 +57,8 @@ pub fn early_write_str(s: &[u8]) {
         for &c in s {
             unsafe { early_write_byte(c) };
         }
-    })
+    });
+    arch_early_restore_serial_state();
 }
 
 /// Per-arch early serial sink readiness trampoline.
@@ -86,10 +87,23 @@ fn arch_early_ensure_serial_ready_loongarch() -> u64 {
         let mut crmd: u64;
         core::arch::asm!("csrrd {}, 0x0", out(reg) crmd, options(nostack));
         let prev = crmd;
+        crmd |= 1 << 3;
+        crmd &= !(1 << 4);
         GUARD = GUARD.wrapping_add(1);
         core::arch::asm!("csrwr {}, 0x0", in(reg) crmd, options(nostack));
         GUARD = GUARD.wrapping_add(crmd ^ prev);
         prev
+    }
+}
+
+/// Restore the CRMD value saved before LoongArch early serial output.
+pub fn arch_early_restore_serial_state() {
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let prev = ARCH_EARLY_LAST_CRMD.load(core::sync::atomic::Ordering::Relaxed);
+        unsafe {
+            core::arch::asm!("csrwr {}, 0x0", in(reg) prev, options(nostack));
+        }
     }
 }
 

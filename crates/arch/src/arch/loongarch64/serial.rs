@@ -14,6 +14,48 @@ const UART_PHYS_BASE: u64 = 0x1FE0_01E0;
 const UART_THR: u64 = 0;
 const UART_LSR: u64 = 5;
 
+const CRMD_IE: u64 = 1 << 2;
+const CRMD_DA: u64 = 1 << 3;
+const CRMD_PG: u64 = 1 << 4;
+
+/// QEMU's LoongArch DMW windows do not reliably cover the UART once
+/// paging is enabled. Temporarily return to the firmware's direct
+/// address mode for every UART MMIO access. Interrupts are masked
+/// while CRMD.PG is cleared because exception vectors and saved
+/// kernel state expect mapped mode.
+#[inline(never)]
+fn with_uart_da_mode<T>(operation: impl FnOnce() -> T) -> T {
+    let mut crmd: u64;
+    unsafe {
+        core::arch::asm!("csrrd {}, 0x0", out(reg) crmd, options(nostack));
+    }
+    if crmd & CRMD_PG == 0 {
+        return operation();
+    }
+
+    let protected = (crmd & !CRMD_IE & !CRMD_PG) | CRMD_DA;
+    unsafe {
+        core::arch::asm!("csrwr {}, 0x0", in(reg) protected, options(nostack));
+    }
+    let result = operation();
+    unsafe {
+        core::arch::asm!("csrwr {}, 0x0", in(reg) crmd, options(nostack));
+    }
+    result
+}
+
+#[inline]
+fn read_uart(offset: u64) -> u8 {
+    with_uart_da_mode(|| unsafe { ptr::read_volatile((UART_PHYS_BASE + offset) as *const u8) })
+}
+
+#[inline]
+fn write_uart(offset: u64, value: u8) {
+    with_uart_da_mode(|| unsafe {
+        ptr::write_volatile((UART_PHYS_BASE + offset) as *mut u8, value)
+    });
+}
+
 /// Initialise the UART. `base == 0` uses the LS7A default at
 /// `0x1FE0_01E0` (the address the Loongson machines and QEMU
 /// virt platform expose).
@@ -26,24 +68,13 @@ pub fn init() {
 pub fn serial_init(base: u64) {
     let b = if base != 0 { base } else { UART_PHYS_BASE };
     UART_BASE.store(b, Ordering::Release);
-    unsafe {
-        ptr::write_volatile((b + 1) as *mut u8, 0x00);
-        ptr::write_volatile((b + 3) as *mut u8, 0x80);
-        ptr::write_volatile((b + 0) as *mut u8, 0x01);
-        ptr::write_volatile((b + 1) as *mut u8, 0x00);
-        ptr::write_volatile((b + 3) as *mut u8, 0x03);
-        ptr::write_volatile((b + 2) as *mut u8, 0xC7);
-    }
-}
-
-fn base() -> u64 {
-    let b = UART_BASE.load(Ordering::Acquire);
-    let phys = if b == 0 { UART_PHYS_BASE } else { b };
-    if crate::arch::loongarch64::paging::paging_enabled() {
-        crate::arch::loongarch64::paging::mmio_virt(phys)
-    } else {
-        phys
-    }
+    let _ = b;
+    write_uart(1, 0x00);
+    write_uart(3, 0x80);
+    write_uart(0, 0x01);
+    write_uart(1, 0x00);
+    write_uart(3, 0x03);
+    write_uart(2, 0xC7);
 }
 
 /// write a single character to the UART. Honours the global
@@ -52,11 +83,8 @@ pub fn write_char(c: u8) {
     if crate::hal::common::serial_disable::is_disabled() {
         return;
     }
-    let b = base();
-    unsafe {
-        while ptr::read_volatile((b + UART_LSR) as *const u8) & 0x20 == 0 {}
-        ptr::write_volatile((b + UART_THR) as *mut u8, c);
-    }
+    while read_uart(UART_LSR) & 0x20 == 0 {}
+    write_uart(UART_THR, c);
 }
 
 /// write a string to the UART. Honours the gate.
@@ -72,11 +100,8 @@ pub fn write_string(s: &str) {
 /// Writes diagnostic strings even in non-debug builds.
 pub fn write_string_always(s: &str) {
     for c in s.bytes() {
-        let b = base();
-        unsafe {
-            while ptr::read_volatile((b + UART_LSR) as *const u8) & 0x20 == 0 {}
-            ptr::write_volatile((b + UART_THR) as *mut u8, c);
-        }
+        while read_uart(UART_LSR) & 0x20 == 0 {}
+        write_uart(UART_THR, c);
     }
 }
 
@@ -174,19 +199,15 @@ impl<'a> fmt::Write for WriteToBuf<'a> {
 
 /// read one byte from the UART. Returns `None` if no data is ready.
 pub fn read_char() -> Option<u8> {
-    let b = base();
-    unsafe {
-        if ptr::read_volatile((b + UART_LSR) as *const u8) & 0x01 == 0 {
-            return None;
-        }
-        Some(ptr::read_volatile((b + UART_THR) as *const u8))
+    if read_uart(UART_LSR) & 0x01 == 0 {
+        return None;
     }
+    Some(read_uart(UART_THR))
 }
 
 /// Returns true if data is waiting in the receive FIFO.
 pub fn data_available() -> bool {
-    let b = base();
-    unsafe { (ptr::read_volatile((b + UART_LSR) as *const u8) & 0x01) != 0 }
+    (read_uart(UART_LSR) & 0x01) != 0
 }
 
 /// Legacy alias for `init()`-style entry points.

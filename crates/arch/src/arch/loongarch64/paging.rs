@@ -24,7 +24,6 @@
 
 use core::arch::asm;
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ke::sync::Spinlock;
 use crate::mm::pfn;
@@ -33,92 +32,6 @@ use crate::mm::pte::pfn_to_phys;
 pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_SHIFT: u64 = 12;
 pub const PAGE_MASK: u64 = !(PAGE_SIZE - 1);
-
-/// Watchpoint state: physical frame of the leaf table that owns the
-/// exception-vector page. vector_page_check resolves and records it;
-/// every PTE write into this frame is logged so the code path that
-/// corrupts the vector mapping (PTE observed flipping to 0x5D3, i.e.
-/// pa=0) can be identified from the serial timeline.
-static LEAF_WATCH_FRAME: AtomicU64 = AtomicU64::new(0);
-static LEAF_WATCH_HITS: AtomicU64 = AtomicU64::new(0);
-static ZERO_PA_HITS: AtomicU64 = AtomicU64::new(0);
-static VECW_HITS: AtomicU64 = AtomicU64::new(0);
-
-/// Log a PTE write if it targets the watched leaf frame, and log any
-/// map of pa=0 into a non-null va (make_pte_loong(0, writable) is
-/// exactly 0x5D3, the value observed corrupting the vector page).
-fn watch_pte_write(op: &str, va: u64, pa: u64, flags: u64, pte_ptr: u64) {
-    // VA-based watch: fire on ANY map of the vector page regardless of
-    // which leaf frame hosts it or when the watch frame was armed.
-    let vec_va = crate::arch::loongarch64::idt::vector_page_va() & PAGE_MASK;
-    if (va & PAGE_MASK) == vec_va {
-        let n = VECW_HITS.fetch_add(1, Ordering::Relaxed);
-        if n < 24 {
-            crate::hal::serial::write_string_always("[VECW] ");
-            crate::hal::serial::write_string_always(op);
-            crate::hal::serial::write_string_always(" va=");
-            crate::hal::serial::write_hex_u64_always(va);
-            crate::hal::serial::write_string_always(" pa=");
-            crate::hal::serial::write_hex_u64_always(pa);
-            crate::hal::serial::write_string_always(" fl=");
-            crate::hal::serial::write_hex_u64_always(flags);
-            crate::hal::serial::write_string_always(" pte_ptr=");
-            crate::hal::serial::write_hex_u64_always(pte_ptr);
-            crate::hal::serial::write_string_always("\r\n");
-        }
-    }
-    let frame = LEAF_WATCH_FRAME.load(Ordering::Relaxed);
-    if frame != 0 && (pte_ptr & PAGE_MASK) == frame {
-        let n = LEAF_WATCH_HITS.fetch_add(1, Ordering::Relaxed);
-        if n < 24 {
-            crate::hal::serial::write_string_always("[LEAFW] ");
-            crate::hal::serial::write_string_always(op);
-            crate::hal::serial::write_string_always(" va=");
-            crate::hal::serial::write_hex_u64_always(va);
-            crate::hal::serial::write_string_always(" pa=");
-            crate::hal::serial::write_hex_u64_always(pa);
-            crate::hal::serial::write_string_always(" fl=");
-            crate::hal::serial::write_hex_u64_always(flags);
-            crate::hal::serial::write_string_always(" pte_ptr=");
-            crate::hal::serial::write_hex_u64_always(pte_ptr);
-            crate::hal::serial::write_string_always("\r\n");
-        }
-    }
-    if (pa & PAGE_MASK) == 0 && va != 0 {
-        let n = ZERO_PA_HITS.fetch_add(1, Ordering::Relaxed);
-        if n < 12 {
-            crate::hal::serial::write_string_always("[PTE0] ");
-            crate::hal::serial::write_string_always(op);
-            crate::hal::serial::write_string_always(" va=");
-            crate::hal::serial::write_hex_u64_always(va);
-            crate::hal::serial::write_string_always(" flags=");
-            crate::hal::serial::write_hex_u64_always(flags);
-            crate::hal::serial::write_string_always("\r\n");
-        }
-    }
-}
-
-/// Log the zeroing of a newly allocated page-table frame if it is the
-/// watched live leaf frame (PFN allocator re-issuing a live frame).
-fn watch_leaf_zero(new_phys: u64) {
-    let frame = LEAF_WATCH_FRAME.load(Ordering::Relaxed);
-    if frame != 0 && (new_phys & PAGE_MASK) == frame {
-        crate::hal::serial::write_string_always("[LEAFW] ZERO new-table pa=");
-        crate::hal::serial::write_hex_u64_always(new_phys);
-        crate::hal::serial::write_string_always(" (live vector-page leaf frame re-issued!)\r\n");
-    }
-}
-
-/// Hook for the PFN allocator: report re-allocation of the watched
-/// live leaf-table frame (cfg-gated call site lives in mm/pfn.rs).
-pub fn watch_pfn_alloc(pfn: u64) {
-    let frame = LEAF_WATCH_FRAME.load(Ordering::Relaxed);
-    if frame != 0 && frame >> PAGE_SHIFT == pfn {
-        crate::hal::serial::write_string_always("[PFNWATCH] frame re-allocated pfn=");
-        crate::hal::serial::write_hex_u64_always(pfn);
-        crate::hal::serial::write_string_always("\r\n");
-    }
-}
 
 /// LoongArch direct address translation window 0.
 ///
@@ -305,6 +218,32 @@ pub fn translate_x86_root_entry(entry: u64) -> u64 {
     make_table_desc_loong(entry & 0x000F_FFFF_FFFF_F000)
 }
 
+/// Run `operation` with CRMD.IE cleared. LoongArch page-table updates
+/// hold a global paging spinlock; a timer or UART interrupt that
+/// schedules while that lock is held can otherwise re-enter the same
+/// lock and hang the bootstrap.
+#[inline]
+fn with_interrupts_disabled<T>(operation: impl FnOnce() -> T) -> T {
+    let mut crmd: u64;
+    unsafe {
+        core::arch::asm!("csrrd {}, 0x0", out(reg) crmd, options(nostack));
+    }
+    const CRMD_IE: u64 = 1 << 2;
+    if crmd & CRMD_IE == 0 {
+        return operation();
+    }
+
+    let masked = crmd & !CRMD_IE;
+    unsafe {
+        core::arch::asm!("csrwr {}, 0x0", in(reg) masked, options(nostack));
+    }
+    let result = operation();
+    unsafe {
+        core::arch::asm!("csrwr {}, 0x0", in(reg) crmd, options(nostack));
+    }
+    result
+}
+
 /// Read the page-root PA out of the `PGDL` CSR (0x19). Kernel VAs
 /// live in the low half (VA63 == 0) and user VAs share that half, so
 /// PGDL — which `enter_first_user_thread` switches to the user root —
@@ -341,7 +280,6 @@ unsafe fn leaf_pte_for_at(root_pa: u64, va: u64) -> *mut u64 {
             None => return core::ptr::null_mut(),
         };
         let new_phys = pfn_to_phys(pfn);
-        watch_leaf_zero(new_phys);
         ptr::write_bytes(new_phys as *mut u8, 0, 4096);
         let new_desc = make_table_desc_loong(new_phys);
         core::ptr::write_volatile(l0.add(l0_idx), new_desc);
@@ -358,7 +296,6 @@ unsafe fn leaf_pte_for_at(root_pa: u64, va: u64) -> *mut u64 {
             None => return core::ptr::null_mut(),
         };
         let new_phys = pfn_to_phys(pfn);
-        watch_leaf_zero(new_phys);
         ptr::write_bytes(new_phys as *mut u8, 0, 4096);
         let new_desc = make_table_desc_loong(new_phys);
         core::ptr::write_volatile(l1.add(l1_idx), new_desc);
@@ -375,7 +312,6 @@ unsafe fn leaf_pte_for_at(root_pa: u64, va: u64) -> *mut u64 {
             None => return core::ptr::null_mut(),
         };
         let new_phys = pfn_to_phys(pfn);
-        watch_leaf_zero(new_phys);
         ptr::write_bytes(new_phys as *mut u8, 0, 4096);
         let new_desc = make_table_desc_loong(new_phys);
         core::ptr::write_volatile(l2.add(l2_idx), new_desc);
@@ -392,7 +328,6 @@ unsafe fn leaf_pte_for_at(root_pa: u64, va: u64) -> *mut u64 {
             None => return core::ptr::null_mut(),
         };
         let new_phys = pfn_to_phys(pfn);
-        watch_leaf_zero(new_phys);
         ptr::write_bytes(new_phys as *mut u8, 0, 4096);
         let new_desc = make_table_desc_loong(new_phys);
         core::ptr::write_volatile(dir1.add(l3_idx), new_desc);
@@ -412,58 +347,61 @@ unsafe fn leaf_pte_for(va: u64) -> *mut u64 {
 }
 
 pub fn map_page(va: u64, pa: u64, flags: u64) -> bool {
-    let _state = PAGING_STATE.lock();
-    let l3_pte = unsafe { leaf_pte_for(va) };
-    if l3_pte.is_null() {
-        return false;
-    }
-    watch_pte_write("map", va, pa, flags, l3_pte as u64);
-    unsafe {
-        core::ptr::write_volatile(l3_pte, make_pte_loong(pa, flags));
-        if paging_enabled() {
-            crate::arch::loongarch64::tlb::flush_page(va & PAGE_MASK);
+    with_interrupts_disabled(|| {
+        let _state = PAGING_STATE.lock();
+        let l3_pte = unsafe { leaf_pte_for(va) };
+        if l3_pte.is_null() {
+            return false;
         }
-    }
-    true
+        unsafe {
+            core::ptr::write_volatile(l3_pte, make_pte_loong(pa, flags));
+            if paging_enabled() {
+                crate::arch::loongarch64::tlb::flush_page(va & PAGE_MASK);
+            }
+        }
+        true
+    })
 }
 
 /// Map one page into a non-current root without switching hardware context.
 pub fn map_page_in_root(root_pfn: u64, va: u64, pa: u64, flags: u64) -> bool {
-    let _state = PAGING_STATE.lock();
-    let root_pa = pfn_to_phys(root_pfn);
-    let leaf_pte = unsafe { leaf_pte_for_at(root_pa, va) };
-    if leaf_pte.is_null() {
-        return false;
-    }
-    watch_pte_write("maproot", va, pa, flags, leaf_pte as u64);
-    unsafe {
-        core::ptr::write_volatile(leaf_pte, make_pte_loong(pa, flags));
-    }
-    if paging_enabled() {
-        crate::arch::loongarch64::tlb::flush_page(va & PAGE_MASK);
-    }
-    true
-}
-
-pub fn unmap_page(va: u64) -> Option<u64> {
-    let _state = PAGING_STATE.lock();
-    let l3_pte = unsafe { leaf_pte_for(va) };
-    if l3_pte.is_null() {
-        return None;
-    }
-    unsafe {
-        let pte = core::ptr::read_volatile(l3_pte);
-        if !is_valid_loong(pte) {
-            return None;
+    with_interrupts_disabled(|| {
+        let _state = PAGING_STATE.lock();
+        let root_pa = pfn_to_phys(root_pfn);
+        let leaf_pte = unsafe { leaf_pte_for_at(root_pa, va) };
+        if leaf_pte.is_null() {
+            return false;
         }
-        let pa = pte & 0x000F_FFFF_FFFF_F000;
-        watch_pte_write("unmap", va, pa, 0, l3_pte as u64);
-        core::ptr::write_volatile(l3_pte, 0);
+        unsafe {
+            core::ptr::write_volatile(leaf_pte, make_pte_loong(pa, flags));
+        }
         if paging_enabled() {
             crate::arch::loongarch64::tlb::flush_page(va & PAGE_MASK);
         }
-        Some(pa)
-    }
+        true
+    })
+}
+
+pub fn unmap_page(va: u64) -> Option<u64> {
+    with_interrupts_disabled(|| {
+        let _state = PAGING_STATE.lock();
+        let l3_pte = unsafe { leaf_pte_for(va) };
+        if l3_pte.is_null() {
+            return None;
+        }
+        unsafe {
+            let pte = core::ptr::read_volatile(l3_pte);
+            if !is_valid_loong(pte) {
+                return None;
+            }
+            let pa = pte & 0x000F_FFFF_FFFF_F000;
+            core::ptr::write_volatile(l3_pte, 0);
+            if paging_enabled() {
+                crate::arch::loongarch64::tlb::flush_page(va & PAGE_MASK);
+            }
+            Some(pa)
+        }
+    })
 }
 
 pub fn translate_virt(va: u64) -> Option<u64> {
@@ -527,7 +465,9 @@ pub fn leaf_entry(va: u64) -> Option<u64> {
         if !is_table_loong(dir1e) {
             return None;
         }
-        let entry = core::ptr::read_volatile(table_pa_loong(dir1e) as *const u64);
+        let leaf_table = table_pa_loong(dir1e) as *const u64;
+        let pte_idx = ((va >> 12) & 0x1FF) as usize;
+        let entry = core::ptr::read_volatile(leaf_table.add(pte_idx));
         if is_valid_loong(entry) {
             Some(entry)
         } else {
@@ -588,9 +528,7 @@ pub unsafe fn load_page_root(pml4_pfn: u64) {
     });
     // Keep the same switch-time guards as RISC-V so the system root can
     // always reach the active image, stack, heap, and serial device.
-    crate::hal::serial::write_string_always("[LAPG] prepare enter\r\n");
     prepare_switch_mappings(pml4_pfn);
-    crate::hal::serial::write_string_always("[LAPG] prepare done\r\n");
     let switch_pa = pa;
     asm!("csrwr {0}, 0x1a", inout(reg) switch_pa => _, options(nostack));
     let switch_pa2 = pa;
@@ -601,15 +539,12 @@ pub unsafe fn load_page_root(pml4_pfn: u64) {
     // identity map and the loaded kernel image) are invalid.
     asm!("csrwr {0}, 0x19", inout(reg) switch_pa2 => _, options(nostack));
     asm!("invtlb 0, $r0, $r0", options(nostack));
-    crate::hal::serial::write_string_always("[LAPG] flushed\r\n");
     // Clear DA and set PG so the new page tables are consulted.
     let mut crmd: u64;
     asm!("csrrd {}, 0x0", out(reg) crmd, options(nostack));
     crmd &= !(1u64 << 3); // clear DA (mutually exclusive with PG)
     crmd |= 1u64 << 4; // set PG
-    crate::hal::serial::write_string_always("[LAPG] enabling\r\n");
     asm!("csrwr {}, 0x0", in(reg) crmd, options(nostack));
-    crate::hal::serial::write_string_always("[LAPG] enabled\r\n");
 }
 
 /// Install the running image and current stack in the destination root.
@@ -626,11 +561,6 @@ fn prepare_switch_mappings(root_pfn: u64) {
     }
     let image_start = return_address & !(16 * 1024 * 1024 - 1);
     let image_end = image_start + 18 * 1024 * 1024;
-    crate::hal::serial::write_string_always("[LAPGROOT] ra=");
-    crate::hal::serial::write_hex_u64_always(return_address);
-    crate::hal::serial::write_string_always(" start=");
-    crate::hal::serial::write_hex_u64_always(image_start);
-    crate::hal::serial::write_string_always("\r\n");
     for page in (image_start..image_end).step_by(PAGE_SIZE as usize) {
         let pa = if paging_enabled() {
             match translate_virt(page) {
@@ -647,74 +577,28 @@ fn prepare_switch_mappings(root_pfn: u64) {
             ));
         }
     }
+    // Exception vectors are re-validated after the process root becomes
+    // active.  Map them here too: the image range normally includes the
+    // vector page, but a process root is private and must not depend on
+    // a later allocator call while the current root may be unmapped.
+    let vec_va = crate::arch::loongarch64::idt::vector_page_va();
+    let vec_pa = if paging_enabled() {
+        match translate_virt(vec_va) {
+            Some(pa) => pa & PAGE_MASK,
+            None => vec_va,
+        }
+    } else {
+        vec_va
+    };
+    if !map_page_in_root(root_pfn, vec_va, vec_pa, KERNEL_CODE) {
+        crate::hal::serial::write_string_always(&alloc::format!(
+            "[LAPGROOT] vector map failed at {:x}\r\n",
+            vec_va
+        ));
+    }
     // Vector-page integrity probe: the exception vectors live in the
     // image identity range; verify the destination root really covers
     // the EENTRY page before switching.
-    let vec_va = crate::arch::loongarch64::idt::vector_page_va();
-    crate::hal::serial::write_string_always("[VECPG] prepare va=");
-    crate::hal::serial::write_hex_u64_always(vec_va);
-    crate::hal::serial::write_string_always(" mapped=");
-    crate::mm::write_decimal_u64(page_is_mapped_in_root(root_pfn, vec_va) as u64);
-    crate::hal::serial::write_string_always("\r\n");
-    // Arm the LEAFW watchpoint on the destination root as early as
-    // possible so PTE writes into the vector-page leaf table are
-    // logged even before the first vector_page_check runs.
-    if let Some(leaf_pa) = leaf_pa_in_root(pfn_to_phys(root_pfn), vec_va) {
-        LEAF_WATCH_FRAME.store(leaf_pa, Ordering::Relaxed);
-    }
-    crate::hal::serial::write_string_always("[LAPGROOT] pc mapped=");
-    crate::mm::write_decimal_u64(page_is_mapped_in_root(root_pfn, return_address) as u64);
-    crate::hal::serial::write_string_always("\r\n");
-    let refill_page = (return_address + 0x418) & PAGE_MASK;
-    crate::hal::serial::write_string_always("[LAPGDUMPPAGE] refill_mapped=");
-    crate::mm::write_decimal_u64(page_is_mapped_in_root(root_pfn, refill_page) as u64);
-    crate::hal::serial::write_string_always(" page=");
-    crate::hal::serial::write_hex_u64_always(refill_page);
-    crate::hal::serial::write_string_always("\r\n");
-    let root_pa = pfn_to_phys(root_pfn);
-    let root_entry = unsafe { core::ptr::read_volatile(root_pa as *const u64) };
-    let l1_pa = table_pa_loong(root_entry);
-    let l1_entry = unsafe {
-        core::ptr::read_volatile((l1_pa + (((return_address >> 39) & 0x1ff) * 8)) as *const u64)
-    };
-    let l2_pa = table_pa_loong(l1_entry);
-    let l2_entry = unsafe {
-        core::ptr::read_volatile((l2_pa + (((return_address >> 30) & 0x1ff) * 8)) as *const u64)
-    };
-    let dir1_pa = table_pa_loong(l2_entry);
-    let dir1_entry = unsafe {
-        core::ptr::read_volatile((dir1_pa + (((return_address >> 21) & 0x1ff) * 8)) as *const u64)
-    };
-    let leaf_pa = table_pa_loong(dir1_entry);
-    let leaf_entry = unsafe {
-        core::ptr::read_volatile((leaf_pa + (((return_address >> 12) & 0x1ff) * 8)) as *const u64)
-    };
-    let pwcl: u64;
-    let pwch: u64;
-    let pgdl: u64;
-    unsafe {
-        asm!("csrrd {}, 0x1c", out(reg) pwcl, options(nostack));
-        asm!("csrrd {}, 0x1d", out(reg) pwch, options(nostack));
-        asm!("csrrd {}, 0x19", out(reg) pgdl, options(nostack));
-    }
-    crate::hal::serial::write_string_always("[LAPGDUMP] root=");
-    crate::hal::serial::write_hex_u64_always(root_entry);
-    crate::hal::serial::write_string_always(" l1=");
-    crate::hal::serial::write_hex_u64_always(l1_entry);
-    crate::hal::serial::write_string_always(" l2=");
-    crate::hal::serial::write_hex_u64_always(l2_entry);
-    crate::hal::serial::write_string_always(" dir1=");
-    crate::hal::serial::write_hex_u64_always(dir1_entry);
-    crate::hal::serial::write_string_always(" pte=");
-    crate::hal::serial::write_hex_u64_always(leaf_entry);
-    crate::hal::serial::write_string_always(" pwcl=");
-    crate::hal::serial::write_hex_u64_always(pwcl);
-    crate::hal::serial::write_string_always(" pwch=");
-    crate::hal::serial::write_hex_u64_always(pwch);
-    crate::hal::serial::write_string_always(" pgdl=");
-    crate::hal::serial::write_hex_u64_always(pgdl);
-    crate::hal::serial::write_string_always("\r\n");
-
     let mut stack_pointer = 0u64;
     unsafe {
         asm!("move {}, $sp", out(reg) stack_pointer, options(nostack));
@@ -824,94 +708,9 @@ pub fn ensure_vector_page_mapped() -> bool {
     map_page(va, pa, VEC_FLAGS)
 }
 
-/// Serial diagnostic: mapping state of the vector page in the
-/// currently active root.
-pub fn vector_page_check(tag: &str) {
-    let va = crate::arch::loongarch64::idt::vector_page_va();
-    let mapped = page_is_mapped_in_root(read_page_root_pfn(), va);
-    let pte = leaf_entry(va);
-    if let Some(leaf_pa) = leaf_pa_in_root(root_phys(), va) {
-        LEAF_WATCH_FRAME.store(leaf_pa, Ordering::Relaxed);
-    }
-    crate::hal::serial::write_string_always("[VECPG] ");
-    crate::hal::serial::write_string_always(tag);
-    crate::hal::serial::write_string_always(" va=");
-    crate::hal::serial::write_hex_u64_always(va);
-    crate::hal::serial::write_string_always(" mapped=");
-    crate::mm::write_decimal_u64(mapped as u64);
-    if let Some(e) = pte {
-        crate::hal::serial::write_string_always(" pte=");
-        crate::hal::serial::write_hex_u64_always(e);
-    }
-    // Report the leaf table frame that owns this VA so a later
-    // checkpoint can reveal the frame being reused.
-    let root = root_phys() as *const u64;
-    let l0e = unsafe { core::ptr::read_volatile(root.add(((va >> 48) & 0x1FF) as usize)) };
-    if is_table_loong(l0e) {
-        let l1e = unsafe {
-            core::ptr::read_volatile(
-                (table_pa_loong(l0e) as *const u64).add(((va >> 39) & 0x1FF) as usize),
-            )
-        };
-        if is_table_loong(l1e) {
-            let l2e = unsafe {
-                core::ptr::read_volatile(
-                    (table_pa_loong(l1e) as *const u64).add(((va >> 30) & 0x1FF) as usize),
-                )
-            };
-            if is_table_loong(l2e) {
-                let dir1e = unsafe {
-                    core::ptr::read_volatile(
-                        (table_pa_loong(l2e) as *const u64).add(((va >> 21) & 0x1FF) as usize),
-                    )
-                };
-                if is_table_loong(dir1e) {
-                    let leaf_pa = table_pa_loong(dir1e);
-                    LEAF_WATCH_FRAME.store(leaf_pa, Ordering::Relaxed);
-                    crate::hal::serial::write_string_always(" leaf_pa=");
-                    crate::hal::serial::write_hex_u64_always(leaf_pa);
-                }
-            }
-        }
-    }
-    crate::hal::serial::write_string_always("\r\n");
-}
-
-/// Pure-read walk of a page-table root for the leaf-table frame that
-/// owns va. Returns None if any level is unmapped. Used to arm the
-/// LEAFW watchpoint for roots other than the active one.
-fn leaf_pa_in_root(root_pa: u64, va: u64) -> Option<u64> {
-    let root = root_pa as *const u64;
-    let l0e = unsafe { core::ptr::read_volatile(root.add(((va >> 48) & 0x1FF) as usize)) };
-    if !is_table_loong(l0e) {
-        return None;
-    }
-    let l1e = unsafe {
-        core::ptr::read_volatile(
-            (table_pa_loong(l0e) as *const u64).add(((va >> 39) & 0x1FF) as usize),
-        )
-    };
-    if !is_table_loong(l1e) {
-        return None;
-    }
-    let l2e = unsafe {
-        core::ptr::read_volatile(
-            (table_pa_loong(l1e) as *const u64).add(((va >> 30) & 0x1FF) as usize),
-        )
-    };
-    if !is_table_loong(l2e) {
-        return None;
-    }
-    let dir1e = unsafe {
-        core::ptr::read_volatile(
-            (table_pa_loong(l2e) as *const u64).add(((va >> 21) & 0x1FF) as usize),
-        )
-    };
-    if !is_table_loong(dir1e) {
-        return None;
-    }
-    Some(table_pa_loong(dir1e))
-}
+/// Diagnostic compatibility stub retained while LoongArch boot checks
+/// are removed from callers.
+pub fn vector_page_check(_tag: &str) {}
 
 pub fn paging_enabled() -> bool {
     let crmd: u64;
@@ -1053,7 +852,17 @@ pub fn init() {
     let mut state = PAGING_STATE.lock();
     let root_pa = core::ptr::addr_of!(state.root.0) as u64;
     debug_assert_eq!(root_pa & (PAGE_SIZE - 1), 0);
+    // If CRMD.PG is already enabled (MM has already called
+    // `load_page_root` and switched to a valid root), we must NOT
+    // overwrite PGDH/PGDL with the zeroed bootstrap table: the next
+    // TLB refill would walk an all-invalid root and loop forever.
+    // Only program the CSRs when PG is still off (early boot).
     unsafe {
+        let mut crmd: u64;
+        asm!("csrrd {}, 0x0", out(reg) crmd, options(nostack));
+        if crmd & (1u64 << 4) != 0 {
+            return; // PG already on — root is managed by `load_page_root`
+        }
         state.root.0 = [0u64; 512];
         asm!("csrwr {0}, 0x1a", inout(reg) root_pa => _, options(nostack));
         let root_pa2 = core::ptr::addr_of!(state.root.0) as u64;

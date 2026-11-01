@@ -503,9 +503,22 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
     let table_index = (syscall_num >> 12) & 0xF;
     if table_index == 0x1 {
         // Shadow SSDT (win32k.sys) service
-        let syscall_frame =
-            unsafe { crate::arch::common::syscall_frame::SyscallFrame::from_trap_frame(tf) };
-        let result = crate::ke::shadow_ssdt::dispatch_shadow_service(syscall_num, &syscall_frame);
+        let syscall_frame = ntoskrnl::arch::common::syscall_frame::SyscallFrame::from_args([
+            arg0(tf),
+            arg1(tf),
+            arg2(tf),
+            arg3(tf),
+            stack_arg(tf, 0),
+            stack_arg(tf, 1),
+            stack_arg(tf, 2),
+            stack_arg(tf, 3),
+            stack_arg(tf, 4),
+            stack_arg(tf, 5),
+            stack_arg(tf, 6),
+            stack_arg(tf, 7),
+        ]);
+        let result =
+            ntoskrnl::ke::shadow_ssdt::dispatch_shadow_service(syscall_num, &syscall_frame);
         return result as SyscallResult;
     }
 
@@ -1558,16 +1571,18 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
         nums::SYS_CMD_EXECUTE => {
             let user_ptr = arg0(tf) as *const u8;
             let user_len = arg1(tf) as usize;
-            match crate::servers::cmd::execute_command_from_user_ptr(user_ptr, user_len) {
-                Ok(exited) => {
-                    if exited {
-                        1
-                    } else {
-                        0
+            let result =
+                match crate::servers::cmd::execute_command_from_user_ptr(user_ptr, user_len) {
+                    Ok(exited) => {
+                        if exited {
+                            1
+                        } else {
+                            0
+                        }
                     }
-                }
-                Err(_) => crate::libs::ntdll::status::STATUS_INVALID_PARAMETER as i64,
-            }
+                    Err(_) => crate::libs::ntdll::status::STATUS_INVALID_PARAMETER as i64,
+                };
+            result
         }
 
         // SYS_PRINT_PROMPT (0x0216) - render the current Ring-3 CMD

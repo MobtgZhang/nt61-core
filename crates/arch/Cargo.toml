@@ -8,5 +8,7 @@ publish = false
 path = "src/lib.rs"
 test = false
 
+
 [dependencies]
-nt61 = { path = "../../nt61", default-features = false }
+nt61-boot-types = { path = "../boot-types" }
+ntoskrnl = { path = "../ntoskrnl" }

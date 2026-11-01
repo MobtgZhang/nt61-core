@@ -52,27 +52,22 @@ unsafe fn write_u32(address: u64, value: u32) {
 
 /// Initialize EXTIOI interrupt controller
 pub fn init(_base: u64) {
-    crate::arch::loongarch64::paging::vector_page_check("pic_init");
     let _ = crate::arch::loongarch64::paging::ensure_vector_page_mapped();
     EXTIOI_BASE.store(EXTIOI_IOCSR_BASE, Ordering::Release);
-    crate::arch::boot::early_write_str(b"[LA64] ext_enter\r\n");
 
     unsafe {
         // Disable all interrupts initially
         for i in 0..(MAX_IRQS / 32) {
             write_u32(EXTIOI_IOCSR_BASE + extioi::ENABLE + (i as u64) * 4, 0);
         }
-        crate::arch::boot::early_write_str(b"[LA64] ext_disable\r\n");
 
         // Route all interrupts to CPU 0 by default
         for i in 0..MAX_IRQS {
             set_route(i as u32, 0);
         }
-        crate::arch::boot::early_write_str(b"[LA64] ext_route\r\n");
     }
 
     EXTIOI_INITIALIZED.store(true, Ordering::Release);
-    crate::arch::boot::early_write_str(b"[LA64] ext_done\r\n");
 }
 
 /// Enable interrupt

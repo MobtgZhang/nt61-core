@@ -383,13 +383,14 @@ global_asm!(
     "  add rsp, 0x38",                     // seven remaining slots
     "  mov rsp, gs:[0x0]",                 // restore user RSP
     "  swapgs",
-    // Restore the user GS selector convention. The swap above returned
-    // the user GS base; `mov gs, rax` leaves the 64-bit base alone.
-    "  mov rax, 0x23",
-    "  mov ds, rax",
-    "  mov es, rax",
-    "  mov fs, rax",
-    "  mov gs, rax",
+    // Restore selector registers without clobbering RAX, which now
+    // carries the dispatcher's return value back to user mode. R11 is
+    // consumed by `sysretq` as RFLAGS and is therefore free here.
+    "  mov r11, 0x23",
+    "  mov ds, r11",
+    "  mov es, r11",
+    "  mov fs, r11",
+    "  mov gs, r11",
   "  sysretq",
 
     user_cs = const USER_CS as u64,
