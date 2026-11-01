@@ -328,9 +328,11 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // Install the early-boot kernel stack before any potentially
     // interruptible code path runs.
     arch::init_kernel_stack();
+    crate::arch::boot::early_write_str(b"K:STACK_DONE\r\n");
 
     boot_debug_print!("Initializing HAL... ");
     hal::init();
+    crate::arch::boot::early_write_str(b"K:HAL_DONE\r\n");
     boot_println!("OK");
 
     // Bring up the abstract text console *before* any subsequent
@@ -342,6 +344,7 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // actual boot trace.
 
     crate::hal::text_console::init();
+    crate::arch::boot::early_write_str(b"K:TC_DONE\r\n");
 
     // ============================================================================
     // PHASE 2: Kernel Executive (ke)
@@ -349,6 +352,7 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
 
     phase_header!(1, "Kernel Executive");
     ke::init();
+    crate::arch::boot::early_write_str(b"K:KE_DONE\r\n");
 
     // ============================================================================
     // PHASE 3: Object Manager (ob)
@@ -356,22 +360,26 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
 
     phase_header!(2, "Object Manager");
     ob::init();
+    crate::arch::boot::early_write_str(b"K:OB_DONE\r\n");
 
     // ============================================================================
     // PHASE 4: Registry / Configuration Manager
     // ============================================================================
     phase_header!(3, "Registry");
     registry::init();
+    crate::arch::boot::early_write_str(b"K:REG_DONE\r\n");
     // Mount the disk hives (SYSTEM/SOFTWARE/SECURITY/SAM/DEFAULT) that
     // winload loaded into memory and published via BootInfo.hives.
     // Without this call every cm::query_* path silently returns None.
     registry::cm::init(boot_info);
+    crate::arch::boot::early_write_str(b"K:CM_DONE\r\n");
 
     // ============================================================================
     // PHASE 5: I/O Manager (io)
     // ============================================================================
     phase_header!(4, "I/O Manager");
     io::init();
+    crate::arch::boot::early_write_str(b"K:IO_DONE\r\n");
 
     // ============================================================================
     // PHASE 6: File System (fs)
@@ -392,12 +400,14 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // for disk-booted configurations this is a no-op.
     fs::mount_ramdisk_from_bootinfo(boot_info);
     fs::init();
+    crate::arch::boot::early_write_str(b"K:FS_DONE\r\n");
 
     // ============================================================================
     // PHASE 7: LPC / ALPC
     // ============================================================================
     phase_header!(6, "LPC/ALPC");
     lpc::init();
+    crate::arch::boot::early_write_str(b"K:LPC_DONE\r\n");
     crate::rtl::klog::phase_trace_marker(601);
 
     // ============================================================================
@@ -408,8 +418,10 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     unsafe {
         drivers::arch::register_storage_backends();
     }
+    crate::arch::boot::early_write_str(b"K:DRVBACK_DONE\r\n");
     crate::rtl::klog::phase_trace_marker(701);
     drivers::init();
+    crate::arch::boot::early_write_str(b"K:DRVINIT_DONE\r\n");
     crate::rtl::klog::phase_trace_marker(702);
     crate::hal::serial::write_string_always("K:P702\r\n");
 

@@ -1015,14 +1015,10 @@ pub fn allocate_pfn() -> Option<PfnNumber> {
     let mut db = PFN_DB.lock();
     if let Some(pfn) = db.pop_zeroed() {
         db.allocate_pfn(pfn);
-        #[cfg(target_arch = "loongarch64")]
-        crate::arch::loongarch64::paging::watch_pfn_alloc(pfn);
         return Some(pfn);
     }
     if let Some(pfn) = db.pop_free() {
         db.allocate_pfn(pfn);
-        #[cfg(target_arch = "loongarch64")]
-        crate::arch::loongarch64::paging::watch_pfn_alloc(pfn);
         return Some(pfn);
     }
     // Self-heal: the free list head is 0 but the count claims there
@@ -1067,8 +1063,6 @@ pub fn allocate_pfn() -> Option<PfnNumber> {
         // Retry the allocation.
         if let Some(pfn) = db.pop_free() {
             db.allocate_pfn(pfn);
-            #[cfg(target_arch = "loongarch64")]
-            crate::arch::loongarch64::paging::watch_pfn_alloc(pfn);
             return Some(pfn);
         }
     }
@@ -1105,8 +1099,6 @@ pub fn allocate_pfn_range(count: PfnNumber) -> Option<PfnNumber> {
                     let allocated = start + i;
                     db.unlink(allocated);
                     db.allocate_pfn(allocated);
-                    #[cfg(target_arch = "loongarch64")]
-                    crate::arch::loongarch64::paging::watch_pfn_alloc(allocated);
                 }
                 return Some(start);
             }
@@ -1122,8 +1114,6 @@ pub fn allocate_pfn_range(count: PfnNumber) -> Option<PfnNumber> {
     // contiguity reject the partial result.
     if let Some(p) = db.pop_free() {
         db.allocate_pfn(p);
-        #[cfg(target_arch = "loongarch64")]
-        crate::arch::loongarch64::paging::watch_pfn_alloc(p);
         return Some(p);
     }
     None

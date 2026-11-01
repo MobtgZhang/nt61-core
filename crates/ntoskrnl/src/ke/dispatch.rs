@@ -328,7 +328,7 @@ pub fn wake(object: &DispatcherHeader, all: bool) -> u32 {
 
                     // Apply priority boost and get new priority
                     let new_priority =
-                        unsafe { crate::ke::scheduler::ki_boost_thread(ethread, boost_type) };
+                        { crate::ke::scheduler::ki_boost_thread(ethread, boost_type) };
                     let priority = new_priority as u8;
 
                     crate::ke::scheduler::add_ready(ethread, priority);
@@ -413,7 +413,7 @@ pub fn tick_wait_list() {
                         // Apply priority boost for timeout wake
                         let boost_type = crate::ke::scheduler::PriorityBoostType::Special;
                         let new_priority =
-                            unsafe { crate::ke::scheduler::ki_boost_thread(ethread, boost_type) };
+                            { crate::ke::scheduler::ki_boost_thread(ethread, boost_type) };
                         let priority = new_priority as u8;
 
                         crate::ke::scheduler::add_ready(ethread, priority);

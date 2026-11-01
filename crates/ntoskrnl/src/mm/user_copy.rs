@@ -246,12 +246,12 @@ pub fn read_user_utf16(src: u64, char_count: u64) -> Result<alloc::vec::Vec<u16>
 /// Check the actual leaf PTE, not merely whether a translation exists.
 /// This rejects kernel-only mappings and enforces write permission for
 /// user-space output buffers on all supported ISAs.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn page_is_user_accessible(_va: u64, _require_write: bool) -> bool {
     false
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn page_is_user_accessible(va: u64, require_write: bool) -> bool {
     #[cfg(test)]
     {

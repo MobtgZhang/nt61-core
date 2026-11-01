@@ -1369,7 +1369,7 @@ pub fn init() {
         // create NULL device driver for bootstrap
         let null_driver = allocate_driver(b"\\Driver\\Null");
         if !null_driver.is_null() {
-            unsafe {
+            {
                 // Set up default major function handlers
                 (*null_driver).major_functions[major::IRP_MJ_CREATE as usize] =
                     Some(null_create_dispatch);

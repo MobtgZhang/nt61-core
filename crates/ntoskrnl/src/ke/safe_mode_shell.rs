@@ -216,16 +216,11 @@ pub fn enter(boot_mode: u32) -> ! {
                 }
             }
         } else {
-            // Tight spin — interrupts are disabled in
-            // SafeBootMode and there's no scheduler tick to
-            // back us off. The arch-specific `halt` issues a
-            // low-power wait (hlt / wfi / idle 0) that the
-            // CPU uses until the next interrupt arrives; the
-            // PS/2 controller on x86_64 and the UART drivers
-            // on the other arches raise the appropriate
-            // wake-up event when a byte is pending, so this
-            // loop burns very little power.
-            crate::arch::halt();
+            // SafeBootMode polls its input devices, so it cannot sleep
+            // on interrupts. `halt()` would place the CPU in hlt/wfi/
+            // idle while interrupts are masked and never receive the
+            // next keystroke on any of the four supported architectures.
+            core::hint::spin_loop();
         }
     }
 }

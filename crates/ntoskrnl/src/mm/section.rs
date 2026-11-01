@@ -172,7 +172,7 @@ pub fn create_section(
             return Err(0xC000_0017u32 as i32); // STATUS_NO_MEMORY
         }
 
-        unsafe {
+        {
             ptr::write(section_ptr, Section::new());
             (*section_ptr).size = size;
             (*section_ptr).max_protection = max_protection;

@@ -117,7 +117,7 @@ pub fn nt_create_process(
         };
 
         // Store PML4 in process
-        unsafe {
+        {
             (*process_ptr).page_table_pml4 = address_space.pml4_phys;
             (*process_ptr).pml4_phys = address_space.pml4_phys;
         }
@@ -137,7 +137,7 @@ pub fn nt_create_process(
         }
 
         // Store stack info
-        unsafe {
+        {
             (*process_ptr).user_stack_base = addr_space.user_stack_base;
             (*process_ptr).user_stack_limit =
                 addr_space.user_stack_base + addr_space.user_stack_size;
@@ -164,7 +164,7 @@ pub fn nt_create_process(
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
-        unsafe {
+        {
             core::ptr::write_bytes(ht_ptr as *mut u8, 0, ht_size);
             (*ht_ptr).next_slot = 1;
             (*process_ptr).object_table = ht_ptr;

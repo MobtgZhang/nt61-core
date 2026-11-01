@@ -432,7 +432,7 @@ pub fn free_aligned(ptr: *mut u8) -> *mut u8 {
         if ptr.is_null() {
             return core::ptr::null_mut();
         }
-        let original = unsafe { *((ptr as *mut *mut u8).sub(1)) };
+        let original = { *((ptr as *mut *mut u8).sub(1)) };
         free(original)
     }
 }

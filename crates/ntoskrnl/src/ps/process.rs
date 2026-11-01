@@ -1785,7 +1785,7 @@ pub fn create_user_process(
         let ht_ptr = ht_buf as *mut ProcessHandleTable;
         crate::hal::serial::write_string_always("PS:create ht ok\r\n");
 
-        unsafe {
+        {
             core::ptr::write_bytes(process as *mut u8, 0, 4096);
             core::ptr::write_bytes(thread_ptr as *mut u8, 0, 4096);
 

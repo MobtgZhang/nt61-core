@@ -164,7 +164,7 @@ fn step3_list_entry() -> bool {
         }
 
         // Walk forward.
-        unsafe {
+        {
             let mut count = 0;
             let mut e = head.flink;
             while !core::ptr::eq(e, &head) {

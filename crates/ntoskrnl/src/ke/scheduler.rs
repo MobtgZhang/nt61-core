@@ -2146,7 +2146,7 @@ pub fn ki_balance_processor(target_cpu: u32) {
                         // Now perform the migration under the queue locks
                         // Locks are automatically released when guards go out of scope
                         let queue = &mut max_prcb.ready_queues[priority_idx];
-                        let entry_ptr = unsafe {
+                        let entry_ptr = {
                             core::ptr::addr_of_mut!((*thread).kthread.global_thread_list_entry)
                                 as *mut ListEntry
                         };
@@ -2304,7 +2304,7 @@ pub fn balance_load() {
                         _ => return,
                     };
                     let queue = &mut max_prcb.ready_queues[priority as usize];
-                    let entry_ptr = unsafe {
+                    let entry_ptr = {
                         core::ptr::addr_of_mut!((*thread).kthread.global_thread_list_entry)
                             as *mut ListEntry
                     };

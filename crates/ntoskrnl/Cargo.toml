@@ -9,4 +9,32 @@ path = "src/lib.rs"
 test = false
 
 [dependencies]
-nt61 = { path = "../../nt61", default-features = false }
+nt61-boot-types = { path = "../boot-types" }
+des = { version = "0.8", optional = true, default-features = false }
+rand_core = { version = "0.6", optional = true, default-features = false, features = ["alloc"] }
+rsa = { version = "0.9", optional = true, features = ["pem", "sha2"] }
+spin = "0.9"
+bitflags = "2.3"
+hashbrown = "0.14"
+nt61-fonts = { path = "../fonts" }
+
+[features]
+binary_panic = []
+x86_64 = []
+aarch64 = []
+loongarch64 = []
+riscv64 = []
+smp = []
+acpi = []
+debug = []
+alloc = []
+btl = []
+loongson_gpu = []
+crypto_libs = ["dep:des"]
+test-support = []
+std = ["rsa_secure", "dep:rsa", "dep:rand_core"]
+rsa_secure = []
+log_level_warn = []
+log_level_error = []
+log_level_info = ["log_level_warn"]
+log_level_debug = ["log_level_info"]

@@ -34,6 +34,12 @@ pub fn boot_log_visible() -> bool {
     BOOT_LOG_VISIBLE.load(Ordering::Acquire)
 }
 
+#[doc(hidden)]
+#[inline]
+pub fn debug_serial_enabled() -> bool {
+    cfg!(feature = "log_level_debug")
+}
+
 /// Boot diagnostics: emit a raw-UART phase marker that bypasses
 /// every output gate so the boot trace stays observable even when
 /// the per-mode display policy silences `boot_println!`.
@@ -520,16 +526,14 @@ macro_rules! boot_err {
 #[macro_export]
 macro_rules! boot_print {
     ($($arg:tt)*) => {{
-        if $crate::rtl::klog::boot_log_visible() {
-            let _ = core::format_args!($($arg)*);
-            #[cfg(feature = "log_level_debug")]
+        if $crate::rtl::klog::boot_log_visible()
+            && $crate::rtl::klog::debug_serial_enabled()
+        {
+            #[cfg(not(test))]
             {
-                #[cfg(not(test))]
-                {
-                    use core::fmt::Write;
-                    let mut writer = $crate::rtl::klog::SerialWriter;
-                    let _ = writer.write_fmt(core::format_args!($($arg)*));
-                }
+                use core::fmt::Write;
+                let mut writer = $crate::rtl::klog::SerialWriter;
+                let _ = writer.write_fmt(core::format_args!($($arg)*));
             }
         }
     }};
@@ -553,13 +557,8 @@ macro_rules! boot_print_always {
 macro_rules! boot_println {
     ($($arg:tt)*) => {{
         {
-            #[cfg(not(feature = "log_level_debug"))]
-            let _ = core::format_args!($($arg)*);
-            #[cfg(feature = "log_level_debug")]
-            {
-                $crate::boot_print!($($arg)*);
-                $crate::boot_print!("\r\n");
-            }
+            $crate::boot_print!($($arg)*);
+            $crate::boot_print!("\r\n");
         }
     }};
 }
@@ -571,9 +570,6 @@ macro_rules! boot_println {
 #[macro_export]
 macro_rules! boot_debug_print {
     ($($arg:tt)*) => {{
-        #[cfg(not(feature = "log_level_debug"))]
-        let _ = core::format_args!($($arg)*);
-        #[cfg(feature = "log_level_debug")]
         $crate::boot_print!($($arg)*);
     }};
 }
@@ -582,9 +578,6 @@ macro_rules! boot_debug_print {
 #[macro_export]
 macro_rules! boot_debug_println {
     ($($arg:tt)*) => {{
-        #[cfg(not(feature = "log_level_debug"))]
-        let _ = core::format_args!($($arg)*);
-        #[cfg(feature = "log_level_debug")]
         $crate::boot_println!($($arg)*);
     }};
 }

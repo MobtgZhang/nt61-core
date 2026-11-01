@@ -124,8 +124,8 @@ pub fn create_wow64_thread(
         // _context_ptr is reserved for future use - thread context tracking
 
         // 5. Initialize TEB32
-        unsafe {
-            unsafe { init_teb32(teb32, thread, process, stack_top) };
+        {
+            { init_teb32(teb32, thread, process, stack_top) };
             thread.set_wow64_teb32(teb32);
         }
 
