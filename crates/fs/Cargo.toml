@@ -9,4 +9,10 @@ path = "src/lib.rs"
 test = false
 
 [dependencies]
-nt61 = { path = "../../nt61", default-features = false }
+nt61-boot-types = { path = "../boot-types" }
+ntoskrnl = { path = "../ntoskrnl" }
+hashbrown = "0.14"
+spin = "0.9"
+
+[dev-dependencies]
+ntoskrnl = { path = "../ntoskrnl", features = ["test-support"] }

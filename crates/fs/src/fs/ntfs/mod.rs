@@ -4604,7 +4604,7 @@ pub fn mount(
         ) as *mut NtfsFileSystem;
 
         if !ntfs.is_null() {
-            unsafe {
+            {
                 let new_ntfs = NtfsFileSystem::new();
                 (*ntfs).base = new_ntfs.base;
                 (*ntfs).ntfs_data = new_ntfs.ntfs_data;
@@ -4675,7 +4675,7 @@ pub fn mount(
             // kprintln!("      Volume mounted successfully");
 
             // Store in global for pagefile access
-            *NTFS_MOUNTED_FS.lock() = Some(unsafe { &mut *ntfs });
+            *NTFS_MOUNTED_FS.lock() = Some(&mut *ntfs);
             *NTFS_MOUNTED.lock() = true;
             // Initialize pagefile support
             init_pagefile(&(*ntfs).ntfs_data);

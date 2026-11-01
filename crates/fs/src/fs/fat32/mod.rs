@@ -418,7 +418,7 @@ pub fn update_fat_entry(fs: &Fat32FileSystem, cluster: u32, value: u32) -> Resul
 
         // read FAT sector
         let mut sector_buf = [0u8; 512];
-        if unsafe { read_sector(fs.base.device, fat_sector, &mut sector_buf) }.is_err() {
+        if { read_sector(fs.base.device, fat_sector, &mut sector_buf) }.is_err() {
             // kprintln!("[FAT32] update_fat_entry: failed to read FAT sector {}", fat_sector);
             return Err(STATUS_UNSUCCESSFUL);
         }
@@ -630,7 +630,7 @@ pub fn write_file(
 
             // read existing sector
             let sector_num = first_sector + sector_in_cluster as u64;
-            if unsafe { read_sector(fs.base.device, sector_num, &mut sector_buf) }.is_err() {
+            if { read_sector(fs.base.device, sector_num, &mut sector_buf) }.is_err() {
                 return Err(STATUS_UNSUCCESSFUL);
             }
 
@@ -675,7 +675,7 @@ pub fn mount(
         };
         let mut buffer = [0u8; 512];
         crate::boot_println!("[FAT32] mount: about to read_sector 0");
-        if unsafe { read_sector(device, 0, &mut buffer) }.is_err() {
+        if { read_sector(device, 0, &mut buffer) }.is_err() {
             // kprintln!("[FAT32] Failed to read boot sector");
             crate::boot_println!("[FAT32] mount: read_sector failed, returning None");
             return None;
@@ -688,7 +688,7 @@ pub fn mount(
         // boot sector is misaligned in practice. We use `read_unaligned`
         // via a `core::ptr::read_unaligned` of the slice.
         let boot: Fat32BootSector =
-            unsafe { core::ptr::read_unaligned(buffer.as_ptr() as *const Fat32BootSector) };
+            { core::ptr::read_unaligned(buffer.as_ptr() as *const Fat32BootSector) };
         crate::boot_println!(
             "[FAT32] mount: boot sector read, jump[0]=0x{:x}",
             boot.jump[0]
@@ -1161,7 +1161,7 @@ pub fn read_cluster_sector(
 /// read a FAT entry for a given cluster number.
 /// Returns the next cluster in the chain, or FAT32_EOC if end of chain or error.
 pub fn read_fat_entry(fs: &Fat32FileSystem, cluster: u32) -> u32 {
-    unsafe {
+    {
         let fat_start = fs.fat_data.fat_start_sector;
         let sector_size = fs.base.sector_size as u64;
         let bytes_per_sector = sector_size as usize;
@@ -1200,7 +1200,7 @@ fn read_cluster_data(
     cluster: u32,
     buffer: &mut [u8],
 ) -> Result<usize, NTSTATUS> {
-    unsafe {
+    {
         let cluster_size = fs.base.cluster_size as usize;
         if buffer.len() < cluster_size {
             // kprintln!("[FAT32] read_cluster_data: buffer too small ({} < {})", buffer.len(), cluster_size);
@@ -1389,7 +1389,7 @@ pub fn calc_long_name_checksum(short_name: &[u8; 11]) -> u8 {
 /// Verify long filename integrity by checking the checksum
 /// Returns true if the checksum matches
 pub fn verify_long_name_checksum(short_name: &[u8; 11], checksum: u8) -> bool {
-    unsafe { calc_long_name_checksum(short_name) == checksum }
+    calc_long_name_checksum(short_name) == checksum
 }
 
 /// read directory entries from the root directory
@@ -1504,7 +1504,7 @@ pub fn write_cluster(fs: &Fat32FileSystem, cluster: u32, data: &[u8]) -> Result<
 /// Find a directory entry by name in the root directory
 /// Returns (cluster, offset_in_cluster) if found, None otherwise
 pub fn find_file_in_root_ex(fs: &Fat32FileSystem, short_name: &[u8; 11]) -> Option<(u32, usize)> {
-    unsafe {
+    {
         let cluster_size = fs.base.cluster_size as usize;
         let sector_size = fs.base.sector_size as usize;
         let first_sector = fs.fat_data.data_start_sector
@@ -1606,7 +1606,7 @@ pub fn find_free_dir_slot_in(fs: &Fat32FileSystem, dir_cluster: u32) -> Option<(
 
         let next = read_fat_entry(fs, current_cluster);
         if next == current_cluster || next >= FAT32_EOC {
-            unsafe {
+            {
                 break;
             }
         }
@@ -2282,7 +2282,7 @@ pub fn rename_file_in_root(
 
 /// Check if a file exists in the root directory
 pub fn file_exists_in_root(fs: &Fat32FileSystem, short_name: &[u8; 11]) -> bool {
-    unsafe { find_file_in_root_ex(fs, short_name).is_some() }
+    find_file_in_root_ex(fs, short_name).is_some()
 }
 
 /// Search a single directory cluster for a file or subdirectory by

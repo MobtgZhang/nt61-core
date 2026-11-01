@@ -285,7 +285,7 @@ fn create_pagefile(
 
     pagefile::set_disk_pagefile(
         0, // Pagefile number
-        crate::fs::FileSystemType::Fat32,
+        ntoskrnl::fs::FileSystemType::Fat32,
         device_id,
         start_sector,
         size_pages,
