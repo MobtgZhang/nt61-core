@@ -9,4 +9,15 @@ path = "src/lib.rs"
 test = false
 
 [dependencies]
-nt61 = { path = "../../nt61", default-features = false }
+nt61-boot-types = { path = "../boot-types" }
+ntoskrnl = { path = "../ntoskrnl" }
+spin = "0.9"
+nt61-fonts = { path = "../fonts" }
+
+[features]
+test-support = []
+loongson_gpu = []
+log_level_error = []
+log_level_warn = []
+log_level_info = ["log_level_warn"]
+log_level_debug = ["log_level_info"]

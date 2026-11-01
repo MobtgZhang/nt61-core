@@ -86,7 +86,11 @@ pub fn poll_all() {
             if len == 0 {
                 break;
             }
-            crate::netstack::process_packet(&buffer[..len], NicType::VirtioNet, nic_idx);
+            crate::netstack::process_packet(
+                &buffer[..len],
+                ntoskrnl::drivers::net::NicType::VirtioNet,
+                nic_idx,
+            );
         }
     }
 
@@ -95,7 +99,11 @@ pub fn poll_all() {
             if len == 0 {
                 break;
             }
-            crate::netstack::process_packet(&buffer[..len], NicType::E1000, nic_idx);
+            crate::netstack::process_packet(
+                &buffer[..len],
+                ntoskrnl::drivers::net::NicType::E1000,
+                nic_idx,
+            );
         }
     }
 
@@ -105,7 +113,11 @@ pub fn poll_all() {
             if len == 0 {
                 break;
             }
-            crate::netstack::process_packet(&buffer[..len], NicType::Rtl8139, nic_idx);
+            crate::netstack::process_packet(
+                &buffer[..len],
+                ntoskrnl::drivers::net::NicType::Rtl8139,
+                nic_idx,
+            );
         }
     }
 

@@ -119,6 +119,7 @@ struct Queue {
     /// Device-visible offset of this queue's doorbell, in bytes.
     notify_off: u16,
     buffers: [*mut u8; QUEUE_SIZE as usize],
+    buffer_physical: [u64; QUEUE_SIZE as usize],
     next_free: u16,
     used_index: u16,
 }
@@ -154,13 +155,14 @@ fn add_event_buffer(queue: &mut Queue) -> Option<u16> {
             pool::free(buffer);
             return None;
         };
-        unsafe {
+        {
             core::ptr::write_bytes(buffer, 0, EVENT_SIZE);
             (*queue.descriptors.add(usize::from(index))).address = address;
             (*queue.descriptors.add(usize::from(index))).length = EVENT_SIZE as u32;
             (*queue.descriptors.add(usize::from(index))).flags = DESC_F_WRITE;
         }
         queue.buffers[usize::from(index)] = buffer;
+        queue.buffer_physical[usize::from(index)] = address;
         Some(index)
     }
 }
@@ -211,6 +213,7 @@ fn take_used_event(device: &mut Device) -> Option<[u8; EVENT_SIZE]> {
     let mut event = [0u8; EVENT_SIZE];
     unsafe { core::ptr::copy_nonoverlapping(buffer, event.as_mut_ptr(), EVENT_SIZE) };
     device.queue.buffers[element.descriptor as usize] = core::ptr::null_mut();
+    device.queue.buffer_physical[element.descriptor as usize] = 0;
     Some(event)
 }
 
@@ -783,6 +786,17 @@ pub fn poll() {
         return;
     }
     let device = unsafe { &mut *device };
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        ensure_current_mapping(device.isr);
+        ensure_current_mapping(device.notify);
+        ensure_current_mapping(device.queue.descriptors.cast::<u8>());
+        ensure_current_mapping(device.queue.available.cast::<u8>());
+        ensure_current_mapping(device.queue.used.cast::<u8>());
+        for (index, buffer) in device.queue.buffers.iter().copied().enumerate() {
+            ensure_current_mapping_physical(buffer, device.queue.buffer_physical[index]);
+        }
+    }
     // Reading the ISR status register clears it; the legacy
     // polling path does not use interrupts so we only need to
     // make sure the read happens (spec-mandated side effect).
@@ -803,6 +817,23 @@ pub fn poll() {
     }
 }
 
+/// Re-map an identity-mapped PCI MMIO pointer into the active root.
+///
+/// AArch64/RISC-V/LoongArch user address spaces are created after the
+/// virtio probe. Device MMIO must therefore be visible in the root that
+/// is active when the shell polls, not only in the boot root.
+#[cfg(not(target_arch = "x86_64"))]
+fn ensure_current_mapping(pointer: *mut u8) {
+    if pointer.is_null() {
+        return;
+    }
+    let va = pointer as u64 & !0xFFF;
+    if crate::arch::translate_virt(va).is_some() {
+        return;
+    }
+    let _ = crate::arch::map_page(va, va, 0x40C);
+}
+
 pub fn try_read_byte() -> Option<u8> {
     poll();
     let head = RING_HEAD.load(Ordering::Acquire);
@@ -812,6 +843,19 @@ pub fn try_read_byte() -> Option<u8> {
     let byte = RING[head & RING_MASK].load(Ordering::Acquire);
     RING_HEAD.store(head.wrapping_add(1), Ordering::Release);
     Some(byte)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn ensure_current_mapping_physical(pointer: *mut u8, physical: u64) {
+    if pointer.is_null() || physical == 0 {
+        return;
+    }
+    let va = pointer as u64 & !0xFFF;
+    let mapped_pa = crate::arch::translate_virt(va);
+    if mapped_pa == Some(physical & !0xFFF) {
+        return;
+    }
+    let _ = crate::arch::map_page(va, physical & !0xFFF, 0x40C);
 }
 
 /// Bring up one event queue through the modern (virtio-1.x) PCI
@@ -949,6 +993,7 @@ fn allocate_queue(size: u16) -> Option<Queue> {
             used_offset: 0,
             notify_off: 0,
             buffers: [core::ptr::null_mut(); QUEUE_SIZE as usize],
+            buffer_physical: [0; QUEUE_SIZE as usize],
             next_free: 0,
             used_index: 0,
         };

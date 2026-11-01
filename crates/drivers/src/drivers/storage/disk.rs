@@ -78,8 +78,8 @@ pub fn get_disk(index: usize) -> Option<DiskInfo> {
     backend().and_then(|backend| backend.get_disk(index))
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use super::DiskBackend;
     use super::DiskInfo;
 

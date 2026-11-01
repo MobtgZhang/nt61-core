@@ -939,7 +939,7 @@ fn identify_controller(c: &mut NvmeController) -> bool {
             }
         };
 
-        unsafe {
+        {
             // Build IDENTIFY command
             let cmd = NvmeSqEntry::identify(1, 0, phys, 0);
 

@@ -333,7 +333,7 @@ fn load_one_driver(path: &str, raw: &[u8]) -> Result<i32, &'static str> {
         let slot_base: u64 = DRIVER_LOAD_BASE + (slot_idx as u64) * DRIVER_LOAD_STRIDE;
 
         // Copy sections.
-        unsafe {
+        {
             for sec in &sections {
                 let dst = (slot_base + sec.virtual_address as u64) as *mut u8;
                 let src_off = sec.raw_data_offset as usize;
@@ -364,7 +364,7 @@ fn load_one_driver(path: &str, raw: &[u8]) -> Result<i32, &'static str> {
         if driver_object_ptr.is_null() {
             return Err("Failed to allocate DriverObject");
         }
-        unsafe {
+        {
             for i in 0..0x100 {
                 core::ptr::write_volatile(driver_object_ptr.add(i), 0u8);
             }
@@ -380,7 +380,7 @@ fn load_one_driver(path: &str, raw: &[u8]) -> Result<i32, &'static str> {
         let path_ptr = path_buf.as_ptr();
 
         let status: i32;
-        unsafe {
+        {
             let f: extern "system" fn(*mut u8, *const u8) -> i32 =
                 core::mem::transmute(entry_addr as *const ());
             status = f(driver_object_ptr, path_ptr);
