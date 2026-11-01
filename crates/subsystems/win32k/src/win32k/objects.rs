@@ -1017,7 +1017,7 @@ pub fn gdi_delete_object(handle: u64) -> bool {
                 }
                 Some(GdiObjectType::Bitmap) => {
                     // Bitmap's Drop will free the bits
-                    let bitmap = unsafe { &mut *(obj_ptr as *mut GdiBitmap) };
+                    let bitmap = { &mut *(obj_ptr as *mut GdiBitmap) };
                     let _ = &bitmap;
                     if !bitmap.bits.is_null() {
                         let _ = crate::mm::pool::free(bitmap.bits);

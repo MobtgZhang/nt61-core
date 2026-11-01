@@ -480,11 +480,11 @@ pub extern "C" fn nt_gdi_get_dc_dword(frame: &SyscallFrame) -> u64 {
 /// NT_GDI_LINE_TO - Draw line to position
 pub extern "C" fn nt_gdi_line_to(frame: &SyscallFrame) -> u64 {
     unsafe {
-        let hdc = unsafe { get_arg0(frame) };
+        let hdc = { get_arg0(frame) };
         let _ = &hdc;
-        let x = unsafe { get_arg1(frame) as i32 };
+        let x = { get_arg1(frame) as i32 };
         let _ = &x;
-        let y = unsafe { get_arg2(frame) as i32 };
+        let y = { get_arg2(frame) as i32 };
         let _ = &y;
 
         // kprintln!("[win32k] NT_GDI_LINE_TO: hdc=0x{:x} ({},{})", hdc, x, y);

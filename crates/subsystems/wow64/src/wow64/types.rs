@@ -1306,7 +1306,7 @@ impl Teb32 {
         if thread.is_null() {
             return null_mut();
         }
-        (*thread).get_wow64_teb32()
+        (*thread).get_wow64_teb32() as *mut Teb32
     }
 
     /// Get PEB32 pointer from TEB32.
