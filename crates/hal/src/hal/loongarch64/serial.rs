@@ -18,30 +18,59 @@ const IER_RX: u8 = 0x01;
 /// LSR bit 0: Data Ready — a byte waits in the receive FIFO.
 const LSR_DR: u8 = 0x01;
 
+const CRMD_IE: u64 = 1 << 2;
+const CRMD_DA: u64 = 1 << 3;
+const CRMD_PG: u64 = 1 << 4;
+
+/// QEMU's DMW windows do not reliably cover the LS7A UART after
+/// paging is enabled. Briefly return to direct address mode for each
+/// access, masking interrupts to avoid entering mapped kernel code
+/// while CRMD.PG is cleared.
+#[inline(never)]
+fn with_uart_da_mode<T>(operation: impl FnOnce() -> T) -> T {
+    let mut crmd: u64;
+    unsafe {
+        core::arch::asm!("csrrd {}, 0x0", out(reg) crmd, options(nostack));
+    }
+    if crmd & CRMD_PG == 0 {
+        return operation();
+    }
+
+    let protected = (crmd & !CRMD_IE & !CRMD_PG) | CRMD_DA;
+    unsafe {
+        core::arch::asm!("csrwr {}, 0x0", in(reg) protected, options(nostack));
+    }
+    let result = operation();
+    unsafe {
+        core::arch::asm!("csrwr {}, 0x0", in(reg) crmd, options(nostack));
+    }
+    result
+}
+
 #[inline]
-fn reg(offset: usize) -> *mut u8 {
-    let phys = if crate::arch::loongarch64::paging::paging_enabled() {
-        crate::arch::loongarch64::paging::mmio_virt(UART_BASE)
-    } else {
-        UART_BASE
-    };
-    (phys as usize + offset) as *mut u8
+fn read_reg(offset: usize) -> u8 {
+    with_uart_da_mode(|| unsafe { read_volatile((UART_BASE as usize + offset) as *const u8) })
+}
+
+#[inline]
+fn write_reg(offset: usize, value: u8) {
+    with_uart_da_mode(|| unsafe {
+        write_volatile((UART_BASE as usize + offset) as *mut u8, value)
+    });
 }
 
 /// Initialize the UART.
 pub fn init() {
-    let _ = reg(0);
+    let _ = read_reg(0);
 }
 
 /// write a single byte.
 pub fn write_char(c: u8) {
     let _tx_guard = crate::hal::common::serial::lock_uart_tx();
-    unsafe {
-        while (read_volatile(reg(5)) & 0x20) == 0 {
-            core::hint::spin_loop();
-        }
-        write_volatile(reg(0), c);
+    while (read_reg(5) & 0x20) == 0 {
+        core::hint::spin_loop();
     }
+    write_reg(0, c);
 }
 
 /// write a string.
@@ -56,7 +85,10 @@ pub fn write_string(s: &str) {
         // cannot interleave their bytes mid-line.
         let _tx_guard = crate::hal::common::serial::lock_uart_tx();
         for c in s.bytes() {
-            write_char(c);
+            while (read_reg(5) & 0x20) == 0 {
+                core::hint::spin_loop();
+            }
+            write_reg(0, c as u8);
         }
     }
 }
@@ -69,10 +101,19 @@ pub fn write_string_always(s: &str) {
     }
     #[cfg(not(test))]
     {
+        // LoongArch64: the UART lives at a physical address that is
+        // only reachable in direct-address mode (CRMD.DA=1, PG=0).
+        // Briefly drop PG, write the bytes, and restore CRMD so the
+        // caller's mapped-mode execution is unaffected.
+        let mut prev_crmd: u64;
+        unsafe { core::arch::asm!("csrrd {}, 0x0", out(reg) prev_crmd, options(nostack)) };
+        let direct = (prev_crmd | (1 << 3)) & !(1 << 4);
+        unsafe { core::arch::asm!("csrwr {}, 0x0", in(reg) direct, options(nostack)) };
         let _tx_guard = crate::hal::common::serial::lock_uart_tx();
         for c in s.bytes() {
             write_char(c);
         }
+        unsafe { core::arch::asm!("csrwr {}, 0x0", in(reg) prev_crmd, options(nostack)) };
     }
 }
 
@@ -109,7 +150,7 @@ pub fn try_get_char() -> Option<u8> {
 /// True when the receive FIFO holds at least one byte.
 #[inline]
 pub fn data_available() -> bool {
-    unsafe { (read_volatile(reg(REG_LSR)) & LSR_DR) != 0 }
+    (read_reg(REG_LSR) & LSR_DR) != 0
 }
 
 /// Arm the 16550 received-data interrupt (IER bit 0). The
@@ -119,18 +160,14 @@ pub fn data_available() -> bool {
 /// the IRQ on its own because enabling hardware IRQs without a
 /// registered handler would storm.
 pub fn enable_rx_irq() {
-    unsafe {
-        let ier = read_volatile(reg(REG_IER));
-        write_volatile(reg(REG_IER), ier | IER_RX);
-    }
+    let ier = read_reg(REG_IER);
+    write_reg(REG_IER, ier | IER_RX);
 }
 
 /// Mask the 16550 received-data interrupt again.
 pub fn disable_rx_irq() {
-    unsafe {
-        let ier = read_volatile(reg(REG_IER));
-        write_volatile(reg(REG_IER), ier & !IER_RX);
-    }
+    let ier = read_reg(REG_IER);
+    write_reg(REG_IER, ier & !IER_RX);
 }
 
 /// Read one byte unconditionally from the data register. Only
@@ -138,5 +175,5 @@ pub fn disable_rx_irq() {
 /// unified keyboard ring's FIFO drain loop.
 #[inline]
 pub fn read_data_reg() -> u8 {
-    unsafe { read_volatile(reg(REG_DATA)) }
+    read_reg(REG_DATA)
 }

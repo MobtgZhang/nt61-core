@@ -226,7 +226,7 @@ pub fn hal_allocate_common_buffer(adapter: &AdapterInfo, len: usize) -> Option<(
         // slot lock only around the table scan, not across the pool call.
         for slot_index in 0..MAX_BUFFERS {
             lock_buffers();
-            let slot_free = unsafe { !(*BUFFERS.buffers.get())[slot_index].in_use };
+            let slot_free = { !(*BUFFERS.buffers.get())[slot_index].in_use };
             if !slot_free {
                 unlock_buffers();
                 continue;

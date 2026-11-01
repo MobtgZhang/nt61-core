@@ -21,11 +21,15 @@ use core::sync::atomic::Ordering;
 /// available.
 pub fn init() {
     super::READY.store(true, Ordering::Release);
+    crate::drivers::input::virtio_input::init();
     crate::hal::x86_64::keyboard::full_reset_for_poll();
 }
 
 /// Try to read one byte (non-blocking).
 pub fn try_read_byte() -> Option<u8> {
+    if let Some(byte) = crate::drivers::input::virtio_input::try_read_byte() {
+        return Some(byte);
+    }
     let raw = crate::hal::x86_64::keyboard::getc();
     if raw >= 0 {
         return Some(raw as u8);
@@ -36,6 +40,7 @@ pub fn try_read_byte() -> Option<u8> {
 }
 
 pub fn poll() {
+    crate::drivers::input::virtio_input::poll();
     if crate::hal::x86_64::serial::data_available() {
         if let Some(byte) = crate::hal::x86_64::serial::read_char() {
             crate::hal::x86_64::keyboard_unified::inject_byte(byte);
