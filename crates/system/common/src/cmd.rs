@@ -3157,5 +3157,7 @@ pub fn execute_command_from_user_ptr(
 pub fn execute_command_bytes(bytes: &[u8]) -> Result<bool, &'static str> {
     let line = core::str::from_utf8(bytes).map_err(|_| "command is not valid UTF-8")?;
     let line = line.trim_matches(|character: char| character == '\0' || character.is_whitespace());
-    Ok(execute_command_line(line))
+    let exit_requested = line.eq_ignore_ascii_case("exit");
+    execute_command_line(line);
+    Ok(exit_requested)
 }

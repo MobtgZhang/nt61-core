@@ -753,8 +753,11 @@ fn init_process_parameters(
     }
     crate::hal::serial::write_string_always("[SMSS] init_process_parameters mapped\r\n");
 
+    crate::hal::serial::write_string_always("[SMSS] init_process_parameters refresh enter\r\n");
     crate::mm::vas::refresh_kernel_mappings(pml4_phys);
+    crate::hal::serial::write_string_always("[SMSS] init_process_parameters refresh done\r\n");
     let previous_root = crate::mm::vas::attach_process(pml4_phys);
+    crate::hal::serial::write_string_always("[SMSS] init_process_parameters attach done\r\n");
 
     let params_va = PARAMS_BASE;
     let params_phys_va = params_phys;
@@ -873,13 +876,13 @@ pub fn init_teb_peb_for_boot_processes() {
             }
 
             // Check PML4 validity before trying to initialize PEB
-            let pml4 = unsafe { (*process).page_table_pml4 };
+            let pml4 = { (*process).page_table_pml4 };
             if pml4 == 0 {
                 return true;
             }
 
             // Initialize PEB if not already set.
-            if unsafe { (*process).peb.is_null() } {
+            if (*process).peb.is_null() {
                 let _peb = init_peb(process);
             }
             true
@@ -1405,12 +1408,12 @@ pub fn load_and_create_process(
         boot_println!(
             "[SMSS] process created process=0x{:x} page_table=0x{:x} alias=0x{:x}",
             process as u64,
-            unsafe { (*process).page_table_pml4 },
-            unsafe { (*process).pml4_phys }
+            { (*process).page_table_pml4 },
+            { (*process).pml4_phys }
         );
 
         // Step 4: Get PML4 for loading PE
-        let pml4_phys = unsafe { (*process).pml4_phys };
+        let pml4_phys = { (*process).pml4_phys };
         if pml4_phys == 0 {
             boot_println!("[SMSS] Invalid PML4 for process {}", process_name);
             return Err(ExeLoadError::LoadFailed);
@@ -1440,10 +1443,10 @@ pub fn load_and_create_process(
         );
         boot_println!(
             "[SMSS] after PE load page_table=0x{:x} alias=0x{:x}",
-            unsafe { (*process).page_table_pml4 },
-            unsafe { (*process).pml4_phys }
+            { (*process).page_table_pml4 },
+            { (*process).pml4_phys }
         );
-        unsafe {
+        {
             (*process).user_rip = mapping.entry_point;
             (*process).user_image_base = mapping.image_base;
             (*process).user_image_size = mapping.image_size;
@@ -2525,13 +2528,13 @@ pub fn launch_cmd_shell() -> ! {
                 if let Some(proc) = crate::ps::process::get_by_pid(result.pid) {
                     crate::hal::serial::write_string_always("[CMD] process found\r\n");
                     let proc_ptr = proc as *mut crate::ps::process::Eprocess;
-                    let main_thread = unsafe { (*proc_ptr).main_thread };
+                    let main_thread = { (*proc_ptr).main_thread };
                     if !main_thread.is_null() {
                         crate::hal::serial::write_string_always("[CMD] main thread ok\r\n");
                         crate::ke::scheduler::setup_bsp(main_thread);
-                        let root_table_phys = unsafe { (*proc_ptr).pml4_phys };
-                        let user_rip = unsafe { (*proc_ptr).user_rip };
-                        let user_rsp = unsafe { (*proc_ptr).user_rsp };
+                        let root_table_phys = { (*proc_ptr).pml4_phys };
+                        let user_rip = { (*proc_ptr).user_rip };
+                        let user_rsp = { (*proc_ptr).user_rsp };
                         crate::hal::serial::write_string_always("[CMD] root=");
                         crate::hal::serial::write_hex_u64_always(root_table_phys);
                         crate::hal::serial::write_string_always(" rip=");
@@ -2546,7 +2549,7 @@ pub fn launch_cmd_shell() -> ! {
                         user_rsp
                     );
                         crate::hal::serial::write_string_always("[CMD] clear console\r\n");
-                        unsafe {
+                        {
                             // Give cmd.exe a clean canvas: wipe both the text
                             // console and the bootvid LFB (which still shows the
                             // boot menu text and the animation's white progress

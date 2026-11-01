@@ -12,7 +12,7 @@
 //! can be unit-tested without the bare-metal kernel.
 
 use super::child;
-use super::config::{PermitRoot, SshdConfig};
+pub use super::config::{PermitRoot, SshdConfig};
 use super::session;
 use crate::ke::sync::Spinlock;
 use crate::netstack::socket::{self, SockAddr, SocketError, SocketType};
@@ -341,7 +341,6 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::servers::sshd::config::SshdConfig;
     use alloc::string::String;
 
     fn reset() {
