@@ -3,7 +3,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NT61_DIR="${ROOT}/nt61"
+NT61_DIR="${ROOT}"
 FIRMWARE_DIR="${FIRMWARE_DIR:-${ROOT}/scripts/firmware}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-35}"
 BUILD_DIR="${BUILD_DIR:-${NT61_DIR}/build/x86_64/ntfs}"

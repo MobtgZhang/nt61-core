@@ -81,7 +81,7 @@ run_host_tests() {
     cd "$NT61_DIR"
 
     log_info "Running nt61 unit tests..."
-    cargo test -p nt61 --test '*' -- --nocapture || {
+    cargo test -p nt61-init --test '*' -- --nocapture || {
         log_warn "Some nt61 tests failed"
     }
 
