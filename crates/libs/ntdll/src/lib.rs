@@ -1,3 +1,17 @@
-//! Re-exported ntdll API.
+//! Ring 3 library: ntdll
 
-pub use nt61::libs::ntdll::*;
+#![no_std]
+#![allow(dead_code)]
+
+extern crate alloc;
+extern crate ntoskrnl;
+
+pub use ntoskrnl::{
+    arch, boot_debug_print, boot_debug_println, boot_print, boot_println, crypto, drivers, fs,
+    hal, io,
+    ke, kernel_main, kprintln, kprintln_debug, kprintln_error, kprintln_info, kprintln_warn, libs,
+    loader, lpc, mm, netstack, ob, ps, registry, rtl, se, servers, userspace,
+};
+
+#[cfg(not(test))]
+pub mod ntdll;

@@ -444,7 +444,7 @@ fn registry_default_security() -> *const crate::se::seaccess::SecurityDescriptor
             return core::ptr::null();
         }
 
-        unsafe {
+        {
             core::ptr::write(acl_ptr, Acl::new());
             let acl = &mut *acl_ptr;
             if !acl.add_access_allowed(
@@ -494,12 +494,12 @@ fn registry_access_allowed(key: *mut RegistryKey, desired_access: u32) -> bool {
         if current_process.is_null() {
             return false;
         }
-        let token = unsafe { (*current_process).get_token() };
+        let token = { (*current_process).get_token() };
         if token.is_null() {
             return false;
         }
 
-        let security = unsafe {
+        let security = {
             if (*key).security.is_null() {
                 (*key).security = registry_default_security();
             }

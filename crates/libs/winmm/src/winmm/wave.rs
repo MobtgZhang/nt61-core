@@ -9,13 +9,12 @@
 
 extern crate alloc;
 use alloc::vec::Vec;
-use alloc::boxed::Box;
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicPtr, Ordering};
 use spin::{Mutex, Once};
 
 use crate::drivers::audio::audio_core::{
     AudioDeviceManager, AudioFormat as CoreAudioFormat, StreamDirection,
-    StreamState, AudioBuffer, VolumeControl,
+    VolumeControl,
 };
 
 /// Wave format tags
@@ -393,8 +392,8 @@ pub fn wave_out_get_dev_caps(device_id: u32, caps: &mut WaveOutCaps) -> u32 {
 pub fn wave_out_open(
     device_id: u32,
     format: &WaveFormatEx,
-    callback: usize,
-    instance: usize,
+    _callback: usize,
+    _instance: usize,
     flags: u32,
 ) -> Result<u32, u32> {
     // Validate format
@@ -542,7 +541,7 @@ pub fn wave_out_write(handle: u32, header: *mut WaveHdr) -> u32 {
         }
 
         // write data to audio driver
-        let data_slice = core::slice::from_raw_parts(
+        let _data_slice = core::slice::from_raw_parts(
             (*header).data,
             (*header).buffer_length as usize,
         );
@@ -616,7 +615,7 @@ pub fn wave_out_reset(handle: u32) -> u32 {
     }
 
     // Mark all pending buffers as done
-    unsafe {
+    {
         for header_cell in &out_handle.pending_buffers {
             let header_ptr = header_cell.load(Ordering::Relaxed);
             if !header_ptr.is_null() {
@@ -633,9 +632,9 @@ pub fn wave_out_reset(handle: u32) -> u32 {
 }
 
 /// Get wave output position
-pub fn wave_out_get_position(handle: u32, time: &mut u32, time_type: u32) -> u32 {
+pub fn wave_out_get_position(handle: u32, time: &mut u32, _time_type: u32) -> u32 {
     let mut wave_manager = WaveDeviceManager::instance();
-    let out_handle = match wave_manager.get_out_handle(handle) {
+    let _out_handle = match wave_manager.get_out_handle(handle) {
         Some(h) => h,
         None => return MMSYSERR_INVALHANDLE,
     };
@@ -715,8 +714,8 @@ pub fn wave_in_get_dev_caps(device_id: u32, caps: &mut WaveInCaps) -> u32 {
 pub fn wave_in_open(
     device_id: u32,
     format: &WaveFormatEx,
-    callback: usize,
-    instance: usize,
+    _callback: usize,
+    _instance: usize,
     flags: u32,
 ) -> Result<u32, u32> {
     // Validate format
@@ -835,7 +834,7 @@ pub fn wave_in_reset(handle: u32) -> u32 {
     }
 
     // Mark all pending buffers as done
-    unsafe {
+    {
         for header_cell in &in_handle.pending_buffers {
             let header_ptr = header_cell.load(Ordering::Relaxed);
             if !header_ptr.is_null() {

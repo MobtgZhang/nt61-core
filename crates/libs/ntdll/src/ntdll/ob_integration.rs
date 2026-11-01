@@ -15,8 +15,8 @@
 //!   When `OB_INTEGRATION` is enabled, each allocation also registers
 //!   the object in ob's global kernel handle table.
 
-use super::super::super::ob;
-use super::super::super::ps::process::Eprocess;
+use crate::ob;
+use crate::ps::process::Eprocess;
 
 /// Maximum handle value for the ntdll table.
 pub const NTDLL_MAX_HANDLES: usize = 256;

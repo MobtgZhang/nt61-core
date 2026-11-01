@@ -131,6 +131,22 @@ pub(crate) fn lookup_handle(h: HANDLE) -> Option<HandleEntry> {
     tbl.entries[idx]
 }
 
+/// Resolve a client-side process handle to its kernel target id.
+pub fn process_handle_target(h: HANDLE) -> Option<u64> {
+    lookup_handle(h).and_then(|entry| match entry.kind {
+        HandleKind::Process => Some(entry.target),
+        _ => None,
+    })
+}
+
+/// Resolve a client-side thread handle to its kernel target id.
+pub fn thread_handle_target(h: HANDLE) -> Option<u64> {
+    lookup_handle(h).and_then(|entry| match entry.kind {
+        HandleKind::Thread => Some(entry.target),
+        _ => None,
+    })
+}
+
 fn encode_handle(idx: usize) -> HANDLE {
     ((idx + 1) as u64) as HANDLE
 }
@@ -591,7 +607,7 @@ fn file_open_common(
             let _ = crate::mm::pool::free(name_storage as *mut u8);
             return (STATUS_NO_MEMORY, None, 0);
         }
-        unsafe {
+        {
             core::ptr::write(file_object, crate::io::FileObject::new());
             core::ptr::copy_nonoverlapping(path_u16.as_ptr(), name_storage, path_u16.len());
             *name_storage.add(path_u16.len()) = 0;
@@ -604,10 +620,10 @@ fn file_open_common(
 
         let irp = crate::io::allocate_irp(1);
         if irp.is_null() {
-            unsafe { free_file_object(file_object) };
+            { free_file_object(file_object) };
             return (STATUS_NO_MEMORY, None, 0);
         }
-        unsafe {
+        {
             let stack = (*irp).current_stack;
             (*stack).major_function = crate::io::major::IRP_MJ_CREATE;
             (*stack).device_object = device;
@@ -624,7 +640,7 @@ fn file_open_common(
             status: STATUS_SUCCESS,
             information: 0,
         };
-        unsafe {
+        {
             let stack = (*irp).current_stack;
             (*stack).completion_routine = Some(create_completion_capture);
             (*stack).completion_context = core::ptr::addr_of_mut!(capture) as *mut ();
@@ -633,28 +649,28 @@ fn file_open_common(
 
         let status = crate::io::io_call_driver(device, irp);
         if status < 0 {
-            unsafe { free_file_object(file_object) };
+            { free_file_object(file_object) };
             return (status, None, 0);
         }
 
         // The filesystem enforces the directory/non-directory create
         // options against the object it returned (wdm.h semantics).
-        if !unsafe { (*file_object).fcb }.is_null() {
-            let fcb = unsafe { (*file_object).fcb } as *mut crate::fs::ntfs::NtfsHandle;
-            let target_is_dir = unsafe { (*fcb).is_directory };
+        if !{ (*file_object).fcb }.is_null() {
+            let fcb = { (*file_object).fcb } as *mut crate::fs::ntfs::NtfsHandle;
+            let target_is_dir = { (*fcb).is_directory };
             if is_directory && !target_is_dir {
-                unsafe { free_file_object(file_object) };
+                { free_file_object(file_object) };
                 return (STATUS_NOT_A_DIRECTORY, None, 0);
             }
             if is_non_directory && target_is_dir {
-                unsafe { free_file_object(file_object) };
+                { free_file_object(file_object) };
                 return (STATUS_FILE_IS_A_DIRECTORY, None, 0);
             }
         }
 
         let handle = alloc_handle(HandleKind::File, file_object as u64);
         if handle.is_null() {
-            unsafe { free_file_object(file_object) };
+            { free_file_object(file_object) };
             return (STATUS_NO_MEMORY, None, 0);
         }
         record_share_entry(handle, path_u16, desired_access, share_access);

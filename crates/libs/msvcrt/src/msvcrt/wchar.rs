@@ -465,7 +465,7 @@ pub unsafe extern "C" fn fputwc(wc: WcharT, stream: *mut FILE) -> WcharT {
     }
 
     let c = (wc & 0xFF) as u8;
-    if crate::libs::msvcrt::stdio::fputc(c as CInt, stream) == EOF {
+    if crate::msvcrt::stdio::fputc(c as CInt, stream) == EOF {
         0xFFFF
     } else {
         wc
@@ -481,7 +481,7 @@ pub unsafe extern "C" fn fgetwc(stream: *mut FILE) -> WcharT {
         return 0xFFFF; // WEOF
     }
 
-    let c = crate::libs::msvcrt::stdio::fgetc(stream);
+    let c = crate::msvcrt::stdio::fgetc(stream);
     if c == EOF {
         0xFFFF
     } else {

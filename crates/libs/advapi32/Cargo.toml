@@ -10,4 +10,5 @@ test = false
 doctest = false
 
 [dependencies]
-nt61 = { path = "../../../nt61", default-features = false, features = ["alloc"] }
+nt61-boot-types = { path = "../../boot-types" }
+ntoskrnl = { path = "../../ntoskrnl" }

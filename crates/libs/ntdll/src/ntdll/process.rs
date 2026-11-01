@@ -85,20 +85,19 @@ pub unsafe extern "C" fn nt_create_process(
     let parent_pid = if parent_process.is_null() || parent_process == nt_current_process() {
         None
     } else {
-        match crate::libs::ntdll::file::lookup_handle(parent_process) {
-            Some(entry) if entry.kind == HandleKind::Process => Some(entry.target),
+        match super::file::lookup_handle(parent_process) {
+            Some(entry) if entry.kind == super::file::HandleKind::Process => Some(entry.target),
             _ => return STATUS_INVALID_HANDLE,
         }
     };
     if !section_handle.is_null() {
-        match crate::libs::ntdll::file::lookup_handle(section_handle) {
-            Some(entry) if entry.kind == HandleKind::Section => {}
+        match super::file::lookup_handle(section_handle) {
+            Some(entry) if entry.kind == super::file::HandleKind::Section => {}
             _ => return STATUS_INVALID_HANDLE,
         }
     }
     for port_handle in [debug_port, exception_port] {
-        if !port_handle.is_null() && crate::libs::ntdll::file::lookup_handle(port_handle).is_none()
-        {
+        if !port_handle.is_null() && super::file::lookup_handle(port_handle).is_none() {
             return STATUS_INVALID_HANDLE;
         }
     }

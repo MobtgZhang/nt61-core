@@ -568,7 +568,7 @@ pub fn nt_access_check_kernel(
         // Copy the ACL into a kernel-side Acl (inline ACE storage).
         let mut kernel_dacl = crate::se::acl::Acl::new();
         let copy_len = acl_size.min(core::mem::size_of::<crate::se::acl::Acl>());
-        let acl_bytes = unsafe {
+        let acl_bytes = {
             core::slice::from_raw_parts_mut(
                 &mut kernel_dacl as *mut crate::se::acl::Acl as *mut u8,
                 copy_len,
@@ -584,7 +584,7 @@ pub fn nt_access_check_kernel(
         // Read the owner SID (fixed 40-byte se::sid layout).
         let mut owner_sid = crate::se::sid::sid::new();
         if owner_ptr != 0 {
-            let sid_bytes = unsafe {
+            let sid_bytes = {
                 core::slice::from_raw_parts_mut(
                     &mut owner_sid as *mut crate::se::sid::sid as *mut u8,
                     core::mem::size_of::<crate::se::sid::sid>(),

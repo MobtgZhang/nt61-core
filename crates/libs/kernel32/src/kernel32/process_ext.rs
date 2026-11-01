@@ -299,18 +299,10 @@ pub unsafe extern "C" fn create_process_w(
     // The handle table records the object each handle refers to, so the real
     // client ids are available here; returning fixed values made every
     // create_process_w caller see the same process/thread.
-    pi.dw_process_id = match crate::libs::ntdll::file::lookup_handle(proc_handle) {
-        Some(entry) if entry.kind == crate::libs::ntdll::file::HandleKind::Process => {
-            entry.target as DWORD
-        }
-        _ => 0,
-    };
-    pi.dw_thread_id = match crate::libs::ntdll::file::lookup_handle(thread_handle) {
-        Some(entry) if entry.kind == crate::libs::ntdll::file::HandleKind::Thread => {
-            entry.target as DWORD
-        }
-        _ => 0,
-    };
+    pi.dw_process_id =
+        crate::libs::ntdll::file::process_handle_target(proc_handle).unwrap_or(0) as DWORD;
+    pi.dw_thread_id =
+        crate::libs::ntdll::file::thread_handle_target(thread_handle).unwrap_or(0) as DWORD;
 
     TRUE
 }
