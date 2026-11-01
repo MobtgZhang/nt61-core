@@ -5,6 +5,8 @@
 //! crate — previously only `csprng` was hooked, so the rest of the
 //! subsystem was dead code that CI never type-checked.
 
+#![allow(unexpected_cfgs)]
+
 pub mod bcrypt;
 pub mod cipher;
 pub mod csprng;
@@ -16,7 +18,7 @@ pub mod rsa;
 // RustCrypto-backed variants. They are opt-in because they pull in
 // external crates; the pure-Rust implementations above are what the
 // kernel actually links against on a default build.
-#[cfg(feature = "crypto_libs")]
+#[cfg(all(feature = "crypto_libs", feature = "rsa_secure"))]
 pub mod rsa_secure;
 
 /// Initialize the cryptography subsystem: seed the CSPRNG from the
