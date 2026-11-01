@@ -1,0 +1,14 @@
+[package]
+name = "nt61-sync"
+version = "0.1.0"
+edition = "2021"
+authors = ["NT6.1.7601 Team"]
+description = "Windows NT 6.1 shared synchronization and atomic helpers"
+license = "MIT OR Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+test = false
+
+[dependencies]
+spin = "0.9"
