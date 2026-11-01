@@ -1186,7 +1186,7 @@ fn read_cstr(buf: &[u8], offset: usize) -> Option<String> {
 //  loader therefore maintains a small database that maps
 //  `(dll_name, fn_name) -> address`.
 
-use crate::ke::sync::Spinlock;
+use ntoskrnl::ke::sync::Spinlock;
 
 struct DbEntry {
     name: String,
@@ -1203,7 +1203,7 @@ impl ImageDatabase {
         let empty = alloc::vec::Vec::new();
 
         Self {
-            images: crate::ke::sync::Spinlock::new(empty),
+            images: ntoskrnl::ke::sync::Spinlock::new(empty),
         }
     }
 
@@ -1558,7 +1558,7 @@ impl TlsData {
         let size = end.saturating_sub(start);
 
         // Allocate from non-paged pool
-        let data_ptr = crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, size);
+        let data_ptr = ntoskrnl::mm::pool::allocate(ntoskrnl::mm::pool::PoolType::NonPaged, size);
 
         if data_ptr.is_null() {
             return None;
@@ -1569,13 +1569,13 @@ impl TlsData {
             core::ptr::write_bytes(data_ptr, 0, size);
         }
 
-        let tls_data = crate::mm::pool::allocate(
-            crate::mm::pool::PoolType::NonPaged,
+        let tls_data = ntoskrnl::mm::pool::allocate(
+            ntoskrnl::mm::pool::PoolType::NonPaged,
             core::mem::size_of::<Self>(),
         ) as *mut Self;
 
         if tls_data.is_null() {
-            let _ = crate::mm::pool::free(data_ptr);
+            let _ = ntoskrnl::mm::pool::free(data_ptr);
             return None;
         }
 
@@ -1599,7 +1599,7 @@ impl TlsData {
         unsafe {
             if !self.tls_data_ptr.is_null() {
                 {
-                    let _ = crate::mm::pool::free(self.tls_data_ptr);
+                    let _ = ntoskrnl::mm::pool::free(self.tls_data_ptr);
                 }
                 self.tls_data_ptr = core::ptr::null_mut();
             }
@@ -1819,11 +1819,11 @@ pub fn call_dll_main(image: &LoadedImage, reason: u32, reserved: u64) -> i32 {
             // copy is not at `image_base`, so its absolute references
             // (relocated data, resolved imports) would dereference the
             // wrong addresses.
-            let system_pml4 = crate::mm::vas::MM_SYSTEM_VAS.lock().pml4_phys;
+            let system_pml4 = ntoskrnl::mm::vas::MM_SYSTEM_VAS.lock().pml4_phys;
             let target = image.image_base + rva as u64;
             if system_pml4 != 0
                 && rva < image.bytes.len()
-                && crate::mm::vas::is_user_range_mapped(system_pml4, target, 0x1000)
+                && ntoskrnl::mm::vas::is_user_range_mapped(system_pml4, target, 0x1000)
             {
                 let fn_ptr = target as *const u8;
                 let entry: extern "C" fn(u64, u32, u64) -> i32 =
@@ -1976,7 +1976,7 @@ fn load_raw_image_into_user_address_space(
     #[cfg(target_arch = "riscv64")]
     let preferred_base = preferred_image_base;
     #[cfg(target_arch = "riscv64")]
-    let image_base = crate::mm::vas::DEFAULT_USER_IMAGE_BASE;
+    let image_base = ntoskrnl::mm::vas::DEFAULT_USER_IMAGE_BASE;
     #[cfg(not(target_arch = "riscv64"))]
     let preferred_base = preferred_image_base;
     #[cfg(not(target_arch = "riscv64"))]
@@ -1995,9 +1995,9 @@ fn load_raw_image_into_user_address_space(
     // at 64 KiB; real PE images can be megabytes).
     let mut phys_pages: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(page_count);
     for _ in 0..page_count {
-        let Some(p) = crate::mm::vas::alloc_zeroed_page_for_vas() else {
+        let Some(p) = ntoskrnl::mm::vas::alloc_zeroed_page_for_vas() else {
             for &pa in &phys_pages {
-                crate::mm::pfn::free_pfn(pa >> 12);
+                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return None;
         };
@@ -2077,7 +2077,7 @@ fn load_raw_image_into_user_address_space(
         rva_image[dst..dst + sz].copy_from_slice(&image[src..src + sz]);
     }
     if delta != 0 {
-        crate::userspace::loader::apply_base_relocations_to_image(&mut rva_image, image, delta);
+        ntoskrnl::userspace::loader::apply_base_relocations_to_image(&mut rva_image, image, delta);
     }
 
     // 3. Map each 4 KiB page at `image_base + i*0x1000` with
@@ -2095,7 +2095,7 @@ fn load_raw_image_into_user_address_space(
         let page_va = image_base + (page_index as u64) * 0x1000;
 
         // Determine the correct FINAL protection for this page
-        let mut final_flags = crate::mm::vas::PTE_RW | crate::mm::vas::PTE_US; // Default: R+W+U
+        let mut final_flags = ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_US; // Default: R+W+U
         for &s in &section_info {
             if page_va >= s.va_start && page_va < s.va_end {
                 final_flags = determine_section_protection(s.chars);
@@ -2104,12 +2104,12 @@ fn load_raw_image_into_user_address_space(
         }
         // For the initial mapping, force RW+NX so we can write into
         // the page and so the page is NOT yet executable.
-        let initial_flags = final_flags | crate::mm::vas::PTE_RW | crate::mm::vas::PTE_NX;
+        let initial_flags = final_flags | ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_NX;
 
-        let r = crate::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, initial_flags);
-        if r != crate::mm::vas::MmStatus::Ok {
+        let r = ntoskrnl::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, initial_flags);
+        if r != ntoskrnl::mm::vas::MmStatus::Ok {
             for &pa in &phys_pages {
-                crate::mm::pfn::free_pfn(pa >> 12);
+                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return None;
         }
@@ -2133,7 +2133,7 @@ fn load_raw_image_into_user_address_space(
     // by the first call to attach_process at boot. If it's still 0
     // (e.g. on the very first attach), we read CR3 itself as the
     // best-effort fallback.
-    let saved_cr3 = crate::arch::switch_to_system_address_space();
+    let saved_cr3 = ntoskrnl::arch::switch_to_system_address_space();
     for i in 0..file_hdr.number_of_sections as usize {
         let sh_off = sect_off + i * 40;
         let sh: SectionHeader = if sh_off + 40 <= image.len() {
@@ -2209,23 +2209,23 @@ fn load_raw_image_into_user_address_space(
     // cmd.exe entry RIP.
     for (i, &p) in phys_pages.iter().enumerate() {
         let page_va = image_base + (i as u64) * 0x1000;
-        let mut final_flags = crate::mm::vas::PTE_RW | crate::mm::vas::PTE_US;
+        let mut final_flags = ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_US;
         for &s in &section_info {
             if page_va >= s.va_start && page_va < s.va_end {
                 final_flags = determine_section_protection(s.chars);
                 break;
             }
         }
-        let r = crate::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, final_flags);
-        if r != crate::mm::vas::MmStatus::Ok {
+        let r = ntoskrnl::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, final_flags);
+        if r != ntoskrnl::mm::vas::MmStatus::Ok {
             for &pa in &phys_pages {
-                crate::mm::pfn::free_pfn(pa >> 12);
+                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return None;
         }
         // Force TLB flush so the NX→X transition is visible to
         // the next instruction fetch on this VA.
-        crate::mm::vas::invalidate_tlb(page_va);
+        ntoskrnl::mm::vas::invalidate_tlb(page_va);
     }
 
     // Belt-and-braces: also flush the entire TLB by reloading CR3.
@@ -2233,10 +2233,10 @@ fn load_raw_image_into_user_address_space(
     // touched during the load) lingers when user-mode execution
     // starts. The cost is one extra CR3 write, which is negligible
     // for a one-shot boot path.
-    crate::arch::flush_tlb();
+    ntoskrnl::arch::flush_tlb();
 
     // Restore CR3 to the user PML4 we were using before the copy.
-    crate::arch::restore_system_address_space(saved_cr3);
+    ntoskrnl::arch::restore_system_address_space(saved_cr3);
 
     let entry_point = image_base + aep as u64;
     // crate::kprintln!("[loader] loaded PE into user PML4: image_base=0x{:x} entry=0x{:x} size=0x{:x}",
@@ -2281,9 +2281,9 @@ fn map_prebuilt_image_into_user_address_space(
     let page_count = size_of_image.div_ceil(0x1000);
     let mut phys_pages: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(page_count);
     for _ in 0..page_count {
-        let Some(p) = crate::mm::vas::alloc_zeroed_page_for_vas() else {
+        let Some(p) = ntoskrnl::mm::vas::alloc_zeroed_page_for_vas() else {
             for &pa in &phys_pages {
-                crate::mm::pfn::free_pfn(pa >> 12);
+                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return None;
         };
@@ -2324,19 +2324,19 @@ fn map_prebuilt_image_into_user_address_space(
     // I-cache translation can exist for this VA.
     for (page_index, &p) in phys_pages.iter().enumerate() {
         let page_va = image_base + (page_index as u64) * 0x1000;
-        let mut final_flags = crate::mm::vas::PTE_RW | crate::mm::vas::PTE_US;
+        let mut final_flags = ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_US;
         for &s in &section_info {
             if page_va >= s.va_start && page_va < s.va_end {
                 final_flags = determine_section_protection(s.chars);
                 break;
             }
         }
-        let initial_flags = final_flags | crate::mm::vas::PTE_RW | crate::mm::vas::PTE_NX;
-        if crate::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, initial_flags)
-            != crate::mm::vas::MmStatus::Ok
+        let initial_flags = final_flags | ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_NX;
+        if ntoskrnl::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, initial_flags)
+            != ntoskrnl::mm::vas::MmStatus::Ok
         {
             for &pa in &phys_pages {
-                crate::mm::pfn::free_pfn(pa >> 12);
+                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return None;
         }
@@ -2345,7 +2345,7 @@ fn map_prebuilt_image_into_user_address_space(
     // Copy the prebuilt image (headers + sections at their RVAs) into
     // the fresh pages via physical addresses while the system root is
     // active, mirroring load_raw_image_into_user_address_space.
-    let saved_cr3 = crate::arch::switch_to_system_address_space();
+    let saved_cr3 = ntoskrnl::arch::switch_to_system_address_space();
     for (page_index, &p) in phys_pages.iter().enumerate() {
         let start = page_index * 0x1000;
         if start >= prebuilt.len() {
@@ -2364,25 +2364,25 @@ fn map_prebuilt_image_into_user_address_space(
     // and real CPUs observe the new PTE (same protocol as load_raw).
     for (i, &p) in phys_pages.iter().enumerate() {
         let page_va = image_base + (i as u64) * 0x1000;
-        let mut final_flags = crate::mm::vas::PTE_RW | crate::mm::vas::PTE_US;
+        let mut final_flags = ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_US;
         for &s in &section_info {
             if page_va >= s.va_start && page_va < s.va_end {
                 final_flags = determine_section_protection(s.chars);
                 break;
             }
         }
-        let r = crate::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, final_flags);
-        if r != crate::mm::vas::MmStatus::Ok {
-            crate::arch::restore_system_address_space(saved_cr3);
+        let r = ntoskrnl::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, final_flags);
+        if r != ntoskrnl::mm::vas::MmStatus::Ok {
+            ntoskrnl::arch::restore_system_address_space(saved_cr3);
             for &pa in &phys_pages {
-                crate::mm::pfn::free_pfn(pa >> 12);
+                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return None;
         }
-        crate::mm::vas::invalidate_tlb(page_va);
+        ntoskrnl::mm::vas::invalidate_tlb(page_va);
     }
-    crate::arch::flush_tlb();
-    crate::arch::restore_system_address_space(saved_cr3);
+    ntoskrnl::arch::flush_tlb();
+    ntoskrnl::arch::restore_system_address_space(saved_cr3);
 
     Some(UserImageMapping {
         image_base,
@@ -2397,7 +2397,7 @@ fn map_prebuilt_image_into_user_address_space(
 /// unmapped region. Idempotent: an already-mapped base is a no-op.
 /// Returns true when the image is mapped (or already was).
 pub fn map_loaded_image_into_kernel_space(loaded: &LoadedImage) -> bool {
-    let system_pml4 = crate::mm::vas::MM_SYSTEM_VAS.lock().pml4_phys;
+    let system_pml4 = ntoskrnl::mm::vas::MM_SYSTEM_VAS.lock().pml4_phys;
     if system_pml4 == 0 || loaded.image_base == 0 || loaded.bytes.is_empty() {
         return false;
     }
@@ -2406,7 +2406,7 @@ pub fn map_loaded_image_into_kernel_space(loaded: &LoadedImage) -> bool {
     if size_of_image == 0 {
         return false;
     }
-    if crate::mm::vas::is_user_range_mapped(system_pml4, image_base, 0x1000) {
+    if ntoskrnl::mm::vas::is_user_range_mapped(system_pml4, image_base, 0x1000) {
         return true;
     }
     let (file_hdr, _opt_size, _magic, opt_off) = match parse_headers(&loaded.bytes) {
@@ -2417,9 +2417,9 @@ pub fn map_loaded_image_into_kernel_space(loaded: &LoadedImage) -> bool {
     let page_count = size_of_image.div_ceil(0x1000);
     let mut phys_pages: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(page_count);
     for _ in 0..page_count {
-        let Some(p) = crate::mm::vas::alloc_zeroed_page_for_vas() else {
+        let Some(p) = ntoskrnl::mm::vas::alloc_zeroed_page_for_vas() else {
             for &pa in &phys_pages {
-                crate::mm::pfn::free_pfn(pa >> 12);
+                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return false;
         };
@@ -2455,28 +2455,28 @@ pub fn map_loaded_image_into_kernel_space(loaded: &LoadedImage) -> bool {
         });
     }
 
-    let us_bit = crate::mm::vas::PTE_US;
+    let us_bit = ntoskrnl::mm::vas::PTE_US;
     for (page_index, &p) in phys_pages.iter().enumerate() {
         let page_va = image_base + (page_index as u64) * 0x1000;
-        let mut final_flags = crate::mm::vas::PTE_RW | crate::mm::vas::PTE_NX;
+        let mut final_flags = ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_NX;
         for &s in &section_info {
             if page_va >= s.va_start && page_va < s.va_end {
                 final_flags = determine_section_protection(s.chars) & !us_bit;
                 break;
             }
         }
-        let initial_flags = final_flags | crate::mm::vas::PTE_RW | crate::mm::vas::PTE_NX;
-        if crate::mm::vas::map_page_in_pml4(system_pml4, page_va, p, initial_flags)
-            != crate::mm::vas::MmStatus::Ok
+        let initial_flags = final_flags | ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_NX;
+        if ntoskrnl::mm::vas::map_page_in_pml4(system_pml4, page_va, p, initial_flags)
+            != ntoskrnl::mm::vas::MmStatus::Ok
         {
             for &pa in &phys_pages {
-                crate::mm::pfn::free_pfn(pa >> 12);
+                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return false;
         }
     }
 
-    let saved_cr3 = crate::arch::switch_to_system_address_space();
+    let saved_cr3 = ntoskrnl::arch::switch_to_system_address_space();
     for (page_index, &p) in phys_pages.iter().enumerate() {
         let start = page_index * 0x1000;
         if start >= loaded.bytes.len() {
@@ -2492,25 +2492,25 @@ pub fn map_loaded_image_into_kernel_space(loaded: &LoadedImage) -> bool {
     }
     for (i, &p) in phys_pages.iter().enumerate() {
         let page_va = image_base + (i as u64) * 0x1000;
-        let mut final_flags = crate::mm::vas::PTE_RW | crate::mm::vas::PTE_NX;
+        let mut final_flags = ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_NX;
         for &s in &section_info {
             if page_va >= s.va_start && page_va < s.va_end {
                 final_flags = determine_section_protection(s.chars) & !us_bit;
                 break;
             }
         }
-        let r = crate::mm::vas::map_page_in_pml4(system_pml4, page_va, p, final_flags);
-        if r != crate::mm::vas::MmStatus::Ok {
-            crate::arch::restore_system_address_space(saved_cr3);
+        let r = ntoskrnl::mm::vas::map_page_in_pml4(system_pml4, page_va, p, final_flags);
+        if r != ntoskrnl::mm::vas::MmStatus::Ok {
+            ntoskrnl::arch::restore_system_address_space(saved_cr3);
             for &pa in &phys_pages {
-                crate::mm::pfn::free_pfn(pa >> 12);
+                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return false;
         }
-        crate::mm::vas::invalidate_tlb(page_va);
+        ntoskrnl::mm::vas::invalidate_tlb(page_va);
     }
-    crate::arch::flush_tlb();
-    crate::arch::restore_system_address_space(saved_cr3);
+    ntoskrnl::arch::flush_tlb();
+    ntoskrnl::arch::restore_system_address_space(saved_cr3);
     true
 }
 
@@ -2523,7 +2523,7 @@ pub fn map_loaded_image_into_kernel_space(loaded: &LoadedImage) -> bool {
 ///   - IMAGE_SCN_MEM_READ (0x40000000): Memory is readable
 ///   - IMAGE_SCN_MEM_WRITE (0x80000000): Memory is writable
 fn determine_section_protection(characteristics: u32) -> u64 {
-    use crate::mm::vas::{PTE_NX, PTE_RW, PTE_US};
+    use ntoskrnl::mm::vas::{PTE_NX, PTE_RW, PTE_US};
 
     let mut flags = PTE_US; // Always user-accessible
 
