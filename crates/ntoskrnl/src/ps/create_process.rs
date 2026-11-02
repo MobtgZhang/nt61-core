@@ -9,12 +9,14 @@ use crate::ob;
 use crate::ps::address_space::ProcessAddressSpace;
 use crate::ps::process::{Eprocess, ProcessHandleTable};
 use crate::se::token;
+use core::ptr::null_mut;
 
 /// NT Status codes
 pub const STATUS_SUCCESS: u32 = 0;
 pub const STATUS_INVALID_PARAMETER: u32 = 0xC000000D;
 pub const STATUS_INSUFFICIENT_RESOURCES: u32 = 0xC000009A;
 pub const STATUS_INVALID_HANDLE: u32 = 0xC0000008;
+pub const STATUS_UNSUCCESSFUL: u32 = 0xC0000001;
 
 /// Process access rights
 pub const PROCESS_TERMINATE: u32 = 0x0001;
@@ -64,9 +66,11 @@ pub fn nt_create_process(
 ) -> u32 {
     unsafe {
         // 1. Validate parent process
+        let mut parent_header = null_mut();
         let parent = if parent_process_handle != 0 {
             match ob::reference_object_by_handle(parent_process_handle) {
                 header if !header.is_null() => {
+                    parent_header = header;
                     // SAFETY: caller has validated the handle via
                     // `reference_object_by_handle`, so `header` points at a
                     // live `OBJECT_HEADER`. `get_object_body` is itself
@@ -112,6 +116,9 @@ pub fn nt_create_process(
                 // `pool::free` is a safe function, so no `unsafe` wrapper is
                 // needed — calling it directly is enough.
                 pool::free(process_ptr as *mut u8);
+                if !parent_header.is_null() {
+                    ob::dereference_object(parent_header);
+                }
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
         };
@@ -123,16 +130,24 @@ pub fn nt_create_process(
         }
 
         // 5. Map PEB and stack
-        let mut addr_space = address_space;
+        let mut addr_space = core::mem::ManuallyDrop::new(address_space);
         if addr_space.map_peb().is_err() {
             // `pool::free` is a safe function, so the unsafe wrapper is
             // not required.
             pool::free(process_ptr as *mut u8);
+            addr_space.cleanup();
+            if !parent_header.is_null() {
+                ob::dereference_object(parent_header);
+            }
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
         if addr_space.map_user_stack().is_err() {
             pool::free(process_ptr as *mut u8);
+            addr_space.cleanup();
+            if !parent_header.is_null() {
+                ob::dereference_object(parent_header);
+            }
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -145,15 +160,6 @@ pub fn nt_create_process(
             (*process_ptr).peb = addr_space.peb_address as *mut crate::ps::process::peb;
         }
 
-        // Transfer ownership of the address space to the process. Without
-        // this the `ProcessAddressSpace` stack local is dropped when
-        // `create_process` returns, which runs `Drop::cleanup()` and frees
-        // the PML4 page *while the process is still running with that CR3*.
-        // The freed page is then reused as an ordinary data buffer, so the
-        // next write (e.g. a command line) corrupts the live PML4 and the
-        // next page walk triple-faults.
-        core::mem::forget(addr_space);
-
         // 6. Allocate handle table
         let ht_size = core::mem::size_of::<ProcessHandleTable>().max(4096);
         let ht_ptr = pool::allocate(pool::PoolType::NonPaged, ht_size) as *mut ProcessHandleTable;
@@ -161,6 +167,10 @@ pub fn nt_create_process(
         if ht_ptr.is_null() {
             // `pool::free` is safe; drop the redundant ` ` wrapper.
             pool::free(process_ptr as *mut u8);
+            addr_space.cleanup();
+            if !parent_header.is_null() {
+                ob::dereference_object(parent_header);
+            }
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -184,6 +194,10 @@ pub fn nt_create_process(
             if process_token.is_null() {
                 pool::free(ht_ptr as *mut u8);
                 pool::free(process_ptr as *mut u8);
+                addr_space.cleanup();
+                if !parent_header.is_null() {
+                    ob::dereference_object(parent_header);
+                }
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
             (*process_ptr).set_token(process_token);
@@ -192,6 +206,10 @@ pub fn nt_create_process(
         if inherit_handles && !ob::inherit_process_handle_table(process_ptr, parent) {
             pool::free(ht_ptr as *mut u8);
             pool::free(process_ptr as *mut u8);
+            addr_space.cleanup();
+            if !parent_header.is_null() {
+                ob::dereference_object(parent_header);
+            }
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -208,13 +226,26 @@ pub fn nt_create_process(
                 let section = ob::get_object_body::<crate::mm::section::Section>(header);
                 let base = (*section).base_address;
                 let size = (*section).size as usize;
-                if base != 0 && size > 0 {
-                    let image = core::slice::from_raw_parts(base as *const u8, size);
-                    if crate::loader::load_pe(image).is_none() {
-                        // PE parsing failed; the process remains in a suspended
-                        // state that NT_CREATE_THREAD can terminate.
-                    }
+                if base == 0 || size == 0 {
+                    ob::dereference_object(header);
+                    return STATUS_INVALID_PARAMETER;
                 }
+                let image = core::slice::from_raw_parts(base as *const u8, size);
+                let mapping = crate::loader::load_into_user_address_space(
+                    (*process_ptr).pml4_phys,
+                    image,
+                );
+                ob::dereference_object(header);
+                let Some(mapping) = mapping else {
+                    pool::free(ht_ptr as *mut u8);
+                    pool::free(process_ptr as *mut u8);
+                    addr_space.cleanup();
+                    if !parent_header.is_null() {
+                        ob::dereference_object(parent_header);
+                    }
+                    return STATUS_UNSUCCESSFUL;
+                };
+                (*process_ptr).user_rip = mapping.entry_point;
             }
         }
 
@@ -233,6 +264,9 @@ pub fn nt_create_process(
             // `pool::free` is safe; no `unsafe` wrapper needed.
             pool::free(ht_ptr as *mut u8);
             pool::free(process_ptr as *mut u8);
+            if !parent_header.is_null() {
+                ob::dereference_object(parent_header);
+            }
             return STATUS_INSUFFICIENT_RESOURCES;
         }
 
@@ -250,6 +284,10 @@ pub fn nt_create_process(
             obj_header,
         )) {
             return crate::libs::ntdll::status::STATUS_NO_MEMORY as u32;
+        }
+
+        if !parent_header.is_null() {
+            ob::dereference_object(parent_header);
         }
 
         STATUS_SUCCESS

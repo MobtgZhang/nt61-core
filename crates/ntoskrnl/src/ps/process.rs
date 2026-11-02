@@ -1188,7 +1188,7 @@ pub const PEB_IMAGE_BASE_ADDRESS: usize = 0x10; // PEB+0x10
 pub const PEB_LDR_OFFSET: usize = 0x18; // PEB+0x18
 pub const PEB_PROCESS_PARAMETERS: usize = 0x20; // PEB+0x20
 pub const PEB_PROCESS_HEAP: usize = 0x30; // PEB+0x30
-pub const PEB_NT_GLOBAL_FLAG: usize = 0x38; // PEB+0x38
+pub const PEB_NT_GLOBAL_FLAG: usize = 0x50; // PEB+0x50
 
 impl peb {
     pub fn new() -> Self {
@@ -1215,7 +1215,7 @@ impl peb {
     /// Get being_debugged flag from PEB header
     #[inline]
     pub fn being_debugged(&self) -> bool {
-        unsafe { *(self.header as *const u8) != 0 }
+        (self.header & 0xFF) != 0
     }
 
     /// Get image base address from PEB
@@ -1514,14 +1514,32 @@ impl UnicodeString {
 
     pub fn from_str(s: &str) -> Self {
         let len = s.len().min(255);
-        let mut buffer = [0u16; 256];
-        for (i, c) in s.chars().take(255).enumerate() {
-            buffer[i] = c as u16;
+        let buffer_size = 256usize.saturating_mul(core::mem::size_of::<u16>());
+        let buffer =
+            crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, buffer_size)
+                as *mut u16;
+        if !buffer.is_null() {
+            unsafe {
+                core::ptr::write_bytes(buffer, 0u8, 256);
+                for (i, c) in s.chars().take(255).enumerate() {
+                    buffer.add(i).write(c as u16);
+                }
+            }
         }
         Self {
             length: (len * 2) as u16,
             maximum_length: ((len + 1) * 2) as u16,
-            buffer: buffer.as_mut_ptr(),
+            buffer,
+        }
+    }
+
+    /// Release the buffer allocated by `from_str`.
+    pub fn free(&mut self) {
+        if !self.buffer.is_null() {
+            unsafe { crate::mm::pool::free(self.buffer as *mut u8) };
+            self.buffer = core::ptr::null_mut();
+            self.length = 0;
+            self.maximum_length = 0;
         }
     }
 }
@@ -1637,6 +1655,9 @@ pub fn create_system_process(pid: u64) -> Option<&'static mut Eprocess> {
     let process = crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, process_size)
         as *mut Eprocess;
     crate::hal::serial::write_string("PS:allocated\r\n");
+    if process.is_null() {
+        return None;
+    }
 
     if !process.is_null() {
         unsafe {
@@ -1670,6 +1691,18 @@ pub fn create_system_process(pid: u64) -> Option<&'static mut Eprocess> {
         if count < list.processes.len() {
             list.processes[count] = process;
             list.process_count = count + 1;
+        } else {
+            drop(list);
+            unsafe {
+                if !(*process).get_token().is_null() {
+                    crate::mm::pool::free((*process).get_token() as *mut u8);
+                }
+                if !(*process).object_table.is_null() {
+                    crate::mm::pool::free((*process).object_table as *mut u8);
+                }
+            }
+            unsafe { crate::mm::pool::free(process as *mut u8) };
+            return None;
         }
 
         if pid == PID_SYSTEM {
@@ -1836,9 +1869,11 @@ pub fn create_user_process(
 
             // Initialize thread
             let thread = thread_ptr;
+            let tid = crate::ps::thread::NEXT_TID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
             (*thread)
                 .client_id
-                .set(pid, pid.wrapping_shl(8).wrapping_add(1));
+                .set(pid, tid);
+            (*thread).kthread.client_id.set(pid, tid);
             (*thread).kthread.process = process;
             (*thread).threads_process = process;
             (*thread).kthread.state = KThreadState::Initialized;
@@ -1889,7 +1924,7 @@ pub fn create_user_process(
             crate::mm::pool::free(stack_vad as *mut u8);
             crate::mm::pfn::free_pfn(pml4_phys >> 12);
             crate::mm::pool::free(thread_ptr as *mut u8);
-            crate::mm::pool::free(process as *mut u8);
+                crate::mm::pool::free(process as *mut Eprocess as *mut u8);
             return None;
         }
 
@@ -1922,21 +1957,86 @@ pub fn create_user_process_from_path(
 /// to, and re-entering the syscall machinery would corrupt the
 /// CPU state saved in the trap frame.
 ///
-/// We never actually free the EPROCESS or PML4 in this minimal
-/// kernel: the only purpose is to park the CPU so QEMU stops
-/// producing further serial output. A full implementation would
-/// unwind the trap frame and switch to the idle thread.
 pub fn process_exit(_exit_code: u32) -> ! {
-    // write a one-line marker so the serial log makes the
-    // cmd.exe termination visible. The marker uses the canonical
-    // "[EXIT]" prefix so the smoke test can grep for it.
-    crate::hal::serial::write_string_always("cmd.exe: process exit (autoexec finished)\r\n");
-    // Park the CPU forever. `halt` is privileged; once the kernel
-    // raises the IPL or masks interrupts the CPU will simply
-    // spin in the hlt instruction until QEMU is killed.
-    loop {
-        crate::arch::halt();
+    // NT 6.1 runs PspExitProcess: tear down the address space, close
+    // all handles, free the EPROCESS and its threads, then switch to
+    // the idle thread so other processes can run.
+
+    // Determine which process is exiting. The caller is the last
+    // user-mode thread, so the PID was saved in the trap frame; for
+    // now we find the process whose main thread state is Terminated.
+    let exit_pid = {
+        let mut found: u64 = 0;
+        let list = PROCESS_LIST.lock();
+        for i in 0..list.process_count {
+            let p = list.processes[i];
+            if !p.is_null() {
+                let proc = unsafe { &mut *p };
+                if !proc.main_thread.is_null()
+                    && unsafe { (*proc.main_thread).kthread.state }
+                        == crate::ps::thread::KThreadState::Terminated
+                {
+                    found = proc.unique_process_id;
+                    break;
+                }
+            }
+        }
+        found
+    };
+
+    if exit_pid != 0 {
+        crate::ps::job::remove_process_from_all_jobs(exit_pid);
+        // Tear down the address space and resources.
+        let process = get_by_pid(exit_pid);
+        if let Some(process) = process {
+            unsafe {
+                let pml4_phys = process.pml4_phys;
+                let handle_table = process.object_table;
+                let main_thread = process.main_thread;
+
+                // Unmap the user stack.
+                if pml4_phys != 0 {
+                    let _ = crate::mm::vas::unmap_user_pages(
+                        pml4_phys,
+                        crate::mm::vas::USER_STACK_BASE,
+                        crate::mm::vas::USER_STACK_SIZE,
+                    );
+                }
+
+                let process_ptr = process as *mut Eprocess;
+
+                // Remove the process while its EPROCESS memory is still
+                // valid. `remove_process_from_list` reads the PID through
+                // the list entry and must not touch freed memory.
+                remove_process_from_list(exit_pid);
+
+                if !main_thread.is_null() {
+                    crate::mm::pool::free(main_thread as *mut u8);
+                }
+
+                // Free the handle table.
+                if !handle_table.is_null() {
+                    crate::mm::pool::free(handle_table as *mut u8);
+                }
+
+                // Free the PML4.
+                if pml4_phys != 0 {
+                    crate::mm::pfn::free_pfn(pml4_phys >> 12);
+                }
+
+                crate::mm::pool::free(process_ptr as *mut u8);
+            }
+        }
+
+        // Release the PID.
+        free_pid(exit_pid);
     }
+
+    crate::hal::serial::write_string_always("cmd.exe: process exit (autoexec finished)\r\n");
+
+    // Switch to the idle thread so the CPU can service other work
+    // instead of parking forever.
+    crate::ke::scheduler::idle_loop()
 }
 
 /// Get process by PID
@@ -1959,14 +2059,76 @@ pub fn terminate_process(pid: u64, exit_code: i32) -> bool {
     let Some(process) = get_by_pid(pid) else {
         return false;
     };
+    crate::ps::job::remove_process_from_all_jobs(pid);
     unsafe {
         process.exit_status = exit_code;
         process.exit_time = crate::hal::common::pit::get_system_time_ms();
         if !process.main_thread.is_null() {
             (*process.main_thread).kthread.state = crate::ps::thread::KThreadState::Terminated;
         }
+
+        // Tear down resources (handle table, address space, token ref, threads)
+        let pml4_phys = process.pml4_phys;
+        let handle_table = process.object_table;
+        let main_thread = process.main_thread;
+
+        if !main_thread.is_null() {
+            crate::mm::pool::free(main_thread as *mut u8);
+        }
+        if !handle_table.is_null() {
+            crate::mm::pool::free(handle_table as *mut u8);
+        }
+        // Remove the process before freeing it: list cleanup reads the
+        // EPROCESS PID and would otherwise dereference freed memory.
+        let process_ptr = process as *mut Eprocess;
+        remove_process_from_list(pid);
+
+        if pml4_phys != 0 {
+            crate::mm::pfn::free_pfn(pml4_phys >> 12);
+        }
+        crate::mm::pool::free(process_ptr as *mut u8);
     }
+    free_pid(pid);
     true
+}
+
+/// Remove a terminated process from PROCESS_LIST and compact the array.
+fn remove_process_from_list(pid: u64) {
+    let mut list = PROCESS_LIST.lock();
+    let mut removed = false;
+    let mut i = 0;
+    while i < list.process_count {
+        let process = list.processes[i];
+        if !process.is_null()
+            && unsafe { (*process).unique_process_id } == pid
+        {
+            // Compact by shifting remaining entries left.
+            let mut j = i;
+            while j + 1 < list.process_count {
+                list.processes[j] = list.processes[j + 1];
+                j += 1;
+            }
+            let last_index = list.process_count.saturating_sub(1);
+            list.processes[last_index] = core::ptr::null_mut();
+            list.process_count -= 1;
+            removed = true;
+            break;
+        }
+        i += 1;
+    }
+    if removed {
+        // Clear special references that point to the removed process.
+        if let Some(p) = list.smss_process {
+            if unsafe { (*p).unique_process_id } == pid {
+                list.smss_process = None;
+            }
+        }
+        if let Some(p) = list.system_process {
+            if unsafe { (*p).unique_process_id } == pid {
+                list.system_process = None;
+            }
+        }
+    }
 }
 
 /// Iterate over all processes
@@ -2128,11 +2290,14 @@ pub fn create_process_full(
     let process = create_user_process(image_path, pid, None)?;
 
     if process.object_table.is_null() {
-        let ht_phys = crate::mm::frame::allocate_pages(1);
-        if let Some(ht_base) = ht_phys {
-            let ht_ptr = ht_base as *mut ProcessHandleTable;
+        let ht_size = core::mem::size_of::<ProcessHandleTable>().max(4096);
+        let ht_ptr = crate::mm::pool::allocate(
+            crate::mm::pool::PoolType::NonPaged,
+            ht_size,
+        ) as *mut ProcessHandleTable;
+        if !ht_ptr.is_null() {
             unsafe {
-                core::ptr::write_bytes(ht_ptr as *mut u8, 0, 4096);
+                core::ptr::write_bytes(ht_ptr as *mut u8, 0, ht_size);
                 (*ht_ptr).next_slot = 1;
             }
             process.object_table = ht_ptr;
@@ -2195,6 +2360,15 @@ static PID_BITMAP: [core::sync::atomic::AtomicU64; PID_BITMAP_WORDS] =
 
 pub fn allocate_pid() -> Option<u64> {
     use core::sync::atomic::Ordering;
+    for reserved_pid in [PID_SERVICES, PID_LSASS, PID_WINLOGON] {
+        if reserved_pid >= PID_BITMAP_FIRST {
+            let offset = (reserved_pid - PID_BITMAP_FIRST) as usize;
+            PID_BITMAP[offset / 64].fetch_or(
+                1u64 << (offset % 64),
+                Ordering::SeqCst,
+            );
+        }
+    }
     // Scan the bitmap for the first zero bit. Atomic CAS loop so
     // multiple CPUs can allocate concurrently without racing.
     for word_idx in 0..PID_BITMAP_WORDS {

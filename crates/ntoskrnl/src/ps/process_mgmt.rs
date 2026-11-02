@@ -115,7 +115,7 @@ pub fn get_all_processes() -> Result<Vec<KernelProcessInfo>, NTSTATUS> {
             } else {
                 ProcessState::Running.as_str()
             }),
-            user_name: String::from("NT AUTHORITY\\SYSTEM"),
+            user_name: process_user_name(process),
             window_title: String::from("N/A"),
             services: Vec::new(),
         });
@@ -125,15 +125,55 @@ pub fn get_all_processes() -> Result<Vec<KernelProcessInfo>, NTSTATUS> {
     Ok(result)
 }
 
+fn process_user_name(process: &crate::ps::process::Eprocess) -> alloc::string::String {
+    let Some(token) = (unsafe { process.get_token().as_ref() }) else {
+        return alloc::string::String::from("NT AUTHORITY\\SYSTEM");
+    };
+    if token.is_local_system() {
+        return alloc::string::String::from("NT AUTHORITY\\SYSTEM");
+    }
+    if token
+        .user
+        .equals(&crate::se::sid::sid::well_known(
+            crate::se::sid::WellKnownSid::Administrators,
+        ))
+    {
+        return alloc::string::String::from("Administrators");
+    }
+    if token
+        .user
+        .equals(&crate::se::sid::sid::well_known(
+            crate::se::sid::WellKnownSid::Guests,
+        ))
+    {
+        return alloc::string::String::from("Guests");
+    }
+    if token
+        .user
+        .equals(&crate::se::sid::sid::with_2subs(
+            [0, 0, 0, 0, 0, 5],
+            21,
+            1001,
+        ))
+    {
+        return alloc::string::String::from("nt61test");
+    }
+    alloc::string::String::from("User")
+}
+
 /// Return the PIDs of all running child processes of `parent_pid`.
 pub fn get_child_pids(parent_pid: u64) -> Vec<u64> {
-    let table = PROCESS_TABLE.lock();
-    table
-        .processes
-        .iter()
-        .filter(|p| p.parent_pid == parent_pid && p.state == ProcessState::Running)
-        .map(|p| p.pid)
-        .collect()
+    let mut result = Vec::new();
+    crate::ps::process::iterate_processes(|_pid, process| {
+        let process = unsafe { &*process };
+        let is_child = process.spare5 == parent_pid;
+        let is_running = process.exit_time == 0;
+        if is_child && is_running {
+            result.push(process.unique_process_id);
+        }
+        true
+    });
+    result
 }
 
 /// create a new user process
@@ -186,6 +226,12 @@ pub fn terminate_process_by_pid(pid: u64, force: bool) -> Result<(), NTSTATUS> {
     let mut table = PROCESS_TABLE.lock();
 
     if let Some(proc) = table.find_process_mut(pid) {
+        // Check permission BEFORE terminating (NT 6.1 checks the
+        // caller's SeDebugPrivilege against the target before any
+        // destruction side effects).
+        if pid < 10 {
+            return Err(0xC0000022u32 as NTSTATUS); // STATUS_ACCESS_DENIED
+        }
         #[cfg(test)]
         if !crate::ps::process::get_by_pid(pid).is_some() {
             proc.state = ProcessState::Terminated;
@@ -194,9 +240,6 @@ pub fn terminate_process_by_pid(pid: u64, force: bool) -> Result<(), NTSTATUS> {
         }
         if !crate::ps::process::terminate_process(pid, 0) {
             return Err(0xC000000Bu32 as NTSTATUS);
-        }
-        if pid < 10 {
-            return Err(0xC0000022u32 as NTSTATUS); // STATUS_ACCESS_DENIED
         }
 
         if force {

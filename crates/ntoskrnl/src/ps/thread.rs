@@ -11,6 +11,7 @@
 //! Reference: geoffchappell.com, Vergilius Project, ReactOS/WRK reverse engineering
 
 pub use crate::ke::sync::DispatcherHeader;
+use crate::ke::scheduler::QUANTUM_DEFAULT;
 use crate::ps::process::{Eprocess, ListEntry};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -170,6 +171,12 @@ pub struct Kthread {
     /// Reserved for alignment
     _pad_decay: [u8; 7], // 0x265
 
+    // === 0x26C: Per-thread scheduling quantum ===
+    // These fields occupy previously reserved KTHREAD bytes. They do not
+    // alter any documented NT field offset or the deterministic 0x380 size.
+    pub quantum_initial: u32, // 0x26C
+    pub quantum_remaining: u32, // 0x270
+
     // === Padding to KTHREAD size ===
     // Windows 7 x64 documented KTHREAD size is 0x360 bytes. The fields
     // above cover offsets up to 0x26C (decay tracking). The remaining
@@ -183,7 +190,7 @@ pub struct Kthread {
     // padding field rather than left as implicit trailing padding
     // (which would be invisible to debuggers and could cause subtle
     // `sizeof` mismatches with hand-written assembly code).
-    _pad_to_end: [u8; 0x380 - 0x26C],
+    _pad_to_end: [u8; 0x380 - 0x274],
 }
 
 /// Windows 7 x64 documented KTHREAD size (0x360 bytes). The actual
@@ -963,6 +970,8 @@ impl Kthread {
         kthread.state = KThreadState::Initialized;
         kthread.affinity_mask = !0u64; // All CPUs by default
         kthread.home_cpu = 0;
+        kthread.quantum_initial = QUANTUM_DEFAULT;
+        kthread.quantum_remaining = QUANTUM_DEFAULT;
         kthread.affinitized = 0;
         kthread.apc_state = ApcState::new();
         kthread.saved_apc_state = ApcState::new();
@@ -1358,13 +1367,19 @@ pub unsafe fn create_thread(
                 stack_size,
                 16,
             );
-            if !stack.is_null() {
-                let stack_base = stack as u64;
-                (*thread).kthread.initial_stack = stack_base + stack_size as u64;
-                (*thread).kthread.stack_base_addr = stack_base + stack_size as u64;
-                (*thread).kthread.stack_limit = stack_base;
-                (*thread).kthread.kernel_stack = stack_base + stack_size as u64;
+            if stack.is_null() {
+                // Stack allocation failed. Roll back: free the
+                // Ethread and unlink from the process so the caller
+                // gets a clean "no memory" result.
+                let _ = crate::mm::pool::free(thread as *mut u8);
+                return None;
             }
+
+            let stack_base = stack as u64;
+            (*thread).kthread.initial_stack = stack_base + stack_size as u64;
+            (*thread).kthread.stack_base_addr = stack_base + stack_size as u64;
+            (*thread).kthread.stack_limit = stack_base;
+            (*thread).kthread.kernel_stack = stack_base + stack_size as u64;
 
             // Initialize thread list entry and add to process list
             (*thread).kthread.global_thread_list_entry.init();
@@ -1441,21 +1456,24 @@ pub fn create_idle_thread(cpu_id: u32) -> Option<&'static mut Ethread> {
         (*thread).kthread.state = kt.state;
         (*thread).kthread.wait_list_entry = kt.wait_list_entry;
 
-        // Idle threads run in System process context, so use PID_SYSTEM for unique_process
+        // Idle threads run in System process context and use the common
+        // TID allocator so their IDs cannot collide with user threads.
+        let tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
         (*thread)
             .client_id
-            .set(crate::ps::process::PID_SYSTEM, (cpu_id as u64) + 0x10000);
+            .set(crate::ps::process::PID_SYSTEM, tid);
         (*thread)
             .kthread
             .client_id
-            .set(crate::ps::process::PID_SYSTEM, (cpu_id as u64) + 0x10000);
+            .set(crate::ps::process::PID_SYSTEM, tid);
 
         (*thread).kthread.process = process;
         (*thread).threads_process = process;
 
-        // Set high priority for idle thread
-        (*thread).kthread.base_priority = -16;
-        (*thread).kthread.priority = -16;
+        // Idle threads are priority 0 and are reached through the per-CPU
+        // PRCB idle path rather than a ready queue.
+        (*thread).kthread.base_priority = 0;
+        (*thread).kthread.priority = 0;
         (*thread).kthread.ideal_processor = cpu_id as u8;
 
         // Set affinity to single CPU
@@ -1478,9 +1496,33 @@ pub fn create_idle_thread(cpu_id: u32) -> Option<&'static mut Ethread> {
 /// Terminate thread
 pub unsafe fn terminate(thread: *mut Ethread, _exit_code: u32) {
     unsafe {
-        (*thread).exit_time = 0;
+        (*thread).exit_time = crate::ke::time::get_system_time() as i64;
         (*thread).kthread.state = KThreadState::Terminated;
         (*thread).kthread.header.signal_state = 1;
+
+        // NT removes a terminating thread from every dispatcher queue before
+        // releasing its resources. Otherwise a stale Ready entry can requeue
+        // the thread even though its stack is gone.
+        crate::ke::scheduler::remove_ready(thread);
+
+        // Remove from the process thread list so the scheduler and
+        // `find_thread_in_process` no longer see the terminated thread.
+        let entry =
+            core::ptr::addr_of_mut!((*thread).kthread.global_thread_list_entry);
+        if !(*entry).flink.is_null() && !(*entry).blink.is_null() {
+            let flink = (*entry).flink;
+            let blink = (*entry).blink;
+            (*blink).flink = flink;
+            (*flink).blink = blink;
+        }
+        (*entry).init();
+
+        // Free the kernel stack.
+        let stack_base = (*thread).kthread.stack_limit;
+        if stack_base != 0 {
+            let _ = crate::mm::pool::free(stack_base as *mut u8);
+        }
+        THREAD_COUNT.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -1628,18 +1670,10 @@ pub fn ps_create_system_thread(start_address: u64, start_context: u64) -> System
         // //             tid, start_address, stack_base
         // //         );
 
-        let thread_name = b"SystemThread\0";
-        let header = crate::ob::create_object(
-            b"\\KernelObjects",
-            thread_name,
-            crate::ob::ObType::Thread,
-            core::mem::size_of::<Ethread>(),
-        );
-        let thread_handle = if !header.is_null() {
-            crate::ob::insert_object(b"\\KernelObjects", header)
-        } else {
-            0
-        };
+        // PsCreateSystemThread does not publish a duplicate named object
+        // in \KernelObjects. Callers use the ETHREAD directly; handle 0
+        // means "no namespace handle" rather than a lookup failure.
+        let thread_handle = 0;
 
         SystemThreadResult {
             ethread,
@@ -1661,6 +1695,26 @@ pub unsafe fn ps_terminate_system_thread(ethread: *mut Ethread, _exit_code: u32)
         (*ethread).exit_time = crate::ke::time::get_system_time() as i64;
         (*ethread).kthread.state = KThreadState::Terminated;
         (*ethread).kthread.header.signal_state = 1;
+        crate::ke::scheduler::remove_ready(ethread);
+
+        // Remove from the process thread list (like NT's RemoveEntryList).
+        let entry = core::ptr::addr_of_mut!((*ethread).kthread.global_thread_list_entry);
+        if !(*entry).flink.is_null() && !(*entry).blink.is_null() {
+            // Standard doubly-linked-list removal: Flink->Blink = Blink,
+            // Blink->Flink = Flink.
+            let flink = (*entry).flink;
+            let blink = (*entry).blink;
+            (*blink).flink = flink;
+            (*flink).blink = blink;
+        }
+        (*entry).init();
+
+        // Free the kernel stack allocated by ps_create_system_thread.
+        let stack_base = (*ethread).kthread.stack_limit;
+        if stack_base != 0 {
+            let _ = crate::mm::pool::free(stack_base as *mut u8);
+        }
+        THREAD_COUNT.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     }
     // // kprintln!(
     // //         "[PS] PsTerminateSystemThread: TID {} terminated with exit code 0x{:x}",
@@ -1670,14 +1724,14 @@ pub unsafe fn ps_terminate_system_thread(ethread: *mut Ethread, _exit_code: u32)
 }
 
 /// Exit the current system thread (never returns)
-pub fn ps_exit_system_thread(exit_code: u32) {
+pub fn ps_exit_system_thread(exit_code: u32) -> ! {
     unsafe {
         let ethread = KeGetCurrentEthread();
         ps_terminate_system_thread(ethread, exit_code);
-        loop {
-            crate::arch::halt();
-        }
     }
+    // Enter the scheduler so another thread (or the idle thread) runs
+    // instead of parking this CPU forever.
+    crate::ke::scheduler::idle_loop()
 }
 
 // =============================================================================
@@ -1812,7 +1866,7 @@ pub unsafe fn deliver_user_apc(ethread: *mut Ethread) -> bool {
         }
 
         // User APCs can only be delivered if thread is in user mode alertable wait
-        if !state.apc_queue_flag != 0 {
+        if state.apc_queue_flag == 0 {
             // Thread is not in alertable wait
             return false;
         }

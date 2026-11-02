@@ -8,13 +8,14 @@ use crate::mm::pfn;
 use crate::mm::pool;
 use crate::mm::vad::{VadEntry, VadFlags, VadProtection, VadTree, VadType};
 use crate::mm::vas;
+use core::sync::atomic::Ordering;
 
 /// User stack base address (Windows 7 x64 layout)
 pub const USER_STACK_BASE: u64 = 0x0000_0030_0000_0000;
 pub const USER_STACK_SIZE: u64 = 0x100000; // 1MB default stack
 
 /// PEB base address (Windows 7 x64 layout)
-pub const PEB_BASE: u64 = 0x0000_007F_FFFF_0000;
+pub const PEB_BASE: u64 = 0x0000_0000_7FFE_D000;
 
 /// TEB base address (Windows 7 x64 layout)
 pub const TEB_BASE: u64 = 0x0000_007F_FFFD_F000;
@@ -93,7 +94,12 @@ impl ProcessAddressSpace {
             (*vad).flags = VadFlags::SEC_COMMIT;
         }
 
-        let _ = self.vad_tree.insert(unsafe { &mut *vad });
+        if self.vad_tree.insert(unsafe { &mut *vad }).is_err() {
+            let _ =
+                vas::unmap_user_pages(self.pml4_phys, self.user_stack_base, self.user_stack_size);
+            unsafe { pool::free(vad.cast::<u8>()) };
+            return Err(STATUS_UNSUCCESSFUL);
+        }
 
         Ok(())
     }
@@ -127,7 +133,11 @@ impl ProcessAddressSpace {
             (*vad).flags = VadFlags::SEC_COMMIT;
         }
 
-        let _ = self.vad_tree.insert(unsafe { &mut *vad });
+        if self.vad_tree.insert(unsafe { &mut *vad }).is_err() {
+            let _ = vas::unmap_user_pages(self.pml4_phys, self.peb_address, 0x1000);
+            unsafe { pool::free(vad.cast::<u8>()) };
+            return Err(STATUS_UNSUCCESSFUL);
+        }
 
         Ok(())
     }
@@ -161,7 +171,11 @@ impl ProcessAddressSpace {
             (*vad).flags = VadFlags::SEC_COMMIT;
         }
 
-        let _ = self.vad_tree.insert(unsafe { &mut *vad });
+        if self.vad_tree.insert(unsafe { &mut *vad }).is_err() {
+            let _ = vas::unmap_user_pages(self.pml4_phys, self.teb_address, 0x1000);
+            unsafe { pool::free(vad.cast::<u8>()) };
+            return Err(STATUS_UNSUCCESSFUL);
+        }
 
         Ok(())
     }
@@ -198,7 +212,12 @@ impl ProcessAddressSpace {
             (*vad).flags = VadFlags::SEC_COMMIT;
         }
 
-        let _ = self.vad_tree.insert(unsafe { &mut *vad });
+        if self.vad_tree.insert(unsafe { &mut *vad }).is_err() {
+            let _ =
+                vas::unmap_user_pages(self.pml4_phys, base, aligned_size);
+            unsafe { pool::free(vad.cast::<u8>()) };
+            return Err(STATUS_UNSUCCESSFUL);
+        }
 
         // Record image base and size
         self.image_base = base;
@@ -228,8 +247,31 @@ impl ProcessAddressSpace {
             let _ = vas::unmap_user_pages(self.pml4_phys, self.image_base, self.image_size);
         }
 
+        // Free every VAD allocated by this address space.  The tree owns the
+        // nodes, but cleanup is also called while a live PML4 is handed to
+        // the process manager (via ManuallyDrop), so this is the only path
+        // that can drain them.
+        let root = self.vad_tree.root();
+        if !root.is_null() {
+            unsafe { free_vad_tree(root) };
+        }
+        self.vad_tree.node_count.store(0, Ordering::SeqCst);
+
         // Free the PML4
         pfn::free_pfn(self.pml4_phys >> 12);
+    }
+}
+
+unsafe fn free_vad_tree(node: *mut VadEntry) {
+    if node.is_null() {
+        return;
+    }
+    unsafe {
+        let left = (*node).left;
+        let right = (*node).right;
+        free_vad_tree(left);
+        free_vad_tree(right);
+        pool::free(node.cast::<u8>());
     }
 }
 
