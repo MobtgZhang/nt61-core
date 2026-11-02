@@ -60,7 +60,32 @@ pub fn run_tests() -> bool {
     stats.test("Object Type Query", test_object_type_query);
     stats.test("Type Index Mapping", test_type_index_mapping);
 
-    stats.finish()
+    let result = stats.finish();
+    cleanup_test_objects();
+    result
+}
+
+/// Delete the objects created by this suite so repeated test runs do not
+/// leave unreachable names and handles in `\KernelObjects`.
+fn cleanup_test_objects() {
+    for name in [
+        b"TestObj1" as &[u8],
+        b"TestObj2",
+        b"TestObjLookup",
+        b"TestHandle1",
+        b"TestHandleClose",
+        b"TestSecDesc",
+        b"TestSecQuery",
+        b"AccessCheckTest",
+        b"TestLink",
+        b"TestLink2",
+        b"TestTypeQuery",
+        b"TestDir",
+        b"TestDir2",
+    ] {
+        let path = [b"\\KernelObjects\\", name].concat();
+        super::remove_object_by_name(&path);
+    }
 }
 
 // =============================================================================
@@ -545,15 +570,6 @@ fn test_access_check() -> bool {
         use crate::se::sid::SID_USERS;
         use crate::se::token::Token;
 
-        static mut TEST_HEAP_STORAGE: [u8; 1024 * 1024] = [0; 1024 * 1024];
-
-        crate::mm::heap::KERNEL_HEAP.configure(
-            core::ptr::addr_of_mut!(TEST_HEAP_STORAGE).cast::<u8>(),
-            (*core::ptr::addr_of!(TEST_HEAP_STORAGE)).len(),
-        );
-
-        super::init();
-
         let process = Box::leak(Box::new(Eprocess::new()));
         let table = Box::leak(Box::new(ProcessHandleTable {
             slots: [null_mut(); HANDLE_TABLE_SIZE],
@@ -611,6 +627,16 @@ fn test_access_check() -> bool {
             return false;
         }
         super::dereference_object(allowed);
+
+        // Cleanup: reclaim the leaked allocations. The raw pointers
+        // are valid because `Box::leak` keeps them alive; `Box::from_raw`
+        // re-attaches an owner so the memory is freed when the boxes
+        // drop at the end of this scope.
+        let _ = Box::from_raw(process as *mut Eprocess);
+        let _ = Box::from_raw(table as *mut ProcessHandleTable);
+        let _ = Box::from_raw(token as *mut Token);
+        let _ = Box::from_raw(acl as *mut Acl);
+        let _ = Box::from_raw(descriptor as *mut SecurityDescriptor);
 
         true
     }

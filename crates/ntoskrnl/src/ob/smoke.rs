@@ -22,8 +22,9 @@ use core::sync::atomic::Ordering;
 // Imports from the parent ob module.
 use super::{
     create_count, create_object, dereference_object, insert_count, insert_object, lookup_count,
-    lookup_directory, lookup_object, reference_count, reference_object, validate_object_name,
-    ObType, STATUS_OBJECT_NAME_INVALID, STATUS_SUCCESS,
+    lookup_directory, lookup_object, reference_count, reference_object,
+    remove_object_by_name, validate_object_name, ObType, STATUS_OBJECT_NAME_INVALID,
+    STATUS_SUCCESS,
 };
 
 /// Run the object manager smoke test.
@@ -38,7 +39,24 @@ pub fn smoke_test() -> bool {
     stats.test("Name Validation", test_name_validation);
     stats.test("Object Counters", test_object_counters);
 
-    stats.finish()
+    let result = stats.finish();
+    cleanup_smoke_objects();
+    result
+}
+
+/// Remove every object this suite creates. Bootstrap names must not leak.
+fn cleanup_smoke_objects() {
+    for name in [
+        b"SmokeObj0" as &[u8],
+        b"SmokeObj1",
+        b"SmokeObj2",
+        b"SmokeRef",
+        b"SmokeCounter",
+        b"SmokeExFastRef",
+    ] {
+        let path = [b"\\KernelObjects\\", name].concat();
+        remove_object_by_name(&path);
+    }
 }
 
 /// Test that the root directory exists.

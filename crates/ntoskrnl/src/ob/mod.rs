@@ -44,7 +44,7 @@ pub type ObStatus = u32;
 /// Successful completion.
 pub const STATUS_SUCCESS: ObStatus = 0;
 /// The information accessed is invalid.
-pub const STATUS_INVALID_PARAMETER: ObStatus = 0xC0000008;
+pub const STATUS_INVALID_PARAMETER: ObStatus = 0xC000000D;
 /// An object name is invalid.
 pub const STATUS_OBJECT_NAME_INVALID: ObStatus = 0xC0000033;
 /// A quota allocation failed.
@@ -52,10 +52,10 @@ pub const STATUS_QUOTA_EXCEEDED: ObStatus = 0xC000007C;
 /// Insufficient system resources exist to complete the API.
 pub const STATUS_INSUFFICIENT_RESOURCES: ObStatus = 0xC000009A;
 /// An object handle is invalid.
-pub const STATUS_INVALID_HANDLE: ObStatus = 0xC0000008; // alias
+pub const STATUS_INVALID_HANDLE: ObStatus = 0xC0000008;
 /// A name collision occurred in the object namespace.
 pub const STATUS_OBJECT_NAME_COLLISION: ObStatus = 0xC0000035;
-/// Indicates the object manager detected a cycle in symbolic-link resolution.
+/// A symbolic-link target path is too long; link depth is limited separately.
 pub const STATUS_NAME_TOO_LONG: ObStatus = 0xC0000106;
 
 /// Maximum number of named entries per directory. NT itself uses
@@ -1130,17 +1130,21 @@ pub fn insert_object_into_process(
     if parent.is_null() {
         return 0;
     }
-    // Publish the object under the namespace lock only. The object
-    // manager's delete lock is acquired after this lock is released;
-    // deletion walks directories in the opposite order.
+    let handle;
     {
         let _namespace_guard = NAMESPACE.lock();
         if parent.num_entries() as usize >= MAX_DIR_ENTRIES {
             return 0;
         }
+        for index in 0..parent.num_entries() as usize {
+            if parent.valid(index) != 0 && core::ptr::eq(parent.entry(index), header) {
+                return 0;
+            }
+        }
         let slot = parent.num_entries() as usize;
         DIRECTORY_ENTRY_HIGH_WATER.fetch_max(slot + 1, core::sync::atomic::Ordering::Relaxed);
         parent.set_entry(slot, header);
+        parent.set_valid(slot, 1);
         header.set_directory(parent);
     }
 
@@ -1150,12 +1154,36 @@ pub fn insert_object_into_process(
     if !process.is_null() {
         let table_ptr = process.object_table();
         if table_ptr.is_null() {
+            {
+                let _namespace_guard = NAMESPACE.lock();
+                remove_directory_entry(parent, header);
+            }
+            let count = header.decrement_reference();
+            if count == 0 && header.handle_count() == 0 {
+                try_delete_object_locked(header);
+            }
             return 0;
         }
-        allocate_handle_in_table_locked(table_ptr, header)
+        handle = allocate_handle_in_table_locked(table_ptr, header);
     } else {
-        allocate_handle_in_global_table_locked(header)
+        handle = allocate_handle_in_global_table_locked(header)
     }
+    if handle == 0 {
+        // The directory entry was published but no handle was
+        // allocated. Roll back the directory insert and drop the
+        // reference so the name can be reused and the object can be
+        // deleted when its reference count reaches zero.
+        {
+            let _namespace_guard = NAMESPACE.lock();
+            remove_directory_entry(parent, header);
+        }
+        let count = header.decrement_reference();
+        if count == 0 && header.handle_count() == 0 {
+            try_delete_object_locked(header);
+        }
+        return 0;
+    }
+    handle
 }
 
 /// Allocate a handle slot in a per-process handle table.
@@ -1734,6 +1762,9 @@ pub fn insert_object(parent_path: &[u8], header: *mut ObjectHeader) -> u64 {
     {
         let _ns = NAMESPACE.lock();
         if parent.num_entries() as usize >= MAX_DIR_ENTRIES {
+            // The directory is full. Roll back the object header
+            // allocated by `create_object` so it does not leak.
+            let _ = unsafe { pool::free(header as *mut u8) };
             return 0;
         }
         let slot = parent.num_entries() as usize;
@@ -1743,7 +1774,19 @@ pub fn insert_object(parent_path: &[u8], header: *mut ObjectHeader) -> u64 {
         header.set_directory(parent);
     };
     // Delegate handle allocation after releasing the namespace lock.
-    allocate_handle_in_global_table(header)
+    let handle = allocate_handle_in_global_table(header);
+    if handle == 0 {
+        // The handle table is full. Roll back the directory insert
+        // and free the header so the name can be reused and no
+        // memory is leaked.
+        {
+            let _ns = NAMESPACE.lock();
+            remove_directory_entry(parent, header);
+        }
+        let _ = unsafe { pool::free(header as *mut u8) };
+        return 0;
+    }
+    handle
 }
 
 /// Reference an object. Returns the new reference count.
@@ -1883,30 +1926,30 @@ pub fn get_object_body<T>(header: *mut ObjectHeader) -> *mut T {
 
 /// Remove one live entry from a manager-owned NT directory.
 fn remove_directory_entry(parent: *mut Directory, target: *mut ObjectHeader) -> bool {
-    for index in 0..parent.num_entries() as usize {
-        if index >= MAX_DIR_ENTRIES {
-            break;
+    let mut removed = false;
+    let mut count = parent.num_entries() as usize;
+    let mut index = 0;
+    while index < count.min(MAX_DIR_ENTRIES) {
+        if parent.valid(index) != 0 && core::ptr::eq(parent.entry(index), target) {
+            // Compact the fixed NT directory entry array after removal.
+            for slot in index..count.saturating_sub(1) {
+                parent.set_entry(slot, parent.entry(slot + 1));
+                parent.set_valid(slot, parent.valid(slot + 1));
+            }
+            count = count.saturating_sub(1);
+            parent.set_num_entries(count as u32);
+            if count < MAX_DIR_ENTRIES {
+                parent.set_entry(count, null_mut());
+                parent.set_valid(count, 0);
+            }
+            removed = true;
+            // Do not advance `index` — the next candidate has been
+            // shifted into this slot.
+        } else {
+            index += 1;
         }
-        if parent.valid(index) == 0 || !core::ptr::eq(parent.entry(index), target) {
-            continue;
-        }
-
-        // Compact the fixed NT directory entry array after removal.
-        let count = parent.num_entries() as usize;
-        for slot in index..count.saturating_sub(1) {
-            parent.set_entry(slot, parent.entry(slot + 1));
-            parent.set_valid(slot, parent.valid(slot + 1));
-        }
-
-        let new_count = count.saturating_sub(1);
-        parent.set_num_entries(new_count as u32);
-        if new_count < MAX_DIR_ENTRIES {
-            parent.set_entry(new_count, null_mut());
-            parent.set_valid(new_count, 0);
-        }
-        return true;
     }
-    false
+    removed
 }
 
 /// internal delete that assumes the caller holds `OB_DELETE_LOCK`.
@@ -1985,7 +2028,7 @@ fn try_delete_object_locked(header: *mut ObjectHeader) -> bool {
             let mut ns = NAMESPACE.lock();
             ns.obj_count = ns.obj_count.saturating_sub(1);
         }
-        let _ = pool::free(header as *mut u8);
+            let _ = pool::free(header as *mut u8);
 
         true
     }
@@ -2000,6 +2043,18 @@ fn delete_object(header: *mut ObjectHeader) {
     }
     let _guard = OB_DELETE_LOCK.lock();
     try_delete_object_locked(header);
+}
+
+/// Remove a named object and perform full deletion. Smoke tests and
+/// lifecycle cleanup use this to avoid leaving bootstrap names pointing at
+/// objects that can never be reached again.
+pub fn remove_object_by_name(path: &[u8]) -> bool {
+    let _guard = OB_DELETE_LOCK.lock();
+    let header = lookup_object(path);
+    if header.is_null() {
+        return false;
+    }
+    try_delete_object_locked(header)
 }
 
 /// Dereference an object.
@@ -2052,11 +2107,21 @@ pub fn decrement_handle_count(header: *mut ObjectHeader) {
 /// Look up an object by name and return a referenced pointer.
 /// `null_mut()` on failure. Increments the lookup counter.
 pub fn open_object_by_name(path: &[u8]) -> *mut ObjectHeader {
+    // Take the delete lock before the namespace lookup. This closes the
+    // lookup/reference race with concurrent dereference-to-zero deletion.
+    // The locked reference helper performs the increment without re-entering
+    // the non-reentrant delete lock.
+    let delete_guard = OB_DELETE_LOCK.lock();
     let h = lookup_object(path);
     if h.is_null() {
+        drop(delete_guard);
         return null_mut();
     }
-    reference_object(h);
+    let count = reference_object_locked(h);
+    drop(delete_guard);
+    if count == 0 {
+        return null_mut();
+    }
     h
 }
 
@@ -2095,19 +2160,20 @@ pub fn reference_object_by_handle_in_process(
         return null_mut();
     }
 
-    // Try per-process table first if process is specified
+    // A process handle is namespace-scoped to that process. Do not allow
+    // numeric collisions to resolve through the kernel's global table.
     if !process.is_null() {
         let delete_guard = OB_DELETE_LOCK.lock();
-        if let Some(h) = lookup_handle_in_process(process, handle) {
+        let found = lookup_handle_in_process(process, handle);
+        if let Some(h) = found {
             let _ = reference_object_locked(h);
             drop(delete_guard);
             return h;
         }
         drop(delete_guard);
-        // Fall through to global table
+        return null_mut();
     }
 
-    // Fall back to global kernel handle table
     reference_object_by_handle(handle)
 }
 
@@ -2734,24 +2800,35 @@ pub const OBJ_EXCLUSIVE: u32 = 0x00000002;
 pub const OBJ_CASE_INSENSITIVE: u32 = 0x00000004;
 pub const OBJ_PERMANENT: u32 = 0x00000010;
 pub const OBJ_TEMPORARY: u32 = 0x00000020;
-pub const OBJ_RESERVED: u32 = 0x00000040;
 
 /// Look up an object with optional symbolic link resolution
 pub fn lookup_object_with_flags(path: &[u8], flags: u32) -> *mut ObjectHeader {
-    let header = lookup_object(path);
+    let header = open_object_by_name(path);
 
     if header.is_null() {
         return null_mut();
     }
 
     // Check if we should resolve symbolic links
-    let resolve_symlinks = (flags & OBJ_RESERVED) == 0; // Default: resolve
+    let resolve_symlinks = (flags & OBJ_PERMANENT) == 0;
 
     if resolve_symlinks {
         unsafe {
             if (*header).get_type() == Some(ObType::SymbolicLink) {
                 let resolved = resolve_symbolic_link(header);
-                if resolved != header {
+                if resolved.is_null() {
+                    dereference_object(header);
+                    return null_mut();
+                }
+                if !core::ptr::eq(resolved, header) {
+                    let guard = OB_DELETE_LOCK.lock();
+                    if resolved.is_deleting() {
+                        drop(guard);
+                        dereference_object(header);
+                        return null_mut();
+                    }
+                    let _ = reference_object_locked(resolved);
+                    drop(guard);
                     dereference_object(header);
                 }
                 return resolved;

@@ -626,9 +626,9 @@ pub fn get_object_type(type_index: u8) -> *mut object_type {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// Delete procedure for Directory objects
 unsafe extern "C" fn directory_delete_procedure(_object: *mut ()) {
-    // _object is intentionally unused - reserved for future debugging
-    // // kprintln!("[OB] Deleting Directory object at {:016x}", _object as u64);
-    // Directory cleanup: nothing specific to do
+    // The fixed directory allocation is owned by the object header/body
+    // allocation; no separate child allocations are stored in the body.
+    let _ = _object;
 }
 
 /// # Safety
@@ -636,9 +636,9 @@ unsafe extern "C" fn directory_delete_procedure(_object: *mut ()) {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// Delete procedure for Device objects
 unsafe extern "C" fn device_delete_procedure(_object: *mut ()) {
-    // _object is intentionally unused - reserved for future debugging
-    // // kprintln!("[OB] Deleting Device object at {:016x}", _object as u64);
-    // Device cleanup: nothing specific to do in bootstrap
+    // DeviceObject storage is owned by the object manager. The IO manager
+    // removes its registry entries before ObDeleteObject releases the body.
+    let _ = _object;
 }
 
 /// # Safety
@@ -646,9 +646,9 @@ unsafe extern "C" fn device_delete_procedure(_object: *mut ()) {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// Delete procedure for Driver objects
 unsafe extern "C" fn driver_delete_procedure(_object: *mut ()) {
-    // _object is intentionally unused - reserved for future debugging
-    // // kprintln!("[OB] Deleting Driver object at {:016x}", _object as u64);
-    // Driver cleanup: nothing specific to do in bootstrap
+    // DriverObject storage is owned by the object manager. The IO manager
+    // owns no separately allocated driver data referenced from the body.
+    let _ = _object;
 }
 
 /// # Safety
@@ -656,9 +656,9 @@ unsafe extern "C" fn driver_delete_procedure(_object: *mut ()) {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// Delete procedure for SymbolicLink objects
 unsafe extern "C" fn symlink_delete_procedure(_object: *mut ()) {
-    // _object is intentionally unused - reserved for future debugging
-    // // kprintln!("[OB] Deleting SymbolicLink object at {:016x}", _object as u64);
-    // SymbolicLink cleanup: nothing specific to do
+    // The target string is embedded in SymbolicLinkBody and is released
+    // with the header/body allocation.
+    let _ = _object;
 }
 
 /// # Safety
@@ -666,11 +666,7 @@ unsafe extern "C" fn symlink_delete_procedure(_object: *mut ()) {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// Delete procedure for Token objects
 unsafe extern "C" fn token_delete_procedure(_object: *mut ()) {
-    // _object is intentionally unused - reserved for future debugging
-    // // kprintln!("[OB] Deleting Token object at {:016x}", _object as u64);
-    // Token cleanup: free the token memory
-    // Note: In a full implementation, we'd decrement token reference count
-    // and only free when it reaches zero
+    unsafe { pool::free(_object.cast::<u8>()) };
 }
 
 // =============================================================================
