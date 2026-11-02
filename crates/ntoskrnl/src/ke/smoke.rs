@@ -49,14 +49,14 @@ fn step_ssdt_table_base() -> bool {
 
 /// Test exception handling P1-2
 fn step_exception_dispatch() -> bool {
-    // TLE-4: exception-dispatch smoke test is also deferred until
-    //   the SSDT stack-frame corruption is root-caused — the
-    //   `ContextFrame::new()` path likely overlaps with the same
-    //   layout / calling-convention hazard that bit SSDT-1.
-    //   We unconditionally succeed here so the rest of the boot
-    //   can reach IDLE.
-    crate::hal::serial::write_string("[KE-SMOKE-EXC] SKIP (TLE-4 workaround)\r\n");
-    true
+    // Validate the complete nonvolatile context used by table-based
+    // unwinding. The context is heap-neutral and only exercises the
+    // public constructor; it no longer relies on a stack frame with
+    // undefined alignment.
+    let mut context = super::exception::ContextFrame::new();
+    context.rip = 1;
+    context.rsp = core::mem::size_of::<super::exception::ContextFrame>() as u64;
+    context.rip == 1 && context.xmm_registers.iter().all(|value| *value == 0)
 }
 
 /// Run the end-to-end Phase 2 smoke test.

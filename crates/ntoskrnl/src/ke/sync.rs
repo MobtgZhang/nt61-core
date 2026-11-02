@@ -420,6 +420,144 @@ impl Default for Mutex {
     }
 }
 
+/// Windows 7 fast mutex (`FAST_MUTEX`).
+///
+/// NT fast mutexes raise IRQL to APC_LEVEL and exclude APC delivery
+/// while held. The kernel uses `KeEnterCriticalRegion` around the lock
+/// hold and releases it in `KeLeaveCriticalRegion`.
+pub struct FastMutex {
+    lock: Spinlock<()>,
+    owner_thread: AtomicU64,
+    recursion_count: AtomicU32,
+}
+
+impl FastMutex {
+    pub const fn new() -> Self {
+        Self {
+            lock: Spinlock::new(()),
+            owner_thread: AtomicU64::new(0),
+            recursion_count: AtomicU32::new(0),
+        }
+    }
+
+    pub fn acquire(&self, tid: u64) -> bool {
+        if self
+            .owner_thread
+            .load(core::sync::atomic::Ordering::Acquire)
+            == tid
+        {
+            self.recursion_count
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        self.lock.lock();
+        self.owner_thread
+            .store(tid, core::sync::atomic::Ordering::Release);
+        self.recursion_count
+            .store(1, core::sync::atomic::Ordering::Release);
+        true
+    }
+
+    pub fn release(&self) {
+        let previous = self
+            .recursion_count
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        if previous <= 1 {
+            self.owner_thread
+                .store(0, core::sync::atomic::Ordering::Release);
+            self.lock.release();
+        }
+    }
+
+    pub fn owner(&self) -> u64 {
+        self.owner_thread.load(core::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Default for FastMutex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Minimal Windows 7 executive resource (`ERESOURCE`) used for shared
+/// and exclusive synchronization.
+pub struct EResource {
+    lock: Spinlock<()>,
+    owner_thread: AtomicU64,
+    exclusive_count: AtomicU32,
+    shared_count: AtomicU32,
+}
+
+impl EResource {
+    pub const fn new() -> Self {
+        Self {
+            lock: Spinlock::new(()),
+            owner_thread: AtomicU64::new(0),
+            exclusive_count: AtomicU32::new(0),
+            shared_count: AtomicU32::new(0),
+        }
+    }
+
+    pub fn acquire_exclusive(&self, tid: u64) -> bool {
+        if self
+            .owner_thread
+            .load(core::sync::atomic::Ordering::Acquire)
+            == tid
+        {
+            self.exclusive_count
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        self.lock.lock();
+        self.owner_thread
+            .store(tid, core::sync::atomic::Ordering::Release);
+        self.exclusive_count
+            .store(1, core::sync::atomic::Ordering::Release);
+        true
+    }
+
+    pub fn release_exclusive(&self, tid: u64) -> bool {
+        if self
+            .owner_thread
+            .load(core::sync::atomic::Ordering::Acquire)
+            != tid
+        {
+            return false;
+        }
+        let previous = self
+            .exclusive_count
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+        if previous <= 1 {
+            self.owner_thread
+                .store(0, core::sync::atomic::Ordering::Release);
+            self.lock.release();
+        }
+        true
+    }
+
+    pub fn acquire_shared(&self) -> bool {
+        if self.owner_thread.load(core::sync::atomic::Ordering::Acquire) != 0 {
+            return false;
+        }
+        self.shared_count
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        true
+    }
+
+    pub fn release_shared(&self) {
+        let _ = self
+            .shared_count
+            .fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl Default for EResource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Counting semaphore.
 pub struct Semaphore {
     pub header: DispatcherHeader,

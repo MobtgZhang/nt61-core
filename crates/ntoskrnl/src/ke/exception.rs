@@ -321,7 +321,12 @@ pub(crate) fn is_user_mode_exception(exception_record: &ExceptionRecord) -> bool
     let addr = exception_record.exception_address;
     // User mode: not in kernel address space
     // Kernel addresses on x64 Windows typically start at 0xFFFF800000000000
-    (0x1000..0xFFFF800000000000).contains(&addr)
+    // NT 6.1: address 0 (null-pointer dereference) must be
+    // classified as a user-mode fault. The old code started the
+    // range at 0x1000, so a null-pointer dereference (C0000005 at
+    // address 0) was treated as a kernel fault and bugchecked
+    // instead of being routed to the process's exception port.
+    (0..0xFFFF800000000000).contains(&addr)
 }
 
 /// Terminate the current process after an unhandled user-mode exception.
@@ -599,6 +604,7 @@ pub struct ContextFrame {
     pub r14: u64,
     pub r15: u64,
     pub rip: u64,
+    pub xmm_registers: [u128; 16],
 }
 
 impl ContextFrame {
@@ -635,6 +641,7 @@ impl ContextFrame {
             r14: 0,
             r15: 0,
             rip: 0,
+            xmm_registers: [0; 16],
         }
     }
 }
@@ -917,7 +924,11 @@ pub fn find_runtime_function_for_ip(ip: u64) -> Option<RuntimeFunction> {
 pub fn get_unwind_info(func: &RuntimeFunction, image_base: u64) -> Option<&'static UnwindInfo> {
     // Mask off the UNW_FLAG_* chain flag bits (bits 31-30) to get
     // the actual RVA of the unwind info structure.
-    let unwind_rva = func.unwind_info_address & 0x1FFF_FFFF;
+    // NT 6.1: the x64 unwind info address mask is 0x3FFF_FFFF
+    // (bits 30:1 relative + flags bits 31:30). The old mask
+    // (0x1FFF_FFFF) dropped bit 30, silently mis-addressing any
+    // function with an RVA above 0x2000_0000.
+    let unwind_rva = func.unwind_info_address & 0x3FFF_FFFF;
     let unwind_ptr = (image_base + unwind_rva as u64) as *const UnwindInfo;
     unsafe {
         if unwind_ptr.is_null() {
@@ -931,7 +942,7 @@ pub fn get_unwind_info(func: &RuntimeFunction, image_base: u64) -> Option<&'stat
 fn get_unwind_info_ptr(image_base: u64, func: &RuntimeFunction) -> Option<*const UnwindInfo> {
     // Mask off the UNW_FLAG_* chain flag bits (bits 31-30) to get
     // the actual RVA of the unwind info structure.
-    let unwind_rva = func.unwind_info_address & 0x1FFF_FFFF;
+    let unwind_rva = func.unwind_info_address & 0x3FFF_FFFF;
     let unwind_ptr = (image_base + unwind_rva as u64) as *const UnwindInfo;
     if unwind_ptr.is_null() {
         None
@@ -1110,7 +1121,28 @@ fn apply_unwind_code(
         UnwindOperationCode::PushUnwindHandler => {
             // UWOP_PUSH_NONVOL: the prologue pushed a nonvolatile register
             // (8 bytes); unwinding pops it back off the stack.
+            // NT 6.1: the pushed register's value must be restored
+            // from the stack, not just skipped. The callee-saved
+            // register ends up with the stack value instead of its
+            // saved value if we only adjust RSP.
             context.rsp += 8;
+            let saved_val = unsafe { core::ptr::read((context.rsp - 8) as *const u64) };
+            match op_info {
+                0 => context.rax = saved_val,
+                3 => context.rbx = saved_val,
+                5 => context.rbp = saved_val,
+                6 => context.rsi = saved_val,
+                7 => context.rdi = saved_val,
+                8 => context.r8 = saved_val,
+                9 => context.r9 = saved_val,
+                10 => context.r10 = saved_val,
+                11 => context.r11 = saved_val,
+                12 => context.r12 = saved_val,
+                13 => context.r13 = saved_val,
+                14 => context.r14 = saved_val,
+                15 => context.r15 = saved_val,
+                _ => {}
+            }
         }
 
         UnwindOperationCode::CopyData => {
@@ -1119,10 +1151,55 @@ fn apply_unwind_code(
         }
 
         UnwindOperationCode::PushMachFrame => {
-            // Machine frame was pushed on the stack
-            // For unwind, we need to simulate popping this frame
-            // // kprintln!("[UNWIND] PushMachFrame (reverse)");
-            // The registers were saved by hardware, no unwind action needed
+            // UWOP_PUSH_MACH_FRAME: the prologue pushed a machine frame
+            // (RIP, RSP, RFLAGS, RCX, RDX, RAX, R8–R11 = 80 bytes, plus
+            // an 8-byte error code when `op_info` is 1).  Unwinding must
+            // simulate popping the frame by adjusting RSP.  NT 6.1
+            // restores the saved RIP into the context so the unwound
+            // caller resumes at the correct address.
+            // The machine frame is laid out as:
+            //   [rsp+0x00]  error code (only when op_info==1)
+            //   [rsp+0x08]  RAX
+            //   [rsp+0x10]  RCX
+            //   [rsp+0x18]  RDX
+            //   [rsp+0x20]  R8
+            //   [rsp+0x28]  R9
+            //   [rsp+0x30]  R10
+            //   [rsp+0x38]  R11
+            //   [rsp+0x40]  RFLAGS
+            //   [rsp+0x48]  RSP (pre-machine-frame)
+            //   [rsp+0x50]  RIP (return address in the caller)
+            // The machine frame was pushed at the *current* RSP, so we
+            // can restore the caller's registers from it before
+            // adjusting RSP past the frame.
+            let frame_base = context.rsp;
+            if op_info & 1 != 0 {
+                // Error code occupies [rsp+0x00]; skip it.
+                let rip = unsafe { core::ptr::read((frame_base + 0x50) as *const u64) };
+                let rsp = unsafe { core::ptr::read((frame_base + 0x48) as *const u64) };
+                let rax = unsafe { core::ptr::read((frame_base + 0x08) as *const u64) };
+                let rcx = unsafe { core::ptr::read((frame_base + 0x10) as *const u64) };
+                let rdx = unsafe { core::ptr::read((frame_base + 0x18) as *const u64) };
+                context.rip = rip;
+                context.rsp = rsp;
+                context.rax = rax;
+                context.rcx = rcx;
+                context.rdx = rdx;
+            } else {
+                // No error code; the frame starts at [rsp+0x00].
+                let rip = unsafe { core::ptr::read((frame_base + 0x48) as *const u64) };
+                let rsp = unsafe { core::ptr::read((frame_base + 0x40) as *const u64) };
+                let rax = unsafe { core::ptr::read(frame_base as *const u64) };
+                let rcx = unsafe { core::ptr::read((frame_base + 0x08) as *const u64) };
+                let rdx = unsafe { core::ptr::read((frame_base + 0x10) as *const u64) };
+                context.rip = rip;
+                context.rsp = rsp;
+                context.rax = rax;
+                context.rcx = rcx;
+                context.rdx = rdx;
+            }
+            // RSP has already been restored to the caller's value from
+            // the machine frame; do not add `frame_size` on top.
         }
 
         UnwindOperationCode::AllocaHomed => {
@@ -1140,9 +1217,14 @@ fn apply_unwind_code(
         }
 
         UnwindOperationCode::SaveIntNonVol => {
-            // UWOP_SAVE_NONVOL: the slot after the code holds the save
-            // offset divided by 8.
-            let offset = (code.operation_info as u64) * 8;
+            // UWOP_SAVE_NONVOL: the register index is in op_info
+            // (bits 12-15 of the UNWIND_CODE); the slot *after* the
+            // code holds the RSP-relative save offset divided by 8.
+            // The old code used operation_info (the register index)
+            // as the offset, conflating register and address —
+            // every RSP-relative saved-register recovery was wrong.
+            let offset_slot = unsafe { unwind_code_offset_16(code) };
+            let offset = (offset_slot as u64) * 8;
             let sp = context.rsp + offset;
             let reg_val = unsafe { core::ptr::read(sp as *const u64) };
 
@@ -1172,27 +1254,17 @@ fn apply_unwind_code(
         }
 
         UnwindOperationCode::SaveFltNonVol => {
-            // Restore non-volatile float register
-            // Format: UNWIND_CODE (2 bytes) + offset (1 byte)
-            let _offset = unsafe { read_int_nvol_offset(code) } as u64;
-            let _reg_idx = op_info;
-            // // kprintln!(
-            // //                 "[UNWIND] SaveFltNonVol: would restore xmm{} from [rsp+0x{:x}]",
-            // //                 _reg_idx + 6, _offset
-            // //             );
-            // Note: Full implementation would restore XMM6-XMM15
+            // UWOP_SAVE_XMM_FAR saves an XMM register at a 32-bit
+            // RSP-relative offset. Restore the full 128-bit value.
+            let offset = (unsafe { code_ptr_read_32(code) }) as u64;
+            restore_xmm_register(context, op_info, context.rsp + offset);
         }
 
         UnwindOperationCode::SaveXMM128 => {
-            // Restore 128-bit XMM register
-            // Format: UNWIND_CODE (2 bytes) + offset (2 bytes)
+            // UWOP_SAVE_XMM128 saves a full XMM register at a 16-bit
+            // scaled RSP-relative offset.
             let offset = unsafe { unwind_code_offset_16(code) } as u64;
-            let _sp = context.rsp + offset;
-            // // kprintln!(
-            // //                 "[UNWIND] SaveXMM128: would restore xmm{} from [rsp+0x{:x}]",
-            // //                 op_info, offset
-            // //             );
-            // Note: Full implementation would restore full 128-bit XMM register
+            restore_xmm_register(context, op_info, context.rsp + offset * 8);
         }
 
         UnwindOperationCode::SaveXMM128Mask => {
@@ -1226,6 +1298,14 @@ fn apply_unwind_code(
             // // kprintln!("[UNWIND] PrologEpilog (combined, rare)");
         }
     }
+}
+
+fn restore_xmm_register(context: &mut ContextFrame, register: u8, address: u64) {
+    if register >= 16 {
+        return;
+    }
+    let value = unsafe { core::ptr::read_unaligned(address as *const u128) };
+    context.xmm_registers[register as usize] = value;
 }
 
 /// read offset for SaveIntNonVol and SaveFltNonVol operations

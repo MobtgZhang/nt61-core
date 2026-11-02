@@ -134,9 +134,16 @@ impl Ssdt {
         }
 
         let mut entries = self.entries.lock();
+        // NT 6.1: re-registering the same index overwrites the old
+        // entry without incrementing the count. The previous code
+        // always did fetch_add, so count() overstated the table
+        // size.
+        let was_empty = entries[syscall_number].is_none();
         let entry = SsdtEntry::new(handler, arg_count, name);
         entries[syscall_number] = Some(entry);
-        self.count.fetch_add(1, Ordering::Release);
+        if was_empty {
+            self.count.fetch_add(1, Ordering::Release);
+        }
 
         Ok(())
     }
@@ -147,15 +154,20 @@ impl Ssdt {
     /// This function must be called from a valid system call context with
     /// proper arguments
     pub unsafe fn dispatch(&self, syscall_number: usize, arguments: &SyscallArguments) -> u32 {
-        let entries = self.entries.lock();
-
         if syscall_number >= MAX_SYSCALLS {
             return STATUS_INVALID_SYSTEM_SERVICE;
         }
 
-        let entry = entries[syscall_number];
-        match entry {
-            Some(entry) => (entry.handler)(arguments),
+        // NT 6.1: the service table is a read-mostly structure.
+        // The spinlock must be released before the handler runs —
+        // any syscall that blocks, faults, or re-enters the SSDT
+        // while the lock is held deadlocks the whole system.
+        let handler = {
+            let entries = self.entries.lock();
+            entries[syscall_number].map(|e| e.handler)
+        };
+        match handler {
+            Some(h) => h(arguments),
             None => STATUS_INVALID_SYSTEM_SERVICE,
         }
     }
@@ -183,7 +195,10 @@ static GLOBAL_SSDT: Ssdt = Ssdt::new();
 
 /// NTSTATUS codes
 pub const STATUS_SUCCESS: u32 = 0x00000000;
-pub const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xC000001C;
+// NT 6.1: the correct value is 0xC000000C. 0xC000001C is
+// STATUS_INVALID_PARAMETER variant territory, not the service
+// dispatch error.
+pub const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xC000000C;
 pub const STATUS_NOT_IMPLEMENTED: u32 = 0xC0000002;
 
 /// Registers the NT services shared by every architecture.

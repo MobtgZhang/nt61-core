@@ -12,44 +12,61 @@
 //!   - **MiModifiedPageWriter** — pops modified pages and
 //!     writes them to the page file.
 //
-//!     In the bootstrap these are not actual kernel threads
-//!     (creating a thread is expensive and the kernel doesn't
-//!     have a full scheduler yet).  Instead we expose a single
-//!     `psss_tick()` function that runs all three on the BSP
-//!     whenever the timer interrupt fires.
+//!     NT 6.1 runs these as real system threads at PASSIVE_LEVEL.
+//!     We create actual system threads via `ps_create_system_thread`
+//!     during `psss::init()`; the timer tick only walks the
+//!     dispatcher wait list (a cheap, ISR-safe operation).
 
 use crate::ke::dispatch;
-use crate::mm::{working_set, writer, zeropage};
 
-/// Run one tick of the PSSS workers. Called from the timer
-/// ISR (or, in the bootstrap, by the BSP loop).
+/// Timer-tick callback: walk the dispatcher wait list to time out
+/// expired waits.  This is the only PSSS work that is safe to run
+/// from the clock ISR.  Zero-page and modified-page-writer work runs
+/// in dedicated system threads at PASSIVE_LEVEL.
 pub fn psss_tick() {
-    // 1. Refill the zeroed list.
-    let z = zeropage::tick();
-    // 2. Drain the modified list to standby (writes to the
-    // page file in the process).
-    let w = writer::tick();
-    // 3. Trim the working set of the current process.
-    let current_pml4 = crate::mm::vas::current_root();
-    if current_pml4 != 0 {
-        working_set::age_working_set(current_pml4);
-        let target = 32; // trim up to 32 pages per tick
-        working_set::trim_working_set(current_pml4, target);
-    }
-    // 4. Walk the dispatcher wait list, time out expired waits.
     dispatch::tick_wait_list();
-    if z + w > 0 {
-        // Optional: log first time to confirm PSSS is alive.
-        static mut FIRST: bool = true;
-        unsafe {
-            if FIRST {
-                FIRST = false;
-                // // kprintln!("    [psss] first tick: zeroed={} wrote={}", z, w);
-            }
+}
+
+/// Entry point for the BalanceSetManager system thread.  Wakes once
+/// per second to trim the working set and refill the zeroed page list.
+extern "C" fn balance_set_manager_entry(_context: u64) {
+    loop {
+        // Busy-wait via scheduler yield; a proper implementation would
+        // use a dispatcher timer, but the bootstrap has no timer wait.
+        crate::ke::scheduler::yield_();
+        crate::ke::scheduler::yield_();
+        crate::ke::scheduler::yield_();
+        // Trim the working set of the current process.
+        let current_pml4 = crate::mm::vas::current_root();
+        if current_pml4 != 0 {
+            crate::mm::working_set::age_working_set(current_pml4);
+            crate::mm::working_set::trim_working_set(current_pml4, 32);
         }
     }
 }
 
+/// Entry point for the MiZeroPageThread system thread.  Pops free
+/// pages and pre-zeroes them.
+extern "C" fn zero_page_thread_entry(_context: u64) {
+    loop {
+        crate::ke::scheduler::yield_();
+        crate::mm::zeropage::tick();
+    }
+}
+
+/// Create the three NT PSSS system threads.  Called from
+/// `ke::init()` (or kernel_main) during bring-up.
 pub fn init() {
-    crate::hal::serial::write_string("[ke.psss] enter\r\n");
+    // NT 6.1 creates these threads at PASSIVE_LEVEL during
+    // Phase 1 initialisation.  We create them here so the timer
+    // ISR no longer runs memory-manager work inline.
+    let _ = crate::ps::thread::ps_create_system_thread(
+        balance_set_manager_entry as *const () as u64,
+        0,
+    );
+    let _ = crate::ps::thread::ps_create_system_thread(
+        zero_page_thread_entry as *const () as u64,
+        0,
+    );
+    // MiModifiedPageWriter is started by `mm::writer::start_modified_page_writer()`.
 }

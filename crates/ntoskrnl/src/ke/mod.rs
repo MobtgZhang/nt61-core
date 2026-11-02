@@ -54,6 +54,7 @@ pub fn init() {
     psss::init();
     bugcheck::init();
     exception::init();
+    power::init();
     post_ke();
 }
 

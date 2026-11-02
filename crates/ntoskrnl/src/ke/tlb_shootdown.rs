@@ -126,6 +126,11 @@ pub fn invalidate_va_all_cpus(va: u64) {
     core::sync::atomic::fence(Ordering::SeqCst);
     crate::arch::send_tlb_shootdown_ipi();
 
+    // The local CPU has already invalidated the single VA; publish that
+    // fact before waiting. A full flush is harmless and also catches
+    // any adjacent mapping established while this request was in flight.
+    local_flush_and_publish();
+
     let mut spin = 0u64;
     loop {
         let mut acked = 0;

@@ -14,6 +14,7 @@
 use crate::ke::sync::{DispatcherHeader, Spinlock};
 use crate::ke::time;
 use crate::mm::pool;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 /// Maximum number of kernel timers we can track. 64 is plenty for
 /// the bootstrap; the real kernel uses a hash table.
@@ -72,32 +73,69 @@ impl Ktimer {
     }
 }
 
-/// Backing storage pointer for the timer table.
-static TIMER_STORAGE: Spinlock<*mut Ktimer> = Spinlock::new(core::ptr::null_mut());
+/// Backing storage pointer for the timer table.  Uses an
+/// `AtomicPtr` so that `timer_array()` never takes a lock (it is
+/// safe to call from any context, including inside `create_timer`
+/// while `TIMER_TABLE_LOCK` is already held).
+static TIMER_STORAGE: AtomicPtr<Ktimer> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Serialises one-time allocation of the timer backing array.  A
+/// separate lock from the timer-table lock so that `create_timer`
+/// (which holds `TIMER_TABLE_LOCK`) can call `timer_array()`
+/// without a re-entrant deadlock.
+static TIMER_ALLOC_LOCK: Spinlock<()> = Spinlock::new(());
+
+/// Serialises timer-table mutations (create, alloc_slot, field
+/// write).  `timer_array()` never takes this lock, so it is safe
+/// to call from inside a critical section holding it.
+static TIMER_TABLE_LOCK: Spinlock<()> = Spinlock::new(());
 
 /// Get (or allocate on first call) the timer backing array.
+///
+/// Never takes the `TIMER_STORAGE` lock.  The one-time allocation
+/// is serialised by `TIMER_ALLOC_LOCK` (a separate lock) so it is
+/// safe to call from inside `create_timer` which already holds
+/// `TIMER_STORAGE`.
 fn timer_array() -> &'static mut [Ktimer; MAX_TIMERS] {
-    crate::hal::serial::write_string("[ke.timer] ta:lock\r\n");
-    let mut g = TIMER_STORAGE.lock();
-    crate::hal::serial::write_string("[ke.timer] ta:locked\r\n");
-    if g.is_null() {
-        crate::hal::serial::write_string("[ke.timer] ta:alloc\r\n");
-        let bytes =
-            pool::allocate(pool::PoolType::NonPaged, MAX_TIMERS * TIMER_SIZE) as *mut Ktimer;
-        crate::hal::serial::write_string("[ke.timer] ta:post-alloc\r\n");
-        if bytes.is_null() {
-            crate::hal::serial::write_string("[ke.timer] ta:fb\r\n");
-            static mut FALLBACK: [Ktimer; MAX_TIMERS] = [const { Ktimer::new("<fb>") }; MAX_TIMERS];
-            return unsafe { &mut *core::ptr::addr_of_mut!(FALLBACK) };
-        }
-        unsafe {
-            core::ptr::write_bytes(bytes as *mut u8, 0u8, MAX_TIMERS * TIMER_SIZE);
-        }
-        *g = bytes;
+    // Fast path: storage already allocated.
+    let current = TIMER_STORAGE.load(Ordering::Acquire);
+    if !current.is_null() {
+        // SAFETY: the pointer was written atomically and never
+        // freed; the backing page is exactly MAX_TIMERS Ktimers.
+        return unsafe { &mut *(current as *mut [Ktimer; MAX_TIMERS]) };
     }
-    // SAFETY: pool alloc returned exactly MAX_TIMERS Ktimers, all zeroed.
-    let arr_ptr = *g as *mut [Ktimer; MAX_TIMERS];
-    unsafe { &mut *arr_ptr }
+    // Slow path: one-time allocation, serialised by a separate lock.
+    let _alloc_lock = TIMER_ALLOC_LOCK.lock();
+    // Double-check: another CPU may have allocated while we waited.
+    let current = TIMER_STORAGE.load(Ordering::Acquire);
+    if !current.is_null() {
+        // SAFETY: same as the fast path.
+        return unsafe { &mut *(current as *mut [Ktimer; MAX_TIMERS]) };
+    }
+    let bytes = pool::allocate(pool::PoolType::NonPaged, MAX_TIMERS * TIMER_SIZE)
+        as *mut Ktimer;
+    if bytes.is_null() {
+        static mut FALLBACK: [Ktimer; MAX_TIMERS] = [const { Ktimer::new("<fb>") }; MAX_TIMERS];
+        // SAFETY: FALLBACK is a static array with the same lifetime as
+        // the process.
+        return unsafe { &mut *core::ptr::addr_of_mut!(FALLBACK) };
+    }
+    unsafe {
+        core::ptr::write_bytes(bytes as *mut u8, 0u8, MAX_TIMERS * TIMER_SIZE);
+    }
+    // Publish the pointer atomically.  Use `compare_exchange` with a
+    // null expectation to guard against an extremely unlikely race
+    // (two CPUs both reaching this point despite the alloc lock).
+    let _ = TIMER_STORAGE.compare_exchange(
+        core::ptr::null_mut(),
+        bytes,
+        Ordering::Release,
+        Ordering::Acquire,
+    );
+    // SAFETY: the pointer was either just published (by us) or by
+    // another CPU; in both cases it points to MAX_TIMERS Ktimers.
+    let ptr = TIMER_STORAGE.load(Ordering::Acquire);
+    unsafe { &mut *(ptr as *mut [Ktimer; MAX_TIMERS]) }
 }
 
 /// Allocate a timer slot. Returns the index.
@@ -126,6 +164,11 @@ pub static mut SPURIOUS_INTS: u32 = 0;
 /// create a named timer. The timer is not armed; call
 /// `arm_ms` / `arm_at` on it before `tick()` will fire it.
 pub fn create_timer(name: &'static str) -> Option<usize> {
+    // NT 6.1: the timer table is protected by a single lock held
+    // across slot allocation and the field write.  `timer_array()`
+    // does NOT take `TIMER_TABLE_LOCK`, so there is no re-entrant
+    // deadlock.
+    let _lock = TIMER_TABLE_LOCK.lock();
     let idx = alloc_slot()?;
     let arr = timer_array();
     let kt = Ktimer::new(name);

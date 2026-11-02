@@ -27,6 +27,7 @@ pub const MS_PER_DAY: u64 = 86_400_000;
 
 /// Monotonic tick count in milliseconds. Boot is tick 0.
 static SYSTEM_TIME: AtomicU64 = AtomicU64::new(0);
+static WALL_CLOCK_BASE: AtomicU64 = AtomicU64::new(0);
 static INTERRUPT_TIME: AtomicU64 = AtomicU64::new(0);
 /// Counter for the number of times `ke::time::advance_tick` was
 /// called. Used by the smoke test to verify the timer ISR is
@@ -56,7 +57,9 @@ fn pick_time_source() -> TimeSource {
 /// Initialize time subsystem.
 pub fn init() {
     crate::hal::serial::write_string("[ke.time] enter\r\n");
-    SYSTEM_TIME.store(0, Ordering::SeqCst);
+    let wall_clock = wall_clock_100ns();
+    WALL_CLOCK_BASE.store(wall_clock, Ordering::SeqCst);
+    SYSTEM_TIME.store(wall_clock, Ordering::SeqCst);
     INTERRUPT_TIME.store(0, Ordering::SeqCst);
     ADVANCE_COUNT.store(0, Ordering::SeqCst);
     let source = pick_time_source();
@@ -66,6 +69,39 @@ pub fn init() {
     // //         source, TICKS_PER_SECOND, 1000 / TICKS_PER_SECOND
     // //     );
     // // kprintln!("    Time: tick_count=0 system_time=0 interrupt_time=0");
+}
+
+/// Read the platform RTC and convert it to NT epoch 100-ns intervals.
+/// Returns zero when the platform has no RTC or reports an invalid date.
+fn wall_clock_100ns() -> u64 {
+    let Some(time) = crate::hal::common::cmos::query_real_time_clock() else {
+        return 0;
+    };
+    if !(1601..=9999).contains(&(time.year as u64))
+        || !(1..=12).contains(&time.month)
+        || !(1..=31).contains(&time.day)
+    {
+        return 0;
+    }
+    fn is_leap(year: u16) -> bool {
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    }
+    let mut days = 0u64;
+    for year in 1601..time.year {
+        days += if is_leap(year) { 366 } else { 365 };
+    }
+    let month_days = if is_leap(time.year) {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+    for month in 1..time.month {
+        days += month_days[(month - 1) as usize] as u64;
+    }
+    days += time.day as u64 - 1;
+    let seconds_of_day =
+        time.hour as u64 * 3_600 + time.minute as u64 * 60 + time.second() as u64;
+    (days * 86_400 + seconds_of_day) * 10_000_000
 }
 
 /// Advance the time counters by one tick. Called from the clock
@@ -101,6 +137,11 @@ pub fn get_unix_time() -> u64 {
     } else {
         (st - EPOCH_DIFF_100NS) / 10_000_000
     }
+}
+
+/// Wall-clock boot base in 100-ns intervals since the NT epoch.
+pub fn get_wall_clock_base() -> u64 {
+    WALL_CLOCK_BASE.load(Ordering::SeqCst)
 }
 
 /// Get current interrupt time in 100ns intervals since boot.
