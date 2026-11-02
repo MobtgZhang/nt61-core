@@ -337,7 +337,7 @@ pub fn draw_text_centered_global(
         Some(s) => s,
         None => return,
     };
-    let width_px = text.len() as u32 * 8;
+    let width_px = text.chars().count() as u32 * 8;
     if width_px >= state.width as u32 {
         return;
     }
@@ -357,6 +357,9 @@ pub fn mark_phase_global(current_phase: u32, gop: &mut GraphicsOutput) {
         None => return,
     };
     let (width, height, total) = (state.width, state.height, state.total_phases);
+    if height < 60 {
+        return;
+    }
     let bar_y0 = height - 60;
     let bar_h = 16;
     let pad = 40usize;
@@ -367,6 +370,7 @@ pub fn mark_phase_global(current_phase: u32, gop: &mut GraphicsOutput) {
     } else {
         ((current_phase as usize + 1) * bar_w) / (total as usize)
     };
+    let filled = filled.min(bar_w);
     let _ = gop.blt(BltOp::VideoFill {
         color: BltPixel::new(0x60, 0x50, 0x40),
         dest: (bar_x0, bar_y0),
@@ -409,6 +413,9 @@ pub fn draw_progress_border_global(gop: &mut GraphicsOutput) {
         None => return,
     };
     let (width, height) = (state.width, state.height);
+    if height < 60 {
+        return;
+    }
     let bar_y0 = height - 60;
     let bar_h = 16;
     let pad = 40usize;

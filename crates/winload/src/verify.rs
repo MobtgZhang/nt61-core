@@ -45,6 +45,9 @@ fn hex_decode(text: &str) -> Option<alloc::vec::Vec<u8>> {
     while let (Some(hi), Some(lo)) = (digits.next(), digits.next()) {
         out.push(hex_val(hi)? * 16 + hex_val(lo)?);
     }
+    if digits.next().is_some() {
+        return None;
+    }
     Some(out)
 }
 
@@ -56,6 +59,8 @@ fn pe_file_checksum(image: &[u8], checksum_field_off: usize) -> u32 {
     let mut i = 0;
     while i + 2 <= image.len() {
         let word = if i == checksum_field_off {
+            0
+        } else if i + 2 == checksum_field_off {
             0
         } else {
             u32::from(image[i]) | (u32::from(image[i + 1]) << 8)
@@ -69,7 +74,7 @@ fn pe_file_checksum(image: &[u8], checksum_field_off: usize) -> u32 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     sum = (sum & 0xFFFF) + (sum >> 16);
-    (sum + u64::from(image.len() as u16)) as u32
+    sum.wrapping_add(image.len() as u64) as u32
 }
 
 fn optional_header_offset(image: &[u8]) -> Option<usize> {
@@ -157,14 +162,7 @@ pub fn verify_image(path: &str, image: &[u8]) -> Result<(), &'static str> {
         let opt = optional_header_offset(image).ok_or("bad optional header")?;
         let computed = pe_file_checksum(image, opt + PE32PLUS_CHECKSUM_OFFSET);
         if computed != stored {
-            // Build-generated PEs may carry a stale checksum because the
-            // ELF→PE converter does not recompute it after section layout
-            // changes. Warn but allow the load; RSA/signature checks below
-            // still apply when a trust anchor is provisioned.
-            debug_println!(
-                "[VERIFY] {} PE CheckSum mismatch (stored={stored:#x} computed={computed:#x}); allowing build-generated image",
-                path
-            );
+            return Err("PE CheckSum mismatch");
         } else {
             debug_println!("[VERIFY] {} PE CheckSum ok ({computed:#x})", path);
         }

@@ -119,12 +119,47 @@ fn read_inode(
     media_id: u32,
     ext4: &Ext4Boot,
     inode_num: u32,
-    inode_table_lba: u64,
+    partition_start_lba: u64,
 ) -> Option<Vec<u8>> {
     if inode_num == 0 {
         return None;
     }
+    if ext4.inodes_per_group == 0 {
+        return None;
+    }
+    let group = (inode_num - 1) / ext4.inodes_per_group;
     let local = (inode_num - 1) % ext4.inodes_per_group;
+
+    let sectors_per_block = (ext4.block_size / 512) as u64;
+    let descriptor_offset = group.checked_mul(64)?;
+    let descriptor_lba = partition_start_lba
+        + ((ext4.first_data_block + 1) as u64)
+            .checked_mul(sectors_per_block)?
+        + u64::from(descriptor_offset / 512);
+    let mut descriptor_sector = [0u8; 512];
+    if block_io
+        .read_blocks(media_id, descriptor_lba, &mut descriptor_sector)
+        .is_err()
+    {
+        return None;
+    }
+    let descriptor_offset_in_sector = (descriptor_offset % 512) as usize;
+    if descriptor_offset_in_sector + 64 > descriptor_sector.len() {
+        return None;
+    }
+    let descriptor = &descriptor_sector[descriptor_offset_in_sector..];
+    let inode_table_block = u32::from_le_bytes([
+        descriptor[8],
+        descriptor[9],
+        descriptor[10],
+        descriptor[11],
+    ]);
+    if inode_table_block == 0 {
+        return None;
+    }
+    let inode_table_lba = partition_start_lba
+        + (inode_table_block as u64).checked_mul(sectors_per_block)?;
+
     let block_in_table = (local * (ext4.inode_size as u32)) / ext4.block_size;
     let sectors_per_block = (ext4.block_size / 512) as u64;
     let lba = inode_table_lba + block_in_table as u64 * sectors_per_block;
@@ -143,18 +178,22 @@ fn read_inode(
 }
 
 /// Extract the i_size_lo and i_block[15] fields from an inode buffer.
-fn parse_inode(inode: &[u8]) -> Option<(u32, [u32; 15])> {
+fn parse_inode(inode: &[u8]) -> Option<(u64, [u32; 15])> {
     if inode.len() < 160 {
         return None;
     }
     let i_size_lo = u32::from_le_bytes([inode[4], inode[5], inode[6], inode[7]]);
+    let i_size_hi = u32::from_le_bytes([inode[108], inode[109], inode[110], inode[111]]);
     let mut i_block = [0u32; 15];
     for i in 0..15 {
         let off = 40 + i * 4;
         i_block[i] =
             u32::from_le_bytes([inode[off], inode[off + 1], inode[off + 2], inode[off + 3]]);
     }
-    Some((i_size_lo, i_block))
+    Some((
+        u64::from(i_size_lo) | (u64::from(i_size_hi) << 32),
+        i_block,
+    ))
 }
 
 /// Walk an inode's extent tree and return the bytes of the file's data.
@@ -166,7 +205,7 @@ fn read_extents(
     media_id: u32,
     ext4: &Ext4Boot,
     i_block: &[u32; 15],
-    size: u32,
+    size: u64,
     partition_start_lba: u64,
 ) -> Option<Vec<u8>> {
     let eh_magic = (i_block[0] & 0xFFFF) as u16;
@@ -179,6 +218,7 @@ fn read_extents(
     let eh_depth = (i_block[1] >> 16) as u16;
     let mut out = Vec::with_capacity(size as usize);
     let mut bytes_left = size as usize;
+    let mut next_logical = 0usize;
 
     if eh_depth == 0 {
         for i in 0..eh_entries as usize {
@@ -193,22 +233,45 @@ fn read_extents(
             let ee_len = (w1 & 0xFFFF) as u16 as u32;
             let ee_start_hi = (w1 >> 16) & 0xFFFF;
             let ee_start_lo = w2;
-            let _ = ee_block;
+            let ee_start_block = ee_block as usize;
             if ee_len == 0 {
                 break;
             }
+            if next_logical < ee_start_block {
+                let gap = core::cmp::min(ee_start_block.saturating_sub(next_logical), bytes_left);
+                out.extend(core::iter::repeat_n(0u8, gap));
+                bytes_left = bytes_left.saturating_sub(gap);
+                next_logical += gap;
+            }
+            if next_logical != ee_start_block || bytes_left == 0 {
+                break;
+            }
+            let unwritten = (w1 & 0x8000) != 0;
+            let ee_len = (w1 & 0x7FFF) as u32;
+            if unwritten {
+                let take =
+                    core::cmp::min(ee_len as usize * ext4.block_size as usize, bytes_left);
+                out.extend(core::iter::repeat_n(0u8, take));
+                bytes_left = bytes_left.saturating_sub(take);
+                next_logical += take;
+                if bytes_left == 0 {
+                    break;
+                }
+                continue;
+            }
             let physical = ((ee_start_hi << 16) | ee_start_lo) as u32;
-            let blk_bytes = (ee_len as usize) * (ext4.block_size as usize);
-            let sectors = ((ee_len as u32) * (ext4.block_size / 512)) as u32;
+            let take = core::cmp::min(ee_len as usize * ext4.block_size as usize, bytes_left);
+            let sectors =
+                (take.div_ceil(ext4.block_size as usize) * (ext4.block_size / 512) as usize) as u32;
             let data = read_partition_sectors(
                 block_io,
                 media_id,
                 partition_start_lba + physical as u64 * (ext4.block_size / 512) as u64,
                 sectors,
             )?;
-            let take = blk_bytes.min(bytes_left);
             out.extend_from_slice(&data[..take]);
-            bytes_left -= take;
+            bytes_left = bytes_left.saturating_sub(take);
+            next_logical += take;
             if bytes_left == 0 {
                 break;
             }
@@ -258,14 +321,36 @@ fn read_extents(
                     leaf[e_off + 10],
                     leaf[e_off + 11],
                 ]);
-                let _ = e_w0;
+                let ee_block = e_w0;
                 let ee_len = (e_w1 & 0xFFFF) as u32;
                 let ee_start_hi = (e_w1 >> 16) & 0xFFFF;
                 let ee_start_lo = e_w2;
                 if ee_len == 0 {
                     break;
                 }
+                if next_logical < ee_block as usize {
+                    let gap = core::cmp::min(ee_block as usize - next_logical, bytes_left);
+                    out.extend(core::iter::repeat_n(0u8, gap));
+                    bytes_left -= gap;
+                    next_logical += gap;
+                }
+                if next_logical != ee_block as usize || bytes_left == 0 {
+                    break;
+                }
+                let unwritten = (e_w1 & 0x8000) != 0;
+                let ee_len = e_w1 & 0x7FFF;
                 let physical = ((ee_start_hi << 16) | ee_start_lo) as u32;
+                if unwritten {
+                    let take =
+                        core::cmp::min(ee_len as usize * ext4.block_size as usize, bytes_left);
+                    out.extend(core::iter::repeat_n(0u8, take));
+                    bytes_left -= take;
+                    next_logical += take;
+                    if bytes_left == 0 {
+                        break;
+                    }
+                    continue;
+                }
                 let blk_bytes = (ee_len as usize) * (ext4.block_size as usize);
                 let sectors = ((ee_len as u32) * (ext4.block_size / 512)) as u32;
                 let lba = partition_start_lba + (physical as u64) * (ext4.block_size / 512) as u64;
@@ -273,6 +358,7 @@ fn read_extents(
                 let take = blk_bytes.min(bytes_left);
                 out.extend_from_slice(&data[..take]);
                 bytes_left -= take;
+                next_logical += take;
                 if bytes_left == 0 {
                     break;
                 }
@@ -285,7 +371,9 @@ fn read_extents(
     } else {
         return None;
     }
-    out.truncate(size as usize);
+    if out.len() < size as usize {
+        out.resize(size as usize, 0u8);
+    }
     Some(out)
 }
 
@@ -329,7 +417,6 @@ fn resolve_path(
     block_io: &uefi::proto::media::block::BlockIO,
     media_id: u32,
     ext4: &Ext4Boot,
-    inode_table_lba: u64,
     start_ino: u32,
     path: &str,
     partition_start_lba: u64,
@@ -341,7 +428,7 @@ fn resolve_path(
         .collect();
     let mut current = start_ino;
     for part in &parts {
-        let inode = read_inode(block_io, media_id, ext4, current, inode_table_lba)?;
+        let inode = read_inode(block_io, media_id, ext4, current, partition_start_lba)?;
         let parsed = parse_inode(&inode);
         let (size, i_block) = parsed?;
         let dir_data = match read_extents(
@@ -441,33 +528,10 @@ pub fn read_ext4_system_file(path: &str) -> Option<Vec<u8>> {
             }
         };
 
-        // read BGDT at block (first_data_block + 1).
-        let bgdt_lba = partition_start_lba
-            + ((ext4.first_data_block + 1) as u64) * ((ext4.block_size / 512) as u64);
-        let mut bgdt = [0u8; 512];
-        if block_ref
-            .read_blocks(this_media_id, bgdt_lba, &mut bgdt)
-            .is_err()
-        {
-            uefi::println!("[EXT4] BGDT read failed at LBA {}", bgdt_lba);
-            core::mem::forget(block);
-            continue;
-        }
-        let inode_table_block = u32::from_le_bytes([bgdt[8], bgdt[9], bgdt[10], bgdt[11]]);
-        if inode_table_block == 0 {
-            uefi::println!("[EXT4] inode table block is zero");
-            core::mem::forget(block);
-            continue;
-        }
-
-        // Resolve path -> inode.
-        let inode_table_lba =
-            partition_start_lba + (inode_table_block as u64) * ((ext4.block_size / 512) as u64);
         let target_ino = match resolve_path(
             &*block_ref,
             this_media_id,
             &ext4,
-            inode_table_lba,
             EXT4_ROOT_INO,
             path,
             partition_start_lba,
@@ -486,7 +550,7 @@ pub fn read_ext4_system_file(path: &str) -> Option<Vec<u8>> {
             this_media_id,
             &ext4,
             target_ino,
-            inode_table_lba,
+            partition_start_lba,
         )?;
         uefi::println!("[EXT4] resolved '{}' -> inode {}", path, target_ino);
         let (size, i_block) = parse_inode(&inode)?;

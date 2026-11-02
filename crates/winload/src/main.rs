@@ -100,6 +100,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 mod arch;
 mod ext4_boot;
+mod refs_boot;
 mod fat32_boot;
 mod fat_lfn;
 mod gop_display;
@@ -332,6 +333,11 @@ fn open_system_file_data(path: &str) -> Option<Vec<u8>> {
         // EXT4 System partition: UEFI SimpleFileSystem only speaks
         // FAT, so EXT4 volumes are resolved by the in-tree reader.
         if let Some(data) = crate::ext4_boot::read_ext4_system_file(path) {
+            return Some(data);
+        }
+        // ReFS System partition: resolve via the self-describing
+        // directory index produced by the in-tree builder.
+        if let Some(data) = crate::refs_boot::read_refs_system_file(path) {
             return Some(data);
         }
         #[cfg(feature = "log_level_debug")]
@@ -1584,7 +1590,7 @@ fn parse_pe32plus(image: &[u8]) -> Option<(u64, u64, u64, bool)> {
     Some((image_base, size_of_image, entry_rva, is_dll))
 }
 
-fn copy_pe_sections(image: &[u8], dest: u64) -> usize {
+fn copy_pe_sections(image: &[u8], dest: u64, image_size: usize) -> usize {
     let dos = image.as_ptr() as *const DosHeader;
     let e_lfanew = unsafe { (*dos).e_lfanew } as usize;
     // opt_off = e_lfanew + 4 (PE sig) + 20 (COFF header) → optional header.
@@ -1663,6 +1669,13 @@ fn copy_pe_sections(image: &[u8], dest: u64) -> usize {
             continue;
         }
         let src = unsafe { image.as_ptr().add(src_in_buf) };
+        let section_end = (virtual_addr as usize)
+            .checked_add(copy_len)
+            .ok_or(0usize)
+            .unwrap_or(usize::MAX);
+        if section_end > image_size {
+            continue;
+        }
         let dst = unsafe { dest_ptr.add(virtual_addr as usize) };
         // Copy via 8-byte aligned chunks. The release-mode
         // `core::ptr::copy_nonoverlapping` misbehaves under QEMU
@@ -1868,7 +1881,7 @@ fn allocate_and_map_image(image_base: u64, size_of_image: u64, raw_bytes: &[u8])
     debug_println!("[A3] zero ok");
 
     // Copy each section into its virtual address.
-    let copied = copy_pe_sections(raw_bytes, dest_addr);
+    let copied = copy_pe_sections(raw_bytes, dest_addr, pages * 0x1000);
     if copied == 0 {
         return None;
     }
@@ -2829,11 +2842,11 @@ fn capture_esp_partition() {
 
     // Publish the result in PERSISTENT so `build_boot_info` can
     // copy it into BootInfo.
-    pd.esp_image_base = buffer_ptr as u64;
-    pd.esp_image_size = mirror_bytes as u64;
+    pd.esp_image_base = if total_ok == 0 { 0 } else { buffer_ptr as u64 };
+    pd.esp_image_size = total_ok.saturating_mul(block_size as u64);
     pd.esp_block_size = block_size as u32;
     pd.esp_partition_lba = 0; // partition-relative LBA; full ESP starts at 0
-    pd.esp_partition_sectors = total_blocks;
+    pd.esp_partition_sectors = if first_err.is_some() { total_ok } else { total_blocks };
     // Save the BlockIO media_id so capture_system_partition can
     // recognise the ESP handle and pick a different partition as
     // the system partition (works even when system is FAT32 too).
@@ -3102,8 +3115,8 @@ fn capture_system_partition() {
         first_err,
     );
 
-    pd.sys_image_base = buffer_ptr as u64;
-    pd.sys_image_size = mirror_bytes as u64;
+    pd.sys_image_base = if total_ok == 0 { 0 } else { buffer_ptr as u64 };
+    pd.sys_image_size = total_ok.saturating_mul(block_size as u64);
     pd.sys_block_size = block_size as u32;
 
     drop(block_io);
@@ -4443,6 +4456,10 @@ fn os_loader_run() -> ! {
                 "[WINLOAD] L10 ExitBootServices failed after retry: 0x{:x}",
                 status.0
             );
+            panic!(
+                "[WINLOAD] ExitBootServices failed after retry: 0x{:x}",
+                status.0
+            );
         }
     }
 
@@ -4641,8 +4658,9 @@ extern "efiapi" fn efi_main(_image: uefi::Handle, _st: *const core::ffi::c_void)
     arch::current::write_debug_marker(b"WINL>\r\n");
 
     debug_println!("[WINLOAD] before helpers init");
-    if let Err(_e) = uefi::helpers::init() {
-        // ignored
+    if let Err(e) = uefi::helpers::init() {
+        debug_println!("[WINLOAD] helpers init failed: {:?}", e.status());
+        return e.status();
     }
     debug_println!("[WINLOAD] after helpers init");
 
