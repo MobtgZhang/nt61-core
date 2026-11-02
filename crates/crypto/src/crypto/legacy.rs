@@ -9,6 +9,7 @@
 extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use crate::ke::sync::Spinlock;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[repr(transparent)]
@@ -129,6 +130,8 @@ pub struct KeyContext {
 }
 
 static PROV_COUNTER: AtomicUsize = AtomicUsize::new(0x4000);
+static HASHES: Spinlock<Vec<(usize, HashContext)>> = Spinlock::new(Vec::new());
+static HASH_COUNTER: AtomicUsize = AtomicUsize::new(0x5000);
 
 /// # Safety
 ///
@@ -226,10 +229,12 @@ pub unsafe extern "C" fn crypt_create_hash(
         _ => return 0,
     };
 
-    let _context = HashContext { alg_id, state };
-    let _ = _context;
-
-    0 // FALSE: no persistent hash state is available
+    let handle = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    HASHES
+        .lock()
+        .push((handle, HashContext { alg_id, state }));
+    *hash = handle;
+    1 // TRUE
 }
 
 /// # Safety
@@ -245,10 +250,20 @@ pub unsafe extern "C" fn crypt_hash_data(
         return 0;
     }
 
-    let _input = core::slice::from_raw_parts(data, data_len as usize);
-    let _ = _input;
-
-    0 // FALSE: refusing to discard input
+    let input = core::slice::from_raw_parts(data, data_len as usize);
+    let mut hashes = HASHES.lock();
+    let Some((_, context)) = hashes.iter_mut().find(|(entry_hash, _)| *entry_hash == hash)
+    else {
+        return 0;
+    };
+    match &mut context.state {
+        HashState::Md5(state) => state.update(input),
+        HashState::Sha1(state) => state.update(input),
+        HashState::Sha256(state) => state.update(input),
+        HashState::Sha384(state) => state.update(input),
+        HashState::Sha512(state) => state.update(input),
+    }
+    1
 }
 
 /// # Safety
@@ -265,9 +280,57 @@ pub unsafe extern "C" fn crypt_get_hash_param(
         return 0;
     }
 
-    // No digest state is retained, so no hash parameter can be served
-    // truthfully. Fail closed rather than fabricating values.
-    0
+    let mut hashes = HASHES.lock();
+    let Some((_, context)) = hashes.iter_mut().find(|(entry_hash, _)| *entry_hash == hash)
+    else {
+        return 0;
+    };
+
+    if _param == hp::HP_HASHSIZE {
+        let size: u32 = match context.state {
+            HashState::Md5(_) => 16,
+            HashState::Sha1(_) => 20,
+            HashState::Sha256(_) => 32,
+            HashState::Sha384(_) => 48,
+            HashState::Sha512(_) => 64,
+        };
+        if _data.is_null() {
+            *data_len = 4;
+            return 1;
+        }
+        if (*data_len as usize) < 4 {
+            *data_len = 4;
+            return 0;
+        }
+        core::ptr::write_bytes(_data, 0, 4);
+        _data.copy_from(size.to_le_bytes().as_ptr(), 4);
+        *data_len = 4;
+        return 1;
+    }
+
+    if _param != hp::HP_HASHVAL {
+        return 0;
+    }
+
+    let digest: Vec<u8> = match &mut context.state {
+        HashState::Md5(state) => state.finalize().to_vec(),
+        HashState::Sha1(state) => state.finalize().to_vec(),
+        HashState::Sha256(state) => state.finalize().to_vec(),
+        HashState::Sha384(state) => state.finalize().to_vec(),
+        HashState::Sha512(state) => state.finalize().to_vec(),
+    };
+
+    if (*data_len as usize) < digest.len() {
+        *data_len = digest.len() as u32;
+        return 0;
+    }
+    if _data.is_null() {
+        return 0;
+    }
+    let output = core::slice::from_raw_parts_mut(_data, digest.len());
+    output.copy_from_slice(&digest);
+    *data_len = digest.len() as u32;
+    1
 }
 
 /// # Safety
@@ -278,7 +341,10 @@ pub unsafe extern "C" fn crypt_destroy_hash(hash: usize) -> i32 {
         return 0;
     }
 
-    0 // FALSE: no cipher backend is available
+    let mut hashes = HASHES.lock();
+    let before = hashes.len();
+    hashes.retain(|(entry_hash, _)| *entry_hash != hash);
+    i32::from(before != hashes.len())
 }
 
 /// # Safety
@@ -496,8 +562,25 @@ pub unsafe extern "C" fn crypt_duplicate_hash(
         return 0;
     }
 
-    // No hash state is retained, so there is nothing to duplicate.
-    0 // FALSE
+    let mut hashes = HASHES.lock();
+    let Some((_, context)) = hashes.iter().find(|(entry_hash, _)| *entry_hash == hash) else {
+        return 0;
+    };
+    let handle = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let duplicate = HashContext {
+        alg_id: context.alg_id,
+        state: match context.alg_id {
+            alg_id::CALG_MD5 => HashState::Md5(crate::crypto::hash::Md5::new()),
+            alg_id::CALG_SHA1 => HashState::Sha1(crate::crypto::hash::Sha1::new()),
+            alg_id::CALG_SHA256 => HashState::Sha256(crate::crypto::hash::Sha256::new()),
+            alg_id::CALG_SHA384 => HashState::Sha384(crate::crypto::hash::Sha384::new()),
+            alg_id::CALG_SHA512 => HashState::Sha512(crate::crypto::hash::Sha512::new()),
+            _ => return 0,
+        },
+    };
+    hashes.push((handle, duplicate));
+    *new_hash = handle;
+    1
 }
 
 /// # Safety

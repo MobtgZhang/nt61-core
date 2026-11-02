@@ -41,7 +41,11 @@ impl Prng {
                 csprng::fill(&mut key);
                 PrngState::AesCtr(AesCtrState::new(&key))
             }
-            PrngAlgorithm::Lcg => PrngState::Lcg(LcgState::new(0x123456789abcdef0)),
+            PrngAlgorithm::Lcg => {
+                let mut seed = [0u8; 8];
+                csprng::fill(&mut seed);
+                PrngState::Lcg(LcgState::new(u64::from_le_bytes(seed)))
+            }
         };
 
         Self { algorithm, state }
@@ -73,7 +77,16 @@ impl Prng {
                 } else {
                     0x123456789abcdef0
                 };
-                PrngState::Lcg(LcgState::new(seed_val))
+                if seed.len() < 8 {
+                    let mut mixed = [0u8; 8];
+                    csprng::fill(&mut mixed);
+                    for (destination, source) in mixed.iter_mut().zip(seed) {
+                        *destination ^= source;
+                    }
+                    PrngState::Lcg(LcgState::new(u64::from_le_bytes(mixed)))
+                } else {
+                    PrngState::Lcg(LcgState::new(seed_val))
+                }
             }
         };
 
@@ -335,7 +348,8 @@ impl EntropyPool {
     }
 
     pub fn extract(&mut self, output: &mut [u8]) {
-        let hash = crate::crypto::hash::sha256(&self.pool);
+        let mut hash = crate::crypto::hash::sha256(&self.pool);
+        let mut counter: u64 = 0;
 
         let mut offset = 0;
         while offset < output.len() {
@@ -343,6 +357,12 @@ impl EntropyPool {
             let to_copy = remaining.min(32);
             output[offset..offset + to_copy].copy_from_slice(&hash[..to_copy]);
             offset += to_copy;
+
+            counter = counter.wrapping_add(1);
+            let mut next_input = [0u8; 40];
+            next_input[..32].copy_from_slice(&hash);
+            next_input[32..].copy_from_slice(&counter.to_le_bytes());
+            hash = crate::crypto::hash::sha256(&next_input);
         }
 
         for i in 0..256 {
@@ -363,7 +383,7 @@ pub mod hwrng {
     }
 
     pub fn has_rdseed() -> bool {
-        crate::arch::hardware_random_u64().is_some()
+        crate::arch::hardware_seed_u64().is_some()
     }
 
     pub fn rdrand_fill(buf: &mut [u8]) -> bool {
@@ -381,6 +401,16 @@ pub mod hwrng {
     }
 
     pub fn rdseed_fill(buf: &mut [u8]) -> bool {
-        rdrand_fill(buf)
+        let mut cursor = 0;
+        while cursor < buf.len() {
+            let Some(value) = crate::arch::hardware_seed_u64() else {
+                return false;
+            };
+            let bytes = value.to_le_bytes();
+            let len = (buf.len() - cursor).min(8);
+            buf[cursor..cursor + len].copy_from_slice(&bytes[..len]);
+            cursor += len;
+        }
+        true
     }
 }

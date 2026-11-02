@@ -195,36 +195,33 @@ impl Aes256 {
 
         const RCON: [u8; 7] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40];
 
-        for i in 2..15 {
-            let prev = round_keys[i - 1];
-            let prev2 = round_keys[i - 2];
-
-            if i % 2 == 0 {
-                let mut temp = [prev[12], prev[13], prev[14], prev[15]];
+        // AES-256 uses 8 words (60 expansion words). SubWord is applied
+        // after RotWord once every eight words, and after SubWord without
+        // RotWord when i % 8 == 4 (FIPS-197 §5.2).
+        let mut words = [[0u8; 4]; 60];
+        for (word, key_word) in words.iter_mut().zip(key.chunks_exact(4)) {
+            word.copy_from_slice(key_word);
+        }
+        for i in 8..60 {
+            let mut temp = words[i - 1];
+            if i % 8 == 0 {
                 temp.rotate_left(1);
                 for byte in &mut temp {
                     *byte = SBOX[*byte as usize];
                 }
-                temp[0] ^= RCON[(i / 2) - 1];
-
-                for j in 0..4 {
-                    round_keys[i][j] = prev2[j] ^ temp[j];
-                }
-                for j in 4..16 {
-                    round_keys[i][j] = prev2[j] ^ round_keys[i][j - 4];
-                }
-            } else {
-                let mut temp = [prev[12], prev[13], prev[14], prev[15]];
+                temp[0] ^= RCON[(i / 8) - 1];
+            } else if i % 8 == 4 {
                 for byte in &mut temp {
                     *byte = SBOX[*byte as usize];
                 }
-
-                for j in 0..4 {
-                    round_keys[i][j] = prev2[j] ^ temp[j];
-                }
-                for j in 4..16 {
-                    round_keys[i][j] = prev2[j] ^ round_keys[i][j - 4];
-                }
+            }
+            for byte_index in 0..4 {
+                words[i][byte_index] = words[i - 8][byte_index] ^ temp[byte_index];
+            }
+        }
+        for (round_key, group) in words.chunks_exact(4).enumerate() {
+            for (destination, word) in round_keys[round_key].chunks_exact_mut(4).zip(group) {
+                destination.copy_from_slice(word);
             }
         }
     }
@@ -882,6 +879,21 @@ mod tests {
         ];
         let mut block = pt;
         Aes128::new(&key).encrypt_block(&mut block);
+        assert_eq!(block, expected, "ct mismatch: {:02x?}", block);
+    }
+
+    #[test]
+    fn aes256_matches_fips197_c3() {
+        let key: alloc::vec::Vec<u8> = (0..=31).collect();
+        let mut block = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        Aes256::new(key.as_array::<32>().unwrap()).encrypt_block(&mut block);
+        let expected = [
+            0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49,
+            0x60, 0x89,
+        ];
         assert_eq!(block, expected, "ct mismatch: {:02x?}", block);
     }
 

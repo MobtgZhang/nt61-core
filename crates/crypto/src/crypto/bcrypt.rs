@@ -181,13 +181,29 @@ pub unsafe extern "C" fn bcrypt_get_property(
             algorithm::SHA512 => 64,
             _ => return STATUS_INVALID_PARAMETER,
         },
-        property::OBJECT_LENGTH => 256, // Simplified
-        property::BLOCK_LENGTH => {
-            if get_algorithm_for_handle(object_handle) == algorithm::DES3 {
-                8
-            } else {
-                16
+        property::OBJECT_LENGTH => {
+            let algorithm = get_algorithm_for_handle(object_handle);
+            if algorithm.is_empty() {
+                return STATUS_INVALID_HANDLE;
             }
+            match algorithm.as_str() {
+                algorithm::MD5 => 64,
+                algorithm::SHA1 => 64,
+                algorithm::SHA256 => 64,
+                algorithm::SHA384 => 96,
+                algorithm::SHA512 => 128,
+                algorithm::DES3 => 24,
+                algorithm::AES => 16,
+                algorithm::RSA => 0,
+                _ => return STATUS_INVALID_HANDLE,
+            }
+        }
+        property::BLOCK_LENGTH => {
+            let algorithm = get_algorithm_for_handle(object_handle);
+            if algorithm.is_empty() {
+                return STATUS_INVALID_HANDLE;
+            }
+            if algorithm == algorithm::DES3 { 8 } else { 16 }
         }
         _ => return STATUS_NOT_SUPPORTED,
     };
@@ -207,7 +223,7 @@ pub unsafe extern "C" fn bcrypt_get_property(
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 pub unsafe extern "C" fn bcrypt_set_property(
-    _object_handle: usize,
+    object_handle: usize,
     property: *const u16,
     input: *const u8,
     _input_len: u32,
@@ -223,7 +239,21 @@ pub unsafe extern "C" fn bcrypt_set_property(
     };
 
     match prop_str.as_str() {
-        property::CHAINING_MODE => STATUS_SUCCESS,
+        property::CHAINING_MODE => {
+            let mode = match read_wide_string(input as *const u16) {
+                Some(mode) if matches!(mode.as_str(), chaining_mode::CBC | chaining_mode::ECB) => {
+                    mode
+                }
+                _ => return STATUS_NOT_SUPPORTED,
+            };
+            let mut keys = KEYS.lock();
+            let Some((_, context)) = keys.iter_mut().find(|(stored, _)| *stored == object_handle)
+            else {
+                return STATUS_INVALID_HANDLE;
+            };
+            context.chaining_mode = mode;
+            STATUS_SUCCESS
+        }
         _ => STATUS_NOT_SUPPORTED,
     }
 }
@@ -252,6 +282,7 @@ pub unsafe extern "C" fn bcrypt_create_hash(
         algorithm::SHA256 => HashState::Sha256(crate::crypto::hash::Sha256::new()),
         algorithm::SHA384 => HashState::Sha384(crate::crypto::hash::Sha384::new()),
         algorithm::SHA512 => HashState::Sha512(crate::crypto::hash::Sha512::new()),
+        _ if algorithm.is_empty() => return STATUS_INVALID_HANDLE,
         _ => return STATUS_NOT_SUPPORTED,
     };
 
@@ -335,6 +366,8 @@ pub unsafe extern "C" fn bcrypt_destroy_hash(hash_handle: usize) -> i32 {
         return STATUS_INVALID_HANDLE;
     }
 
+    let mut hashes = HASHES.lock();
+    hashes.retain(|(stored, _)| *stored != hash_handle);
     STATUS_SUCCESS
 }
 
@@ -361,7 +394,7 @@ pub unsafe extern "C" fn bcrypt_generate_symmetric_key(
     let key_len_ok = match algorithm.as_str() {
         algorithm::AES => matches!(key_data.len(), 16 | 24 | 32),
         algorithm::DES3 => key_data.len() == 24,
-        _ => true,
+        _ => !algorithm.is_empty(),
     };
     if !key_len_ok {
         return STATUS_INVALID_PARAMETER;
@@ -511,6 +544,8 @@ pub unsafe extern "C" fn bcrypt_destroy_key(key_handle: usize) -> i32 {
         return STATUS_INVALID_HANDLE;
     }
 
+    let mut keys = KEYS.lock();
+    keys.retain(|(stored, _)| *stored != key_handle);
     STATUS_SUCCESS
 }
 
@@ -551,6 +586,7 @@ pub unsafe extern "C" fn bcrypt_generate_key_pair(
 
             STATUS_SUCCESS
         }
+        _ if algorithm.is_empty() => STATUS_INVALID_HANDLE,
         _ => STATUS_NOT_SUPPORTED,
     }
 }
@@ -710,7 +746,7 @@ fn get_algorithm_for_handle(handle: usize) -> String {
         .iter()
         .find(|(stored, _)| *stored == handle)
         .map(|(_, provider)| provider.algorithm.clone())
-        .unwrap_or_else(|| String::from(algorithm::SHA256))
+        .unwrap_or_else(String::new)
 }
 
 fn key_context(key_handle: usize) -> Option<KeyContext> {
