@@ -70,6 +70,8 @@ pub struct Wow64VasState {
     pub allocation_count: u32,
     /// Peak usage.
     pub peak_usage: u32,
+    /// Active allocation records (base → size) for query/free support.
+    pub allocations: alloc::vec::Vec<AllocationEntry>,
 }
 
 impl Default for Wow64VasState {
@@ -80,6 +82,7 @@ impl Default for Wow64VasState {
             end_of_space: WOW64_USER_SPACE_END,
             allocation_count: 0,
             peak_usage: 0,
+            allocations: alloc::vec::Vec::new(),
         }
     }
 }
@@ -93,6 +96,7 @@ impl Wow64VasState {
             end_of_space: WOW64_USER_SPACE_END,
             allocation_count: 0,
             peak_usage: 0,
+            allocations: alloc::vec::Vec::new(),
         }
     }
 
@@ -100,6 +104,7 @@ impl Wow64VasState {
     pub fn reset(&mut self) {
         self.next_alloc = WOW64_USER_SPACE_START;
         self.allocation_count = 0;
+        self.allocations.clear();
     }
 
     /// Get current usage.
@@ -231,6 +236,19 @@ pub fn allocate(
         aligned_base
     };
 
+    // Record the allocation so free() and query() can find it.
+    {
+        let mut vas = WOW64_VAS.lock();
+        vas.allocations.push(AllocationEntry {
+            base,
+            size: aligned_size,
+            allocation_type,
+            protect: _protect,
+            in_use: true,
+        });
+        vas.allocation_count += 1;
+    }
+
     crate::wow64_klog!(
         "allocate: base=0x{:08x} size=0x{:08x} type=0x{:x}",
         base,
@@ -260,9 +278,29 @@ pub fn free(base: u32, size: u32) -> bool {
         return false;
     }
 
-    crate::wow64_klog!("free: base=0x{:08x} size=0x{:08x}", base, size);
+    let aligned_base = align_to_page_down(base);
+    let mut vas = WOW64_VAS.lock();
+    let mut freed = false;
+    for entry in vas.allocations.iter_mut() {
+        if entry.in_use && entry.base == aligned_base {
+            entry.in_use = false;
+            freed = true;
+            break;
+        }
+    }
+    if freed {
+        vas.allocation_count = vas.allocation_count.saturating_sub(1);
+    }
+    drop(vas);
+    if !freed {
+        crate::wow64_klog!(
+            "free: no matching allocation base=0x{:08x} size=0x{:08x}",
+            base,
+            size
+        );
+    }
 
-    true
+    freed
 }
 
 /// Query virtual memory information.
@@ -278,17 +316,41 @@ pub fn query(base: u32) -> Option<Wow64MemoryBasicInformation32> {
         return None;
     }
 
-    // In a real implementation, this would query the VAD tree
-    // For the stub, return a basic structure
-    Some(Wow64MemoryBasicInformation32 {
-        base_address: align_to_page_down(base),
-        allocation_base: align_to_page_down(base),
-        allocation_protect: memory_protect::PAGE_READWRITE,
-        region_size: 0x1000, // Minimum page size
-        state: memory_state::MEM_COMMIT,
-        protect: memory_protect::PAGE_READWRITE,
-        memory_type: 0, // MEM_PRIVATE
-    })
+    let aligned_base = align_to_page_down(base);
+    let vas = WOW64_VAS.lock();
+    // Look up the allocation record for this address.
+    let entry = vas
+        .allocations
+        .iter()
+        .find(|entry| {
+            entry.in_use
+                && base >= entry.base
+                && base < entry.base.wrapping_add(entry.size)
+        });
+
+    if let Some(entry) = entry {
+        Some(Wow64MemoryBasicInformation32 {
+            base_address: entry.base,
+            allocation_base: entry.base,
+            allocation_protect: entry.protect,
+            region_size: entry.size,
+            state: memory_state::MEM_COMMIT,
+            protect: entry.protect,
+            memory_type: 0, // MEM_PRIVATE
+        })
+    } else {
+        drop(vas);
+        // Not tracked: report a free page (MEM_RESERVE, no commit).
+        Some(Wow64MemoryBasicInformation32 {
+            base_address: aligned_base,
+            allocation_base: 0,
+            allocation_protect: 0,
+            region_size: 0x1000,
+            state: memory_state::MEM_RESERVE,
+            protect: 0,
+            memory_type: 0,
+        })
+    }
 }
 
 // =============================================================================
@@ -336,6 +398,20 @@ pub fn allocate_stack(size: u32) -> Option<u32> {
     })
 }
 
+/// Release a WOW64 process heap allocated by [`allocate_heap`].
+pub fn free_heap(base: u32) -> bool {
+    free(base, 0x1000)
+}
+
+/// Release a WOW64 thread stack by its returned top address.
+pub fn free_stack(stack_top: u32) -> bool {
+    let allocation = query(stack_top.saturating_sub(1));
+    let Some(info) = allocation else {
+        return false;
+    };
+    free(info.base_address, info.region_size)
+}
+
 /// read memory from a 32-bit process.
 ///
 /// This is used by the kernel to read from a Wow64 process's address space.
@@ -352,12 +428,15 @@ pub fn read_memory(
         return Err(STATUS_INVALID_PARAMETER);
     }
 
-    crate::wow64_klog!(
-        "read_memory: from=0x{:08x} to=0x{:08x} size=0x{:08x}",
-        base_address,
-        buffer,
-        size
-    );
+    // 32-bit addresses are identity-mapped into the lower 4 GB of the
+    // 64-bit user space, so we can use the kernel's user_copy helpers
+    // with zero-extended addresses.
+    let mut scratch = alloc::vec::Vec::with_capacity(size as usize);
+    scratch.resize(size as usize, 0);
+    crate::mm::user_copy::copy_from_user(&mut scratch, base_address as u64)
+        .map_err(|s| s as u32)?;
+    crate::mm::user_copy::copy_to_user(buffer as u64, &scratch)
+        .map_err(|s| s as u32)?;
 
     Ok(size)
 }
@@ -378,12 +457,12 @@ pub fn write_memory(
         return Err(STATUS_INVALID_PARAMETER);
     }
 
-    crate::wow64_klog!(
-        "write_memory: to=0x{:08x} from=0x{:08x} size=0x{:08x}",
-        base_address,
-        buffer,
-        size
-    );
+    let mut scratch = alloc::vec::Vec::with_capacity(size as usize);
+    scratch.resize(size as usize, 0);
+    crate::mm::user_copy::copy_from_user(&mut scratch, buffer as u64)
+        .map_err(|s| s as u32)?;
+    crate::mm::user_copy::copy_to_user(base_address as u64, &scratch)
+        .map_err(|s| s as u32)?;
 
     Ok(size)
 }

@@ -16,6 +16,7 @@
 
 use crate::libs::wow64::types::*;
 use crate::libs::wow64::wow64vas;
+use crate::ntoskrnl::ntdll::status::STATUS_ACCESS_VIOLATION;
 
 // =============================================================================
 // wow64_allocate_virtual_memory32
@@ -59,13 +60,15 @@ pub unsafe extern "C" fn wow64_allocate_virtual_memory32(
     );
     let _ = zero_bits;
 
-    // Get the requested base address (if any)
-    let requested_base = if base_address != 0 {
-        // Would read from base_address pointer in real implementation
-        0
+    let mut base = if base_address != 0 {
+        match crate::mm::user_copy::read_user_object::<u32>(base_address as u64) {
+            Ok(value) => value as usize,
+            Err(status) => return status as u32,
+        }
     } else {
-        0 // Let the allocator choose
+        0
     };
+    let mut size = region_size as usize;
 
     // Validate allocation type
     if allocation_type == 0 {
@@ -79,27 +82,27 @@ pub unsafe extern "C" fn wow64_allocate_virtual_memory32(
     }
 
     // Allocate through the Wow64 VAS
-    match wow64vas::allocate(
-        region_size,
-        wow64vas::WOW64_ALLOCATION_GRANULARITY,
-        requested_base,
-        allocation_type,
-        protect,
-    ) {
-        Some((allocated_base, allocated_size)) => {
-            crate::wow64_klog!(
-                "Allocated base=0x{:08x} size=0x{:08x}",
-                allocated_base,
-                allocated_size
-            );
-
-            // write results back
-            // In real implementation: write to base_address and region_size pointers
-            let _ = (allocated_base, allocated_size);
-            STATUS_SUCCESS
-        }
-        None => STATUS_NO_MEMORY,
+    let status = unsafe {
+        crate::libs::ntdll::virtual_mem::nt_allocate_virtual_memory(
+            process_handle as usize as *mut core::ffi::c_void,
+            &mut base as *mut usize as *mut crate::libs::ntdll::types::PVOID,
+            zero_bits as usize,
+            &mut size,
+            allocation_type,
+            protect,
+        )
+    };
+    if status >= 0 {
+        let _ = crate::mm::user_copy::write_user_object(
+            base_address as u64,
+            &(base as u32),
+        );
+        let _ = crate::mm::user_copy::write_user_object(
+            region_size as u64,
+            &(size as u32),
+        );
     }
+    status as u32
 }
 
 // =============================================================================
@@ -143,18 +146,27 @@ pub unsafe extern "C" fn wow64_free_virtual_memory32(
     }
 
     // Validate address
-    if !wow64vas::is_valid_user_range(base_address, region_size) {
-        return STATUS_ACCESS_DENIED;
+    if !wow64vas::is_valid_user_address(base_address) {
+        return STATUS_INVALID_PARAMETER;
     }
 
-    // Free through the Wow64 VAS
-    if wow64vas::free(base_address, region_size) {
-        // write actual freed size back
-        // In real implementation: write to region_size pointer
-        STATUS_SUCCESS
-    } else {
-        STATUS_UNSUCCESSFUL
+    let mut base = base_address as usize;
+    let mut size = region_size as usize;
+    let status = unsafe {
+        crate::libs::ntdll::virtual_mem::nt_free_virtual_memory(
+            process_handle as usize as *mut core::ffi::c_void,
+            &mut base as *mut usize as *mut crate::libs::ntdll::types::PVOID,
+            &mut size,
+            free_type,
+        )
+    };
+    if status >= 0 && region_size != 0 {
+        let _ = crate::mm::user_copy::write_user_object(
+            region_size as u64,
+            &(size as u32),
+        );
     }
+    status as u32
 }
 
 // =============================================================================
@@ -192,10 +204,15 @@ pub unsafe extern "C" fn wow64_protect_virtual_memory32(
         old_protect
     );
 
-    // Get base address and size
-    // In real implementation: read from base_address and region_size pointers
-    let base = 0;
-    let size = 0;
+    let mut base = match crate::mm::user_copy::read_user_object::<u32>(base_address as u64) {
+        Ok(value) => value as usize,
+        Err(status) => return status as u32,
+    };
+    let mut size = match crate::mm::user_copy::read_user_object::<u32>(region_size as u64) {
+        Ok(value) => value as usize,
+        Err(status) => return status as u32,
+    };
+    let mut old_protect_value: u32 = 0;
 
     // Validate protection
     if !is_valid_protection(new_protect) {
@@ -203,14 +220,32 @@ pub unsafe extern "C" fn wow64_protect_virtual_memory32(
     }
 
     // Validate range
-    if !wow64vas::is_valid_user_range(base, size) {
-        return STATUS_INVALID_PARAMETER;
+    let status = unsafe {
+        crate::libs::ntdll::virtual_mem::nt_protect_virtual_memory(
+            process_handle as usize as *mut core::ffi::c_void,
+            &mut base as *mut usize as *mut crate::libs::ntdll::types::PVOID,
+            &mut size,
+            new_protect,
+            &mut old_protect_value,
+        )
+    };
+    if status >= 0 {
+        let _ = crate::mm::user_copy::write_user_object(
+            base_address as u64,
+            &(base as u32),
+        );
+        let _ = crate::mm::user_copy::write_user_object(
+            region_size as u64,
+            &(size as u32),
+        );
+        if old_protect != 0 {
+            let _ = crate::mm::user_copy::write_user_object(
+                old_protect as u64,
+                &old_protect_value,
+            );
+        }
     }
-
-    // In real implementation: call 64-bit NT_PROTECT_VIRTUAL_MEMORY
-    // and translate the result
-
-    STATUS_SUCCESS
+    status as u32
 }
 
 // =============================================================================
@@ -258,9 +293,13 @@ pub unsafe extern "C" fn wow64_query_virtual_memory32(
     );
 
     // Validate buffer
-    if buffer == 0 || buffer_size < core::mem::size_of::<Wow64MemoryBasicInformation32>() as u32 {
+    let required_size = core::mem::size_of::<Wow64MemoryBasicInformation32>() as u32;
+    if buffer == 0 || buffer_size < required_size {
         if return_length != 0 {
-            // Would write required size
+            let _ = crate::mm::user_copy::write_user_object(
+                return_length as u64,
+                &required_size,
+            );
         }
         return STATUS_BUFFER_TOO_SMALL;
     }
@@ -274,7 +313,6 @@ pub unsafe extern "C" fn wow64_query_virtual_memory32(
         0 => {
             // MemoryBasicInformation
             if let Some(info) = wow64vas::query(base_address) {
-                // Copy to 32-bit buffer
                 crate::wow64_klog!(
                     "MemoryBasicInformation base=0x{:08x} \
                      size=0x{:08x} state=0x{:08x}",
@@ -282,7 +320,15 @@ pub unsafe extern "C" fn wow64_query_virtual_memory32(
                     info.region_size,
                     info.state
                 );
-                // In real implementation: copy info to buffer
+                if crate::mm::user_copy::write_user_object(buffer as u64, &info).is_err() {
+                    return STATUS_ACCESS_VIOLATION as u32;
+                }
+                if return_length != 0 {
+                    let _ = crate::mm::user_copy::write_user_object(
+                        return_length as u64,
+                        &required_size,
+                    );
+                }
                 STATUS_SUCCESS
             } else {
                 STATUS_UNSUCCESSFUL
@@ -338,17 +384,23 @@ pub unsafe extern "C" fn wow64_read_virtual_memory32(
         return STATUS_ACCESS_DENIED;
     }
 
-    // Use the VAS read function
-    match wow64vas::read_memory(process_handle, base_address, buffer, size) {
-        Ok(bytes_read) => {
-            if number_of_bytes_read != 0 {
-                // Would write to number_of_bytes_read
-            }
-            let _ = bytes_read;
-            STATUS_SUCCESS
-        }
-        Err(status) => status,
+    let mut bytes_read: usize = 0;
+    let status = unsafe {
+        crate::libs::ntdll::virtual_mem::nt_read_virtual_memory(
+            process_handle as usize as *mut core::ffi::c_void,
+            base_address as usize as *mut core::ffi::c_void,
+            buffer as usize as *mut core::ffi::c_void,
+            size as usize,
+            &mut bytes_read,
+        )
+    };
+    if status >= 0 && number_of_bytes_read != 0 {
+        let _ = crate::mm::user_copy::write_user_object(
+            number_of_bytes_read as u64,
+            &(bytes_read as u32),
+        );
     }
+    status as u32
 }
 
 // =============================================================================
@@ -394,17 +446,23 @@ pub unsafe extern "C" fn wow64_write_virtual_memory32(
         return STATUS_ACCESS_DENIED;
     }
 
-    // Use the VAS write function
-    match wow64vas::write_memory(process_handle, base_address, buffer, size) {
-        Ok(bytes_written) => {
-            if number_of_bytes_written != 0 {
-                // Would write to number_of_bytes_written
-            }
-            let _ = bytes_written;
-            STATUS_SUCCESS
-        }
-        Err(status) => status,
+    let mut bytes_written: usize = 0;
+    let status = unsafe {
+        crate::libs::ntdll::virtual_mem::nt_write_virtual_memory(
+            process_handle as usize as *mut core::ffi::c_void,
+            base_address as usize as *mut core::ffi::c_void,
+            buffer as usize as *mut core::ffi::c_void,
+            size as usize,
+            &mut bytes_written,
+        )
+    };
+    if status >= 0 && number_of_bytes_written != 0 {
+        let _ = crate::mm::user_copy::write_user_object(
+            number_of_bytes_written as u64,
+            &(bytes_written as u32),
+        );
     }
+    status as u32
 }
 
 // =============================================================================

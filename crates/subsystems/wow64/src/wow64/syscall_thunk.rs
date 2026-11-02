@@ -97,6 +97,9 @@ pub unsafe fn dispatch_service(service_number: ULONG32, args: *const u32) -> ULO
         service_numbers::NT_SET_CONTEXT_THREAD => nt_set_context_thread_thunk(args),
         service_numbers::NT_QUERY_INFORMATION_THREAD => nt_query_information_thread_thunk(args),
         service_numbers::NT_SET_INFORMATION_THREAD => nt_set_information_thread_thunk(args),
+        service_numbers::NT_SUSPEND_THREAD => nt_suspend_thread_thunk(args),
+        service_numbers::NT_RESUME_THREAD => nt_resume_thread_thunk(args),
+        service_numbers::NT_QUEUE_APC_THREAD => nt_queue_apc_thread_thunk(args),
 
         service_numbers::NT_RAISE_EXCEPTION => nt_raise_exception_thunk(args),
         service_numbers::NT_DISPATCH_EXCEPTION => nt_dispatch_exception_thunk(args),
@@ -700,6 +703,33 @@ unsafe extern "C" fn nt_set_information_thread_thunk(args: *const u32) -> ULONG3
     status as u32
 }
 
+unsafe extern "C" fn nt_suspend_thread_thunk(args: *const u32) -> ULONG32 {
+    let thread_handle = *args as *mut core::ffi::c_void;
+    let previous_count = args.add(1) as *mut u32;
+    crate::libs::ntdll::thread::nt_suspend_thread(thread_handle, previous_count) as u32
+}
+
+unsafe extern "C" fn nt_resume_thread_thunk(args: *const u32) -> ULONG32 {
+    let thread_handle = *args as *mut core::ffi::c_void;
+    let previous_count = args.add(1) as *mut u32;
+    crate::libs::ntdll::thread::nt_resume_thread(thread_handle, previous_count) as u32
+}
+
+unsafe extern "C" fn nt_queue_apc_thread_thunk(args: *const u32) -> ULONG32 {
+    let thread_handle = *args as *mut core::ffi::c_void;
+    let apc_routine = *args.add(1) as NtPVOID;
+    let argument1 = *args.add(2) as NtPVOID;
+    let argument2 = *args.add(3) as NtPVOID;
+    let argument3 = *args.add(4) as NtPVOID;
+    crate::libs::ntdll::thread::nt_queue_apc_thread(
+        thread_handle,
+        apc_routine,
+        argument1,
+        argument2,
+        argument3,
+    ) as u32
+}
+
 // =============================================================================
 // Exception Handling Thunks
 // =============================================================================
@@ -852,6 +882,9 @@ fn register_service_thunks() {
         svc::NT_SET_INFORMATION_THREAD,
         nt_set_information_thread_thunk,
     );
+    ssd_mod::update_service_handler(svc::NT_SUSPEND_THREAD, nt_suspend_thread_thunk);
+    ssd_mod::update_service_handler(svc::NT_RESUME_THREAD, nt_resume_thread_thunk);
+    ssd_mod::update_service_handler(svc::NT_QUEUE_APC_THREAD, nt_queue_apc_thread_thunk);
 
     ssd_mod::update_service_handler(svc::NT_RAISE_EXCEPTION, nt_raise_exception_thunk);
     ssd_mod::update_service_handler(svc::NT_DISPATCH_EXCEPTION, nt_dispatch_exception_thunk);

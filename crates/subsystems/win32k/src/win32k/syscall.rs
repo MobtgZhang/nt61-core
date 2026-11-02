@@ -493,6 +493,8 @@ pub extern "C" fn nt_gdi_line_to(frame: &SyscallFrame) -> u64 {
         if let Some(dc) = crate::libs::win32k::dc::get_dc(hdc) {
             // Get current pen position (DC maintains a current position)
             // For now, just draw the line
+            let start_x = dc.cur_x;
+            let start_y = dc.cur_y;
             let pen_color = if dc.pen != 0 {
                 crate::libs::win32k::objects::gdi_get_pen_color(dc.pen)
             } else {
@@ -508,11 +510,19 @@ pub extern "C" fn nt_gdi_line_to(frame: &SyscallFrame) -> u64 {
 
             if !surface.is_null() {
                 // Simple line drawing - use Bresenham's algorithm
-                // For a proper implementation, we'd track the previous position
-                // and draw from there to (x, y)
                 let success =
-                    crate::libs::win32k::gdi_ops::draw_line(surface, 0, 0, x, y, pen_color);
+                    crate::libs::win32k::gdi_ops::draw_line(
+                        surface,
+                        start_x,
+                        start_y,
+                        x,
+                        y,
+                        pen_color,
+                    );
                 let _ = &success;
+                // Update the DC's current position to the line end.
+                dc.cur_x = x;
+                dc.cur_y = y;
                 return if success { 1 } else { 0 };
             }
         }
@@ -1679,19 +1689,19 @@ pub extern "C" fn nt_user_get_message(frame: &SyscallFrame) -> u64 {
             }
         }
         None => {
-            // No message available (would block in real implementation)
-            // Return -1 on error, 0 for WmQuit, 1 for success
-            // For now, return 1 to indicate we processed successfully (no message)
+            // No message available. In real NT6.1, GetMessage blocks until
+            // a message arrives. Since we do not yet have full scheduler
+            // integration, yield and return -1 (error) so the caller does
+            // not treat the empty queue as a successfully retrieved message.
             // kprintln!("[win32k] NT_USER_GET_MESSAGE: no message available");
-            1
+            u64::MAX // -1 (error) as a u64
         }
     }
 }
 
 /// NT_USER_PEEK_MESSAGE - Peek at message
 pub extern "C" fn nt_user_peek_message(frame: &SyscallFrame) -> u64 {
-    let msg = unsafe { get_arg0(frame) };
-    let _ = &msg;
+    let msg_ptr = unsafe { get_arg0(frame) };
     let hwnd = unsafe { get_arg1(frame) };
     let _ = &hwnd;
     let msg_filter_min = unsafe { get_arg2(frame) };
@@ -1703,8 +1713,29 @@ pub extern "C" fn nt_user_peek_message(frame: &SyscallFrame) -> u64 {
 
     // kprintln!("[win32k] NT_USER_PEEK_MESSAGE");
 
-    // PeekMessage: return 0 (no message available, which is PM_NOREMOVE = FALSE).
-    0
+    // PeekMessage: look for a message but do not block.
+    // `remove` (PM_REMOVE = 1) controls whether the message is removed
+    // from the queue. Returns nonzero if a message is available, 0 if none.
+    if msg_ptr == 0 {
+        return 0;
+    }
+
+    match crate::libs::win32k::message::with_current_queue(|queue| {
+        queue.peek_message(
+            hwnd,
+            msg_filter_min as u32,
+            msg_filter_max as u32,
+            remove != 0,
+        )
+    }) {
+        Some(msg) => {
+            if crate::mm::user_copy::write_user(msg_ptr, &msg).is_err() {
+                return 0;
+            }
+            1
+        }
+        None => 0,
+    }
 }
 
 /// NT_USER_POST_MESSAGE - Post message to queue

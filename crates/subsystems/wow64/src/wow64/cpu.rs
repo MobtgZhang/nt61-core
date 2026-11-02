@@ -440,12 +440,26 @@ pub fn emulate_far_call(
         return Err(CpuError::InvalidSegmentSelector);
     }
 
-    // Push return address (CS:EIP) onto stack
+    // Push old EIP first, then old CS.  The resulting stack layout is
+    // [ESP]=CS, [ESP+4]=EIP, matching an x86 far-call return frame.
     let esp = cpu_state.context32.esp;
-    cpu_state.context32.esp = esp.wrapping_sub(4);
-    // In real implementation, write CS to stack
-    cpu_state.context32.esp = cpu_state.context32.esp.wrapping_sub(4);
-    // In real implementation, write EIP to stack
+    if crate::mm::user_copy::write_user_object(
+        esp.wrapping_sub(4) as u64,
+        &cpu_state.context32.eip,
+    )
+    .is_err()
+    {
+        return Err(CpuError::ProtectionFault);
+    }
+    if crate::mm::user_copy::write_user_object(
+        esp.wrapping_sub(8) as u64,
+        &cpu_state.context32.cs,
+    )
+    .is_err()
+    {
+        return Err(CpuError::ProtectionFault);
+    }
+    cpu_state.context32.esp = esp.wrapping_sub(8);
 
     // Update CS and EIP
     cpu_state.context32.cs = target_cs as u32;
@@ -456,18 +470,28 @@ pub fn emulate_far_call(
 
 /// Emulate a far return (RET FAR).
 pub fn emulate_far_return(cpu_state: &mut Wow64CpuState) -> Result<(), CpuError> {
-    // Pop return address (EIP:CS) from stack
     let esp = cpu_state.context32.esp;
-    // In real implementation, read EIP from stack
-    let _new_eip = 0; // Placeholder
-    cpu_state.context32.esp = esp.wrapping_add(4);
-    // In real implementation, read CS from stack
-    let _new_cs = 0; // Placeholder
-    cpu_state.context32.esp = cpu_state.context32.esp.wrapping_add(4);
+    let mut new_eip = 0u32;
+    let mut new_cs = 0u32;
+    if crate::mm::user_copy::read_user_object::<u32>(esp as u64)
+        .map(|value| new_eip = value)
+        .is_err()
+    {
+        return Err(CpuError::ProtectionFault);
+    }
+    if crate::mm::user_copy::read_user_object::<u32>(esp.wrapping_add(4) as u64)
+        .map(|value| new_cs = value)
+        .is_err()
+    {
+        return Err(CpuError::ProtectionFault);
+    }
 
-    // Validate and update
-    // cpu_state.context32.cs = new_cs;
-    // cpu_state.context32.eip = new_eip;
+    if !is_valid_segment_selector(new_cs as u16, cpu_state.mode) {
+        return Err(CpuError::InvalidSegmentSelector);
+    }
+    cpu_state.context32.cs = new_cs;
+    cpu_state.context32.eip = new_eip;
+    cpu_state.context32.esp = esp.wrapping_add(8);
 
     Ok(())
 }

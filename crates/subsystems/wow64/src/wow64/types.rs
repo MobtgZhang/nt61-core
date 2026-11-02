@@ -408,7 +408,7 @@ pub struct Wow64ProcessInformation {
 /// WOW64_MEMORY_BASIC_INFORMATION32 - Memory region information in 32-bit terms.
 /// Used by Wow64QueryVirtualMemory.
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Wow64MemoryBasicInformation32 {
     /// Base address of region.
     pub base_address: ULONG32,

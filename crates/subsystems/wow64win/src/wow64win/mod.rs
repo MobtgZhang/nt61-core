@@ -241,8 +241,35 @@ pub unsafe extern "C" fn wow64_win32k_syscall(
     // 3. Call into win32k.sys
     // 4. Translate the return value back to 32-bit
 
-    // For stub, return 0 (success)
-    0
+    // Copy 32-bit parameters into the 64-bit syscall frame.
+    // Zero-extend each ULONG32 to u64 for the native call.
+    let param_count = entry.param_count as usize;
+    let mut args = [0u64; 12];
+    for i in 0..param_count.min(12) {
+        let param_ptr = unsafe { params.add(i) };
+        if param_ptr.is_null() {
+            return STATUS_INVALID_PARAMETER as ULONG32;
+        }
+        args[i] = unsafe { core::ptr::read_volatile(param_ptr) } as u64;
+    }
+
+    let frame = crate::arch::common::syscall_frame::SyscallFrame::from_args(args);
+
+    // Dispatch through the shadow SSDT (win32k service table).
+    // Win32k syscalls have high nibble 0x1 in the real NT6.1 layout.
+    let shadow_syscall_num = 0x1000u32 | (syscall_id & 0xFFF);
+    let result = crate::ke::shadow_ssdt::dispatch_shadow_service(
+        shadow_syscall_num,
+        &frame,
+    );
+
+    crate::wow64_klog!(
+        "Win32k syscall {} returned 0x{:x}",
+        syscall_id,
+        result
+    );
+
+    result as ULONG32
 }
 
 // =============================================================================
@@ -279,8 +306,17 @@ pub unsafe extern "C" fn wow64_win32k_callback_return(
     // 2. Switch to 32-bit stack
     // 3. Return control to 32-bit code
 
-    // For stub, halt
-    crate::arch::halt_loop()
+    // In this kernel, the callback return path is handled by the
+    // Wow64Context switch in the trap handler. We log and spin rather
+    // than halting the entire machine, which would kill the system.
+    crate::wow64_klog!(
+        "Win32k callback_return called (buffer=0x{:x} len={}); no 32-bit context available",
+        buffer as u64,
+        buffer_length
+    );
+    loop {
+        crate::arch::cpu_pause();
+    }
 }
 
 // =============================================================================

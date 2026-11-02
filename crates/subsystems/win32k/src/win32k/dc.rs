@@ -232,6 +232,9 @@ pub struct DcObject {
 
     // Mapping mode and transformations
     pub map_mode: i32,
+    // Current pen position (updated by MoveToEx, consumed by LineTo)
+    pub cur_x: i32,
+    pub cur_y: i32,
     pub viewport_ext: SizeL,
     pub window_ext: SizeL,
     pub viewport_org: PointL,
@@ -266,6 +269,8 @@ impl DcObject {
             text_color: 0x00000000, // Black
             bg_color: 0x00FFFFFF,   // White
             text_align: TA_LEFT | TA_TOP | TA_NOUPDATECP,
+            cur_x: 0,
+            cur_y: 0,
             bk_mode: OPAQUE,
             rop_mode: R2_COPYPEN,
             stretch_mode: 0,

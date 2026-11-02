@@ -297,6 +297,19 @@ fn get_handle_table() -> &'static mut GdiHandleTable {
     unsafe { &mut *inner }
 }
 
+/// Run a closure with the GDI handle table while holding the global spinlock.
+///
+/// This is the safe entry point for concurrent access: the lock is held
+/// for the duration of the closure, preventing simultaneous mutation.
+fn with_handle_table<R>(f: impl FnOnce(&mut GdiHandleTable) -> R) -> R {
+    let mut guard = GDI_HANDLE_TABLE.lock();
+    if guard.is_none() {
+        *guard = Some(GdiHandleTable::new());
+    }
+    let table = guard.as_mut().unwrap();
+    f(table)
+}
+
 // =============================================================================
 // GDI Object Structures
 // =============================================================================
