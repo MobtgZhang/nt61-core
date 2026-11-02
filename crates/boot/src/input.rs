@@ -62,7 +62,7 @@ impl InputEx {
         if status != uefi::Status::SUCCESS {
             return None;
         }
-        raw_key_to_key(key.unicode_char, key.scan_code)
+        raw_key_to_key(normalize_ex_key(key.unicode_char, key.scan_code))
     }
 
     fn wait_for_key_event(&self) -> Option<Event> {
@@ -72,7 +72,17 @@ impl InputEx {
     }
 }
 
-fn raw_key_to_key(unicode_char: uefi::Char16, scan_code: u16) -> Option<Key> {
+fn normalize_ex_key(unicode_char: uefi::Char16, scan_code: u16) -> (uefi::Char16, u16) {
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+    {
+        if let Ok(swapped_unicode) = uefi::Char16::try_from(scan_code) {
+            return (swapped_unicode, u16::from(unicode_char));
+        }
+    }
+    (unicode_char, scan_code)
+}
+
+fn raw_key_to_key((unicode_char, scan_code): (uefi::Char16, u16)) -> Option<Key> {
     if scan_code != 0 {
         return Some(Key::Special(ScanCode(scan_code)));
     }

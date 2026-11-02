@@ -7,7 +7,7 @@ extern crate alloc;
 static ALLOCATOR: ntoskrnl::mm::heap::KernelHeapAllocator = ntoskrnl::mm::heap::KernelHeapAllocator;
 
 pub const STATUS_SUCCESS: i32 = 0;
-pub const STATUS_INVALID_PARAMETER: i32 = -1;
+pub const STATUS_INVALID_PARAMETER: i32 = -1073741811;
 
 type InitFn = fn();
 type DispatchFn = unsafe extern "efiapi" fn(*mut u8, *mut u8) -> i32;

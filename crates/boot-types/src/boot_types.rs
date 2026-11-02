@@ -312,7 +312,7 @@ impl BootInfo {
     pub const VERSION: u64 = 8;
 
     pub fn is_valid(&self) -> bool {
-        self.magic == Self::MAGIC
+        self.magic == Self::MAGIC && self.version == Self::VERSION
     }
 
     /// Build a `BootInfo` with sane defaults for bring-up paths
@@ -328,7 +328,7 @@ impl BootInfo {
             memory_map: 0,
             memory_map_entries: 0,
             memory_map_size_bytes: 0,
-            memory_descriptor_size: 24,
+            memory_descriptor_size: 40,
             _reserved: 0,
             cmdline: 0,
             acpi_rsdp: 0,
@@ -380,7 +380,7 @@ impl BootInfo {
     /// loader-supplied context (e.g. `cargo test` harnesses).
     pub fn zeroed() -> Self {
         Self {
-            magic: Self::MAGIC,
+            magic: 0,
             version: 0,
             kernel_physical_base: 0,
             kernel_virtual_base: 0,

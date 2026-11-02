@@ -63,8 +63,12 @@ impl Framebuffer {
 
     /// Fast fill rectangle using memory copy
     pub fn fill_rect_fast(&mut self, x: u32, y: u32, w: u32, h: u32, color: Color) {
-        let x_end = (x + w).min(self.info.width);
-        let y_end = (y + h).min(self.info.height);
+        if x >= self.info.width || y >= self.info.height || w == 0 || h == 0 {
+            return;
+        }
+
+        let x_end = x.saturating_add(w).min(self.info.width);
+        let y_end = y.saturating_add(h).min(self.info.height);
         let actual_w = x_end - x;
 
         if actual_w == 0 || y_end <= y {

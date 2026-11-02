@@ -117,6 +117,7 @@ pub enum HiveError {
     TooSmall,
     BadMagic,
     BadVersion,
+    BadChecksum,
     OutOfBounds,
     Truncated,
 }
@@ -154,11 +155,16 @@ fn read_u16(data: &[u8], off: usize) -> Option<u16> {
 
 /// Compute header checksum: xor of dwords [0, 0x1FC) (127 dwords)
 fn compute_header_checksum(data: &[u8]) -> u32 {
-    let mut sum = 0u32;
-    for i in (0..0x1FC).step_by(4) {
-        sum ^= read_u32(data, i).unwrap_or(0);
+    let mut sum = 0u64;
+    for offset in (0x20..0x3FC).step_by(4) {
+        if offset == 0x1FC {
+            continue;
+        }
+        sum = sum.wrapping_add(u64::from(u32::from_le_bytes(
+            data[offset..offset + 4].try_into().unwrap_or_default(),
+        )));
     }
-    sum
+    ((sum >> 32).wrapping_add(sum & 0xFFFF_FFFF)) as u32
 }
 
 /// Decode a registry value name. Short names (<=64 bytes) are ASCII encoded,
@@ -280,12 +286,10 @@ impl<'a> Hive<'a> {
             return Err(HiveError::BadVersion);
         }
 
-        // Check checksum (optional - some hives may have invalid checksum)
         let stored_csum = read_u32(data, 0x1FC).ok_or(HiveError::TooSmall)?;
         let computed_csum = compute_header_checksum(data);
         if stored_csum != computed_csum {
-            // Don't fail on checksum mismatch - some BCD files may have this
-            // Return Ok but continue
+            return Err(HiveError::BadChecksum);
         }
 
         // Root offset is HBIN-relative (relative to 0x1000)

@@ -228,8 +228,8 @@ pub fn read_section_headers(data: &[u8], opt: &PeHeaderInfo) -> Vec<SectionHeade
             ]),
         };
 
-        // Skip zero-size sections
-        if section.size_of_raw_data > 0 && section.pointer_to_raw_data > 0 {
+        // Preserve BSS-only sections so callers can zero them.
+        if section.virtual_size > 0 {
             sections.push(section);
         }
     }

@@ -158,6 +158,11 @@ enum PartitionType {
     /// partition's first sector (0 for a partition-level handle, the
     /// GPT-supplied start LBA for a disk-level handle).
     Ntfs { partition_start_lba: u64 },
+    /// ReFS — VBR OEM ID `ReFS    ` at the partition's boot sector. The
+    /// simplified in-tree builder uses the Microsoft basic-data GPT GUID
+    /// (same as NTFS), so the probe distinguishes them by reading the
+    /// partition's first sector.
+    Refs { partition_start_lba: u64 },
     /// EXT4 — superblock magic `0xEF53` or a GPT entry with the Linux
     /// filesystem GUID. `partition_start_lba` has the same semantics as
     /// the NTFS case.
@@ -1634,6 +1639,11 @@ fn probe_partition_type(handle: uefi::Handle) -> PartitionType {
                     partition_start_lba: 0,
                 };
             }
+            if &first[3..11] == b"ReFS    " {
+                return PartitionType::Refs {
+                    partition_start_lba: 0,
+                };
+            }
         }
         if has_sfs_protocol(handle) {
             return PartitionType::Fat;
@@ -1700,13 +1710,9 @@ fn probe_partition_type(handle: uefi::Handle) -> PartitionType {
     // way the dispatcher invokes the matching reader directly,
     // without spending time on the FAT entry (which the SFS
     // loop already failed on).
-    let fat_guid = [
-        0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0x4B, 0xBA, 0x00, 0xA0, 0xC9, 0x3E, 0xC9,
-        0x3B,
-    ];
-    let ntfs_guid = [
-        0xA0, 0x88, 0x2D, 0x83, 0xEB, 0xD1, 0xCD, 0x41, 0xB7, 0x96, 0x21, 0xE3, 0x66, 0x65, 0xFF,
-        0xCC,
+    let basic_data_guid = [
+        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99,
+        0xC7,
     ];
     let ext4_guid = [
         0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D,
@@ -1730,12 +1736,15 @@ fn probe_partition_type(handle: uefi::Handle) -> PartitionType {
             entries_buf[entry_off + 38],
             entries_buf[entry_off + 39],
         ]);
-        if g == fat_guid {
+        if g == [
+            0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0x4B, 0xBA, 0x00, 0xA0, 0xC9, 0x3E,
+            0xC9, 0x3B,
+        ] {
             continue;
         }
-        if g == ntfs_guid && prefer_ntfs.is_none() {
+        if g == basic_data_guid && prefer_ntfs.is_none() {
             prefer_ntfs = Some(start_lba);
-            debug_println!("[PT]   disk GPT: NTFS partition at LBA {}", start_lba);
+            debug_println!("[PT]   disk GPT: basic-data partition at LBA {}", start_lba);
         }
         if g == ext4_guid && prefer_ext4.is_none() {
             prefer_ext4 = Some(start_lba);
@@ -1748,8 +1757,23 @@ fn probe_partition_type(handle: uefi::Handle) -> PartitionType {
         };
     }
     if prefer_ntfs.is_some() {
+        // Both NTFS and ReFS use the Microsoft basic-data GPT GUID.
+        // Read the partition's boot sector to distinguish them.
+        let start_lba = prefer_ntfs.unwrap();
+        let mut vbr = [0u8; 512];
+        if block_ref.read_blocks(media_id, start_lba, &mut vbr).is_ok() {
+            if &vbr[3..11] == b"ReFS    " {
+                return PartitionType::Refs {
+                    partition_start_lba: start_lba,
+                };
+            }
+            // FAT32 VBR carries "FAT32   " at offset 82 (BS_FilSysType32).
+            if &vbr[82..90] == b"FAT32   " {
+                return PartitionType::Fat;
+            }
+        }
         return PartitionType::Ntfs {
-            partition_start_lba: prefer_ntfs.unwrap(),
+            partition_start_lba: start_lba,
         };
     }
     PartitionType::Unknown
@@ -2133,12 +2157,108 @@ fn probe_system_partition_present() -> bool {
     for handle in handles.iter() {
         if matches!(
             probe_partition_type(*handle),
-            PartitionType::Ntfs { .. } | PartitionType::Ext4 { .. } | PartitionType::Fat
+            PartitionType::Ntfs { .. } | PartitionType::Refs { .. } | PartitionType::Ext4 { .. }
+                | PartitionType::Fat
         ) {
             return true;
         }
     }
     false
+}
+
+/// Read a file from a ReFS System partition using the simplified
+/// self-describing layout produced by the in-tree builder. The directory
+/// index lives at byte 0x2000 (LBA 16) and consists of fixed-size entries:
+/// 256-byte null-padded path + u64 start LBA + u64 byte length, terminated
+/// by a zero-length path.
+fn read_refs_boot_file_for(
+    rel_path: &str,
+    block_io: &uefi::proto::media::block::BlockIO,
+    partition_start_lba: u64,
+) -> Option<Vec<u8>> {
+    let media = block_io.media();
+    let media_id = media.media_id();
+
+    // Read the directory index: LBA 16 .. LBA 24 (8 sectors, 4 KiB)
+    let mut index = [0u8; 4096];
+    if block_io
+        .read_blocks(media_id, partition_start_lba + 16, &mut index)
+        .is_err()
+    {
+        debug_println!("[REFS] failed to read directory index at LBA {}", partition_start_lba + 16);
+        return None;
+    }
+
+    // Normalise the requested path (strip leading '/' and 'C:' prefix)
+    let path = rel_path
+        .trim_start_matches('/')
+        .trim_start_matches(|c| c == 'C' || c == 'c')
+        .trim_start_matches(':')
+        .trim_start_matches('/')
+        .trim_start_matches('\\')
+        .replace('\\', "/");
+
+    const ENTRY_SIZE: usize = 256 + 16;
+    let mut offset = 0usize;
+    while offset + ENTRY_SIZE <= index.len() {
+        let path_field = &index[offset..offset + 256];
+        let null_pos = path_field.iter().position(|&b| b == 0).unwrap_or(256);
+        let entry_path = core::str::from_utf8(&path_field[..null_pos]).unwrap_or("");
+        if entry_path.is_empty() {
+            break;
+        }
+
+        let start_lba = u64::from_le_bytes(
+            index[offset + 256..offset + 256 + 8]
+                .try_into()
+                .unwrap_or([0u8; 8]),
+        );
+        let file_len = u64::from_le_bytes(
+            index[offset + 264..offset + 264 + 8]
+                .try_into()
+                .unwrap_or([0u8; 8]),
+        );
+
+        // Case-insensitive comparison (NT-style)
+        if entry_path.eq_ignore_ascii_case(&path) {
+            debug_println!(
+                "[REFS] found {} at LBA {} ({} bytes)",
+                entry_path,
+                start_lba,
+                file_len
+            );
+
+            // Read the file data from `start_lba`
+            let mut data = alloc::vec![0u8; file_len as usize];
+            let mut sector_off = 0u64;
+            const CHUNK_SECTORS: u64 = 128; // 64 KiB per read
+            let total_sectors = file_len.div_ceil(512);
+            while sector_off < total_sectors {
+                let count = CHUNK_SECTORS.min(total_sectors - sector_off);
+                let chunk_end =
+                    ((sector_off + count) as usize * 512).min(data.len());
+                let chunk_start = sector_off as usize * 512;
+                let chunk = &mut data[chunk_start..chunk_end];
+                if block_io
+                    .read_blocks(
+                        media_id,
+                        partition_start_lba + start_lba + sector_off,
+                        chunk,
+                    )
+                    .is_err()
+                {
+                    debug_println!("[REFS] read failed at sector offset {}", sector_off);
+                    return None;
+                }
+                sector_off += count;
+            }
+            return Some(data);
+        }
+        offset += ENTRY_SIZE;
+    }
+
+    debug_println!("[REFS] {} not found in directory index", rel_path);
+    None
 }
 
 fn read_system_partition_file(rel_path: &str) -> Option<Vec<u8>> {
@@ -2180,6 +2300,36 @@ fn read_system_partition_file(rel_path: &str) -> Option<Vec<u8>> {
                     continue;
                 }
                 let r = read_ntfs_boot_file_for(rel_path, block_ref, partition_start_lba);
+                core::mem::forget(block);
+                if r.is_some() {
+                    return r;
+                }
+            }
+            PartitionType::Refs {
+                partition_start_lba,
+            } => {
+                let sp = unsafe {
+                    boot::open_protocol::<BlockIO>(
+                        OpenProtocolParams {
+                            handle: *handle,
+                            agent: boot::image_handle(),
+                            controller: None,
+                        },
+                        OpenProtocolAttributes::GetProtocol,
+                    )
+                };
+                let Ok(block) = sp else { continue };
+                let block = ManuallyDrop::new(block);
+                let Some(block_ref) = block.get() else {
+                    core::mem::forget(block);
+                    continue;
+                };
+                let media = block_ref.media();
+                if media.block_size() != 512 {
+                    core::mem::forget(block);
+                    continue;
+                }
+                let r = read_refs_boot_file_for(rel_path, block_ref, partition_start_lba);
                 core::mem::forget(block);
                 if r.is_some() {
                     return r;
@@ -3016,17 +3166,20 @@ fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
     // breaks every time the surrounding code shifts the `WINL>` prologue
     // — `efi_main_vma` was already computed above from the parsed PE.
 
-    // Allocate 4 MiB of stack space for winload.efi. The loader and
+    // Allocate 16 MiB of stack space for winload.efi. The loader and
     // kernel driver bring-up use recursive-looking allocations and
     // verbose diagnostics; 64 KiB is insufficient and overflows before
     // virtio queue setup completes.
     let stack_base = ub2::allocate_pages(
         ub2::AllocateType::AnyPages,
-        ub2::MemoryType::BOOT_SERVICES_DATA,
-        1024, // 4 MiB
+        ub2::MemoryType::LOADER_DATA,
+        4096, // 16 MiB
     )
     .map_err(|_e| -> &'static str { "allocate winload stack" })?;
     let stack_top = stack_base.as_ptr() as u64 + 16 * 1024 * 1024;
+    // Reserve one 16-byte slot below the nominal top so the first
+    // push cannot overwrite the halt stub written immediately below.
+    let stack_top = stack_top - 16;
 
     // Write a tiny halt stub at (stack_top - 16). If efi_main ever
     // returns (it shouldn't, since it's `-> !`), control goes here
@@ -3395,6 +3548,14 @@ fn read_mft_record(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
         return None;
     }
 
+    if !apply_mft_update_sequence_fixups(&mut buf) {
+        debug_println!(
+            "[NTFS] read_mft_record({}): invalid update-sequence array",
+            record_num
+        );
+        return None;
+    }
+
     // Print first 16 bytes of MFT record for debugging
     let sig = &buf[0..4];
     debug_println!(
@@ -3450,6 +3611,7 @@ fn read_mft_record(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
                 ih_flags
             );
         }
+
         off += alen as usize;
         if off > n {
             break;
@@ -3457,6 +3619,46 @@ fn read_mft_record(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
     }
 
     Some(buf)
+}
+
+/// Repair the protected bytes in an MFT record using its update-sequence
+/// array. NTFS stores the original two bytes for every sector end in this
+/// array, then replaces those bytes with a sequence number on disk.
+fn apply_mft_update_sequence_fixups(record: &mut [u8]) -> bool {
+    if record.len() < 512 || &record[0..4] != b"FILE" {
+        return false;
+    }
+    let usa_offset = u16::from_le_bytes([record[0x2A], record[0x2B]]) as usize;
+    let usa_count = u16::from_le_bytes([record[0x2C], record[0x2D]]) as usize;
+    if usa_offset < 0x30 || usa_count < 2 {
+        return false;
+    }
+    let fixups_end = usa_offset + usa_count * 2;
+    if fixups_end > record.len() {
+        return false;
+    }
+
+    let mut fixups = alloc::vec![0u8; (usa_count - 1) * 2];
+    fixups.copy_from_slice(&record[usa_offset + 2..fixups_end]);
+    let sequence_number = u16::from_le_bytes([record[usa_offset], record[usa_offset + 1]]);
+
+    for (fixup_index, original) in fixups.chunks_exact(2).enumerate() {
+        let protected_offset = ((fixup_index + 1) * 512) - 2;
+        if protected_offset + 2 > record.len() {
+            return false;
+        }
+        let stored = record[protected_offset..protected_offset + 2]
+            .try_into()
+            .map(u16::from_le_bytes)
+            .unwrap_or(0);
+        let expected = sequence_number.wrapping_add(fixup_index as u16);
+        if stored != expected {
+            return false;
+        }
+        record[protected_offset..protected_offset + 2].copy_from_slice(original);
+    }
+
+    true
 }
 
 /// Decode a UTF-16LE filename attribute (0x30) into a Rust `String`.
@@ -3630,24 +3832,11 @@ fn find_child_in_index(ntfs: &NtfsBoot, parent_record: u64, name: &str) -> Optio
             // AND stay within both the index-block boundary (end_p) and the
             // record boundary (end).
             while p + 16 <= end_p && p + 16 <= end {
-                // ALWAYS print loop top so we can see whether the loop runs.
-                debug_println!(
-                    "[NTFS] LOOP: p=0x{:x} p+16=0x{:x} end_p=0x{:x} end=0x{:x}",
-                    p,
-                    p + 16,
-                    end_p,
-                    end
-                );
                 // Read entry_len at offset +0x08 (u16 LE).
                 if p + 10 > end {
                     break;
                 }
                 let entry_len = u16::from_le_bytes([record[p + 8], record[p + 9]]) as usize;
-                debug_println!(
-                    "[NTFS]   entry_len raw at p+8: 0x{:02x}{:02x}",
-                    record[p + 9],
-                    record[p + 8]
-                );
                 if entry_len == 0 {
                     break;
                 }
@@ -3909,7 +4098,7 @@ fn read_data_stream(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
                     record[off + 0x36],
                     record[off + 0x37],
                 ]);
-                let alloc_size = u64::from_le_bytes([
+                let _alloc_size = u64::from_le_bytes([
                     record[off + 0x28],
                     record[off + 0x29],
                     record[off + 0x2A],
@@ -3942,7 +4131,15 @@ fn read_data_stream(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
                 // run list entirely and returned an all-zero image.
                 let run_off = u16::from_le_bytes([record[off + 0x20], record[off + 0x21]]) as usize;
                 let mut p = off + run_off;
-                let mut out: Vec<u8> = alloc::vec![0u8; alloc_size as usize];
+                const MAX_BOOT_STREAM_BYTES: u64 = 256 * 1024 * 1024;
+                if real_size > MAX_BOOT_STREAM_BYTES {
+                    debug_println!(
+                        "[NTFS-RUN] stream too large: real_size={}",
+                        real_size
+                    );
+                    return None;
+                }
+                let mut out: Vec<u8> = alloc::vec![0u8; real_size as usize];
                 let mut prev_lcn: i64 = 0;
                 let mut out_cursor: usize = 0;
                 while p < off + attr_len {
@@ -3977,8 +4174,17 @@ fn read_data_stream(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
                     let disk_lba = ntfs.partition_start_lba + partition_rel_lba;
                     let byte_count = run_clusters * sector_size;
                     let cluster_count = run_clusters as u32;
-                    debug_println!("[NTFS-RUN] run_clusters={} lcn_delta={} lcn={} disk_lba={} byte_count={} cluster_count={}",
-                        run_clusters, lcn_delta, lcn, disk_lba, byte_count, cluster_count);
+                    if DEBUG_NTFS {
+                        debug_println!(
+                            "[NTFS-RUN] run_clusters={} lcn_delta={} lcn={} disk_lba={} byte_count={} cluster_count={}",
+                            run_clusters,
+                            lcn_delta,
+                            lcn,
+                            disk_lba,
+                            byte_count,
+                            cluster_count
+                        );
+                    }
                     // Use the persistent BlockIO protocol from ntfs.block_io_ptr
                     // instead of opening a new one each time. This avoids
                     // close_protocol panics.
@@ -3993,48 +4199,39 @@ fn read_data_stream(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
                     // zeros — that is why winload's `.rdata`/`.data`/...
                     // sections were zero in RAM even though the on-disk
                     // bytes were valid.
-                    let alloc_size_usize =
-                        core::cmp::min(byte_count as usize, out.len() - out_cursor);
-                    let mut data = alloc::vec![0u8; alloc_size_usize];
-                    // write a marker so we can detect whether read_blocks
-                    // actually wrote anything to the buffer.
-                    for i in 0..alloc_size_usize {
-                        data[i] = 0xfe;
+                    if out_cursor >= out.len() {
+                        break;
                     }
-                    let mut copy_len: usize = 0;
+                    let remaining = out.len() - out_cursor;
+                    if lcn == 0 {
+                        out_cursor += byte_count.min(remaining as u64) as usize;
+                        continue;
+                    }
+                    let alloc_size_usize = core::cmp::min(byte_count as usize, remaining);
+                    let mut data = alloc::vec![0u8; alloc_size_usize];
                     if block
                         .read_blocks(media.media_id(), disk_lba, &mut data)
-                        .is_ok()
+                        .is_err()
                     {
-                        copy_len = data.len().min(out.len() - out_cursor);
-                        // Verify read_blocks actually wrote real data
-                        // (not 0xfe placeholder).
-                        let mut non_fe_count = 0;
-                        for i in 0..alloc_size_usize.min(4096) {
-                            if data[i] != 0xfe {
-                                non_fe_count += 1;
-                            }
-                        }
-                        debug_println!("[NTFS-RUN]   first 4096 bytes: {} non-placeholder (verify={:02x} {:02x} {:02x} {:02x})",
-                            non_fe_count, data[0], data[1], data[2], data[3]);
-                        out[out_cursor..out_cursor + copy_len].copy_from_slice(&data[..copy_len]);
                         debug_println!(
-                            "[NTFS-RUN]   copied {} bytes to out_cursor={}",
-                            copy_len,
-                            out_cursor
+                            "[NTFS-RUN]   read_blocks FAILED for disk_lba={}",
+                            disk_lba
                         );
-                    } else {
-                        debug_println!("[NTFS-RUN]   read_blocks FAILED for disk_lba={}", disk_lba);
+                        return None;
                     }
+                    let copy_len = data.len();
+                    out[out_cursor..out_cursor + copy_len].copy_from_slice(&data);
                     out_cursor += copy_len;
-                    // SAFETY: do NOT advance by byte_count here, because
-                    // the *last* run of the file is usually shorter than
-                    // a full run (`byte_count` rounds up to sector_size).
-                    // The next run-list entry will simply not exist; the
-                    // caller truncates to `real_size` afterwards.
                 }
                 // Trim to real_size so the caller sees the exact file length.
-                out.truncate(real_size as usize);
+                if out_cursor != real_size as usize {
+                    debug_println!(
+                        "[NTFS-RUN] incomplete stream: cursor={} real_size={}",
+                        out_cursor,
+                        real_size
+                    );
+                    return None;
+                }
                 return Some(out);
             }
         }

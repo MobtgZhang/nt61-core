@@ -13,6 +13,7 @@ const SYSTEM_TYPE_GUID: [u8; 16] = [
 
 #[derive(Debug, Clone, Copy)]
 struct Fat32Geometry {
+    sector_size: u32,
     sectors_per_cluster: u32,
     reserved_sectors: u32,
     fat_count: u32,
@@ -25,6 +26,36 @@ pub trait SectorReader {
 }
 
 pub fn find_fat32_system_partition(reader: &dyn SectorReader) -> Option<u64> {
+    if let Some(lba) = find_gpt_fat32_partition(reader) {
+        return Some(lba);
+    }
+    find_mbr_fat32_partition(reader)
+}
+
+fn find_mbr_fat32_partition(reader: &dyn SectorReader) -> Option<u64> {
+    let mbr = reader.read_sectors(0, 1)?;
+    let signature = mbr.get(mbr.len().checked_sub(2)?..mbr.len())?;
+    if mbr.len() < SECTOR_SIZE || signature != [0x55, 0xAA] {
+        return None;
+    }
+
+    for index in 0..4 {
+        let entry = mbr.get((0x1BE + index * 16)..(0x1CE + index * 16))?;
+        let kind = entry[4];
+        if matches!(kind, 0x06 | 0x0B | 0x0C | 0x0E) {
+            let first_lba = u32::from_le_bytes(entry[8..12].try_into().ok()?) as u64;
+            let boot_sector = reader.read_sectors(first_lba, 1)?;
+            if boot_sector.len() >= SECTOR_SIZE
+                && boot_sector.get(82..90) == Some(b"FAT32   ")
+            {
+                return Some(first_lba);
+            }
+        }
+    }
+    None
+}
+
+fn find_gpt_fat32_partition(reader: &dyn SectorReader) -> Option<u64> {
     let gpt_header = reader.read_sectors(1, 1)?;
     if gpt_header.get(0..8)? != b"EFI PART" {
         return None;
@@ -36,24 +67,42 @@ pub fn find_fat32_system_partition(reader: &dyn SectorReader) -> Option<u64> {
         return None;
     }
 
-    let entries_per_sector = SECTOR_SIZE / entry_size;
+    let entries_per_sector = gpt_header.len() / entry_size;
+    let entries_per_sector = if entries_per_sector == 0 {
+        1
+    } else {
+        entries_per_sector
+    };
     let entry_sectors = (entry_count as usize + entries_per_sector - 1) / entries_per_sector;
     if entries_per_sector == 0 || entry_sectors == 0 {
         return None;
     }
     let entries = reader.read_sectors(entry_lba, entry_sectors as u32)?;
     for index in 0..entry_count as usize {
-        let entry = entries.get(index * entry_size..(index + 1) * entry_size)?;
-        if entry.get(0..16)? != SYSTEM_TYPE_GUID {
+        let Some(entry) = entries.get(index * entry_size..(index + 1) * entry_size) else {
+            continue;
+        };
+        let Some(type_guid) = entry.get(0..16) else {
+            continue;
+        };
+        if type_guid != SYSTEM_TYPE_GUID {
             continue;
         }
-        let first_lba = u64::from_le_bytes(entry.get(32..40)?.try_into().ok()?);
-        let last_lba = u64::from_le_bytes(entry.get(40..48)?.try_into().ok()?);
+        let Some(first_lba_bytes) = entry.get(32..40) else {
+            continue;
+        };
+        let Some(last_lba_bytes) = entry.get(40..48) else {
+            continue;
+        };
+        let first_lba = u64::from_le_bytes(first_lba_bytes.try_into().ok()?);
+        let last_lba = u64::from_le_bytes(last_lba_bytes.try_into().ok()?);
         if last_lba <= first_lba {
             continue;
         }
         let boot_sector = reader.read_sectors(first_lba, 1)?;
-        if boot_sector.len() < SECTOR_SIZE || &boot_sector[82..90] != b"FAT32   " {
+        if boot_sector.len() < SECTOR_SIZE
+            || boot_sector.get(82..90) != Some(b"FAT32   ")
+        {
             continue;
         }
         return Some(first_lba);
@@ -70,7 +119,9 @@ fn parse_geometry(boot_sector: &[u8]) -> Option<Fat32Geometry> {
         return None;
     }
     let bytes_per_sector = u16::from_le_bytes(boot_sector[11..13].try_into().ok()?);
-    if bytes_per_sector != SECTOR_SIZE as u16 {
+    if !matches!(bytes_per_sector, 512 | 1024 | 2048 | 4096)
+        || bytes_per_sector != boot_sector.len() as u16
+    {
         return None;
     }
     let sectors_per_cluster = boot_sector[13] as u32;
@@ -85,6 +136,7 @@ fn parse_geometry(boot_sector: &[u8]) -> Option<Fat32Geometry> {
         return None;
     }
     Some(Fat32Geometry {
+        sector_size: bytes_per_sector as u32,
         sectors_per_cluster,
         reserved_sectors,
         fat_count,
@@ -124,11 +176,7 @@ fn normalize_path(path: &str) -> Option<Vec<String>> {
             components.push(String::from_utf8(bytes).ok()?);
         }
     }
-    if components.is_empty() {
-        None
-    } else {
-        Some(components)
-    }
+    Some(components)
 }
 
 fn data_start(geometry: &Fat32Geometry) -> u32 {
@@ -161,14 +209,22 @@ fn next_cluster(
     geometry: &Fat32Geometry,
     cluster: u32,
 ) -> Option<u32> {
-    let fat_lba = partition_start_lba + geometry.reserved_sectors as u64;
     let fat_offset = cluster as usize * 4;
-    let sector = fat_offset / SECTOR_SIZE;
-    let byte = fat_offset % SECTOR_SIZE;
-    let fat = reader.read_sectors(fat_lba + sector as u64, 1)?;
-    Some(u32::from_le_bytes(
-        fat.get(byte..byte + 4)?.try_into().ok()?,
-    ))
+    let sector_size = geometry.sector_size as usize;
+    let sector = fat_offset / sector_size;
+    let byte = fat_offset % sector_size;
+    for fat_index in 0..geometry.fat_count {
+        let fat_lba = partition_start_lba + geometry.reserved_sectors as u64
+            + u64::from(fat_index) * u64::from(geometry.fat_sectors);
+        let Some(fat) = reader.read_sectors(fat_lba + sector as u64, 1) else {
+            continue;
+        };
+        let Some(bytes) = fat.get(byte..byte + 4) else {
+            continue;
+        };
+        return Some(u32::from_le_bytes(bytes.try_into().ok()?));
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -186,7 +242,7 @@ fn read_directory_chain(
     first_cluster: u32,
 ) -> Option<Vec<DirectoryEntry>> {
     let mut entries = Vec::new();
-    let mut lfn_parts: Vec<(u8, Vec<u16>)> = Vec::new();
+    let mut lfn_parts: Vec<(u8, u8, Vec<u16>)> = Vec::new();
     let mut cluster = first_cluster;
     for _ in 0..0x10000 {
         let sector_data = read_cluster(reader, partition_start_lba, geometry, cluster)?;
@@ -194,11 +250,15 @@ fn read_directory_chain(
             if entry_bytes[0] == 0 {
                 return Some(entries);
             }
-            if entry_bytes[0] == 0xE5 || entry_bytes[11] == 0x0F {
-                if entry_bytes[11] == 0x0F {
-                    if let Some(lfn) = parse_lfn(entry_bytes.try_into().ok()?) {
-                        lfn_parts.push(lfn);
-                    }
+            if entry_bytes[0] == 0xE5 {
+                lfn_parts.clear();
+                continue;
+            }
+            if entry_bytes[11] == 0x0F {
+                if let Some(lfn) = parse_lfn(entry_bytes.try_into().ok()?) {
+                    lfn_parts.push(lfn);
+                } else {
+                    lfn_parts.clear();
                 }
                 continue;
             }
@@ -208,12 +268,18 @@ fn read_directory_chain(
             let low = u16::from_le_bytes(entry_bytes[26..28].try_into().ok()?);
             let cluster = (u32::from(high) << 16) | u32::from(low);
             let size = u32::from_le_bytes(entry_bytes[28..32].try_into().ok()?);
+            let sfn_checksum = lfn_checksum(raw_name);
+            let lfn_parts = lfn_parts
+                .iter()
+                .filter(|(_, checksum, _)| *checksum == sfn_checksum)
+                .cloned()
+                .collect::<Vec<_>>();
             let mut name = if lfn_parts.is_empty() {
                 decode_sfn(raw_name)?
             } else {
-                decode_lfn(&mut lfn_parts)?
+                decode_lfn(&mut lfn_parts.clone())?
             };
-            while name.ends_with(' ') || name.ends_with('.') {
+            while name.ends_with(' ') {
                 name.pop();
             }
             entries.push(DirectoryEntry {
@@ -231,7 +297,7 @@ fn read_directory_chain(
     Some(entries)
 }
 
-fn parse_lfn(entry: &[u8; 32]) -> Option<(u8, Vec<u16>)> {
+fn parse_lfn(entry: &[u8; 32]) -> Option<(u8, u8, Vec<u16>)> {
     let sequence = entry[0] & 0x1F;
     if sequence == 0 || sequence > 20 {
         return None;
@@ -249,13 +315,13 @@ fn parse_lfn(entry: &[u8; 32]) -> Option<(u8, Vec<u16>)> {
         let value = u16::from_le_bytes([entry[offset], entry[offset + 1]]);
         chars.push(value);
     }
-    Some((sequence, chars))
+    Some((sequence, entry[13], chars))
 }
 
-fn decode_lfn(parts: &mut Vec<(u8, Vec<u16>)>) -> Option<String> {
-    parts.sort_by_key(|(sequence, _)| *sequence);
+fn decode_lfn(parts: &mut Vec<(u8, u8, Vec<u16>)>) -> Option<String> {
+    parts.sort_by_key(|&(sequence, _, _)| sequence);
     let mut chars = Vec::new();
-    for (_, part) in parts.drain(..) {
+    for (_, _, part) in parts.drain(..) {
         chars.extend(part);
     }
     let mut name = String::new();
@@ -263,9 +329,17 @@ fn decode_lfn(parts: &mut Vec<(u8, Vec<u16>)>) -> Option<String> {
         if value == 0 || value == 0xFFFF {
             break;
         }
-        name.push(char::from_u32(u32::from(value))?);
+        name.push(char::from_u32(u32::from(value)).unwrap_or(char::REPLACEMENT_CHARACTER));
     }
     Some(name)
+}
+
+fn lfn_checksum(raw_name: &[u8]) -> u8 {
+    let mut checksum: u8 = 0;
+    for byte in raw_name.iter().take(11) {
+        checksum = checksum.wrapping_mul(2).wrapping_add(*byte);
+    }
+    checksum
 }
 
 fn decode_sfn(raw: &[u8]) -> Option<String> {
@@ -325,7 +399,15 @@ fn read_file_data(
     if entry.is_directory {
         return None;
     }
-    let cluster_size = geometry.sectors_per_cluster as usize * SECTOR_SIZE;
+    if entry.size == 0 {
+        return Some(Vec::new());
+    }
+    const MAX_BOOT_FILE_BYTES: usize = 256 * 1024 * 1024;
+    if entry.size as usize > MAX_BOOT_FILE_BYTES {
+        return None;
+    }
+    let cluster_size =
+        geometry.sectors_per_cluster as usize * geometry.sector_size as usize;
     let mut output = Vec::with_capacity(entry.size as usize);
     let mut remaining = entry.size as usize;
     let mut cluster = entry.cluster;

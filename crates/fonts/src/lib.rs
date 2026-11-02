@@ -91,9 +91,9 @@ impl FontFace {
     pub fn line_metrics(&self, pixel_size: u32) -> Option<FontLineMetrics> {
         let metrics = self.font.horizontal_line_metrics(pixel_size as f32)?;
         Some(FontLineMetrics {
-            ascent: (metrics.ascent + 0.5) as i32,
-            descent: (metrics.descent - 0.5) as i32,
-            line_gap: (metrics.line_gap + 0.5) as i32,
+            ascent: round_away_from_zero(metrics.ascent),
+            descent: round_away_from_zero(metrics.descent),
+            line_gap: round_away_from_zero(metrics.line_gap),
             line_height: (metrics.new_line_size + 0.5).max(1.0) as u32,
         })
     }
@@ -118,6 +118,14 @@ impl FontFace {
 
 /// The geometry optimization size requested by `fontdue`.
 const DEFAULT_OPTIMIZATION_SIZE: f32 = 16.0;
+
+fn round_away_from_zero(value: f32) -> i32 {
+    if value >= 0.0 {
+        (value + 0.5) as i32
+    } else {
+        (value - 0.5) as i32
+    }
+}
 
 #[cfg(test)]
 mod tests {

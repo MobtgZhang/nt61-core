@@ -57,6 +57,7 @@ impl From<HiveError> for BcdError {
             HiveError::Truncated => BcdError::Truncated,
             HiveError::OutOfBounds => BcdError::MissingObject,
             HiveError::BadVersion => BcdError::InvalidVersion,
+            HiveError::BadChecksum => BcdError::InvalidSignature,
         }
     }
 }
