@@ -788,11 +788,20 @@ pub mod obj {
 /// `RTL_CRITICAL_SECTION_DEBUG` - Debug info for critical sections.
 #[repr(C)]
 pub struct RtlCriticalSectionDebug {
-    pub debug_info: *mut RtlCriticalSectionDebug,
-    pub reference_count: i32,
+    pub r#type: u16,
+    pub creator_back_trace_index: u16,
+    pub critical_section: *mut RtlCriticalSection,
+    pub process_table: u32,
     pub entry_count: u32,
-    pub flags: u32,
+    pub contention_count: u32,
+    pub creator_back_trace_index_high: u16,
+    pub spare: u16,
 }
+
+const _: () = assert!(
+    core::mem::size_of::<RtlCriticalSectionDebug>() == 32,
+    "RTL_CRITICAL_SECTION_DEBUG must be 32 bytes on x64"
+);
 
 /// `RTL_CRITICAL_SECTION` - Critical section for thread synchronization.
 /// Size must be 40 bytes on x64 (Windows 7 compatible).

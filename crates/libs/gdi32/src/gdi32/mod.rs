@@ -212,16 +212,10 @@ pub fn has_gdi_handle(h: u64) -> bool {
 /// handle value the caller should hand out. The new
 /// entry occupies the next free slot.
 pub fn register_object(obj: GdiObject) -> u64 {
-    let mut t = GDI_OBJECTS.lock();
-    let h = GDI_HANDLE_BASE + t.len() as u64;
-    t.push(h);
-
     let mut table = GDI_OBJECT_TABLE.lock();
-    // Ensure the inner table is at least `len()` long.
-    while table.len() < t.len() {
-        table.push(None);
-    }
+    let h = GDI_HANDLE_BASE + table.len() as u64;
     table.push(Some(obj));
+    GDI_OBJECTS.lock().push(h);
     h
 }
 

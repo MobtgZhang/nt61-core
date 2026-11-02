@@ -430,7 +430,7 @@ pub fn test_critical_section() -> bool {
             recursion_count: 0,
             owning_thread: 0,
             magic: 0,
-            spin: crate::ke::sync::Spinlock::new(()),
+            spin_count: 4000,
         };
         initialize_critical_section(&mut cs);
         enter_critical_section(&mut cs);
@@ -481,16 +481,25 @@ pub fn test_format_message() -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn smoke_test() -> bool {
-    // crate::kprintln!("  [K32 SMOKE]   running kernel32 smoke test (stubbed - aggregate)...");
-    // The detailed kernel32 tests are stubbed for now since
-    // they exercise user-mode APIs that aren't fully wired
-    // up. We just verify the basic test runs to completion.
     let mut all_ok = true;
     all_ok &= test_get_set_last_error();
-    if all_ok {
-        // crate::kprintln!("  [K32 SMOKE]   all {} checks passed", TEST_COUNTER.load(Ordering::Relaxed));
-    } else {
-        // crate::kprintln!("  [K32 SMOKE FAIL] one or more checks failed");
-    }
+    all_ok &= test_time();
+    all_ok &= test_directories();
+    all_ok &= test_module_self();
+    all_ok &= test_load_getproc_free();
+    all_ok &= test_virtual_alloc_free();
+    all_ok &= test_heap_round_trip();
+    all_ok &= test_event();
+    all_ok &= test_mutex();
+    all_ok &= test_semaphore();
+    all_ok &= test_wait();
+    all_ok &= test_thread();
+    all_ok &= test_create_process();
+    all_ok &= test_get_current_process();
+    all_ok &= test_file_io();
+    all_ok &= test_console();
+    all_ok &= test_critical_section();
+    all_ok &= test_env_var();
+    all_ok &= test_format_message();
     all_ok
 }

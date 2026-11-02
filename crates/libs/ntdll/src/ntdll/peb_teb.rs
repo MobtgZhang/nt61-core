@@ -14,6 +14,33 @@
 //! References: MSDN Library "Windows 7" — PEB and TEB.
 
 use super::types::{HANDLE, PVOID};
+use crate::ke::sync::Spinlock;
+use alloc::vec::Vec;
+
+const SEM_FAILCRITICALERRORS: u32 = 0x0000_0001;
+const SEM_NOGPFAULTERRORBOX: u32 = 0x0000_0002;
+const SEM_NOALIGNMENTFAULTEXCEPT: u32 = 0x0000_0004;
+const SEM_NOOPENFILEERRORBOX: u32 = 0x0000_8000;
+const VALID_THREAD_ERROR_MODE: u32 = SEM_FAILCRITICALERRORS
+    | SEM_NOGPFAULTERRORBOX
+    | SEM_NOALIGNMENTFAULTEXCEPT
+    | SEM_NOOPENFILEERRORBOX;
+
+struct ThreadErrorMode {
+    thread_id: u64,
+    mode: u32,
+}
+
+static THREAD_ERROR_MODES: Spinlock<Vec<ThreadErrorMode>> = Spinlock::new(Vec::new());
+
+fn current_thread_id() -> u64 {
+    let thread = crate::ps::thread::get_current_ethread();
+    if thread.is_null() {
+        0
+    } else {
+        unsafe { (*thread).client_id.unique_thread as u64 }
+    }
+}
 
 /// `PEB` (Process environment Block), 64-bit Windows 7 layout.
 #[repr(C)]
@@ -122,16 +149,46 @@ pub unsafe extern "C" fn rtl_get_current_peb() -> *mut peb {
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// `rtl_get_thread_error_mode` / `rtl_set_thread_error_mode` — return 0
-/// (default error mode).
+/// `rtl_get_thread_error_mode` returns the calling thread's error mode.
 pub unsafe extern "C" fn rtl_get_thread_error_mode() -> u32 {
-    0
+    let thread_id = current_thread_id();
+    let modes = THREAD_ERROR_MODES.lock();
+    modes
+        .iter()
+        .find(|entry| entry.thread_id == thread_id)
+        .map(|entry| entry.mode)
+        .unwrap_or(0)
 }
 /// # Safety
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// Caller must ensure `old_mode`, when non-null, points to writable memory.
 pub unsafe extern "C" fn rtl_set_thread_error_mode(_mode: u32, _old_mode: *mut u32) -> i32 {
-    0
+    if _mode & !VALID_THREAD_ERROR_MODE != 0 {
+        return super::status::STATUS_INVALID_PARAMETER;
+    }
+
+    let thread_id = current_thread_id();
+    let mut modes = THREAD_ERROR_MODES.lock();
+    if !_old_mode.is_null() {
+        *_old_mode = modes
+            .iter()
+            .find(|entry| entry.thread_id == thread_id)
+            .map(|entry| entry.mode)
+            .unwrap_or(0);
+    }
+
+    if let Some(entry) = modes
+        .iter_mut()
+        .find(|entry| entry.thread_id == thread_id)
+    {
+        entry.mode = _mode;
+    } else {
+        modes.push(ThreadErrorMode {
+            thread_id,
+            mode: _mode,
+        });
+    }
+    super::status::STATUS_SUCCESS
 }
 
 /// # Safety

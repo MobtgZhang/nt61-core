@@ -11,11 +11,10 @@
 
 use super::error::set_last_error;
 use super::types::{BOOL, DWORD, FALSE, HANDLE, LPCWSTR, TRUE};
-use crate::ke::sync::Spinlock;
 use crate::libs::ntdll::status::{STATUS_INVALID_HANDLE, STATUS_SUCCESS};
 use crate::libs::ntdll::sync as ntdll_sync;
 use core::ptr;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // ---------------------------------------------------------------------------
 // Events
@@ -222,7 +221,7 @@ pub struct CriticalSection {
     pub recursion_count: u32,
     pub owning_thread: u32,
     pub magic: u32,
-    pub spin: Spinlock<()>,
+    pub spin_count: u32,
 }
 
 /// # Safety
@@ -237,7 +236,7 @@ pub unsafe extern "C" fn initialize_critical_section(cs: *mut CriticalSection) {
     (*cs).recursion_count = 0;
     (*cs).owning_thread = 0;
     (*cs).magic = CRITICAL_SECTION_MAGIC;
-    (*cs).spin = Spinlock::new(());
+    (*cs).spin_count = 4000;
 }
 
 /// # Safety
@@ -248,9 +247,46 @@ pub unsafe extern "C" fn enter_critical_section(cs: *mut CriticalSection) {
     if cs.is_null() {
         return;
     }
-    let _g = (*cs).spin.lock();
-    (*cs).recursion_count += 1;
-    (*cs).owning_thread = 1;
+    let thread_id = current_thread_id();
+    let spin_count = (*cs).spin_count.max(4000);
+    let mut spins = 0;
+    loop {
+        match (*cs).lock.load(Ordering::Acquire) {
+            0 => {
+                if (*cs)
+                    .lock
+                    .compare_exchange_weak(0, thread_id, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    (*cs).recursion_count = 1;
+                    (*cs).owning_thread = thread_id;
+                    return;
+                }
+            }
+            owner if owner == thread_id => {
+                (*cs).recursion_count += 1;
+                return;
+            }
+            _ => {
+                if spins >= spin_count {
+                    loop {
+                        if (*cs)
+                            .lock
+                            .compare_exchange_weak(0, thread_id, Ordering::Acquire, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            (*cs).recursion_count = 1;
+                            (*cs).owning_thread = thread_id;
+                            return;
+                        }
+                        core::hint::spin_loop();
+                    }
+                }
+                core::hint::spin_loop();
+                spins = spins.saturating_add(1);
+            }
+        }
+    }
 }
 
 /// # Safety
@@ -261,11 +297,14 @@ pub unsafe extern "C" fn leave_critical_section(cs: *mut CriticalSection) {
     if cs.is_null() {
         return;
     }
-    if (*cs).recursion_count > 0 {
-        (*cs).recursion_count -= 1;
+    let thread_id = current_thread_id();
+    if (*cs).owning_thread != thread_id || (*cs).recursion_count == 0 {
+        return;
     }
+    (*cs).recursion_count -= 1;
     if (*cs).recursion_count == 0 {
         (*cs).owning_thread = 0;
+        (*cs).lock.store(0, Ordering::Release);
     }
 }
 
@@ -280,15 +319,24 @@ pub unsafe extern "C" fn delete_critical_section(cs: *mut CriticalSection) {
     (*cs).magic = 0;
 }
 
+fn current_thread_id() -> u32 {
+    let thread = crate::arch::common::percpu::get_current_thread();
+    if thread.is_null() {
+        return 0;
+    }
+    unsafe { (*thread).client_id.unique_thread as u32 }
+}
+
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `initialize_critical_section_and_spin_count` / `set_critical_section_spin_count`.
 pub unsafe extern "C" fn initialize_critical_section_and_spin_count(
     cs: *mut CriticalSection,
-    _spins: DWORD,
+    spins: DWORD,
 ) -> BOOL {
     initialize_critical_section(cs);
+    (*cs).spin_count = spins & 0xFFFFFFFF;
     TRUE
 }
 
@@ -296,8 +344,13 @@ pub unsafe extern "C" fn initialize_critical_section_and_spin_count(
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 pub unsafe extern "C" fn set_critical_section_spin_count(
-    _cs: *mut CriticalSection,
-    _spins: DWORD,
+    cs: *mut CriticalSection,
+    spins: DWORD,
 ) -> DWORD {
-    0
+    if cs.is_null() {
+        return 0;
+    }
+    let old = (*cs).spin_count;
+    (*cs).spin_count = spins & 0xFFFFFFFF;
+    old
 }

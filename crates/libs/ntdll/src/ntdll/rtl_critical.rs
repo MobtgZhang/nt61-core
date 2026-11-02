@@ -8,10 +8,12 @@
 //! References: MSDN Library "Windows 7" — RTL_CRITICAL_SECTION.
 
 use super::status::{STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
-use super::sync::{nt_create_event, nt_set_event, nt_wait_for_single_object_kernel};
+use super::sync::{nt_create_event, nt_reset_event, nt_set_event};
 use super::types::{ObjectAttributes, RtlCriticalSection, HANDLE, NTSTATUS};
 use core::ptr;
 use core::sync::atomic::{AtomicI32, Ordering};
+
+const CRITICAL_SECTION_DEFAULT_SPIN_COUNT: u32 = 4000;
 
 /// # Safety
 ///
@@ -23,12 +25,24 @@ pub unsafe extern "C" fn rtl_initialize_critical_section(
         return STATUS_INVALID_PARAMETER;
     }
     let cs = &mut *critical_section;
-    cs.debug_info = ptr::null_mut();
+    let debug = crate::mm::pool::allocate(
+        crate::mm::pool::PoolType::NonPaged,
+        core::mem::size_of::<super::types::RtlCriticalSectionDebug>(),
+    );
+    if debug.is_null() {
+        return super::status::STATUS_NO_MEMORY;
+    }
+    let debug = debug as *mut super::types::RtlCriticalSectionDebug;
+    ptr::write_bytes(debug, 0, 1);
+    (*debug).r#type = 0;
+    (*debug).critical_section = critical_section;
+
+    cs.debug_info = debug;
     cs.lock_count = -1;
     cs.recursion_count = 0;
     cs.owning_thread = ptr::null_mut();
     cs.lock_semaphore = ptr::null_mut();
-    cs.spin_count = 0;
+    cs.spin_count = CRITICAL_SECTION_DEFAULT_SPIN_COUNT as usize;
     STATUS_SUCCESS
 }
 
@@ -57,34 +71,68 @@ pub unsafe extern "C" fn rtl_enter_critical_section(
     }
     let cs = &mut *critical_section;
     let current_thread = get_current_thread_handle();
-
-    let lock_ptr = &cs.lock_count as *const i32 as *mut AtomicI32;
-    let old_count = (*lock_ptr).fetch_add(1, Ordering::Acquire);
-
-    if old_count == -1 {
-        cs.owning_thread = current_thread;
-        cs.recursion_count = 1;
-        return STATUS_SUCCESS;
-    }
-
     if cs.owning_thread == current_thread {
         cs.recursion_count += 1;
+        let lock_ptr = &cs.lock_count as *const i32 as *mut AtomicI32;
+        (*lock_ptr).fetch_add(1, Ordering::Acquire);
         return STATUS_SUCCESS;
     }
 
-    if cs.lock_semaphore.is_null() {
-        let mut oa = ObjectAttributes::new();
-        let mut event: HANDLE = ptr::null_mut();
-        nt_create_event(&mut event, 0, &mut oa, 1, 0);
-        cs.lock_semaphore = event;
-    }
+    let lock_ptr = &cs.lock_count as *const i32 as *mut AtomicI32;
+    let spin_count = cs.spin_count.max(CRITICAL_SECTION_DEFAULT_SPIN_COUNT as usize);
+    let mut spins = 0usize;
 
-    if !cs.lock_semaphore.is_null() {
-        nt_wait_for_single_object_kernel(cs.lock_semaphore, 0, None);
-    }
+    loop {
+        if (*lock_ptr)
+            .compare_exchange(-1, 0, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            cs.owning_thread = current_thread;
+            cs.recursion_count = 1;
+            break;
+        }
 
-    cs.owning_thread = current_thread;
-    cs.recursion_count = 1;
+        if (*lock_ptr).load(Ordering::Acquire) == -1 {
+            continue;
+        }
+
+        if spins >= spin_count {
+            if !cs.debug_info.is_null() {
+                let debug = cs.debug_info;
+                unsafe { (*debug).contention_count = (*debug).contention_count.wrapping_add(1) };
+            }
+            if cs.lock_semaphore.is_null() {
+                let mut oa = ObjectAttributes::new();
+                let mut event: HANDLE = ptr::null_mut();
+                if nt_create_event(&mut event, 0, &mut oa, 1, 0) == super::status::STATUS_SUCCESS {
+                    cs.lock_semaphore = event;
+                }
+            }
+            if !cs.lock_semaphore.is_null() {
+                nt_reset_event(cs.lock_semaphore, ptr::null_mut());
+            }
+            // NT critical sections block in the kernel when the spin
+            // budget is exhausted. The current runtime has no blocking
+            // user-mode scheduler primitive, so keep waiting while the
+            // event remains unsignaled. Releasing the section signals
+            // the event, and ownership is only taken under the atomic
+            // count, preserving exclusion.
+            loop {
+                if (*lock_ptr)
+                    .compare_exchange(-1, 0, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    cs.owning_thread = current_thread;
+                    cs.recursion_count = 1;
+                    return STATUS_SUCCESS;
+                }
+                core::hint::spin_loop();
+            }
+        }
+
+        core::hint::spin_loop();
+        spins = spins.saturating_add(1);
+    }
     STATUS_SUCCESS
 }
 
@@ -100,7 +148,7 @@ pub unsafe extern "C" fn rtl_try_enter_critical_section(
     let cs = &mut *critical_section;
     let current_thread = get_current_thread_handle();
 
-    if cs.owning_thread == current_thread {
+    if !cs.owning_thread.is_null() && cs.owning_thread == current_thread {
         let lock_ptr = &cs.lock_count as *const i32 as *mut AtomicI32;
         (*lock_ptr).fetch_add(1, Ordering::Acquire);
         cs.recursion_count += 1;
@@ -130,6 +178,10 @@ pub unsafe extern "C" fn rtl_leave_critical_section(
         return STATUS_INVALID_PARAMETER;
     }
     let cs = &mut *critical_section;
+    let current_thread = get_current_thread_handle();
+    if cs.owning_thread != current_thread || cs.recursion_count <= 0 {
+        return super::status::STATUS_INVALID_PARAMETER;
+    }
 
     cs.recursion_count -= 1;
     if cs.recursion_count > 0 {
@@ -138,7 +190,6 @@ pub unsafe extern "C" fn rtl_leave_critical_section(
         return STATUS_SUCCESS;
     }
 
-    cs.owning_thread = ptr::null_mut();
     let lock_ptr = &cs.lock_count as *const i32 as *mut AtomicI32;
     let old_count = (*lock_ptr).fetch_sub(1, Ordering::Release);
 
@@ -146,6 +197,9 @@ pub unsafe extern "C" fn rtl_leave_critical_section(
         nt_set_event(cs.lock_semaphore, ptr::null_mut());
     }
 
+    if cs.recursion_count == 0 {
+        cs.owning_thread = ptr::null_mut();
+    }
     STATUS_SUCCESS
 }
 
@@ -161,13 +215,18 @@ pub unsafe extern "C" fn rtl_delete_critical_section(
     let cs = &mut *critical_section;
 
     if !cs.lock_semaphore.is_null() {
+        super::file::nt_close(cs.lock_semaphore);
         cs.lock_semaphore = ptr::null_mut();
     }
 
     cs.lock_count = -1;
     cs.recursion_count = 0;
     cs.owning_thread = ptr::null_mut();
-    cs.debug_info = ptr::null_mut();
+    if !cs.debug_info.is_null() {
+        let debug = cs.debug_info;
+        cs.debug_info = ptr::null_mut();
+        crate::mm::pool::free(debug as *mut u8);
+    }
     STATUS_SUCCESS
 }
 
@@ -192,6 +251,6 @@ fn get_current_thread_handle() -> HANDLE {
     if ethread.is_null() {
         ptr::null_mut()
     } else {
-        unsafe { (*ethread).client_id.unique_thread as HANDLE }
+        ethread.cast::<core::ffi::c_void>()
     }
 }

@@ -19,19 +19,33 @@ use crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
 use crate::mm::user_copy::{copy_from_user, copy_to_user, read_user_object, write_user_object};
 
 /// Thread context structure for nt_get_context_thread/nt_set_context_thread
-#[repr(C)]
-#[derive(Default)]
+#[repr(C, align(16))]
+#[derive(Default, Clone, Copy)]
 pub struct Context {
+    pub p1_home: u64,
+    pub p2_home: u64,
+    pub p3_home: u64,
+    pub p4_home: u64,
+    pub p5_home: u64,
+    pub p6_home: u64,
     /// Context flags - determines which registers are valid
     pub context_flags: u32,
     /// Segment registers
     pub mx_csr: u32,
-    pub cs: u16,
-    pub gs: u16,
-    pub fs: u16,
-    pub es: u16,
-    pub ds: u16,
+    pub seg_cs: u16,
+    pub seg_ds: u16,
+    pub seg_es: u16,
+    pub seg_fs: u16,
+    pub seg_gs: u16,
+    pub seg_ss: u16,
+    pub eflags: u32,
     /// Integer registers
+    pub dr0: u64,
+    pub dr1: u64,
+    pub dr2: u64,
+    pub dr3: u64,
+    pub dr6: u64,
+    pub dr7: u64,
     pub rdi: u64,
     pub rsi: u64,
     pub rdx: u64,
@@ -50,33 +64,70 @@ pub struct Context {
     /// control registers
     pub rsp: u64,
     pub rip: u64,
-    /// Debug registers
-    pub dr0: u64,
-    pub dr1: u64,
-    pub dr2: u64,
-    pub dr3: u64,
-    pub dr6: u64,
-    pub dr7: u64,
-    /// Floating point
-    pub float_save: [u64; 8], // Simplified
-    /// XMM registers
-    pub xmm0: [u64; 2],
-    pub xmm1: [u64; 2],
-    pub xmm2: [u64; 2],
-    pub xmm3: [u64; 2],
-    pub xmm4: [u64; 2],
-    pub xmm5: [u64; 2],
-    pub xmm6: [u64; 2],
-    pub xmm7: [u64; 2],
-    pub xmm8: [u64; 2],
-    pub xmm9: [u64; 2],
-    pub xmm10: [u64; 2],
-    pub xmm11: [u64; 2],
-    pub xmm12: [u64; 2],
-    pub xmm13: [u64; 2],
-    pub xmm14: [u64; 2],
-    pub xmm15: [u64; 2],
+    pub float_save: XSaveFormat,
+    pub vector_register: [M128A; 26],
+    pub vector_control: u64,
+    pub debug_control: u64,
+    pub last_branch_to_rip: u64,
+    pub last_branch_from_rip: u64,
+    pub last_exception_to_rip: u64,
+    pub last_exception_from_rip: u64,
 }
+
+/// A 128-bit AVX/SSE register value.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct M128A {
+    pub low: u64,
+    pub high: u64,
+}
+
+/// x64 `XSAVE_FORMAT` / `XMM_SAVE_AREA32` used by `CONTEXT`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct XSaveFormat {
+    pub control_word: u16,
+    pub status_word: u16,
+    pub tag_word: u8,
+    pub reserved1: u8,
+    pub error_opcode: u16,
+    pub error_offset: u32,
+    pub error_selector: u16,
+    pub reserved2: u16,
+    pub data_offset: u32,
+    pub data_selector: u16,
+    pub reserved3: u16,
+    pub mx_csr: u32,
+    pub mx_csr_mask: u32,
+    pub float_registers: [M128A; 8],
+    pub xmm_registers: [M128A; 16],
+    pub reserved4: [u8; 96],
+}
+
+impl Default for XSaveFormat {
+    fn default() -> Self {
+        Self {
+            control_word: 0,
+            status_word: 0,
+            tag_word: 0,
+            reserved1: 0,
+            error_opcode: 0,
+            error_offset: 0,
+            error_selector: 0,
+            reserved2: 0,
+            data_offset: 0,
+            data_selector: 0,
+            reserved3: 0,
+            mx_csr: 0,
+            mx_csr_mask: 0,
+            float_registers: [M128A::default(); 8],
+            xmm_registers: [M128A::default(); 16],
+            reserved4: [0; 96],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<Context>() == 0x4d0);
 
 // Context flags for CONTEXT structure
 pub const CONTEXT_INTEGER: u32 = 0x00010001;
