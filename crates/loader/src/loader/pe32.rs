@@ -418,10 +418,13 @@ pub fn parse_pe32(data: &[u8]) -> Option<PE32HeaderInfo> {
 
     let num_sections = file_header.number_of_sections;
     let opt_header_size = file_header.size_of_optional_header as usize;
+    if opt_header_size < 0x60 {
+        return None;
+    }
 
     // Parse optional header
     let oh_offset = fh_offset + core::mem::size_of::<FileHeader>();
-    if oh_offset + opt_header_size > data.len() {
+    if oh_offset + core::mem::size_of::<crate::loader::OptionalHeader32>() > data.len() {
         return None;
     }
 
@@ -504,12 +507,12 @@ impl PE32HeaderInfo {
     /// Convert an RVA to a file offset.
     pub fn rva_to_file_offset(&self, rva: u32) -> Option<u32> {
         for section in &self.section_headers {
-            if rva >= section.virtual_address
-                && rva
-                    < section.virtual_address + section.virtual_size.max(section.size_of_raw_data)
-            {
+            let section_end = section.virtual_address.checked_add(
+                section.virtual_size.max(section.size_of_raw_data),
+            )?;
+            if rva >= section.virtual_address && rva < section_end {
                 let offset_in_section = rva - section.virtual_address;
-                return Some(section.pointer_to_raw_data + offset_in_section);
+                return section.pointer_to_raw_data.checked_add(offset_in_section);
             }
         }
         None
@@ -831,7 +834,8 @@ pub fn apply_relocations(image: &mut LoadedImage32, delta: i32) {
         }
 
         let entry_count = (block_size as usize - 8) / 2;
-        for index in 0..entry_count {
+        let mut index = 0;
+        while index < entry_count {
             let entry_offset = offset + 8 + index * 2;
             let entry = match read_u16(&image.image_data, entry_offset) {
                 Some(value) => value,
@@ -871,24 +875,26 @@ pub fn apply_relocations(image: &mut LoadedImage32, delta: i32) {
                     };
                     if let Some(bytes) = image.slice_for_rva_mut(rva, 2) {
                         let value = u16::from_le_bytes([bytes[0], bytes[1]]);
-                        let mut high_delta = (delta as u32) >> 16;
-                        let low_delta = (delta as u32) & 0xFFFF;
-                        let next_low_after_delta =
-                            u32::from(next_low).checked_add(low_delta).unwrap_or(0);
-                        if next_low_after_delta > 0xFFFF {
-                            high_delta = high_delta.wrapping_add(1);
-                        }
-                        let adjusted = (value as i32 + high_delta as i32) as u16;
+                        let adjusted = apply_highadj(value, next_low, delta);
                         bytes.copy_from_slice(&adjusted.to_le_bytes());
                     }
+                    index += 1;
                 }
                 _ => {}
             }
+            index += 1;
         }
 
         offset += block_size as usize;
         block_offset += block_size as usize;
     }
+}
+
+fn apply_highadj(current: u16, next_low: u16, delta: i32) -> u16 {
+    let combined = ((current as i64) << 16)
+        .wrapping_add(i16::from_le_bytes(next_low.to_le_bytes()) as i64)
+        .wrapping_add(delta as i64);
+    (combined >> 16) as u16
 }
 
 // =============================================================================

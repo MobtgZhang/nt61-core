@@ -116,7 +116,7 @@ impl FileHeader {
             0xAA64 => Some(MachineType::ARM64),
             0x0200 => Some(MachineType::IA64),
             0x6264 => Some(MachineType::LOONGARCH64),
-            0xE42C => Some(MachineType::RISCV64),
+            0x5064 => Some(MachineType::RISCV64),
             _ => None,
         }
     }
@@ -245,11 +245,11 @@ pub struct ImportLookupEntry64 {
 
 impl ImportLookupEntry64 {
     pub fn is_name(&self) -> bool {
-        (self.value & 0x8000000000000000) != 0
+        (self.value & 0x8000000000000000) == 0
     }
 
     pub fn is_ordinal(&self) -> bool {
-        (self.value & 0x8000000000000000) == 0
+        (self.value & 0x8000000000000000) != 0
     }
 
     pub fn name_rva(&self) -> u32 {
@@ -1026,7 +1026,7 @@ fn apply_base_relocations(loaded: &mut LoadedImage, raw: &[u8], delta: i64) -> u
     applied
 }
 
-fn apply_highadj(current: u16, next: u16, delta: i64) -> u16 {
+pub(crate) fn apply_highadj(current: u16, next: u16, delta: i64) -> u16 {
     let combined = ((current as i64) << 16)
         .wrapping_add(i16::from_le_bytes(next.to_le_bytes()) as i64)
         .wrapping_add(delta);
@@ -1318,7 +1318,11 @@ fn parse_exports(image: &LoadedImage, raw_pe: &[u8]) -> Vec<DbEntry> {
         Some(p) => p,
         None => return Vec::new(),
     };
-    let (export_rva, _export_size) = read_data_directory_pe32plus(raw_pe, opt_off, 0);
+    let (export_rva, _export_size) = if _magic == 0x10B {
+        read_data_directory_pe32(raw_pe, opt_off, 0)
+    } else {
+        read_data_directory_pe32plus(raw_pe, opt_off, 0)
+    };
     if export_rva == 0 {
         return Vec::new();
     }
@@ -2218,6 +2222,7 @@ fn load_raw_image_into_user_address_space(
         }
         let r = ntoskrnl::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, final_flags);
         if r != ntoskrnl::mm::vas::MmStatus::Ok {
+            ntoskrnl::arch::restore_system_address_space(saved_cr3);
             for &pa in &phys_pages {
                 ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }

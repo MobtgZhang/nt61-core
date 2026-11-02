@@ -75,7 +75,7 @@ pub fn validate_checksum(data: &[u8]) -> bool {
         return false;
     }
 
-    let checksum_offset = pe_offset + 0x58 + 24; // +24 for file header size
+    let checksum_offset = pe_offset + 4 + 20 + 0x40;
     if checksum_offset + 4 > data.len() {
         return false;
     }
@@ -87,32 +87,33 @@ pub fn validate_checksum(data: &[u8]) -> bool {
         data[checksum_offset + 3],
     ]);
 
+    let stored_checksum_raw = stored_checksum;
+    if stored_checksum_raw == 0 {
+        return true;
+    }
+    let stored_checksum = stored_checksum_raw;
     let mut checksum: u64 = 0;
     let mut i = 0;
-
-    while i + 4 <= data.len() {
-        if i == checksum_offset {
-            i += 4;
-            continue;
-        }
-
-        let dword = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]) as u64;
-
-        checksum = checksum.wrapping_add(dword);
-        checksum = (checksum & 0xFFFFFFFF) + (checksum >> 32);
-        i += 4;
+    while i + 2 <= data.len() {
+        let word = if i == checksum_offset {
+            0u32
+        } else if i + 2 == checksum_offset {
+            0u32
+        } else {
+            u32::from(data[i]) | (u32::from(data[i + 1]) << 8)
+        };
+        checksum = checksum.wrapping_add(word as u64);
+        checksum = (checksum & 0xFFFF) + (checksum >> 16);
+        i += 2;
     }
 
-    while i < data.len() {
+    if i < data.len() {
         checksum = checksum.wrapping_add(data[i] as u64);
-        i += 1;
+        checksum = (checksum & 0xFFFF) + (checksum >> 16);
     }
 
     checksum = (checksum & 0xFFFF) + (checksum >> 16);
-    checksum = checksum.wrapping_add(checksum >> 16);
-    checksum &= 0xFFFF;
-
-    let calculated_checksum = (checksum.wrapping_add(data.len() as u64)) as u32;
+    let calculated_checksum = checksum.wrapping_add(data.len() as u64) as u32;
 
     calculated_checksum == stored_checksum
 }
@@ -149,11 +150,12 @@ pub fn is_valid_address_range(base: u64, size: u64) -> bool {
 
 pub fn rva_to_file_offset(rva: u32, sections: &[crate::loader::SectionHeader]) -> Option<u32> {
     for section in sections {
-        if rva >= section.virtual_address
-            && rva < section.virtual_address + section.virtual_size.max(section.size_of_raw_data)
-        {
+        let section_end = section
+            .virtual_address
+            .checked_add(section.virtual_size.max(section.size_of_raw_data))?;
+        if rva >= section.virtual_address && rva < section_end {
             let offset_in_section = rva - section.virtual_address;
-            return Some(section.pointer_to_raw_data + offset_in_section);
+            return section.pointer_to_raw_data.checked_add(offset_in_section);
         }
     }
     None
