@@ -133,7 +133,12 @@ impl Default for Nic {
 static mut NICS: [Option<Nic>; 4] = [const { None }; 4];
 static mut NIC_COUNT: usize = 0;
 
-/// Get a reference to the global e1000 NIC list
+/// Get a reference to the global e1000 NIC list.
+///
+/// SAFETY: The array is only mutated during `init()` (single-threaded boot).
+/// After init, callers must lock the individual NIC's per-NIC spinlock
+/// before mutating any NIC state. Reads of `nics[i]` by index are safe
+/// because the NIC is present (or None) for the lifetime of the driver.
 fn get_nics() -> &'static mut [Option<Nic>; 4] {
     unsafe { &mut *core::ptr::addr_of_mut!(NICS) }
 }
@@ -378,11 +383,17 @@ pub fn send(nic_idx: usize, data: &[u8]) -> bool {
         // Get next TX descriptor
         let desc_idx = n.tx_next as usize % 32;
 
-        // Wait for descriptor to be free
+        // Wait for the controller to consume the descriptor. Reusing a
+        // live descriptor corrupts the TX ring, so bail out if it does
+        // not complete promptly.
         for _ in 0..100 {
             if (*n.tx_desc.add(desc_idx)).status & TSTA_DD as u8 != 0 {
                 break;
             }
+            core::hint::spin_loop();
+        }
+        if (*n.tx_desc.add(desc_idx)).status & TSTA_DD as u8 == 0 {
+            return false;
         }
 
         // Copy data to TX buffer
@@ -395,10 +406,14 @@ pub fn send(nic_idx: usize, data: &[u8]) -> bool {
 
         // Setup TX descriptor
         let phys = virt_to_phys(buf as u64).unwrap_or(0);
-        (*n.tx_desc.add(desc_idx)).buffer_addr = phys;
-        (*n.tx_desc.add(desc_idx)).length = copy_len as u16;
-        (*n.tx_desc.add(desc_idx)).cmd = (TCMD_EOP | TCMD_IFCS | TCMD_RS) as u8;
-        (*n.tx_desc.add(desc_idx)).status = 0;
+        let desc = &mut *n.tx_desc.add(desc_idx);
+        desc.buffer_addr = phys;
+        desc.length = copy_len as u16;
+        desc.cmd = (TCMD_EOP | TCMD_IFCS | TCMD_RS) as u8;
+        desc.status = 0;
+        core::sync::atomic::compiler_fence(
+            core::sync::atomic::Ordering::Release,
+        );
 
         // Advance TX tail pointer
         n.tx_next = (n.tx_next + 1) % 32;

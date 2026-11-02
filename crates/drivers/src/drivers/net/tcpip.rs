@@ -569,6 +569,7 @@ pub fn tdi_connect(
     conn.tcp_socket_id = Some(tcp_socket_id);
     conn.remote_address = Some(*remote_address);
     conn.state = TdiConnectionState::Connecting;
+    drop(conn_objects);
 
     TCPIP_STATS
         .tcp_connections_established
@@ -583,16 +584,31 @@ pub fn tdi_connect(
         core::hint::spin_loop();
         let socket_state = crate::netstack::tcp::socket_state(tcp_socket_id);
         if socket_state == crate::netstack::tcp::TcpState::Established {
-            conn.state = TdiConnectionState::Connected;
             break;
         }
         let elapsed = crate::hal::common::pit::get_system_time_ms() - start;
         if elapsed >= CONNECT_TIMEOUT_MS {
+            let mut conn_objects = TDI_CONNECTION_OBJECTS.lock();
+            let Some(conn) = conn_objects
+                .iter_mut()
+                .find(|obj| obj.id == conn_id && obj.valid)
+            else {
+                return Ok(());
+            };
             conn.state = TdiConnectionState::Disconnected;
             return Err(-6); // Connection failed
         }
     }
 
+    let mut conn_objects = TDI_CONNECTION_OBJECTS.lock();
+    let Some(conn) = conn_objects
+        .iter_mut()
+        .find(|obj| obj.id == conn_id && obj.valid)
+    else {
+        return Ok(());
+    };
+    conn.state = TdiConnectionState::Connected;
+    conn.state = TdiConnectionState::Connected;
     Ok(())
 }
 
@@ -1228,10 +1244,11 @@ unsafe fn handle_tdi_send(irp: *mut Irp, stack: *mut IoStackLocation) -> u32 {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 unsafe fn handle_tdi_receive(irp: *mut Irp, stack: *mut IoStackLocation) -> u32 {
     let input_buffer = (*stack).parameters.device_io_control.type3_input_buffer as *const u8;
+    let input_length = (*stack).parameters.device_io_control.input_buffer_length as usize;
     let output_buffer = (*irp).user_buffer as *mut u8;
     let output_length = (*stack).parameters.device_io_control.output_buffer_length as usize;
 
-    if input_buffer.is_null() || output_buffer.is_null() || output_length == 0 {
+    if input_buffer.is_null() || input_length < 8 || output_buffer.is_null() || output_length == 0 {
         return 0xC000000D;
     }
 
@@ -1329,24 +1346,38 @@ unsafe fn handle_tdi_receive_datagram(irp: *mut Irp, stack: *mut IoStackLocation
 
     match tdi_receive_datagram(addr_id, data_buffer, &mut remote_address) {
         Ok(bytes_received) => {
+            // TDI_ADDRESS_IP layout (14 bytes):
+            //   offset 0..2  sin_family  (AF_INET = 2, native byte order)
+            //   offset 2..4  sin_port    (network byte order)
+            //   offset 4..8  in_addr     (network byte order)
+            //   offset 8..14 sin_zero    (must be zeroed)
+            let af_inet: u16 = 2;
             output_buffer
                 .offset(0)
-                .write(((remote_address.sin_port >> 8) & 0xFF) as u8);
+                .write((af_inet & 0xFF) as u8);
             output_buffer
                 .offset(1)
-                .write((remote_address.sin_port & 0xFF) as u8);
+                .write((af_inet >> 8) as u8);
             output_buffer
                 .offset(2)
-                .write(((remote_address.in_addr >> 24) & 0xFF) as u8);
+                .write(((remote_address.sin_port >> 8) & 0xFF) as u8);
             output_buffer
                 .offset(3)
-                .write(((remote_address.in_addr >> 16) & 0xFF) as u8);
+                .write((remote_address.sin_port & 0xFF) as u8);
             output_buffer
                 .offset(4)
-                .write(((remote_address.in_addr >> 8) & 0xFF) as u8);
+                .write(((remote_address.in_addr >> 24) & 0xFF) as u8);
             output_buffer
                 .offset(5)
+                .write(((remote_address.in_addr >> 16) & 0xFF) as u8);
+            output_buffer
+                .offset(6)
+                .write(((remote_address.in_addr >> 8) & 0xFF) as u8);
+            output_buffer
+                .offset(7)
                 .write((remote_address.in_addr & 0xFF) as u8);
+            // Zero the 6-byte padding (sin_zero) at offsets 8..14.
+            core::ptr::write_bytes(output_buffer.offset(8), 0, 6);
 
             (*irp).io_status.information = 14 + bytes_received;
             0

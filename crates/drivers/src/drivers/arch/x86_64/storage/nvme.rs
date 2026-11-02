@@ -23,6 +23,9 @@ const REG_CAP: u64 = 0x00;
 const REG_VS: u64 = 0x08;
 const REG_CC: u64 = 0x14;
 const REG_CSTS: u64 = 0x1C;
+const REG_AQA: u64 = 0x24;
+const REG_ASQ: u64 = 0x28;
+const REG_ACQ: u64 = 0x2C;
 
 /// Doorbell offsets (relative to BAR0, stride depends on DSTRD)
 const REG_SQ0TDBL: u64 = 0x1000; // First submission queue doorbell
@@ -62,6 +65,8 @@ const ADMIN_GET_FEATURES: u8 = 0x0A;
 const ADMIN_ASYNC_EVENT: u8 = 0x0C;
 const ADMIN_FW_COMMIT: u8 = 0x10;
 const ADMIN_FW_IMAGE: u8 = 0x11;
+const IO_WRITE: u8 = 0x01;
+const IO_READ: u8 = 0x02;
 
 // ============================================================================
 // NVMe Data Structures
@@ -118,6 +123,8 @@ pub struct NvmeSqEntry {
     /// Command Dword 11: command-specific (e.g. LBA high /
     /// LRW length fields for read/write).
     pub cdw11: u32,
+    /// Command Dword 12: command-specific (e.g. NVM transfer length).
+    pub cdw12: u32,
 }
 
 impl NvmeSqEntry {
@@ -132,6 +139,7 @@ impl NvmeSqEntry {
             prp2,
             cdw10: 0,
             cdw11: 0,
+            cdw12: 0,
         }
     }
 
@@ -146,6 +154,7 @@ impl NvmeSqEntry {
             prp2: 0,
             cdw10: 0,
             cdw11: 0,
+            cdw12: 0,
         }
     }
 
@@ -160,6 +169,7 @@ impl NvmeSqEntry {
             prp2: 0,
             cdw10: 0,
             cdw11: 0,
+            cdw12: 0,
         }
     }
 
@@ -176,6 +186,7 @@ impl NvmeSqEntry {
             prp2: 0,
             cdw10: qid as u32,
             cdw11: 0,
+            cdw12: 0,
         }
     }
 
@@ -194,6 +205,7 @@ impl NvmeSqEntry {
             prp2: 0,
             cdw10: (qsize as u32 - 1) | ((qid as u32) << 16),
             cdw11: (qp_attrs as u32) | ((cqid as u32) << 16),
+            cdw12: 0,
         }
     }
 
@@ -211,6 +223,7 @@ impl NvmeSqEntry {
             prp2,
             cdw10: (numd - 1) & 0xFFFF,
             cdw11: 0,
+            cdw12: 0,
         }
     }
 
@@ -227,6 +240,7 @@ impl NvmeSqEntry {
             prp2: 0,
             cdw10: qid as u32,
             cdw11: 0,
+            cdw12: 0,
         }
     }
 
@@ -245,6 +259,7 @@ impl NvmeSqEntry {
             prp2: 0,
             cdw10: (qsize as u32 - 1) | ((qid as u32) << 16),
             cdw11: (vector as u32) | ((qp_attrs as u32) << 16),
+            cdw12: 0,
         }
     }
 
@@ -261,6 +276,7 @@ impl NvmeSqEntry {
             prp2: 0,
             cdw10: (sqid as u32) | ((cid as u32) << 16),
             cdw11: 0,
+            cdw12: 0,
         }
     }
 
@@ -278,6 +294,7 @@ impl NvmeSqEntry {
             prp2: 0,
             cdw10: 0,
             cdw11: 0,
+            cdw12: 0,
         }
     }
 
@@ -297,6 +314,7 @@ impl NvmeSqEntry {
             prp2: 0,
             cdw10: 0,
             cdw11: 0,
+            cdw12: 0,
         }
     }
 
@@ -315,6 +333,7 @@ impl NvmeSqEntry {
             prp2,
             cdw10: offset,
             cdw11: numd - 1,
+            cdw12: 0,
         }
     }
 }
@@ -554,6 +573,20 @@ struct NvmeController {
     last_status: u32,
     /// Number of admin commands completed
     admin_completions: u32,
+    /// I/O submission queue base virtual address
+    io_sq_base_virt: u64,
+    /// I/O submission queue size
+    io_sq_size: u16,
+    /// I/O submission queue tail
+    io_sq_tail: u16,
+    /// I/O completion queue base virtual address
+    io_cq_base_virt: u64,
+    /// I/O completion queue size
+    io_cq_size: u16,
+    /// I/O completion queue head
+    io_cq_head: u16,
+    /// I/O completion queue phase tag
+    io_cq_phase: u8,
 }
 
 impl Default for NvmeController {
@@ -580,9 +613,16 @@ impl Default for NvmeController {
             admin_cq_base_virt: 0,
             admin_cq_size: 0,
             admin_cq_head: 0,
-            admin_cq_phase: 1,
+            admin_cq_phase: 0,
             last_status: 0,
             admin_completions: 0,
+            io_sq_base_virt: 0,
+            io_sq_size: 0,
+            io_sq_tail: 0,
+            io_cq_base_virt: 0,
+            io_cq_size: 0,
+            io_cq_head: 0,
+            io_cq_phase: 0,
         }
     }
 }
@@ -823,7 +863,7 @@ fn init_controller(c: &mut NvmeController, bar0: u64) -> bool {
 
         // Parse CAP fields
         c.max_q_entries = ((c.cap & CAP_MQES_MASK) + 1) as u16;
-        c.doorbell_stride = 4u32 << (((c.cap >> 32) & CAP_DSTRD_MASK) >> 32);
+        c.doorbell_stride = 4u32 << (((c.cap >> 32) & 0xF) as u32);
 
         // read version
         c.vs = mmio_read32(mmio, REG_VS);
@@ -837,6 +877,11 @@ fn init_controller(c: &mut NvmeController, bar0: u64) -> bool {
             return false;
         }
 
+        // NVMe requires admin queues to exist before CC.EN is set.
+        if !setup_admin_queues(c) {
+            return false;
+        }
+
         // Enable the controller
         if !enable_controller(c) {
             return false;
@@ -845,6 +890,13 @@ fn init_controller(c: &mut NvmeController, bar0: u64) -> bool {
         // Perform Identify
         if !identify_controller(c) {
             // kprintln!("[NVMe] Warning: Identify command failed");
+            return false;
+        }
+
+        // Allocate the I/O queues after controller bring-up, just as
+        // stornvme.sys does before issuing NVM read/write commands.
+        if !setup_io_queues(c) {
+            return false;
         }
 
         c.state = NvmeControllerState::Ready;
@@ -918,11 +970,98 @@ fn enable_controller(c: &mut NvmeController) -> bool {
     }
 }
 
+/// Allocate and program the controller's admin queues.
+unsafe fn setup_admin_queues(c: &mut NvmeController) -> bool {
+    let queue_page =
+        crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, 4096, 4096);
+    if queue_page.is_null() {
+        return false;
+    }
+
+    core::ptr::write_bytes(queue_page, 0, 4096);
+    let Some(sq_phys) = crate::mm::vm::virt_to_phys(queue_page as u64) else {
+        crate::mm::pool::free_aligned(queue_page);
+        return false;
+    };
+    let cq_phys = sq_phys + 512;
+
+    c.admin_sq_base_virt = queue_page as u64;
+    c.admin_sq_size = 2;
+    c.admin_sq_tail = 0;
+    c.admin_cq_base_virt = queue_page.add(512) as u64;
+    c.admin_cq_size = 2;
+    c.admin_cq_head = 0;
+    c.admin_cq_phase = 0;
+
+    // Queue size fields in AQA contain the entry count minus one.
+    mmio_write32(c.mmio_base, REG_AQA, 1 | (1 << 16));
+    mmio_write32(c.mmio_base, REG_ASQ, sq_phys as u32);
+    mmio_write32(c.mmio_base, REG_ASQ + 4, (sq_phys >> 32) as u32);
+    mmio_write32(c.mmio_base, REG_ACQ, cq_phys as u32);
+    mmio_write32(c.mmio_base, REG_ACQ + 4, (cq_phys >> 32) as u32);
+    true
+}
+
+/// Allocate and create NVMe queue pair 1 for NVM commands.
+unsafe fn setup_io_queues(c: &mut NvmeController) -> bool {
+    let queue_page =
+        crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, 4096, 4096);
+    if queue_page.is_null() {
+        return false;
+    }
+
+    core::ptr::write_bytes(queue_page, 0, 4096);
+    let Some(sq_phys) = crate::mm::vm::virt_to_phys(queue_page as u64) else {
+        crate::mm::pool::free_aligned(queue_page);
+        return false;
+    };
+    let cq_phys = sq_phys + 512;
+
+    let mut create_cq = NvmeSqEntry::create_io_cq(1, 2, 0, 1);
+    create_cq.prp1 = cq_phys;
+    if !submit_admin_command(c, create_cq) {
+        crate::mm::pool::free_aligned(queue_page);
+        return false;
+    }
+
+    let mut create_sq = NvmeSqEntry::create_io_sq(1, 2, 1, 1);
+    create_sq.prp1 = sq_phys;
+    if !submit_admin_command(c, create_sq) {
+        crate::mm::pool::free_aligned(queue_page);
+        return false;
+    }
+
+    c.io_sq_base_virt = queue_page as u64;
+    c.io_sq_size = 2;
+    c.io_sq_tail = 0;
+    c.io_cq_base_virt = queue_page.add(512) as u64;
+    c.io_cq_size = 2;
+    c.io_cq_head = 0;
+    c.io_cq_phase = 0;
+
+    let doorbell_stride = c.doorbell_stride as u64;
+    mmio_write32(
+        c.mmio_base,
+        REG_SQ0TDBL + 2 * doorbell_stride,
+        c.io_sq_tail as u32,
+    );
+    mmio_write32(
+        c.mmio_base,
+        REG_CQ0HDBL + 2 * doorbell_stride,
+        c.io_cq_head as u32,
+    );
+    true
+}
+
 fn identify_controller(c: &mut NvmeController) -> bool {
     unsafe {
         // Allocate buffer for identify data
         let buf_size = 4096;
-        let buf = crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, buf_size);
+        let buf = crate::mm::pool::allocate_aligned(
+            crate::mm::pool::PoolType::NonPaged,
+            buf_size,
+            4096,
+        );
         if buf.is_null() {
             // kprintln!("[NVMe] Failed to allocate identify buffer");
             return false;
@@ -934,7 +1073,7 @@ fn identify_controller(c: &mut NvmeController) -> bool {
             Some(p) => p,
             None => {
                 // virt_to_phys failed - release buffer and return error
-                let _ = crate::mm::pool::free(buf);
+                let _ = crate::mm::pool::free_aligned(buf);
                 return false;
             }
         };
@@ -945,7 +1084,7 @@ fn identify_controller(c: &mut NvmeController) -> bool {
 
             // Submit command (simplified - in real implementation would use admin queue)
             if !submit_admin_command(c, cmd) {
-                let _ = crate::mm::pool::free(buf);
+                let _ = crate::mm::pool::free_aligned(buf);
                 return false;
             }
 
@@ -982,7 +1121,7 @@ fn identify_controller(c: &mut NvmeController) -> bool {
                              // kprintln!("[NVMe]   Model: {}", model);
         }
 
-        let _ = crate::mm::pool::free(buf);
+        let _ = crate::mm::pool::free_aligned(buf);
         true
     }
 }
@@ -1004,10 +1143,8 @@ fn identify_controller(c: &mut NvmeController) -> bool {
 fn submit_admin_command(c: &mut NvmeController, cmd: NvmeSqEntry) -> bool {
     // Check if admin queues are initialized
     if c.admin_sq_base_virt == 0 || c.admin_cq_base_virt == 0 {
-        // Queues not initialized, fall back to diagnostic mode
-        c.admin_submits = c.admin_submits.wrapping_add(1);
-        c.last_opcode = cmd.cdw0 & 0xFF;
-        return true;
+        // Never report an unprogrammed queue as a successful command.
+        return false;
     }
 
     // 1. write command to submission queue
@@ -1070,6 +1207,61 @@ fn submit_admin_command(c: &mut NvmeController, cmd: NvmeSqEntry) -> bool {
 
     // Timeout
     c.admin_submits = c.admin_submits.wrapping_add(1);
+    c.last_opcode = cmd.cdw0 & 0xFF;
+    false
+}
+
+/// Submit an NVM command on queue pair 1 and poll its completion entry.
+fn submit_io_command(c: &mut NvmeController, cmd: NvmeSqEntry) -> bool {
+    if c.io_sq_base_virt == 0 || c.io_cq_base_virt == 0 {
+        return false;
+    }
+
+    let tail = c.io_sq_tail;
+    let sq_base = c.io_sq_base_virt as *mut NvmeSqEntry;
+    unsafe {
+        core::ptr::write_volatile(sq_base.add(tail as usize), cmd);
+    }
+
+    c.io_sq_tail = (tail + 1) % c.io_sq_size;
+    let doorbell_stride = c.doorbell_stride as u64;
+    unsafe {
+        mmio_write32(
+            c.mmio_base,
+            REG_SQ0TDBL + 2 * doorbell_stride,
+            c.io_sq_tail as u32,
+        );
+    }
+
+    let timeout = 1_000_000;
+    let expected_phase = c.io_cq_phase;
+    for _ in 0..timeout {
+        let head = c.io_cq_head;
+        let cq_base = c.io_cq_base_virt as *const NvmeCqEntry;
+        let entry = unsafe { core::ptr::read_volatile(cq_base.add(head as usize)) };
+
+        if entry.p() == (expected_phase != 0) {
+            let success = entry.success();
+            c.io_cq_head = (head + 1) % c.io_cq_size;
+            if c.io_cq_head == 0 {
+                c.io_cq_phase ^= 1;
+            }
+            unsafe {
+                mmio_write32(
+                    c.mmio_base,
+                    REG_CQ0HDBL + 2 * doorbell_stride,
+                    c.io_cq_head as u32,
+                );
+            }
+            c.last_status = entry.cdw3;
+            c.last_opcode = cmd.cdw0 & 0xFF;
+            return success;
+        }
+
+        core::hint::spin_loop();
+    }
+
+    c.last_status = u32::MAX;
     c.last_opcode = cmd.cdw0 & 0xFF;
     false
 }
@@ -1150,118 +1342,117 @@ pub fn last_admin_opcode() -> u32 {
 /// read sectors from NVMe device
 /// Returns true on success
 pub fn read_sectors(controller: usize, nsid: u32, lba: u64, buffer: &mut [u8]) -> bool {
-    if buffer.len() < 512 {
+    if buffer.len() < 512 || !buffer.len().is_multiple_of(512) {
         return false;
     }
 
-    unsafe {
-        if let Some(ref mut c) = NVME_CONTROLLERS[controller] {
-            if c.state != NvmeControllerState::Ready {
-                return false;
-            }
-
-            // Allocate DMA buffer for the read
-            let buf_size = 4096.min(buffer.len());
-            let buf = crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, buf_size);
-            if buf.is_null() {
-                return false;
-            }
-
-            // Get physical address
-            // This is critical for NVMe DMA - we cannot use virtual address as physical
-            let phys = match crate::mm::vm::virt_to_phys(buf as u64) {
-                Some(p) => p,
-                None => {
-                    // virt_to_phys failed - release buffer and return error
-                    let _ = crate::mm::pool::free(buf);
-                    return false;
-                }
-            };
-
-            // Build NVMe read command ( Opcode 02h for NVM Command Set ).
-            // Per NVMe 1.4 §6.4 the read command encodes the starting
-            // LBA in CDW10 (low 32 bits) and CDW11 (high 16 bits in the
-            // upper half of the dword, low 16 bits reserved / LRW fields).
-            let mut cmd = NvmeSqEntry::default();
-            cmd.cdw0 = 0x0002_0000; // NVM read command
-            cmd.nsid = nsid;
-            cmd.prp1 = phys;
-            cmd.prp2 = 0;
-            cmd.cdw10 = lba as u32;
-            cmd.cdw11 = ((lba >> 32) as u32) & 0xFFFF_0000;
-
-            // Submit command
-            if submit_admin_command(c, cmd) {
-                // In a full implementation, we would wait for completion
-                // For now, just copy buffer data
-                core::ptr::copy_nonoverlapping(buf as *const u8, buffer.as_mut_ptr(), buf_size);
-                let _ = crate::mm::pool::free(buf);
-                return true;
-            }
-
-            let _ = crate::mm::pool::free(buf);
+    let chunk_sectors = 4096 / 512;
+    for (chunk, offset) in buffer.chunks_mut(4096).enumerate() {
+        if !read_nvme_chunk(controller, nsid, lba + (chunk * chunk_sectors) as u64, offset) {
+            return false;
         }
     }
 
-    false
+    true
+}
+
+/// Read at most one page of NVMe sectors into a page-aligned DMA buffer.
+fn read_nvme_chunk(controller: usize, nsid: u32, lba: u64, buffer: &mut [u8]) -> bool {
+    unsafe {
+        let Some(ref mut c) = NVME_CONTROLLERS[controller] else {
+            return false;
+        };
+        if c.state != NvmeControllerState::Ready {
+            return false;
+        }
+
+        let buf_size = buffer.len();
+        let buf = crate::mm::pool::allocate_aligned(
+            crate::mm::pool::PoolType::NonPaged,
+            buf_size,
+            4096,
+        );
+        if buf.is_null() {
+            return false;
+        }
+
+        let Some(phys) = crate::mm::vm::virt_to_phys(buf as u64) else {
+            crate::mm::pool::free_aligned(buf);
+            return false;
+        };
+
+        let mut cmd = NvmeSqEntry::default();
+        cmd.cdw0 = IO_READ as u32;
+        cmd.nsid = nsid;
+        cmd.prp1 = phys;
+        cmd.cdw10 = lba as u32;
+        cmd.cdw11 = ((lba >> 32) & 0xFFFF) as u32;
+        cmd.cdw12 = (buf_size / 512 - 1) as u32;
+
+        let success = submit_io_command(c, cmd);
+        if success {
+            core::ptr::copy_nonoverlapping(buf as *const u8, buffer.as_mut_ptr(), buf_size);
+        }
+        crate::mm::pool::free_aligned(buf);
+        success
+    }
 }
 
 /// write sectors to NVMe device
 /// Returns true on success
 pub fn write_sectors(controller: usize, nsid: u32, lba: u64, buffer: &[u8]) -> bool {
-    if buffer.len() < 512 {
+    if buffer.len() < 512 || !buffer.len().is_multiple_of(512) {
         return false;
     }
 
-    unsafe {
-        if let Some(ref mut c) = NVME_CONTROLLERS[controller] {
-            if c.state != NvmeControllerState::Ready {
-                return false;
-            }
-
-            // Allocate DMA buffer for the write
-            let buf_size = 4096.min(buffer.len());
-            let buf = crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, buf_size);
-            if buf.is_null() {
-                return false;
-            }
-
-            // Copy data to DMA buffer
-            core::ptr::copy_nonoverlapping(buffer.as_ptr(), buf, buf_size);
-
-            // Get physical address
-            // This is critical for NVMe DMA - we cannot use virtual address as physical
-            let phys = match crate::mm::vm::virt_to_phys(buf as u64) {
-                Some(p) => p,
-                None => {
-                    // virt_to_phys failed - release buffer and return error
-                    let _ = crate::mm::pool::free(buf);
-                    return false;
-                }
-            };
-
-            // Build NVMe write command (Opcode 01h). The write command
-            // uses the same LBA encoding as read: CDW10 = LBA low,
-            // CDW11 = LBA high in the upper 16 bits.
-            let mut cmd = NvmeSqEntry::default();
-            cmd.cdw0 = 0x0001_0000; // NVM write command
-            cmd.nsid = nsid;
-            cmd.prp1 = phys;
-            cmd.prp2 = 0;
-            cmd.cdw10 = lba as u32;
-            cmd.cdw11 = ((lba >> 32) as u32) & 0xFFFF_0000;
-
-            // Submit command
-            if submit_admin_command(c, cmd) {
-                let _ = crate::mm::pool::free(buf);
-                return true;
-            }
-
-            let _ = crate::mm::pool::free(buf);
+    let chunk_sectors = 4096 / 512;
+    for (chunk, offset) in buffer.chunks(4096).enumerate() {
+        if !write_nvme_chunk(controller, nsid, lba + (chunk * chunk_sectors) as u64, offset) {
+            return false;
         }
     }
 
-    false
+    true
+}
+
+/// Write at most one page of NVMe sectors from a page-aligned DMA buffer.
+fn write_nvme_chunk(controller: usize, nsid: u32, lba: u64, buffer: &[u8]) -> bool {
+    unsafe {
+        let Some(ref mut c) = NVME_CONTROLLERS[controller] else {
+            return false;
+        };
+        if c.state != NvmeControllerState::Ready {
+            return false;
+        }
+
+        let buf_size = buffer.len();
+        let buf = crate::mm::pool::allocate_aligned(
+            crate::mm::pool::PoolType::NonPaged,
+            buf_size,
+            4096,
+        );
+        if buf.is_null() {
+            return false;
+        }
+        core::ptr::copy_nonoverlapping(buffer.as_ptr(), buf, buf_size);
+
+        let Some(phys) = crate::mm::vm::virt_to_phys(buf as u64) else {
+            crate::mm::pool::free_aligned(buf);
+            return false;
+        };
+
+        let mut cmd = NvmeSqEntry::default();
+        cmd.cdw0 = IO_WRITE as u32;
+        cmd.nsid = nsid;
+        cmd.prp1 = phys;
+        cmd.cdw10 = lba as u32;
+        cmd.cdw11 = ((lba >> 32) & 0xFFFF) as u32;
+        cmd.cdw12 = (buf_size / 512 - 1) as u32;
+
+        let success = submit_io_command(c, cmd);
+        crate::mm::pool::free_aligned(buf);
+        success
+    }
 }
 
 /// Get the number of NVMe controllers found

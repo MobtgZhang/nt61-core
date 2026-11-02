@@ -54,6 +54,7 @@ const OP_PORTSC: u32 = 0x44;
 /// USBCMD bits.
 const USBCMD_RUN: u32 = 1 << 0;
 const USBCMD_HCRST: u32 = 1 << 1;
+const USBCMD_ASYE: u32 = 1 << 5;
 
 /// USBSTS bits.
 const USBSTS_HCH: u32 = 1 << 0;
@@ -144,7 +145,7 @@ pub struct UsbEndpointDescriptor {
 const QTD_TOKEN_ACTIVE: u32 = 1 << 7;
 const QTD_TOKEN_HALT: u32 = 1 << 6;
 
-/// EHCI Queue Transfer Descriptor (qTD) - 64 bytes
+/// EHCI Queue Transfer Descriptor (qTD) - 32 bytes
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EhciQtd {
@@ -210,10 +211,10 @@ impl EhciQh {
         let ep_cap = (dir_nak)
             | (3u32 << 28)  // nak_count = 3
             | ((match speed {
-                UsbSpeed::High => 0u32,
-                UsbSpeed::Full => 1u32,
-                UsbSpeed::Low => 2u32,
-                UsbSpeed::Super => 0u32,
+                UsbSpeed::Full => 0u32,
+                UsbSpeed::Low => 1u32,
+                UsbSpeed::High => 2u32,
+                UsbSpeed::Super => 2u32,
             }) << 12)
             | (((ep_addr & 0x0F) as u32) << 8)
             | (((max_packet as u32) & 0x3FF) << 16);
@@ -637,6 +638,7 @@ pub fn control_transfer(
             32,
         ) as *mut EhciQtd;
         if qtd_mem.is_null() {
+            crate::mm::pool::free_aligned(qh_mem as *mut u8);
             return Err("EHCI: qTD allocation failed");
         }
         core::ptr::write_bytes(
@@ -665,6 +667,8 @@ pub fn control_transfer(
         let setup_buf =
             crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, 8, 8);
         if setup_buf.is_null() {
+            crate::mm::pool::free_aligned(qh_mem as *mut u8);
+            crate::mm::pool::free_aligned(qtd_mem as *mut u8);
             return Err("EHCI: setup buffer allocation failed");
         }
         core::ptr::copy_nonoverlapping(setup_bytes.as_ptr(), setup_buf, 8);
@@ -726,6 +730,13 @@ pub fn control_transfer(
         core::ptr::write_volatile(&mut (*qh_mem).current_qtd, qtd_phys as u32);
         core::ptr::write_volatile(&mut (*qh_mem).next_qtd, qtd_phys as u32);
 
+        // Enable the async schedule before posting the queue head.
+        let cmd = core::ptr::read_volatile((op_base + OP_USBCMD as u64) as *const u32);
+        core::ptr::write_volatile(
+            (op_base + OP_USBCMD as u64) as *mut u32,
+            cmd | USBCMD_RUN | USBCMD_ASYE,
+        );
+
         // Program ASYNCLISTADDR to the QH.
         core::ptr::write_volatile(
             (op_base + OP_ASYNCLISTADDR as u64) as *mut u32,
@@ -750,23 +761,33 @@ pub fn control_transfer(
                 break;
             }
             if (token & QTD_TOKEN_HALT) != 0 {
+                let _ = crate::mm::pool::free_aligned(setup_buf);
+                crate::mm::pool::free_aligned(qh_mem as *mut u8);
+                crate::mm::pool::free_aligned(qtd_mem as *mut u8);
                 return Err("EHCI: transfer halted (stall or error)");
             }
             iterations += 1;
             core::hint::spin_loop();
         }
         if iterations >= max_iterations {
+            let _ = crate::mm::pool::free_aligned(setup_buf);
+            crate::mm::pool::free_aligned(qh_mem as *mut u8);
+            crate::mm::pool::free_aligned(qtd_mem as *mut u8);
             return Err("EHCI: control transfer timeout");
         }
 
-        // Read the status qTD's bytes_transferred for the data phase.
+        // Read the data qTD's bytes_transferred for the data phase; the
+        // zero-length status qTD never reports a byte count.
+        let data_qtd_mem = qtd_mem.add(1);
         let bytes = if has_data {
-            core::ptr::read_volatile(&(*status_qtd_mem).bytes_transferred())
+            core::ptr::read_volatile(&(*data_qtd_mem).bytes_transferred())
         } else {
             0
         };
 
-        let _ = has_data;
+        let _ = crate::mm::pool::free_aligned(setup_buf);
+        crate::mm::pool::free_aligned(qh_mem as *mut u8);
+        crate::mm::pool::free_aligned(qtd_mem as *mut u8);
         Ok(bytes as u32)
     }
 }

@@ -44,6 +44,7 @@ pub const IR0_BASE: u16 = 0x20; // first interrupter register set
 
 /// Interrupter register offsets within IR0.
 pub const ERSTSZ: u16 = 0x00;
+pub const ERSTBA: u16 = 0x08;
 pub const ERDP: u16 = 0x10;
 
 /// USBCMD bits.
@@ -430,6 +431,7 @@ pub(crate) struct XhciController {
     max_ports: u8,
     hcs_params2: u32,
     hcc_params1: u32,
+    runtime_offset: u64,
     cmd: u32,
     sts: u32,
     initialised: bool,
@@ -443,6 +445,10 @@ pub(crate) struct XhciController {
     event_ring_phys: u64,
     /// Event ring virtual pointer.
     event_ring_virt: u64,
+    /// Event Ring Segment Table virtual pointer.
+    event_erst_virt: u64,
+    /// Event Ring Segment Table physical address.
+    event_erst_phys: u64,
     /// Event ring size (TRBs).
     event_ring_size: usize,
     /// Event ring dequeue index.
@@ -588,8 +594,15 @@ pub(crate) unsafe fn write_slot_context(
     ctx_phys: u64,
 ) -> Result<(), &'static str> {
     if let Some(Some(c)) = (*core::ptr::addr_of_mut!(XHCI_CONTROLLERS)).get_mut(controller) {
+        if slot == 0 || slot as u32 > c.dcbaa.max_slots as u32 {
+            return Err("Invalid xHCI slot");
+        }
+        if c.dcbaa.virt == 0 {
+            return Err("xHCI DCBAA not allocated");
+        }
         // Per xHCI 1.2 the DCBAA stride is 8 bytes.
-        mmio_write64(c.mmio_base, (slot as u32) * 8, ctx_phys);
+        let entry = c.dcbaa.virt as *mut u64;
+        core::ptr::write_volatile(entry.add((slot - 1) as usize), ctx_phys);
         Ok(())
     } else {
         Err("No controller")
@@ -655,6 +668,7 @@ fn init_controller(bar_phys: u64) -> Option<XhciController> {
     }
 
     let op_base = mmio + cap_length as u64;
+    let runtime_offset = unsafe { mmio_read32(op_base, RTSOFF as u32) } as u64 & !1;
 
     // Reset the controller (USBCMD.HCRST) and wait for the bit to
     // self-clear. Bound the poll so a wedged device cannot hang the
@@ -708,6 +722,7 @@ fn init_controller(bar_phys: u64) -> Option<XhciController> {
         max_ports,
         hcs_params2,
         hcc_params1,
+        runtime_offset,
         cmd,
         sts,
         initialised: true,
@@ -718,6 +733,8 @@ fn init_controller(bar_phys: u64) -> Option<XhciController> {
         ep0_ring: None,
         event_ring_phys: 0,
         event_ring_virt: 0,
+        event_erst_phys: 0,
+        event_erst_virt: 0,
         event_ring_size: 0,
         event_dequeue_idx: 0,
         event_cycle_bit: true,
@@ -740,9 +757,13 @@ pub fn init() {
                 // Allocate the event ring and transfer ring during
                 // init so control transfers work after enumeration.
                 let mut c = c;
-                let _ = init_event_ring(&mut c);
-                let _ = ensure_ep0_ring(&mut c);
-                push_xhci(c);
+                if init_event_ring(&mut c).is_ok()
+                    && init_dcbaa(&mut c).is_ok()
+                    && init_command_ring(&mut c).is_ok()
+                {
+                    let _ = ensure_ep0_ring(&mut c);
+                    push_xhci(c);
+                }
             }
         }
     }
@@ -909,12 +930,66 @@ fn execute_command(c: &mut XhciController, trb: XhciTrb) -> Result<u32, &'static
         // was never posted to real ring memory.
         return Err("xHCI command ring not set up");
     }
-    // A real implementation would enqueue the TRB, ring doorbell 0
-    // and wait for a Command Completion event on the event ring.
-    // That machinery is not implemented yet, so report the failure
-    // honestly instead of synthesising a success code.
-    let _ = trb.trb_type();
-    Err("xHCI command completion eventing not implemented")
+    let ring_ptr = c.cmd_ring.virt as *mut XhciTrb;
+    let enqueue_idx = c.cmd_ring.enqueue_idx;
+    let mut trb = trb;
+    if c.cmd_ring.cycle_bit {
+        trb.control |= TRB_C;
+    } else {
+        trb.control &= !TRB_C;
+    }
+    unsafe {
+        core::ptr::write_volatile(ring_ptr.add(enqueue_idx), trb);
+    }
+    let trb_phys = c.cmd_ring.phys
+        + (enqueue_idx as u64) * core::mem::size_of::<XhciTrb>() as u64;
+    c.cmd_ring.enqueue_idx = (enqueue_idx + 1) % c.cmd_ring.size;
+    if c.cmd_ring.enqueue_idx == 0 {
+        c.cmd_ring.cycle_bit = !c.cmd_ring.cycle_bit;
+    }
+
+    // Command doorbell: slot 0, target 0.
+    let doorbell_base = c.mmio_base + c.cap_length as u64 + DBOFF as u64;
+    unsafe {
+        core::ptr::write_volatile(doorbell_base as *mut u32, 0);
+    }
+
+    poll_command_event(c, trb_phys, 100_000)
+}
+
+/// Poll the event ring for a Command Completion event whose TRB pointer
+/// matches `expected_trb_phys`.
+fn poll_command_event(
+    c: &mut XhciController,
+    expected_trb_phys: u64,
+    timeout_iters: usize,
+) -> Result<u32, &'static str> {
+    if c.event_ring_virt == 0 || c.event_ring_size == 0 {
+        return Err("xHCI event ring not allocated");
+    }
+    let event_ptr = c.event_ring_virt as *const XhciTrb;
+    for _ in 0..timeout_iters {
+        let idx = c.event_dequeue_idx;
+        let trb = unsafe { core::ptr::read_volatile(event_ptr.add(idx)) };
+        if trb.cycle_bit() == c.event_cycle_bit {
+            c.event_dequeue_idx = (idx + 1) % c.event_ring_size;
+            if c.event_dequeue_idx == 0 {
+                c.event_cycle_bit = !c.event_cycle_bit;
+            }
+            let event_ptr_val = ((trb.ptr_high as u64) << 32) | trb.ptr_low as u64;
+            if trb.trb_type() == TRB_TYPE_COMMAND_COMPLETION
+                && (event_ptr_val == expected_trb_phys || event_ptr_val == 0)
+            {
+                if trb.is_success() {
+                    return Ok((trb.control >> 24) & 0xFF);
+                }
+                return Err("xHCI command completion error");
+            }
+        } else {
+            core::hint::spin_loop();
+        }
+    }
+    Err("xHCI command completion timeout")
 }
 
 /// Enable a device slot
@@ -937,7 +1012,7 @@ pub fn enable_slot(slot_type: u8) -> Result<u8, &'static str> {
 /// Address a device
 pub fn address_device(
     slot: u8,
-    port: u8,
+    _port: u8,
     speed: UsbSpeed,
     ctx_base: u64,
 ) -> Result<(), &'static str> {
@@ -953,13 +1028,16 @@ pub fn address_device(
         let proto = speed.to_protocol_code();
         c.cmd_event_idx = c.cmd_event_idx.wrapping_add(proto as usize);
 
-        // Tag this address-device command with the slot id and route
-        // its context base through the controller's command-ring
-        // head pointer so completion handler can locate the device
-        // state.
-        let bdf = (port as u32) << 8;
+        // Program the context pointer into the DCBAA before posting
+        // the Address Device command. The controller reads it from
+        // there, not from the command TRB payload.
+        if slot == 0 || slot as u32 > c.dcbaa.max_slots as u32 || c.dcbaa.virt == 0 {
+            return Err("Invalid xHCI slot");
+        }
+        let dcbaa_entry = c.dcbaa.virt as *mut u64;
+        core::ptr::write_volatile(dcbaa_entry.add((slot - 1) as usize), ctx_base);
+        let bdf = (slot as u32 & 0xFF) | (((speed as u32) & 0x0F) << 20);
         c.cmd = (c.cmd & !(0xFF << 16)) | bdf | ((slot as u32 & 0xFF) << 16);
-        let _ = ctx_base;
 
         let trb = XhciTrb::address_device(bdf, ctx_base);
         execute_command(c, trb)?;
@@ -1223,19 +1301,90 @@ pub fn control_transfer(
 fn init_event_ring(c: &mut XhciController) -> Result<(), &'static str> {
     const EVENT_TRBS: usize = 32;
     const EVENT_BYTES: usize = EVENT_TRBS * core::mem::size_of::<XhciTrb>();
-    let ptr =
-        crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, EVENT_BYTES, 64);
+    let ptr = crate::mm::pool::allocate_aligned(
+        crate::mm::pool::PoolType::NonPaged,
+        EVENT_BYTES,
+        64,
+    );
     if ptr.is_null() {
         return Err("xHCI: event ring allocation failed");
     }
+    let erst_ptr = crate::mm::pool::allocate_aligned(
+        crate::mm::pool::PoolType::NonPaged,
+        core::mem::size_of::<u64>() * 2,
+        64,
+    );
+    if erst_ptr.is_null() {
+        crate::mm::pool::free_aligned(ptr);
+        return Err("xHCI: event ring segment table allocation failed");
+    }
     unsafe {
         core::ptr::write_bytes(ptr, 0, EVENT_BYTES);
+        core::ptr::write_bytes(erst_ptr, 0, core::mem::size_of::<u64>() * 2);
+        let erst = erst_ptr as *mut u64;
+        core::ptr::write_volatile(erst, ptr as u64);
+        core::ptr::write_volatile(erst.add(1), EVENT_TRBS as u64);
     }
     c.event_ring_phys = ptr as u64;
     c.event_ring_virt = ptr as u64;
+    c.event_erst_virt = erst_ptr as u64;
+    c.event_erst_phys = erst_ptr as u64;
     c.event_ring_size = EVENT_TRBS;
     c.event_dequeue_idx = 0;
     c.event_cycle_bit = true;
+    Ok(())
+}
+
+/// Allocate and program the Device Context Base Address Array.
+fn init_dcbaa(c: &mut XhciController) -> Result<(), &'static str> {
+    let bytes = ((c.max_slots as usize) + 1) * core::mem::size_of::<u64>();
+    let virt =
+        crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, bytes, 64);
+    if virt.is_null() {
+        return Err("xHCI: DCBAA allocation failed");
+    }
+    unsafe {
+        core::ptr::write_bytes(virt, 0, bytes);
+    }
+    c.dcbaa.phys = virt as u64;
+    c.dcbaa.virt = virt as u64;
+    c.dcbaa.max_slots = c.max_slots;
+    let op_base = c.mmio_base + c.cap_length as u64;
+    unsafe {
+        mmio_write64(op_base, DCBAAP as u32, c.dcbaa.phys);
+    }
+    Ok(())
+}
+
+/// Allocate and program the command ring. A Link TRB marks the ring end.
+fn init_command_ring(c: &mut XhciController) -> Result<(), &'static str> {
+    const COMMAND_TRBS: usize = 64;
+    let bytes = COMMAND_TRBS * core::mem::size_of::<XhciTrb>();
+    let virt = crate::mm::pool::allocate_aligned(
+        crate::mm::pool::PoolType::NonPaged,
+        bytes,
+        64,
+    );
+    if virt.is_null() {
+        return Err("xHCI: command ring allocation failed");
+    }
+    unsafe {
+        core::ptr::write_bytes(virt, 0, bytes);
+        let last = virt as *mut XhciTrb;
+        core::ptr::write_volatile(
+            last.add(COMMAND_TRBS - 1),
+            XhciTrb::link(virt as u64, true),
+        );
+    }
+    c.cmd_ring.phys = virt as u64;
+    c.cmd_ring.virt = virt as u64;
+    c.cmd_ring.size = COMMAND_TRBS;
+    c.cmd_ring.enqueue_idx = 0;
+    c.cmd_ring.cycle_bit = true;
+    let op_base = c.mmio_base + c.cap_length as u64;
+    unsafe {
+        mmio_write64(op_base, CRCR as u32, c.cmd_ring.phys | CRCR_RCS as u64);
+    }
     Ok(())
 }
 
@@ -1245,13 +1394,16 @@ fn program_event_ring(c: &XhciController) {
     if c.event_ring_phys == 0 || c.event_ring_size == 0 {
         return;
     }
-    let rts = c.mmio_base + RTSOFF as u64;
+    let rts = c.mmio_base + c.cap_length as u64 + c.runtime_offset;
     let ir0 = rts + IR0_BASE as u64;
     unsafe {
         // ERSTSZ: number of event ring segment table entries (1).
         let erstsz = (ir0 + ERSTSZ as u64) as *mut u32;
         core::ptr::write_volatile(erstsz, 1);
 
+        // ERSTBA: one segment table entry pointing at the event ring.
+        let erstba = (ir0 + ERSTBA as u64) as *mut u64;
+        core::ptr::write_volatile(erstba, c.event_erst_phys);
         // ERDP: event ring dequeue pointer + EHB bit clear.
         let erdp = (ir0 + ERDP as u64) as *mut u64;
         // The ERDP register is 64 bits but only the low 32 are valid
