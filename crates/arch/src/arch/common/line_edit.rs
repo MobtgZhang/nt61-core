@@ -18,7 +18,7 @@ use crate::hal::text_console;
 use crate::ke::sync::Spinlock;
 use alloc::vec::Vec;
 
-pub const LINE_CAPACITY: usize = 256;
+pub const LINE_CAPACITY: usize = 1024;
 const HISTORY_MAX: usize = 16;
 
 static HISTORY: Spinlock<Vec<[u8; LINE_CAPACITY]>> = Spinlock::new(Vec::new());

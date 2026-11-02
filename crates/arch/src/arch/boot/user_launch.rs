@@ -56,20 +56,20 @@ pub fn launch_wininit_exe(
     // wininit.exe should start services.exe and lsass.exe
     // We start them directly from here to ensure they're launched
     boot_println!("[SAFE-CMD] Launching services.exe...");
-    let _ = crate::servers::smss::load_and_create_process(
+    crate::servers::smss::load_and_create_process(
         "C:\\Windows\\System32\\services.exe",
         "services.exe",
         0,
         0x500,
-    );
+    )?;
 
     boot_println!("[SAFE-CMD] Launching lsass.exe...");
-    let _ = crate::servers::smss::load_and_create_process(
+    crate::servers::smss::load_and_create_process(
         "C:\\Windows\\System32\\lsass.exe",
         "lsass.exe",
         0,
         0x600,
-    );
+    )?;
 
     Ok(result)
 }

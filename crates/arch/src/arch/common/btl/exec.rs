@@ -55,7 +55,7 @@ pub(crate) mod test_support {
 pub struct GuestState {
     /// Guest GPRs indexed by `X86Reg as usize` (RIP stored separately).
     pub regs: [u64; 16],
-    /// Guest RFLAGS (only CF/PF/ZF/SF/OF are modelled).
+    /// Guest RFLAGS (status flags plus AF/DF; system flags are preserved).
     pub rflags: u64,
     /// Guest instruction pointer.
     pub rip: u64,
@@ -65,7 +65,7 @@ impl GuestState {
     pub const fn new() -> Self {
         Self {
             regs: [0; 16],
-            rflags: 0,
+            rflags: RFLAGS_FIXED,
             rip: 0,
         }
     }
@@ -91,7 +91,9 @@ impl GuestState {
     }
 
     fn set_flag(&mut self, bit: u32, v: bool) {
-        self.rflags = (self.rflags & !(1u64 << bit)) | ((v as u64) << bit);
+        self.rflags = ((self.rflags & !(1u64 << bit)) | ((v as u64) << bit))
+            | (self.rflags & RFLAGS_SYSTEM)
+            | RFLAGS_FIXED;
     }
 }
 
@@ -105,7 +107,14 @@ const FLAG_CF: u32 = 0;
 const FLAG_PF: u32 = 2;
 const FLAG_ZF: u32 = 6;
 const FLAG_SF: u32 = 7;
+const FLAG_AF: u32 = 4;
+const FLAG_DF: u32 = 10;
 const FLAG_OF: u32 = 11;
+const RFLAGS_FIXED: u64 = 0x2;
+const RFLAGS_SYSTEM: u64 =
+    (1u64 << FLAG_IF) | (1u64 << 12) | (1u64 << 13) | (1u64 << 14) | (1u64 << FLAG_RF);
+const FLAG_IF: u32 = 9;
+const FLAG_RF: u32 = 16;
 
 const MASK8: u64 = 0xFF;
 
@@ -123,12 +132,20 @@ fn update_flags(state: &mut GuestState, op: AluOp, a: u64, b: u64, result: u64) 
             let carry = (a ^ result) & (b ^ result);
             state.set_flag(FLAG_CF, result < a);
             state.set_flag(FLAG_OF, (carry >> 63) != 0);
+            state.set_flag(
+                FLAG_AF,
+                (((a ^ b ^ result) & 0x10) >> 4) != 0,
+            );
         }
         AluOp::Sub | AluOp::Cmp => {
             let diff = a ^ b;
             let borrow = a ^ result;
             state.set_flag(FLAG_CF, a < b);
             state.set_flag(FLAG_OF, (diff & borrow & (1u64 << 63)) != 0);
+            state.set_flag(
+                FLAG_AF,
+                (((a ^ result) & (b ^ a) & 0x10) >> 4) != 0,
+            );
         }
         _ => {
             state.set_flag(FLAG_CF, false);

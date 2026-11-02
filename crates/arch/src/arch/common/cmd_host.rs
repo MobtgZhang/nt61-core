@@ -7,6 +7,7 @@
 //! through the shared HAL facades.
 
 pub const SYS_PUTCHAR: u32 = 0x0202;
+pub const SYS_EXIT_PROCESS: u32 = 0x0201;
 pub const SYS_POLL_KEY: u32 = 0x0203;
 pub const SYS_GET_KEY: u32 = 0x0204;
 pub const SYS_CLEARSCREEN: u32 = 0x0205;
@@ -73,6 +74,10 @@ pub unsafe fn read_line(buffer: *mut u8, length: usize) -> Option<usize> {
 
 pub fn return_to_firmware() -> ! {
     crate::arch::halt_loop()
+}
+
+pub fn exit_process(exit_code: u32) -> ! {
+    crate::ntoskrnl::ps::process::process_exit(exit_code)
 }
 
 pub fn execute_command(buffer: *const u8, length: usize) -> Result<bool, &'static str> {
