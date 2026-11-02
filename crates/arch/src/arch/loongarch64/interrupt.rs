@@ -10,7 +10,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const MAX_IRQS: usize = 256;
-const MAX_CPUS: usize = 64;
+const MAX_CPUS: usize = 256;
 
 const EXTIOI_IOCSR_BASE: u64 = 0x1400;
 static EXTIOI_BASE: AtomicU64 = AtomicU64::new(EXTIOI_IOCSR_BASE);

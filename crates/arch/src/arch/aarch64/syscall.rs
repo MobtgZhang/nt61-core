@@ -115,6 +115,7 @@ pub unsafe extern "C" fn syscall_dispatch_with_tf(syscall_num: u64, tf: *mut Tra
             }
         }
         host::SYS_RETURN_TO_FIRMWARE => host::return_to_firmware(),
+        host::SYS_EXIT_PROCESS => host::exit_process(tf_ref.x0 as u32),
         host::SYS_CMD_EXECUTE => {
             match host::execute_command(tf_ref.x0 as *const u8, tf_ref.x1 as usize) {
                 Ok(exited) => exited as u64,

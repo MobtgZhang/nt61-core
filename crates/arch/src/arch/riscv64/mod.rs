@@ -47,7 +47,7 @@ use core::arch::asm;
 
 /// Maximum CPUs supported (SMP bring-up is out of scope for the
 /// bootstrap; the boot CPU is CPU 0).
-pub const MAX_CPUS: usize = 64;
+pub const MAX_CPUS: usize = 256;
 
 /// Cache line size.
 pub const CACHE_LINE: usize = 64;

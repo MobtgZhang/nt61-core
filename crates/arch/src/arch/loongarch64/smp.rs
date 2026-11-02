@@ -21,7 +21,7 @@ use crate::arch::loongarch64::soc;
 static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 static SECONDARY_ROOT_PFN: AtomicU32 = AtomicU32::new(0);
 
-const MAX_AP_STACKS: usize = 64;
+const MAX_AP_STACKS: usize = 256;
 const AP_STACK_SIZE: usize = 64 * 1024;
 
 #[no_mangle]
@@ -135,7 +135,6 @@ pub unsafe extern "Rust" fn __smp_boot_secondary(_pml4_pfn: u64) {
     let entry = secondary_entry as *const () as u64;
     for cpu in 1..count {
         unsafe { mail_send(cpu, entry) };
-        CPU_COUNT.fetch_add(1, Ordering::SeqCst);
     }
 }
 

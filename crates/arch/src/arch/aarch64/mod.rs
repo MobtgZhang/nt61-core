@@ -38,7 +38,7 @@ use core::arch::asm;
 /// Per-CPU scratch area (TLS pointer). Each CPU gets one entry of
 /// `MAX_CPUS` and we use this for the PRCB and the idle stack in a
 /// real build. For the bootstrap we just store zero.
-pub const MAX_CPUS: usize = 64;
+pub const MAX_CPUS: usize = 256;
 
 /// Cache line size for aarch64 (typically 64 bytes).
 pub const CACHE_LINE: usize = 64;

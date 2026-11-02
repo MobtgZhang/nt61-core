@@ -170,6 +170,8 @@ pub unsafe extern "C" fn dispatch_syscall(frame: *mut TrapFrame) {
 /// argument slots that aren't used by a particular NT call are
 /// still passed so we can detect garbage.
 fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    const SYS_EXIT_PROCESS_U64: u64 =
+        crate::arch::common::cmd_host::SYS_EXIT_PROCESS as u64;
     match num {
         SYS_NT_CLOSE => {
             // NT_CLOSE(handle) — Phase 1 returns success for any handle
@@ -270,6 +272,9 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             }
         }
         SYS_RETURN_TO_FIRMWARE => crate::arch::common::cmd_host::return_to_firmware(),
+        SYS_EXIT_PROCESS_U64 => {
+            crate::arch::common::cmd_host::exit_process(a0 as u32)
+        }
         SYS_CMD_EXECUTE => {
             match crate::arch::common::cmd_host::execute_command(a0 as *const u8, a1 as usize) {
                 Ok(exited) => exited as u64,

@@ -408,6 +408,47 @@ pub fn translate_virt(va: u64) -> Option<u64> {
     }
 }
 
+/// Report whether a page is mapped in an arbitrary AArch64 translation root.
+pub fn page_is_mapped_in_root(root_pfn: u64, va: u64) -> bool {
+    let l0_phys = if root_pfn & 0x0000_FFFF_FFFF_F000 == root_pfn {
+        root_pfn << 12
+    } else {
+        root_pfn & 0x0000_FFFF_FFFF_F000
+    };
+    let l0 = l0_phys as *const u64;
+    unsafe {
+        let l0e = core::ptr::read_volatile(l0.add(((va >> 39) & 0x1FF) as usize));
+        if (l0e & 0x3) != 0x3 {
+            return false;
+        }
+        let l1e = core::ptr::read_volatile(
+            ((l0e & 0x0000_FFFF_FFFF_F000) as *const u64)
+                .add(((va >> 30) & 0x1FF) as usize),
+        );
+        if (l1e & 0x3) == 0x1 {
+            return true;
+        }
+        if (l1e & 0x3) != 0x3 {
+            return false;
+        }
+        let l2e = core::ptr::read_volatile(
+            ((l1e & 0x0000_FFFF_FFFF_F000) as *const u64)
+                .add(((va >> 21) & 0x1FF) as usize),
+        );
+        if (l2e & 0x3) == 0x1 {
+            return true;
+        }
+        if (l2e & 0x3) != 0x3 {
+            return false;
+        }
+        let l3e = core::ptr::read_volatile(
+            ((l2e & 0x0000_FFFF_FFFF_F000) as *const u64)
+                .add(((va >> 12) & 0x1FF) as usize),
+        );
+        is_valid_page(l3e)
+    }
+}
+
 /// Return the L3 page descriptor covering `va`.
 pub fn leaf_entry(va: u64) -> Option<u64> {
     unsafe {

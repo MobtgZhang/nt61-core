@@ -158,7 +158,13 @@ pub unsafe extern "C" fn arch_aarch64_trap_dispatch(kind: u64, tf: *mut TrapFram
             handle_irq();
         }
         _ => {
-            // Unhandled class: hang so the developer can debug.
+            // Unhandled class: emit the class before hanging so an
+            // unrecoverable architecture state is never silent.
+            crate::hal::serial::write_string_always(
+                "[KERN-FAULT] unhandled AArch64 exception class: ",
+            );
+            crate::hal::serial::write_hex_u64_always(kind);
+            crate::hal::serial::write_string_always("\r\n");
             loop {
                 unsafe { core::arch::asm!("wfi", options(nostack)) };
             }

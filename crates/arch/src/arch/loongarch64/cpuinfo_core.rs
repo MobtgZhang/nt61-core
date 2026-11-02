@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use crate::arch::loongarch64::soc;
 
 /// Maximum CPUs we track — must match MAX_CPUS in mod.rs.
-const MAX_CPUS: usize = 64;
+const MAX_CPUS: usize = 256;
 
 /// SMT sibling identification. A logical CPU id is encoded as
 /// `(physical_id << 1) | thread_id` (LA664-style 2-way HT).
