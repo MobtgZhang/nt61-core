@@ -183,8 +183,11 @@ pub fn spurious_count() -> u32 {
 /// both 0xFF and 0x0F as spurious.
 pub fn set_spurious_vector(vector: u8) {
     let svr = read_lapic(lapic_reg::SVR);
+    // Mask off any previous vector bits before OR-ing in the new
+    // spurious vector so stale bits from a malformed read do not
+    // leak into the result.
     let coerced = (vector as u32) | svr::SPURIOUS_VECTOR_LOW_BITS;
-    write_lapic(lapic_reg::SVR, svr | svr::ENABLE | coerced);
+    write_lapic(lapic_reg::SVR, (svr & !0xFF) | svr::ENABLE | coerced);
 }
 
 // =====================================================================
@@ -326,8 +329,12 @@ pub fn init() -> bool {
     // 12 bits are reserved; the actual base sits at bits 12..36.
     let apic_base_msr = rdmsr(0x1B);
     let phys_base = apic_base_msr & 0x0000_0FFF_FFFF_F000;
-    let va = crate::mm::syspte::map_io_space(phys_base.max(LAPIC_BASE), 1)
-        .unwrap_or(phys_base.max(LAPIC_BASE));
+    let Some(va) = crate::mm::syspte::map_io_space(phys_base.max(LAPIC_BASE), 1) else {
+        // Without a valid virtual mapping the LAPIC cannot be
+        // accessed; using the physical address as a pointer would
+        // corrupt memory on a non-identity-mapped system.
+        return false;
+    };
     LAPIC_VA.store(va, Ordering::Release);
 
     // Software enable + spurious vector 0xFF.
@@ -371,8 +378,13 @@ pub fn init_smp() {
         let apic_base_msr = rdmsr(0x1B);
         apic_base_msr & 0x0000_0FFF_FFFF_F000
     };
-    let va =
-        crate::mm::syspte::map_io_space(phys.max(LAPIC_BASE), 1).unwrap_or(phys.max(LAPIC_BASE));
+    // If the MMIO mapping fails, a raw physical address used as a
+    // virtual address is a wild pointer. Leave the LAPIC unmapped
+    // and return so callers do not issue MMIO through it.
+    let va = match crate::mm::syspte::map_io_space(phys.max(LAPIC_BASE), 1) {
+        Some(v) => v,
+        None => return,
+    };
     LAPIC_VA.store(va, Ordering::Release);
 
     // Software enable + spurious vector 0xFF.
@@ -566,7 +578,13 @@ pub fn broadcast_ipi(vector: u8, mode: IpiDeliveryMode) {
 /// Initialise the I/O APIC. `phys_base` is the MMIO base from the
 /// ACPI MADT; we map it into kernel virtual space.
 pub fn init_io_apic(phys_base: u64) -> bool {
-    let va = crate::mm::syspte::map_io_space(phys_base, 1).unwrap_or(phys_base);
+    // If the mapping fails, returning a physical address as a
+    // virtual address would fault on every MMIO access. Report the
+    // failure instead of proceeding with a wild pointer.
+    let va = match crate::mm::syspte::map_io_space(phys_base, 1) {
+        Some(v) => v,
+        None => return false,
+    };
     IOAPIC_VA.store(va, Ordering::Release);
     IOAPIC_BASE_PFN.store((phys_base >> 12) as u32, Ordering::Release);
     true
@@ -590,9 +608,29 @@ pub fn ioapic_max_redir() -> u8 {
 /// raise. `dest_apic_id` is the destination LAPIC ID.
 pub fn program_ioapic(gsi: u8, vector: u8, dest_apic_id: u8) {
     let reg = (gsi as u32) * 2 + 0x10;
-    let low = (vector as u32) & 0xFF;
+    // I/O APIC redirection entry (low dword):
+    //   bits 0..7  = vector
+    //   bit 11     = delivery status (RO)
+    //   bit 12     = remote IRR (RO)
+    //   bit 13     = interrupt input pin polarity (0 = high-active,
+    //                1 = low-active; PCI INTx is low-active)
+    //   bit 14     = trigger mode (0 = edge, 1 = level; PCI INTx
+    //                requires level)
+    //   bit 15     = mask
+    // PCI INTx (GSIs 16+ on q35) must be level/low-active to keep
+    // the shared line asserted until the EOI; legacy ISA IRQs stay
+    // edge/high-active.
+    const PIN_POLARITY_LOW: u32 = 1 << 13;
+    const TRIGGER_LEVEL: u32 = 1 << 14;
+    const MASKED: u32 = 1 << 15;
+
+    let low = if gsi >= 16 {
+        (vector as u32) & 0xFF | PIN_POLARITY_LOW | TRIGGER_LEVEL
+    } else {
+        (vector as u32) & 0xFF
+    };
     let high = ((dest_apic_id as u32) & 0xFF) << 24;
-    write_ioapic(reg, low);
+    write_ioapic(reg, low & !MASKED);
     write_ioapic(reg + 1, high);
 }
 

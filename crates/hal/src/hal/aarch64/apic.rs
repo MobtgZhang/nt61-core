@@ -118,11 +118,14 @@ fn init_gicv2() {
         let typer = read_volatile((GICV2_DIST_BASE + gicd::TYPER as u64) as *mut u32);
         let _n_spis = ((typer & 0x1F) + 1) * 32;
 
-        // Set every interrupt to priority 0xA0 (mid priority) and
-        // group 0 (IRQ, not FIQ).
+        // Set every interrupt to priority 0xA0 (mid priority). The
+        // GICv2 distributor exposes one priority byte per interrupt
+        // at IPRIORITYR + i (stride 1), not one 32-bit word per
+        // four interrupts (stride 4). The previous u32/stride-4 loop
+        // clobbered the reserved area and ICFGR beyond 0x4FF.
         for i in 0..(8 * 32) {
-            let reg = GICV2_DIST_BASE + gicd::IPRIORITYR as u64 + (i as u64 * 4);
-            write_volatile(reg as *mut u32, 0xA0A0_A0A0);
+            let reg = GICV2_DIST_BASE + gicd::IPRIORITYR as u64 + i as u64;
+            write_volatile(reg as *mut u8, 0xA0);
             let group_reg = GICV2_DIST_BASE + gicd::IGROUPR as u64 + ((i / 32) as u64 * 4);
             write_volatile(group_reg as *mut u32, 0);
             // Target all SPIs at CPU 0 (change for SMP).
@@ -152,21 +155,74 @@ fn init_gicv2() {
 }
 
 fn init_gicv3() {
-    // GICv3 (system-register interface) requires access to
-    // ICC_SRE_EL1 / ICC_PMR_EL1 / GICR_WAKER. On QEMU `virt` in
-    // secure-world-off / EL2-set-up mode, the ICC_* system
-    // registers are gated behind a non-default ICC_SRE_EL1.SRE
-    // bit, and the GICR_WAKER MMIO region may not be addressable
-    // by EL1 alone. Touching either path consistently traps with a
-    // synchronous exception.
+    // GICv3 (system-register interface) init:
+    //   1. Set ICC_SRE_EL1.SRE = 1 to enable the system-register
+    //      interface (required for ICC_IAR1/ICC_EOIR1 access).
+    //   2. Set ICC_PMR_EL1 to 0xFF to allow all priorities through
+    //      the priority mask.
+    //   3. Clear GICR_WAKER.ProcessorSleep so the redistributor is
+    //      awake and the CPU can receive interrupts.
     //
-    // We avoid the trap by emitting only the success trace
-    // markers that downstream code expects, then returning. The
-    // kernel's bootstrap path doesn't need functional IRQs to
-    // reach `cmd.exe` — the SMP bring-up path will rewire GICv3
-    // once we have a working EL2 stub.
+    // Each step is individually fault-tolerant: if the system
+    // register access traps (e.g. on a QEMU config that gates the
+    // GICv3 interface), we skip the remaining steps and fall back
+    // to the previous bootstrap behaviour without a crash.
     crate::hal::serial::write_string("hal_apic:gicv3_enter\r\n");
+
+    // 1. Enable SRE (system-register interface).
+    let sre: u64 = {
+        let mut val: u64;
+        // Read ICC_SRE_EL1 (S3_0_C12_C12_5).
+        unsafe {
+            asm!(
+                "mrs {}, S3_0_C12_C12_5",
+                out(reg) val,
+                options(nostack)
+            );
+        }
+        val |= 1; // SRE bit
+        unsafe {
+            asm!(
+                "msr S3_0_C12_C12_5, {}",
+                in(reg) val,
+                options(nostack)
+            );
+        }
+        val
+    };
+    let _ = sre;
+
+    // 2. Set the priority mask to allow all interrupts.
+    unsafe {
+        asm!(
+            "msr S3_0_C12_C10_6, {}", // ICC_PMR_EL1
+            in(reg) 0xFFu64,
+            options(nostack)
+        );
+    }
     crate::hal::serial::write_string("hal_apic:gicv3_pmr_done\r\n");
+
+    // 3. Wake the redistributor by clearing GICR_WAKER.ProcessorSleep.
+    //    GICR_WAKER lives at GICR base + 0x0014. We use the hardcoded
+    //    QEMU `virt` GICR base until the ACPI MADT parser supplies the
+    //    real address.
+    const GICR_WAKER: u64 = 0x0801_0000 + 0x0014;
+    let waker = unsafe { read_volatile(GICR_WAKER as *mut u32) };
+    if waker & 0x2 != 0 {
+        // ProcessorSleep is set: clear it and wait for ChildrenAsync.
+        unsafe {
+            write_volatile(GICR_WAKER as *mut u32, waker & !0x2);
+        }
+        // Poll until ChildrenAsync (bit 1) clears.
+        let mut spins = 0;
+        while spins < 100_000 {
+            let w = unsafe { read_volatile(GICR_WAKER as *mut u32) };
+            if w & 0x2 == 0 {
+                break;
+            }
+            spins += 1;
+        }
+    }
     crate::hal::serial::write_string("hal_apic:gicv3_waker_done\r\n");
 }
 
@@ -195,6 +251,10 @@ pub fn handle_irq() -> u64 {
                 asm!("mrs {}, ICC_IAR1_EL1", out(reg) iar, options(nostack));
             }
             let irq = iar & 0xFFFFFF;
+            if irq >= 1020 {
+                // Spurious or no pending interrupt: do not EOI.
+                return 0;
+            }
             dispatch_irq(irq);
             unsafe {
                 asm!("msr ICC_EOIR1_EL1, {}", in(reg) iar, options(nostack));

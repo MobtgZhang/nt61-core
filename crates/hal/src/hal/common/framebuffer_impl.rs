@@ -211,20 +211,20 @@ pub fn scroll_up(lines: u32) {
     if !FB_ACTIVE.load(Ordering::Relaxed) {
         return;
     }
-    let w = FB_WIDTH.load(Ordering::Relaxed);
     let h = FB_HEIGHT.load(Ordering::Relaxed);
+    // Use the framebuffer pitch (stride between rows) instead of
+    // w * bpp/8 — the pitch may include padding on GPUs whose
+    // scanline is wider than the visible width.
     let pitch = FB_PITCH.load(Ordering::Relaxed) as usize;
-    let bpp = FB_BPP.load(Ordering::Relaxed) as usize;
     let addr = FB_ADDR.load(Ordering::Relaxed) as usize;
-    let bytes_per_row = (w as usize) * (bpp / 8);
-    let total_bytes = (h as usize) * bytes_per_row;
+    let total_bytes = (h as usize) * pitch;
     if (lines as usize) >= h as usize {
         unsafe {
             core::ptr::write_bytes(addr as *mut u8, 0, total_bytes);
         }
         return;
     }
-    let shift = (lines as usize) * bytes_per_row;
+    let shift = (lines as usize) * pitch;
     unsafe {
         core::ptr::copy(
             (addr + shift) as *const u8,
@@ -233,7 +233,6 @@ pub fn scroll_up(lines: u32) {
         );
         core::ptr::write_bytes((addr + total_bytes - shift) as *mut u8, 0, shift);
     }
-    let _ = pitch;
 }
 
 /// 8x16 VGA font for printable ASCII. Each row is a 16-bit

@@ -64,6 +64,16 @@ fn hpet_reg64(off: u64) -> u64 {
     unsafe { ptr::read_volatile((va + off) as *const u64) }
 }
 
+fn hpet_reg_write64(off: u64, val: u64) {
+    let va = hpet_va();
+    if va == 0 {
+        return;
+    }
+    unsafe {
+        ptr::write_volatile((va + off) as *mut u64, val);
+    }
+}
+
 /// Initialise the HPET. `acpi_hpet_phys` is the physical address
 /// of the ACPI HPET table; if it is 0 we silently succeed with
 /// HPET disabled.
@@ -82,7 +92,12 @@ pub fn init(acpi_hpet_phys: u64) -> bool {
 
     // Map the registers. The HPET spec requires a 1 KiB aligned
     // region; we map 1 page (4 KiB) which is plenty.
-    let va = crate::mm::syspte::map_io_space(base, 1).unwrap_or(base);
+    // A raw physical address used as a virtual address is a wild
+    // pointer. Report the mapping failure instead of proceeding.
+    let va = match crate::mm::syspte::map_io_space(base, 1) {
+        Some(v) => v,
+        None => return false,
+    };
     HPET_VA.store(va, Ordering::Release);
 
     let cap = hpet_reg64(HPET_REG_CAP);
@@ -136,9 +151,10 @@ pub fn counter() -> u64 {
     if hi_first == hi_second {
         (hi_first << 32) | lo
     } else {
-        // The counter rolled over between the two reads; trust
-        // the high value we read first.
-        (hi_first << 32) | lo
+        // The counter rolled over between the two reads. The low
+        // value was read after the wrap, so it belongs with the
+        // newer (second) high word.
+        (hi_second << 32) | lo
     }
 }
 
@@ -189,7 +205,10 @@ pub fn delay_us(us: u32) -> bool {
 pub fn program_timer0(delay_ticks: u32) {
     let cur = counter();
     let target = cur.wrapping_add(delay_ticks as u64);
-    hpet_reg_write(0x108, target as u32);
+    // Timer 0 comparator lives at offset 0x108. Write the full
+    // 64-bit target so the comparator does not silently truncate
+    // to the low 32 bits.
+    hpet_reg_write64(0x108, target);
 }
 
 #[cfg(test)]

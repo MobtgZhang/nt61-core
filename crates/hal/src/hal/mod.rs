@@ -213,5 +213,5 @@ pub fn hal_initialize_processor(cpu_id: u32, alloc_ist: bool) -> i32 {
 
 /// Shutdown hardware
 pub fn shutdown() {
-    // Clean up hardware
+    crate::hal::common::shutdown();
 }

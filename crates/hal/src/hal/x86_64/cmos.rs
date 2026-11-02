@@ -217,18 +217,36 @@ pub fn hal_query_real_time_clock() -> Option<TimeFields> {
 
     unlock();
 
+    // 12-hour mode: bit 7 of the hour byte is the PM flag. Extract
+    // it before the BCD-to-binary conversion so it is not lost.
+    let pm_flag = hour & 0x80;
+    let hour_7bit = hour & 0x7F;
+
     if !binary_mode {
         second = bcd_to_bin(second);
         minute = bcd_to_bin(minute);
-        hour = bcd_to_bin(hour & 0x7F);
+        hour = bcd_to_bin(hour_7bit);
         day = bcd_to_bin(day);
         month = bcd_to_bin(month);
         year = bcd_to_bin(year as u8) as u16;
+    } else {
+        hour = hour_7bit;
     }
 
-    // 12-hour mode: bit 7 of the hour byte is the PM flag.
-    if !hour_24 && (hour & 0x80) != 0 {
-        hour = ((hour & 0x7F) + 12) % 24;
+    // Convert 12-hour time to 24-hour. The RTC encodes 12-hour
+    // time as 1..12 with the PM flag in bit 7:
+    //   12 AM (midnight) → 0
+    //   1 AM – 11 AM    → 1..11
+    //   12 PM (noon)     → 12
+    //   1 PM – 11 PM    → 13..23
+    if !hour_24 {
+        hour = if hour == 12 {
+            if pm_flag != 0 { 12 } else { 0 }
+        } else if pm_flag != 0 {
+            hour + 12
+        } else {
+            hour
+        };
     }
 
     // CMOS stores a two-digit year. The conventional pivot is
@@ -260,9 +278,9 @@ pub fn hal_set_real_time_clock(time: &TimeFields) -> bool {
         return false;
     }
 
-    // Pause the RTC update cycle.
+    wait_for_update_complete();
     let prev_status_b = read_register_raw(reg::STATUS_B);
-    write_register_raw(reg::STATUS_B, prev_status_b & !0x80);
+    write_register_raw(reg::STATUS_B, prev_status_b | 0x80);
 
     let binary_mode = (prev_status_b & status_b::BINARY_MODE) != 0;
     let hour_24 = (prev_status_b & status_b::HOUR_FORMAT_24) != 0;
@@ -307,7 +325,7 @@ pub fn hal_set_real_time_clock(time: &TimeFields) -> bool {
     write_register_raw(reg::MONTH, month);
     write_register_raw(reg::YEAR, year2);
 
-    // Resume updates.
+    // Resume updates with the caller's previous SET state.
     write_register_raw(reg::STATUS_B, prev_status_b);
 
     unlock();

@@ -123,6 +123,14 @@ fn map_acpi(phys: u64) -> Option<u64> {
     result
 }
 
+fn map_acpi_pages(phys: u64, page_count: u64) -> Option<u64> {
+    crate::mm::syspte::map_io_space(phys, page_count)
+}
+
+fn unmap_acpi(va: u64, page_count: u64) {
+    crate::mm::syspte::unmap_io_space(va, page_count);
+}
+
 /// Sum the bytes of `buf` modulo 256. A valid ACPI table sums
 /// to zero.
 fn checksum(buf: &[u8]) -> u8 {
@@ -328,19 +336,29 @@ fn collect_rsdt(rsdt_phys: u64, out: &mut Vec<(*const AcpiTableHeader, [u8; 4])>
 }
 
 fn push_table(phys: u64) -> Option<(*const AcpiTableHeader, [u8; 4])> {
-    let va = map_acpi(phys)? as *const u8;
+    // Map at least the header first so we can read the length.
+    let header_va = map_acpi(phys)? as *const u8;
     unsafe {
+        // Read the table length from the header.
+        let length = read_u32(header_va.add(4));
+        if length < 36 {
+            unmap_acpi(header_va as u64, 1);
+            return None;
+        }
+        let total_bytes = length as usize;
+        let page_count = ((total_bytes + 4095) / 4096) as u64;
+        unmap_acpi(header_va as u64, 1);
+        let va = match map_acpi_pages(phys, page_count) {
+            Some(va) => va as *const u8,
+            None => return None,
+        };
         let mut sig = [0u8; 4];
         for i in 0..4 {
             sig[i] = ptr::read_volatile(va.add(i));
         }
         let p = va as *const AcpiTableHeader;
         // Validate checksum: sum of header bytes must be zero.
-        let length = read_u32(va.add(4));
-        if length < 36 {
-            return None;
-        }
-        let bytes = core::slice::from_raw_parts(va, length as usize);
+        let bytes = core::slice::from_raw_parts(va, total_bytes);
         if checksum(bytes) != 0 {
             return None;
         }
@@ -356,8 +374,20 @@ pub fn validate_rsdp(rsdp_phys: u64) -> bool {
     };
     let va = va as *const u8;
     unsafe {
-        let length = read_u32(va.add(20));
-        let n = if length == 0 { 20 } else { length as usize };
+        // Revision 1 RSDP is only 20 bytes long; the length field at
+        // offset 20 does not exist. Only read it when the revision
+        // (at offset 15) indicates an extended structure.
+        let revision = ptr::read_volatile(va.add(15));
+        let n = if revision >= 2 {
+            let length = read_u32(va.add(20));
+            if length == 0 {
+                20
+            } else {
+                length as usize
+            }
+        } else {
+            20
+        };
         if n > 36 {
             return false;
         }
@@ -1065,8 +1095,11 @@ pub fn parse_srat() -> bool {
             SRAT_ENTRY_PROCESSOR => {
                 if entry_len >= 16 && info.processor_count < MAX_MADT_LAPICS {
                     let proximity = fadt_read_u32(entry_va, 2);
-                    let apic_id = fadt_read_u32(entry_va, 6);
-                    let flags = fadt_read_u32(entry_va, 14);
+                    // ACPI SRAT Type 0: APIC ID is u8 at offset 6;
+                    // Flags is u32 at offset 10.
+                    let apic_id =
+                        unsafe { ptr::read_volatile(entry_va.add(6)) } as u32;
+                    let flags = fadt_read_u32(entry_va, 10);
                     if flags & 1 != 0 {
                         info.processors[info.processor_count] = SratProcessor {
                             proximity_domain: proximity,
@@ -1079,9 +1112,11 @@ pub fn parse_srat() -> bool {
             }
             SRAT_ENTRY_MEMORY if entry_len >= 32 && info.memory_count < MAX_SRAT_MEMORY_ENTRIES => {
                 let proximity = fadt_read_u32(entry_va, 2);
-                let base = fadt_read_u64(entry_va, 10);
-                let len = fadt_read_u64(entry_va, 18);
-                let flags = fadt_read_u32(entry_va, 30);
+                // ACPI SRAT Type 1: base_address (u64) at offset 8,
+                // length (u64) at offset 16, flags (u32) at offset 28.
+                let base = fadt_read_u64(entry_va, 8);
+                let len = fadt_read_u64(entry_va, 16);
+                let flags = fadt_read_u32(entry_va, 28);
                 if flags & 1 != 0 {
                     info.memory[info.memory_count] = SratMemory {
                         proximity_domain: proximity,
@@ -1095,6 +1130,10 @@ pub fn parse_srat() -> bool {
             _ => {}
         }
         offset += entry_len;
+    }
+    // Publish the parsed snapshot into the shared cache.
+    unsafe {
+        *SRAT.value.get() = info;
     }
     true
 }
@@ -1157,6 +1196,10 @@ pub fn parse_slit() -> bool {
         for j in 0..domains {
             info.distances[i][j] = read_u8(table, dist_off + i * domains + j);
         }
+    }
+    // Publish the parsed snapshot into the shared cache.
+    unsafe {
+        *SLIT.value.get() = info;
     }
     true
 }

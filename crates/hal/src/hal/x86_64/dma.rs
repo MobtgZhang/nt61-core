@@ -32,6 +32,11 @@ mod ports {
     pub const DMA1_MASK: u16 = 0x0A;
     pub const DMA1_MODE: u16 = 0x0B;
     pub const DMA1_FLIPFLOP: u16 = 0x0C;
+
+    // Slave (DMA2) controller registers for channels 4-7.
+    pub const DMA2_MASK: u16 = 0xD4;
+    pub const DMA2_MODE: u16 = 0xD6;
+    pub const DMA2_FLIPFLOP: u16 = 0xD8;
 }
 
 // Mode register bits.
@@ -48,7 +53,7 @@ fn mask_set(channel: u8) {
     let (port, state) = if channel < 4 {
         (ports::DMA1_MASK, &DMA1_MASK_STATE)
     } else {
-        (ports::DMA1_MASK, &DMA2_MASK_STATE)
+        (ports::DMA2_MASK, &DMA2_MASK_STATE)
     };
     let prev = state.load(Ordering::Relaxed);
     let new = prev | (1 << (channel & 0x03));
@@ -57,19 +62,24 @@ fn mask_set(channel: u8) {
 }
 
 fn mask_clear(channel: u8) {
-    let state = if channel < 4 {
-        &DMA1_MASK_STATE
+    let (port, state) = if channel < 4 {
+        (ports::DMA1_MASK, &DMA1_MASK_STATE)
     } else {
-        &DMA2_MASK_STATE
+        (ports::DMA2_MASK, &DMA2_MASK_STATE)
     };
     let prev = state.load(Ordering::Relaxed);
     let new = prev & !(1 << (channel & 0x03));
     state.store(new, Ordering::Relaxed);
-    write_port_uchar(ports::DMA1_MASK, channel & 0x03);
+    write_port_uchar(port, channel & 0x03);
 }
 
-fn reset_flipflop() {
-    write_port_uchar(ports::DMA1_FLIPFLOP, 0xFF);
+fn reset_flipflop(channel: u8) {
+    let port = if channel < 4 {
+        ports::DMA1_FLIPFLOP
+    } else {
+        ports::DMA2_FLIPFLOP
+    };
+    write_port_uchar(port, 0xFF);
 }
 
 fn program_channel(channel: u8, mode: u8, addr: u32, count: u16) {
@@ -85,7 +95,7 @@ fn program_channel(channel: u8, mode: u8, addr: u32, count: u16) {
     );
 
     mask_set(channel);
-    reset_flipflop();
+    reset_flipflop(channel);
 
     let (lo, hi, page) = if channel < 4 {
         let a = addr & 0xFFFF;
@@ -105,24 +115,32 @@ fn program_channel(channel: u8, mode: u8, addr: u32, count: u16) {
     };
     write_port_uchar(count_port, (count_val & 0xFF) as u8);
     write_port_uchar(count_port, ((count_val >> 8) & 0xFF) as u8);
-    write_port_uchar(ports::DMA1_MODE, mode | (channel & 0x03));
+    let mode_port = if channel < 4 {
+        ports::DMA1_MODE
+    } else {
+        ports::DMA2_MODE
+    };
+    write_port_uchar(mode_port, mode | (channel & 0x03));
     mask_clear(channel);
 }
 
 /// read the current count of `channel` (0..7). The value is the
 /// "remaining" count, with a bias of 1 — the user code adds 1 to
 /// recover the original count.
-pub fn hal_read_dma_counter(channel: u8) -> u8 {
+pub fn hal_read_dma_counter(channel: u8) -> u16 {
     if channel >= 8 {
         return 0;
     }
-    reset_flipflop();
+    reset_flipflop(channel);
     let port = ports::DMA1_COUNT[channel as usize];
     let lo = read_port_uchar(port);
     let hi = read_port_uchar(port);
     let raw = ((hi as u16) << 8) | (lo as u16);
-    let count = if channel < 4 { raw + 1 } else { (raw + 1) << 1 };
-    (count & 0xFF) as u8
+    if channel < 4 {
+        raw + 1
+    } else {
+        (raw + 1) << 1
+    }
 }
 
 // =====================================================================
@@ -291,6 +309,9 @@ pub fn hal_free_common_buffer(_adapter: &AdapterInfo, phys: u64, virt: u64, size
             if slot.in_use && slot.phys == phys && slot.virt == virt && slot.size == size {
                 slot.in_use = false;
                 found = true;
+                // Return the pages to the kernel pool so the memory
+                // is not leaked on every buffer release.
+                let _ = crate::mm::pool::free(virt as *mut u8);
                 break;
             }
         }
