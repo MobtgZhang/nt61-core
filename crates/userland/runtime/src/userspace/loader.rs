@@ -281,7 +281,11 @@ pub fn apply_base_relocations_to_image(image: &mut [u8], raw: &[u8], delta: i64)
 
     // The .reloc directory itself is usually inside .rdata (a section
     // the file maps 1:1), so resolve it through the section table.
-    let section_table = opt_off + 2 + 18 * 2 + 4 + 4 + 4 + 4 + 4 + 8 + 2 + 2 + 2 + 2;
+    let size_of_optional_header = u16::from_le_bytes([
+        raw[cof_off + 16],
+        raw[cof_off + 17],
+    ]);
+    let section_table = opt_off + size_of_optional_header as usize;
     let mut cur = match rva_to_file_offset(raw, section_table, number_of_sections, reloc_rva) {
         Some(offset) => offset,
         None => return 0,
@@ -500,6 +504,32 @@ pub fn init_teb_in_pml4(pml4: u64, _peb: u64) -> Result<u64, NTSTATUS> {
     Ok(TEB_VA)
 }
 
+/// Write the Win7 x64 TEB self-pointer and PEB back-link after the
+/// TEB page is mapped. NT 6.1 initializes `NtTib.Self` and
+/// `ProcessEnvironmentBlock` before a thread enters user mode.
+pub unsafe fn link_teb_to_peb(teb_va: u64, peb_va: u64) {
+    #[repr(C)]
+    struct NtTib {
+        exception_list: u64,
+        stack_base: u64,
+        stack_limit: u64,
+        sub_system_caller: u64,
+        fiber_data: u64,
+        arbitrary_user_pointer: u64,
+        self_pointer: u64,
+    }
+    #[repr(C)]
+    struct Teb {
+        nt_tib: NtTib,
+        environment_pointer: u64,
+        client_id: u64,
+        process_environment_block: u64,
+    }
+    let teb = teb_va as *mut Teb;
+    (*teb).nt_tib.self_pointer = teb_va;
+    (*teb).process_environment_block = peb_va;
+}
+
 // ---------------------------------------------------------------------------
 // User-stack construction
 // ---------------------------------------------------------------------------
@@ -508,8 +538,20 @@ pub fn init_teb_in_pml4(pml4: u64, _peb: u64) -> Result<u64, NTSTATUS> {
 /// startup frame, and return the initial user-mode RSP. The Windows
 /// x64 ABI requires RSP to be 16-byte aligned at the call site.
 pub fn build_user_stack(_pml4: u64, _teb_va: u64, _image_path: &str) -> Result<u64, NTSTATUS> {
-    // The full implementation walks process_parameters, env, command
-    // line, and a small "thread-startup" frame. For Phase 1 we hand
-    // back a placeholder 16-byte-aligned address above the TEB.
+    let pages = DEFAULT_USER_STACK_SIZE.div_ceil(0x1000);
+    for index in 0..pages {
+        let phys = crate::mm::pfn::allocate_pfn().ok_or(STATUS_NO_MEMORY)?;
+        let phys = crate::mm::pte::pfn_to_phys(phys);
+        let page_va = USER_STACK_TOP - index * 0x1000;
+        let result = vas::map_page_in_pml4(
+            _pml4,
+            page_va,
+            phys,
+            pte::PTE_P | pte::PTE_RW | pte::PTE_US,
+        );
+        if result != vas::MmStatus::Ok {
+            return Err(STATUS_NO_MEMORY);
+        }
+    }
     Ok(USER_STACK_TOP)
 }

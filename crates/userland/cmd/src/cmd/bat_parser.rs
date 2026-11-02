@@ -8,7 +8,6 @@
 //! - SETLOCAL/ENDLOCAL environment scoping
 //! - Variable expansion %VAR%
 
-use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -74,7 +73,7 @@ pub struct BatchParser {
     /// Preprocessed lines (comments removed, variables expanded)
     lines: Vec<String>,
     /// Labels (label_name -> line_index)
-    labels: Vec<(&'static str, usize)>,
+    labels: Vec<(String, usize)>,
     /// Current execution position
     current: usize,
     /// FOR loop variable stack
@@ -94,6 +93,7 @@ pub struct BatchParser {
 }
 
 /// FOR loop context
+#[derive(Clone)]
 pub struct ForContext {
     pub variable: String,
     pub items: Vec<String>,
@@ -187,7 +187,7 @@ impl BatchParser {
                     true_branch,
                     false_branch,
                 } => {
-                    let cond = self.evaluate_condition(&condition)?;
+                    let cond = self.evaluate_condition(&condition, executor)?;
                     // The lowered block-IF puts a GOTO in the true branch
                     // (e.g. `IF "%A%" == "%B%" GOTO :__IF_THEN_1__`). If
                     // condition is true we just run the GOTO; if false,
@@ -248,10 +248,9 @@ impl BatchParser {
                 }
                 LineType::Exit { batch_only, code } => {
                     if batch_only {
-                        // Pop call stack if we're in a called subroutine
-                        if let Some(_saved_pos) = self.call_stack.pop() {
-                            // Return to caller
-                            return Ok(());
+                        if let Some(saved_pos) = self.call_stack.pop() {
+                            self.current = saved_pos;
+                            continue;
                         }
                         self.running = false;
                         return Ok(());
@@ -734,7 +733,7 @@ impl BatchParser {
             if trimmed.starts_with(':') && !trimmed.is_empty() {
                 let label = trimmed.trim_start_matches(':').trim().to_uppercase();
                 if !label.is_empty() && !label.starts_with(':') {
-                    self.labels.push((Box::leak(label.into_boxed_str()), i));
+                    self.labels.push((label, i));
                 }
             }
         }
@@ -847,36 +846,40 @@ impl BatchParser {
 
         // IF [NOT] EXIST filename [cmd]
         if upper_body.contains(" EXIST ") {
+            let (condition, command) = split_condition_command(&body, " EXIST ", 1);
             return LineType::If {
-                condition: body.clone(),
-                true_branch: String::new(),
+                condition,
+                true_branch: command,
                 false_branch: None,
             };
         }
 
         // IF [NOT] DEFINED var [cmd]
         if upper_body.contains(" DEFINED ") {
+            let (condition, command) = split_condition_command(&body, " DEFINED ", 1);
             return LineType::If {
-                condition: body.clone(),
-                true_branch: String::new(),
+                condition,
+                true_branch: command,
                 false_branch: None,
             };
         }
 
         // IF ERRORLEVEL n [cmd]
         if upper_body.contains("ERRORLEVEL ") {
+            let (condition, command) = split_condition_command(&body, "ERRORLEVEL ", 1);
             return LineType::If {
-                condition: body.clone(),
-                true_branch: String::new(),
+                condition,
+                true_branch: command,
                 false_branch: None,
             };
         }
 
         // IF string1 == string2 [cmd]
         if upper_body.contains("==") {
+            let (condition, command) = split_condition_command(&body, "==", 1);
             return LineType::If {
-                condition: body.clone(),
-                true_branch: String::new(),
+                condition,
+                true_branch: command,
                 false_branch: None,
             };
         }
@@ -885,9 +888,10 @@ impl BatchParser {
         for tok in &["EQU", "NEQ", "LSS", "LEQ", "GTR", "GEQ"] {
             let needle = alloc::format!(" {} ", tok);
             if upper_body.contains(&needle) {
+                let (condition, command) = split_condition_command(&body, &needle, 1);
                 return LineType::If {
-                    condition: body.clone(),
-                    true_branch: String::new(),
+                    condition,
+                    true_branch: command,
                     false_branch: None,
                 };
             }
@@ -983,6 +987,10 @@ impl BatchParser {
         // that as `running = false`, which the main loop
         // exits cleanly.
         if target == "EOF" {
+            if let Some(saved_pos) = self.call_stack.pop() {
+                self.current = saved_pos;
+                return Ok(());
+            }
             self.running = false;
             return Ok(());
         }
@@ -999,7 +1007,11 @@ impl BatchParser {
     }
 
     /// Evaluate IF condition
-    fn evaluate_condition(&self, condition: &str) -> Result<bool, BatError> {
+    fn evaluate_condition(
+        &mut self,
+        condition: &str,
+        executor: &mut dyn BatchExecutor,
+    ) -> Result<bool, BatError> {
         let upper = condition.to_uppercase();
 
         // IF DEFINED variable / IF NOT DEFINED variable
@@ -1033,8 +1045,7 @@ impl BatchParser {
             if parts.len() >= 3 {
                 let is_not = parts.len() >= 4 && parts[1].to_uppercase() == "NOT";
                 let filename = if is_not { parts[2] } else { parts[1] };
-                let _ = &filename;
-                let exists = true; // Simplified: assume file exists
+                let exists = executor.file_exists(filename);
 
                 return Ok(if is_not { !exists } else { exists });
             }
@@ -1204,17 +1215,30 @@ impl BatchParser {
 
         // Check if it's calling another batch file
         if target.ends_with(".bat") || target.ends_with(".cmd") {
-            // Save current position
-            self.call_stack.push(self.current);
+            let saved_lines = self.lines.clone();
+            let saved_labels = self.labels.clone();
+            let saved_current = self.current;
+            let saved_for_stack = self.for_stack.clone();
+            let saved_call_stack = self.call_stack.clone();
+            let saved_setlocal_stack = self.setlocal_stack.clone();
+            let saved_variables = self.variables.clone();
+            let saved_echo = self.echo;
+            let _saved_error_level = self.error_level;
+            let saved_running = self.running;
 
-            // Execute the sub-batch
-            let result = self.execute(target, executor);
+            let mut child = BatchParser::new();
+            let result = child.execute(target, executor);
+            self.error_level = child.error_level;
 
-            // Restore position
-            if let Some(pos) = self.call_stack.pop() {
-                self.current = pos;
-            }
-
+            self.lines = saved_lines;
+            self.labels = saved_labels;
+            self.current = saved_current;
+            self.for_stack = saved_for_stack;
+            self.call_stack = saved_call_stack;
+            self.setlocal_stack = saved_setlocal_stack;
+            self.variables = saved_variables;
+            self.echo = saved_echo;
+            self.running = saved_running;
             return result;
         }
 
@@ -1404,6 +1428,29 @@ impl Default for BatchParser {
     }
 }
 
+fn split_condition_command(
+    body: &str,
+    marker: &str,
+    operands_after_marker: usize,
+) -> (String, String) {
+    let upper_body = body.to_uppercase();
+    let marker_upper = marker.to_uppercase();
+    let Some(marker_pos) = upper_body.find(&marker_upper) else {
+        return (body.trim().to_string(), String::new());
+    };
+
+    let condition = body[..marker_pos].trim().to_string();
+    let mut command = body[marker_pos + marker.len()..].trim_start();
+    for _ in 0..operands_after_marker {
+        let Some(space) = command.find(char::is_whitespace) else {
+            return (condition, String::new());
+        };
+        command = command[space..].trim_start();
+    }
+
+    (condition, command.trim().to_string())
+}
+
 /// Trait for batch file command execution
 pub trait BatchExecutor {
     /// read a batch file's contents
@@ -1414,6 +1461,9 @@ pub trait BatchExecutor {
 
     /// Echo a line (for batch echo)
     fn echo_line(&self, line: &str);
+
+    /// Report whether a shell path exists.
+    fn file_exists(&self, path: &str) -> bool;
 }
 
 /// Get environment variable (simplified)
@@ -1578,4 +1628,22 @@ fn eval_int_expr(expr: &str) -> Option<i64> {
         return None;
     }
     Some(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BatchParser;
+
+    #[test]
+    fn autoexec_batch_parses_and_collects_labels() {
+        const AUTOEXEC: &str = include_str!("../../../../../resources/bat/autoexec.bat");
+        let mut parser = BatchParser::new();
+        parser.preprocess(AUTOEXEC);
+        parser.collect_labels();
+        assert!(!parser.lines.is_empty());
+        assert!(parser
+            .labels
+            .iter()
+            .any(|(label, _)| label.eq_ignore_ascii_case("CheckCall")));
+    }
 }

@@ -1,5 +1,6 @@
 pub const SYS_PUTCHAR: u32 = 0x0202;
-pub const SYS_RETURN_TO_FIRMWARE: u32 = 0x0214;
+#[allow(dead_code)]
+pub const SYS_EXIT_PROCESS: u32 = 0x0201;
 pub const SYS_READ_LINE: u32 = 0x0211;
 pub const SYS_CMD_EXECUTE: u32 = 0x0215;
 pub const SYS_PRINT_PROMPT: u32 = 0x0216;
@@ -17,8 +18,7 @@ unsafe extern "sysv64" fn syscall5_raw(
     arg4: usize,
 ) -> u64 {
     core::arch::naked_asm!(
-        "mov r10, rsi",
-        "mov r9, r8",
+        "mov r10, r8",
         "mov r8, rcx",
         "mov rax, rdi",
         "syscall",
@@ -57,7 +57,7 @@ pub fn read_line(buffer: &mut [u8]) -> usize {
 
 #[inline]
 pub fn execute_command(command: &[u8]) -> bool {
-    let mut buffer = [0u8; 256];
+    let mut buffer = [0u8; 1024];
     let length = command.len().min(buffer.len() - 1);
     buffer[..length].copy_from_slice(&command[..length]);
     syscall5(
@@ -75,15 +75,16 @@ pub fn print_prompt() {
     syscall5(SYS_PRINT_PROMPT, 0, 0, 0, 0, 0);
 }
 
+#[allow(dead_code)]
 #[inline(always)]
-pub fn return_to_firmware(mode: u32) -> ! {
-    syscall5(SYS_RETURN_TO_FIRMWARE, mode as usize, 0, 0, 0, 0);
-    loop {
-        core::hint::spin_loop()
-    }
+pub fn halt() -> ! {
+    exit_process(0)
 }
 
 #[inline(always)]
-pub fn halt() -> ! {
-    return_to_firmware(0)
+pub fn exit_process(exit_code: u32) -> ! {
+    syscall5(SYS_EXIT_PROCESS, exit_code as usize, 0, 0, 0, 0);
+    loop {
+        core::hint::spin_loop();
+    }
 }

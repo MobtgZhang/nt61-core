@@ -66,12 +66,24 @@ pub unsafe fn find_main(argc: i32, argv: *const *const u8) -> i32 {
         None => return 2,
     };
 
+    if files.is_empty() {
+        return 2;
+    }
+
+    let mut total_matches = 0usize;
     for file_path in &files {
         let mut buffer = [0u8; 65536];
         let bytes_read = match crate::fs::vfs::vfs_read(file_path, &mut buffer) {
             Ok(n) => n,
-            Err(_) => continue,
+            Err(_) => {
+                crate::kprintln!("File not found - {}", file_path);
+                return 2;
+            }
         };
+        if bytes_read == buffer.len() {
+            crate::kprintln!("File is too large - {}", file_path);
+            return 2;
+        }
         let text = core::str::from_utf8(&buffer[..bytes_read]).unwrap_or("");
 
         let mut match_count = 0usize;
@@ -91,6 +103,7 @@ pub unsafe fn find_main(argc: i32, argv: *const *const u8) -> i32 {
             let matches = haystack.contains(&needle_cased);
             if matches != invert {
                 match_count += 1;
+                total_matches += 1;
                 if !count_only {
                     if line_numbers {
                         crate::kprintln!("{}: {}", line_no, line);
@@ -104,5 +117,5 @@ pub unsafe fn find_main(argc: i32, argv: *const *const u8) -> i32 {
             crate::kprintln!("{}", match_count);
         }
     }
-    0
+    if total_matches == 0 { 1 } else { 0 }
 }

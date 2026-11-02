@@ -51,8 +51,14 @@ pub unsafe fn more_main(argc: i32, argv: *const *const u8) -> i32 {
             crate::kprintln!("{}", line);
             line_count += 1;
             if line_count.is_multiple_of(SCREEN_LINES) {
-                // In a real console we would prompt "-- More --" and wait
-                // for a keypress. For now just continue printing.
+                crate::ntoskrnl::kprint!("-- More --");
+                loop {
+                    match crate::hal::keyboard_input::try_read_byte() {
+                        Some(b'\r') | Some(b'\n') | Some(b' ') | Some(b'q') => break,
+                        _ => {}
+                    }
+                }
+                crate::kprintln!();
             }
         }
     }

@@ -68,7 +68,6 @@ pub const NT_SET_VALUE_KEY: u32 = 0x005D;
 pub const NT_ENUMERATE_VALUE_KEY: u32 = 0x0010;
 pub const NT_ENUMERATE_KEY: u32 = 0x002F;
 pub const NT_DELETE_KEY: u32 = 0x00B3;
-pub const NT_CLOSE_KEY: u32 = 0x000C;
 
 // Process / thread time
 pub const NT_QUERY_SYSTEM_TIME: u32 = 0x0057;

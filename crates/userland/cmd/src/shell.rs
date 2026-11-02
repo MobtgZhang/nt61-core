@@ -3,7 +3,7 @@ use crate::arch;
 const BANNER: &[u8] = b"Microsoft Windows [Version 6.1.7601]\r\n";
 const COPYRIGHT: &[u8] = b"Copyright (c) 2009 Microsoft Corporation. All rights reserved.\r\n";
 
-const LINE_BUFFER_SIZE: usize = 256;
+const LINE_BUFFER_SIZE: usize = 1024;
 
 #[derive(Default)]
 struct Shell;

@@ -96,18 +96,27 @@ pub fn run_batch_file<O: Output>(
         return true;
     }
 
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; 32768];
     let read_size = core::cmp::min(size, buf.len());
     let n = fat32::read_file(fs, cluster, read_size as u32, &mut buf).unwrap_or(0);
+    if size > buf.len() {
+        output.put_str(b"Batch file is too large: ");
+        output.put_str(name);
+        output.put_str(b"\r\n");
+        return true;
+    }
 
     // Process the batch file line by line
-    let mut line = [0u8; 128];
+    let mut line = [0u8; 1024];
     let mut line_len = 0usize;
+    let mut line_overflow = false;
     let mut i = 0usize;
     while i < n {
         let b = buf[i];
         if b == b'\n' || b == b'\r' {
-            if line_len > 0 {
+            if line_overflow {
+                output.put_str(b"Batch line is too long.\r\n");
+            } else if line_len > 0 {
                 // Strip a leading '@' (silent echo)
                 let exec_cmd = if line[0] == b'@' {
                     &line[1..line_len]
@@ -117,13 +126,18 @@ pub fn run_batch_file<O: Output>(
                 dispatch_fn(exec_cmd);
                 line_len = 0;
             }
+            line_overflow = false;
         } else if line_len < line.len() {
             line[line_len] = b;
             line_len += 1;
+        } else {
+            line_overflow = true;
         }
         i += 1;
     }
-    if line_len > 0 {
+    if line_overflow {
+        output.put_str(b"Batch line is too long.\r\n");
+    } else if line_len > 0 {
         dispatch_fn(&line[..line_len]);
     }
     true
