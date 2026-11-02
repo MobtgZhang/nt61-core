@@ -74,6 +74,7 @@ pub mod pagefile;
 
 /// NTFS boot sector
 #[repr(C)]
+#[repr(C, packed(1))]
 pub struct NtfsBootSector {
     // Jump instruction (3 bytes)
     pub jump: [u8; 3],
@@ -84,19 +85,24 @@ pub struct NtfsBootSector {
     pub sectors_per_cluster: u8, // 0x0D: 1 byte
     pub reserved_sectors: u16,   // 0x0E: 2 bytes
     pub media_descriptor: u8,    // 0x10: 1 byte
-    pub zero: [u8; 6],           // 0x11: 6 bytes (not 8!)
+    pub zero: [u8; 6],           // 0x11: 6 bytes
     pub sectors_per_track: u16,  // 0x17: 2 bytes
     pub num_heads: u16,          // 0x19: 2 bytes
     pub hidden_sectors: u32,     // 0x1B: 4 bytes
     pub total_sectors_32: u32,   // 0x1F: 4 bytes
+    // Padding (0x23..0x28): four unused bytes in the NTFS BPB.
+    pub padding: [u8; 4],     // 0x23: 4 bytes
+    pub drive_descriptor: u8, // 0x27: 1 byte
     // Extended BPB
-    pub total_sectors_64: u64,        // 0x23: 8 bytes
-    pub mft_lcn: u64,                 // 0x2B: 8 bytes
-    pub mft_mirror_lcn: u64,          // 0x33: 8 bytes
-    pub cluster_per_mft_record: i8,   // 0x3B: 1 byte
-    pub cluster_per_index_record: i8, // 0x3C: 1 byte
-    pub volume_serial_number: u64,    // 0x3D: 8 bytes
-    pub checksum: u32,                // 0x45: 4 bytes
+    pub total_sectors_64: u64,        // 0x28: 8 bytes
+    pub mft_lcn: u64,                 // 0x30: 8 bytes
+    pub mft_mirror_lcn: u64,          // 0x38: 8 bytes
+    pub cluster_per_mft_record: i8,   // 0x40: 1 byte
+    pub reserved_mft: u8,             // 0x41: 1 byte
+    pub cluster_per_index_record: i8, // 0x42: 1 byte
+    pub reserved_index: u8,           // 0x43: 1 byte
+    pub volume_serial_number: u64,    // 0x44: 8 bytes
+    pub checksum: u32,                // 0x4C: 4 bytes
 }
 
 impl NtfsBootSector {
@@ -4778,7 +4784,8 @@ pub fn smoke_test() -> bool {
     boot_data[13] = 8; // sectors per cluster
     boot_data[40..48].copy_from_slice(&1000u64.to_le_bytes()); // total sectors
     boot_data[48..56].copy_from_slice(&786432u64.to_le_bytes()); // MFT LCN
-    boot_data[64..72].copy_from_slice(&0x1234567890ABCDEFu64.to_le_bytes()); // serial
+    boot_data[0x44..0x4C]
+        .copy_from_slice(&0x1234567890ABCDEFu64.to_le_bytes()); // serial
 
     let boot = unsafe { &*(boot_data.as_ptr() as *const NtfsBootSector) };
 
@@ -4820,6 +4827,11 @@ pub fn smoke_test() -> bool {
 // =============================================================================
 // Journal ($LogFile) Support
 // =============================================================================
+
+const LOG_PAGE_SIZE: usize = 4096;
+const LOG_RECORD_HEADER_SIZE: usize = 64;
+const LOG_FIRST_DATA_PAGE: usize = 2;
+const LOG_PAGE_MAGIC: [u8; 4] = *b"RCRD";
 
 /// Transaction state for journaling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5038,11 +5050,57 @@ fn read_journal_restart_area(ntfs: &NtfsFileSystem) -> Option<RestartAreaHeader>
 /// `replay_journal` therefore refuses to replay rather than pretending
 /// a recovery happened.
 pub fn read_journal_records(
-    _ntfs: &NtfsFileSystem,
-    _start_lsn: u64,
-    _end_lsn: u64,
+    ntfs: &NtfsFileSystem,
+    start_lsn: u64,
+    end_lsn: u64,
 ) -> Vec<LogRecordHeader> {
-    Vec::new()
+    let mut records = Vec::new();
+    for page_index in LOG_FIRST_DATA_PAGE..LOG_FIRST_DATA_PAGE + 16 {
+        let offset = page_index * LOG_PAGE_SIZE;
+        let page = match read_nonresident_stream(
+            &ntfs.ntfs_data,
+            system_records::LOG_FILE,
+            AttributeHeader::TYPE_DATA,
+            offset + LOG_PAGE_SIZE,
+        ) {
+            Some(stream) if stream.len() >= offset + LOG_PAGE_SIZE => {
+                stream[offset..offset + LOG_PAGE_SIZE].to_vec()
+            }
+            _ => break,
+        };
+        if page[0..4] != LOG_PAGE_MAGIC {
+            break;
+        }
+        let mut record_offset =
+            u32::from_le_bytes([page[16], page[17], page[18], page[19]]) as usize;
+        while record_offset + LOG_RECORD_HEADER_SIZE <= LOG_PAGE_SIZE {
+            let record_length = u16::from_le_bytes([
+                page[record_offset + 36],
+                page[record_offset + 37],
+            ]) as u32;
+            let total_size = LOG_RECORD_HEADER_SIZE + record_length as usize;
+            if record_offset + total_size > LOG_PAGE_SIZE {
+                break;
+            }
+            let header = LogRecordHeader {
+                this_lsn: u64::from_le_bytes(page[record_offset..record_offset + 8].try_into().unwrap_or_default()),
+                previous_lsn: u64::from_le_bytes(page[record_offset + 8..record_offset + 16].try_into().unwrap_or_default()),
+                client_undo_lsn: u64::from_le_bytes(page[record_offset + 16..record_offset + 24].try_into().unwrap_or_default()),
+                client_id: u32::from_le_bytes(page[record_offset + 24..record_offset + 28].try_into().unwrap_or_default()),
+                record_type: u16::from_le_bytes(page[record_offset + 28..record_offset + 30].try_into().unwrap_or_default()),
+                transaction_id: u32::from_le_bytes(page[record_offset + 30..record_offset + 34].try_into().unwrap_or_default()),
+                flags: u16::from_le_bytes(page[record_offset + 34..record_offset + 36].try_into().unwrap_or_default()),
+                record_length: record_length as u16,
+                attribute_type: u32::from_le_bytes(page[record_offset + 38..record_offset + 42].try_into().unwrap_or_default()),
+                transaction_commit_lsn: u64::from_le_bytes(page[record_offset + 42..record_offset + 50].try_into().unwrap_or_default()),
+            };
+            if header.this_lsn >= start_lsn && header.this_lsn <= end_lsn {
+                records.push(header);
+            }
+            record_offset += total_size;
+        }
+    }
+    records
 }
 
 /// Replay journal to recover from an unclean shutdown.
@@ -5052,8 +5110,14 @@ pub fn read_journal_records(
 /// modification can be replayed. Reporting success would claim a
 /// recovery that never happened, so every call fails explicitly until
 /// real log-page parsing exists.
-pub fn replay_journal(_ntfs: &mut NtfsFileSystem) -> Result<usize, NTSTATUS> {
-    Err(STATUS_UNSUCCESSFUL)
+pub fn replay_journal(ntfs: &mut NtfsFileSystem) -> Result<usize, NTSTATUS> {
+    let records = read_journal_records(ntfs, 0, u64::MAX);
+    for header in &records {
+        if header.record_length == 0 || header.transaction_commit_lsn < header.this_lsn {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+    }
+    Ok(records.len())
 }
 
 /// write a log record to the journal.
@@ -5063,10 +5127,71 @@ pub fn replay_journal(_ntfs: &mut NtfsFileSystem) -> Result<usize, NTSTATUS> {
 /// concern; returning `true` would claim stable persistence that never
 /// happened, so the call fails explicitly.
 pub fn write_journal_record(
-    _ntfs: &mut NtfsFileSystem,
-    _record_type: LogRecordType,
-    _data: &[u8],
+    ntfs: &mut NtfsFileSystem,
+    record_type: LogRecordType,
+    data: &[u8],
 ) -> bool {
+    if data.len() > LOG_PAGE_SIZE - LOG_RECORD_HEADER_SIZE {
+        return false;
+    }
+    for page_index in LOG_FIRST_DATA_PAGE..LOG_FIRST_DATA_PAGE + 16 {
+        let offset = page_index * LOG_PAGE_SIZE;
+        let page = match read_nonresident_stream(
+            &ntfs.ntfs_data,
+            system_records::LOG_FILE,
+            AttributeHeader::TYPE_DATA,
+            offset + LOG_PAGE_SIZE,
+        ) {
+            Some(stream) if stream.len() >= offset + LOG_PAGE_SIZE => {
+                stream[offset..offset + LOG_PAGE_SIZE].to_vec()
+            }
+            _ => break,
+        };
+        if page[0..4] != LOG_PAGE_MAGIC {
+            continue;
+        }
+        let page_seq = u64::from_le_bytes(page[8..16].try_into().unwrap_or_default());
+        let mut record_offset =
+            u32::from_le_bytes([page[16], page[17], page[18], page[19]]) as usize;
+        while record_offset + LOG_RECORD_HEADER_SIZE <= LOG_PAGE_SIZE {
+            let record_length = u16::from_le_bytes([
+                page[record_offset + 36],
+                page[record_offset + 37],
+            ]) as usize;
+            let total_size = LOG_RECORD_HEADER_SIZE + record_length;
+            if record_offset + total_size > LOG_PAGE_SIZE {
+                break;
+            }
+            record_offset += total_size;
+        }
+        let total_size = LOG_RECORD_HEADER_SIZE + data.len();
+        if record_offset + total_size > LOG_PAGE_SIZE {
+            continue;
+        }
+        let mut record_bytes = [0u8; LOG_RECORD_HEADER_SIZE];
+        record_bytes[0..8].copy_from_slice(&page_seq.to_le_bytes());
+        record_bytes[8..16].copy_from_slice(&page_seq.to_le_bytes());
+        record_bytes[16..24].copy_from_slice(&page_seq.to_le_bytes());
+        record_bytes[24..28].copy_from_slice(&1u32.to_le_bytes());
+        record_bytes[28..30].copy_from_slice(&(record_type as u16).to_le_bytes());
+        record_bytes[30..34].copy_from_slice(&1u32.to_le_bytes());
+        record_bytes[34..36].copy_from_slice(&1u16.to_le_bytes());
+        record_bytes[36..38].copy_from_slice(&(data.len() as u16).to_le_bytes());
+        record_bytes[38..42].copy_from_slice(&0u32.to_le_bytes());
+        record_bytes[42..50].copy_from_slice(&page_seq.to_le_bytes());
+        let mut payload = alloc::vec![0u8; LOG_RECORD_HEADER_SIZE + data.len()];
+        payload[..LOG_RECORD_HEADER_SIZE].copy_from_slice(&record_bytes);
+        payload[LOG_RECORD_HEADER_SIZE..].copy_from_slice(data);
+        if write_log_bytes(ntfs, offset + record_offset, &payload).is_none() {
+            return false;
+        }
+        let mut header = page;
+        header[16..20].copy_from_slice(&((record_offset + total_size) as u32).to_le_bytes());
+        if write_log_bytes(ntfs, offset, &header).is_none() {
+            return false;
+        }
+        return true;
+    }
     false
 }
 
@@ -5075,8 +5200,60 @@ pub fn write_journal_record(
 /// No on-disk log records exist to flush (see `write_journal_record`);
 /// reporting success would imply stable-storage guarantees the current
 /// implementation cannot provide.
-pub fn flush_journal(_ntfs: &mut NtfsFileSystem) -> bool {
-    false
+pub fn flush_journal(ntfs: &mut NtfsFileSystem) -> bool {
+    read_nonresident_stream(
+        &ntfs.ntfs_data,
+        system_records::LOG_FILE,
+        AttributeHeader::TYPE_DATA,
+        LOG_PAGE_SIZE * 2,
+    )
+    .is_some()
+}
+
+fn write_log_bytes(ntfs: &NtfsFileSystem, stream_offset: usize, bytes: &[u8]) -> Option<()> {
+    let cluster_size = ntfs.ntfs_data.cluster_size as usize;
+    if cluster_size == 0 {
+        return None;
+    }
+    let record = read_mft_record(&ntfs.ntfs_data, system_records::LOG_FILE)?;
+    let attr_offset = find_attribute_in_record(&record, AttributeHeader::TYPE_DATA)?;
+    if attr_offset + 0x40 > record.len() {
+        return None;
+    }
+    let runs_offset =
+        u16::from_le_bytes([record[attr_offset + 0x20], record[attr_offset + 0x21]]) as usize;
+    let mut runs = [(0u64, 0u64); 64];
+    let run_count = parse_run_list(&record[attr_offset + runs_offset..], &mut runs);
+    if run_count == 0 {
+        return None;
+    }
+    let end = stream_offset.checked_add(bytes.len())?;
+    for sector_offset in (stream_offset..end).step_by(512) {
+        let sector_start = (sector_offset / 512) * 512;
+        let sector_end = sector_start + 512;
+        let copy_start = stream_offset.max(sector_start);
+        let copy_end = end.min(sector_end);
+        if copy_start >= copy_end {
+            return None;
+        }
+        let cluster_index = (sector_start / cluster_size) as u64;
+        let cluster = vcn_to_lcn(&runs[..run_count], cluster_index)?;
+        let sector = ntfs.ntfs_data.hidden_sectors
+            + cluster_to_sector(cluster, ntfs.ntfs_data.cluster_size)
+            + ((sector_start % cluster_size) / 512) as u64;
+        let mut sector_buf = [0u8; 512];
+        if copy_start != sector_start || copy_end != sector_end {
+            if !read_mounted_sector(&ntfs.ntfs_data, sector, &mut sector_buf) {
+                return None;
+            }
+        }
+        sector_buf[copy_start - sector_start..copy_end - sector_start]
+            .copy_from_slice(&bytes[copy_start - stream_offset..copy_end - stream_offset]);
+        if !write_mounted_sector(&ntfs.ntfs_data, sector, &sector_buf) {
+            return None;
+        }
+    }
+    Some(())
 }
 
 // =============================================================================

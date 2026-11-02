@@ -24,7 +24,10 @@
 //! registers a `Fat32FileSystem`; `Fat32FileSystem::read_file` reads
 //! the bytes of a file by walking the cluster chain. write support is
 //! out of scope for the bootstrap.
-use crate::libs::ntdll::{status::STATUS_UNSUCCESSFUL, types::NTSTATUS};
+use crate::libs::ntdll::{
+    status::{STATUS_IO_DEVICE_ERROR, STATUS_UNSUCCESSFUL},
+    types::NTSTATUS,
+};
 
 extern crate alloc;
 
@@ -892,36 +895,22 @@ pub fn read_file(
             break;
         }
         // read one cluster's worth of sectors.
+        let sector_size = fs.base.sector_size as usize;
         for s in 0..(fs.base.cluster_size / fs.base.sector_size) {
             let mut sector = [0u8; 512];
             let rs = unsafe { read_sector(fs.base.device, first_sector + s as u64, &mut sector) };
-            crate::boot_println!(
-                "[FAT32] read_file: read_sector({}) = {:?}",
-                first_sector + s as u64,
-                rs
-            );
-            if rs.is_ok() {
-                let copy = core::cmp::min(sector.len(), to_copy - s as usize * sector.len());
-                if copy == 0 {
-                    break;
-                }
-                crate::boot_println!(
-                    "[FAT32] read_file: copying to out[{}..{}]",
-                    written + s as usize * sector.len(),
-                    written + s as usize * sector.len() + copy
-                );
-                // SAFETY: byte-by-byte copy to dodge SIMD alignment
-                // requirements (sector is a 16-byte aligned stack array,
-                // not 32-byte aligned).
-                unsafe {
-                    let dst = out.as_mut_ptr().add(written + s as usize * sector.len());
-                    let src = sector.as_ptr();
-                    for i in 0..copy {
-                        core::ptr::write_volatile(dst.add(i), *src.add(i));
-                    }
-                }
-                crate::boot_println!("[FAT32] read_file: copy done");
+            if rs.is_err() {
+                return Err(STATUS_IO_DEVICE_ERROR);
             }
+
+            let sector_offset = s as usize * sector_size;
+            let src_start = core::cmp::min(sector_offset, to_copy);
+            let src_end = core::cmp::min(sector_offset + sector_size, to_copy);
+            if src_start >= src_end {
+                break;
+            }
+            let copy_len = src_end - src_start;
+            out[written + src_start..written + src_end].copy_from_slice(&sector[..copy_len]);
         }
         crate::boot_println!(
             "[FAT32] read_file: cluster loop done, about to written += {}",
@@ -1090,8 +1079,10 @@ pub fn list_directory_cluster(
                     }
 
                     if entry.is_long_name() {
-                        // Accumulate long name parts (stored in reverse order)
-                        long_name_buffer.extend_from_slice(&entry.name);
+                        // Preserve the entire 32-byte LFN record. The name
+                        // field is only 11 bytes and contains checksum/type
+                        // bytes in the middle of the record.
+                        long_name_buffer.extend_from_slice(&buffer[offset..offset + 32]);
                         offset += 32;
                         continue;
                     }
@@ -1283,8 +1274,10 @@ pub fn decode_long_name_utf16(long_name_buffer: &[u8]) -> Vec<u16> {
         entry_start = entry_start.saturating_sub(32);
 
         // Each entry contains 13 characters (26 bytes for UTF-16)
-        // Offsets within entry: 1,3,5,7,9,12,14,16,18,20,22,24
-        let offsets = [1usize, 3, 5, 7, 9, 12, 14, 16, 18, 20, 22, 24];
+        // LFN fields: five chars before the attributes, four between the
+        // attribute/checksum bytes, three before the first-cluster fields,
+        // and two in the final reserved field.
+        let offsets = [1usize, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
 
         for &off in &offsets {
             let pos = entry_start + off;
@@ -1791,8 +1784,15 @@ fn lfn_name_utf16(long_name: &[u8]) -> alloc::vec::Vec<u16> {
 fn short_name_for_long(long_name: &[u8], index: u8) -> [u8; 11] {
     let mut name = [b' '; 11];
     let dot = long_name.iter().rposition(|byte| *byte == b'.');
+    let count = if index >= 100 {
+        3
+    } else if index >= 10 {
+        2
+    } else {
+        1
+    };
     let stem_end = dot.unwrap_or(long_name.len());
-    let stem = &long_name[..stem_end.min(8)];
+    let stem = &long_name[..stem_end.min(8 - count)];
     let extension = dot
         .and_then(|dot| long_name.get(dot + 1..))
         .unwrap_or(&[])
@@ -1804,17 +1804,10 @@ fn short_name_for_long(long_name: &[u8], index: u8) -> [u8; 11] {
     }
     name.make_ascii_uppercase();
     if index > 0 {
-        let count = if index >= 100 {
-            3
-        } else if index >= 10 {
-            2
-        } else {
-            1
-        };
         name[8 - count] = b'~';
         let mut value = index;
-        for position in (0..count).rev() {
-            name[8 - position] = b'0' + value % 10;
+        for position in (8 - count + 1)..8 {
+            name[position] = b'0' + value % 10;
             value /= 10;
         }
     }
@@ -1864,14 +1857,15 @@ fn find_contiguous_free_dir_slots(
             if read_cluster_sector(fs, current_cluster, sector_index, &mut buffer).is_err() {
                 continue;
             }
-            for entry_index in 0..entries_per_sector {
-                let run_available = entries_per_sector - entry_index;
-                if run_available >= count {
-                    let base = entry_index * 32;
-                    if buffer[base] == 0 || buffer[base] == 0xE5 {
-                        let offset = sector_index as usize * sector_size + base;
-                        return Some((current_cluster, offset));
-                    }
+            for entry_index in 0..entries_per_sector.saturating_sub(count - 1) {
+                let base = entry_index * 32;
+                let all_free = (0..count).all(|run| {
+                    let first = buffer[base + run * 32];
+                    first == 0 || first == 0xE5
+                });
+                if all_free {
+                    let offset = sector_index as usize * sector_size + base;
+                    return Some((current_cluster, offset));
                 }
             }
         }
@@ -1921,25 +1915,49 @@ fn delete_lfn_entries(
     let sector_size = fs.base.sector_size as usize;
     let sector_index = main_offset / sector_size;
     let main_index = (main_offset % sector_size) / 32;
-    if main_index == 0 {
-        return Ok(());
-    }
+
+    // Scan backwards across sector boundaries within the same directory
+    // cluster to find and delete all LFN entries that precede the main
+    // (short-name) entry. Previously this only scanned within the same
+    // sector, so LFN entries in the previous sector survived deletion.
+    let mut current_sector = sector_index as u32;
+    let mut current_index = main_index;
     let mut buffer = [0u8; 512];
-    if read_cluster_sector(fs, dir_cluster, sector_index as u32, &mut buffer).is_err() {
+    if read_cluster_sector(fs, dir_cluster, current_sector, &mut buffer).is_err() {
         return Err(STATUS_UNSUCCESSFUL);
     }
-    let mut index = main_index;
-    while index > 0 {
-        index -= 1;
-        let offset = index * 32;
+
+    loop {
+        if current_index == 0 {
+            // Reached the start of this sector; move to the previous
+            // sector within the same cluster.
+            if current_sector == 0 {
+                // Reached the start of the cluster chain; no more LFN
+                // entries to scan backwards (we cannot follow the FAT
+                // chain backwards without a full traversal).
+                return Ok(());
+            }
+            current_sector -= 1;
+            current_index = sector_size / 32;
+            // Load the new sector
+            if read_cluster_sector(fs, dir_cluster, current_sector, &mut buffer).is_err() {
+                return Err(STATUS_UNSUCCESSFUL);
+            }
+        }
+        current_index -= 1;
+        let offset = current_index * 32;
         if buffer[offset + 11] != 0x0F || buffer[offset + 13] != checksum {
+            // Not an LFN entry or wrong checksum; stop scanning.
+            // Write back the current (possibly modified) sector.
             break;
         }
+        // Mark this LFN entry as deleted.
         buffer[offset] = 0xE5;
         let end = offset + 32;
         buffer[offset + 1..end].fill(0);
     }
-    write_cluster_sector(fs, dir_cluster, sector_index as u32, &buffer)
+
+    write_cluster_sector(fs, dir_cluster, current_sector, &buffer)
 }
 
 pub fn create_entry_long(
@@ -1953,6 +1971,7 @@ pub fn create_entry_long(
     if long_name.len() <= 11 {
         let mut short_name = [b' '; 11];
         short_name[..long_name.len()].copy_from_slice(long_name);
+        short_name.make_ascii_uppercase();
         return create_dir_entry_in_dir(
             fs,
             dir_cluster,
@@ -2037,11 +2056,10 @@ pub fn rename_file_in_dir_long(
     };
     let (cluster, offset, entry) =
         find_dir_entry_location(fs, dir_cluster, &old_short_name).ok_or(STATUS_UNSUCCESSFUL)?;
-    delete_lfn_entries(fs, cluster, offset, &old_short_name)?;
-    delete_file_entry(fs, cluster, offset)?;
     if new_long_name.len() <= 11 {
         let mut new_short_name = [b' '; 11];
         new_short_name[..new_long_name.len()].copy_from_slice(new_long_name);
+        delete_lfn_entries(fs, cluster, offset, &old_short_name)?;
         return rename_entry_at(fs, cluster, offset, &new_short_name);
     }
 
@@ -2050,20 +2068,41 @@ pub fn rename_file_in_dir_long(
         let new_short_name = short_name_for_long(new_long_name, index);
         if find_dir_entry_location(fs, dir_cluster, &new_short_name).is_none() {
             write_lfn_entries(fs, dir_cluster, new_long_name, &new_short_name)?;
-            return create_dir_entry_in_dir(
+            create_dir_entry_in_dir(
                 fs,
                 dir_cluster,
                 &new_short_name,
                 ((entry.first_cluster_high as u32) << 16) | entry.first_cluster_low as u32,
                 entry.file_size,
                 entry.attributes,
-            );
+            )?;
+            delete_lfn_entries(fs, cluster, offset, &old_short_name)?;
+            delete_file_entry_without_freeing_chain(fs, cluster, offset)?;
+            return Ok(());
         }
         index += 1;
         if index == 0 {
             return Err(STATUS_UNSUCCESSFUL);
         }
     }
+}
+
+/// Mark a short-name entry deleted without freeing its cluster chain.
+/// Rename uses this only after the replacement entry has been created.
+fn delete_file_entry_without_freeing_chain(
+    fs: &Fat32FileSystem,
+    cluster: u32,
+    byte_offset: usize,
+) -> Result<(), NTSTATUS> {
+    let sector_size = fs.base.sector_size as usize;
+    let sector_index = byte_offset / sector_size;
+    let offset_in_sector = byte_offset % sector_size;
+    let mut buffer = [0u8; 512];
+    if read_cluster_sector(fs, cluster, sector_index as u32, &mut buffer).is_err() {
+        return Err(STATUS_UNSUCCESSFUL);
+    }
+    buffer[offset_in_sector] = 0xE5;
+    write_cluster_sector(fs, cluster, sector_index as u32, &buffer)
 }
 
 #[cfg(test)]

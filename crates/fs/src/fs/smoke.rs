@@ -327,11 +327,15 @@ fn step5_ntfs_boot_sector() -> bool {
         num_heads: 255,
         hidden_sectors: 0,
         total_sectors_32: 0,
+        padding: [0; 4],
+        drive_descriptor: 0x80,
         total_sectors_64: 1_000_000,
         mft_lcn: 0x1000,
         mft_mirror_lcn: 0x2000,
         cluster_per_mft_record: -3, // 1 << 3 == 8 sectors per MFT record
+        reserved_mft: 0,
         cluster_per_index_record: -3,
+        reserved_index: 0,
         volume_serial_number: 0xAABBCCDDEEFF0011,
         checksum: 0,
     };
