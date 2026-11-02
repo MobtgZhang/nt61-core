@@ -2496,9 +2496,16 @@ pub fn full_build(build_dir: &Path, format: &str, _size_mb: u32, arch: &str) -> 
         &format!("Format: {} / Arch: {}", format, arch),
     );
 
-    let fs_choice = super::image::DualPartitionFs::parse(format).ok_or_else(|| {
+    // QCOW2 is a container format, not a filesystem: build a FAT32
+    // dual-partition image first, then encode it as QCOW2 below.
+    let inner_format = if format.eq_ignore_ascii_case("qcow2") {
+        "fat32"
+    } else {
+        format
+    };
+    let fs_choice = super::image::DualPartitionFs::parse(inner_format).ok_or_else(|| {
         BuildError::InvalidParam(format!(
-            "unknown --format-flag value: {} (expected fat32 | ntfs | ext4)",
+            "unknown --format-flag value: {} (expected fat32 | ntfs | ext4 | refs | qcow2 | ramfs)",
             format
         ))
     })?;
@@ -2623,6 +2630,18 @@ pub fn full_build(build_dir: &Path, format: &str, _size_mb: u32, arch: &str) -> 
         &dirs.system, // System source directory (Windows/* files)
         fs_choice,
     )?;
+
+    let image_path = if format.eq_ignore_ascii_case("qcow2") {
+        let raw_path = image_path.clone();
+        let raw = std::fs::read(&raw_path).map_err(BuildError::Io)?;
+        let qcow2 = super::image::encode_raw_as_qcow2(&raw);
+        let qcow2_path = dirs.images.join("disk.qcow2");
+        std::fs::write(&qcow2_path, qcow2).map_err(BuildError::Io)?;
+        std::fs::remove_file(&raw_path).map_err(BuildError::Io)?;
+        qcow2_path
+    } else {
+        image_path
+    };
 
     log::summary(6, 0);
     log::success(&format!("Build complete! Image: {}", image_path.display()));

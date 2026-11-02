@@ -109,7 +109,6 @@ pub struct Qcow2Image {
     l2_tables: HashMap<u32, Vec<u64>>,
     refcount_table: Vec<u64>,
     data: Vec<u8>,
-    current_offset: u64,
     l1_table_offset: u64,
     refcount_table_offset: u64,
 }
@@ -208,10 +207,8 @@ impl Qcow2Image {
         }
         // Pre-allocate to virtual_size so all cluster allocations stay within the buffer.
         // current_offset starts at original file size so new allocations don't overwrite existing data.
-        let orig_size = data.len();
         let mut data_vec = data.to_vec();
         data_vec.resize(size as usize, 0);
-        let current_offset = orig_size as u64;
         Ok(Self {
             virtual_size: size,
             cluster_size,
@@ -220,7 +217,6 @@ impl Qcow2Image {
             l2_tables: HashMap::new(),
             refcount_table: Vec::new(),
             data: data_vec,
-            current_offset,
             l1_table_offset,
             refcount_table_offset,
         })
@@ -263,12 +259,6 @@ impl Qcow2Image {
             self.data[l2_entry_off + 6],
             self.data[l2_entry_off + 7],
         ]);
-        if l2_entry & 0x3 == 0x1 {
-            for b in buf.iter_mut() {
-                *b = 0;
-            }
-            return Ok(());
-        }
         let cluster_off = (l2_entry & 0x00FF_FFFF_FFFF_FFFF) as usize;
         let offset_in_cluster = ((lba as u64) * 512) % cluster_size;
         let file_off = cluster_off + offset_in_cluster as usize;
@@ -345,7 +335,6 @@ impl Qcow2Image {
             l2_tables: HashMap::new(),
             refcount_table,
             data: Vec::new(),
-            current_offset: data_start,
             l1_table_offset,
             refcount_table_offset,
         };
@@ -413,8 +402,7 @@ impl Qcow2Image {
 
     /// Finalize the QCOW2 image
     pub fn finalize(&mut self) -> Result<Vec<u8>> {
-        // Write only up to current_offset (the end of data we've written/modified).
-        let mut image = self.data[..self.current_offset as usize].to_vec();
+        let mut image = self.data.clone();
 
         // Write header
         let header = self.build_header();

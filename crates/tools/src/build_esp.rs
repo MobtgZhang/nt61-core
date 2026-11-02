@@ -2,9 +2,11 @@
 //!
 //! Creates the complete UEFI ESP directory structure and disk images.
 
-use nt61_tools::{fs::new_guid_v4, hive_gen};
-use std::fs::{self, File};
-use std::io::{Seek, SeekFrom, Write};
+use nt61_tools::{
+    fs::{image::populate_fat32_image, image::write_single_gpt, Fat32Image},
+    hive_gen,
+};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 const ESP_TEMPLATE: &str = r#"NT6.1.7601 EFI System Partition
@@ -505,115 +507,38 @@ fn create_bootvars_data(timeout: u32) -> Vec<u8> {
 pub fn create_esp_image(paths: &EspPaths, arch: Arch) -> std::io::Result<PathBuf> {
     let img_path = paths.images_dir.join(format!("esp-{}.img", arch.as_str()));
     let size_mb = 64;
+    let sector_size = 512u64;
+    let partition_start_lba = 2048u64;
+    let partition_sectors = (size_mb as u64 * 1024 * 1024) / sector_size;
+    let partition_end_lba = partition_start_lba + partition_sectors - 1;
+    let backup_entry_sectors = 32u64;
+    let total_sectors = partition_end_lba + backup_entry_sectors + 2;
 
     println!("  Creating FAT32 disk image: {:?}", &img_path);
     println!("    Size: {} MB", size_mb);
 
-    // Create raw image file
-    let mut file = File::create(&img_path)?;
-
-    // Write GPT header
-    let mut gpt = vec![0u8; 1024]; // Protective MBR (512) + GPT header (92) + padding
-
-    // Protective MBR (first 512 bytes)
-    gpt[510] = 0x55;
-    gpt[511] = 0xAA;
-
-    // GPT signature
-    gpt[512..520].copy_from_slice(b"EFI PART");
-
-    // GPT revision (1.0)
-    gpt[520..524].copy_from_slice(&0x00010000u32.to_le_bytes());
-
-    // Header size (92 bytes)
-    gpt[524..528].copy_from_slice(&92u32.to_le_bytes());
-
-    // CRC32 of header (placeholder)
-    gpt[528..532].copy_from_slice(&0u32.to_le_bytes());
-
-    // Reserved
-    gpt[532..540].copy_from_slice(&0u64.to_le_bytes());
-
-    // Current LBA (1)
-    gpt[540..548].copy_from_slice(&1u64.to_le_bytes());
-
-    // Backup LBA (will be at end)
-    let total_sectors = (size_mb * 1024 * 1024) / 512;
-    let backup_lba: u64 = total_sectors - 1;
-    gpt[548..556].copy_from_slice(&backup_lba.to_le_bytes());
-
-    // First usable LBA (34 - after GPT header and partition table)
-    gpt[556..564].copy_from_slice(&34u64.to_le_bytes());
-
-    // Last usable LBA
-    gpt[564..572].copy_from_slice(&(total_sectors - 34).to_le_bytes());
-
-    // Disk GUID (random)
-    let guid = new_guid_v4();
-    gpt[572..588].copy_from_slice(guid.as_bytes());
-
-    // Partition entry LBA (2)
-    gpt[588..596].copy_from_slice(&2u64.to_le_bytes());
-
-    // Number of partition entries (128)
-    gpt[596..600].copy_from_slice(&128u32.to_le_bytes());
-
-    // Size of partition entry (128 bytes)
-    gpt[600..604].copy_from_slice(&128u32.to_le_bytes());
-
-    // CRC32 of partition entries (placeholder)
-    gpt[604..608].copy_from_slice(&0u32.to_le_bytes());
-
-    // Write protective MBR + GPT header
-    file.write_all(&gpt)?;
-
-    // Partition entry (128 bytes, starting at LBA 2)
-    let mut partition_entry = vec![0u8; 128];
-
-    // Partition type GUID (EFI System Partition)
-    let esp_type = uuid::Uuid::parse_str("C12A7328-F81F-11D2-BA4B-00A0C93EC93B").unwrap();
-    partition_entry[0..16].copy_from_slice(esp_type.as_bytes());
-
-    // Unique partition GUID
-    let part_guid = new_guid_v4();
-    partition_entry[16..32].copy_from_slice(part_guid.as_bytes());
-
-    // Starting LBA (34)
-    partition_entry[32..40].copy_from_slice(&34u64.to_le_bytes());
-
-    // Ending LBA (use most of the disk)
-    let end_lba: u64 = total_sectors - 34;
-    partition_entry[40..48].copy_from_slice(&end_lba.to_le_bytes());
-
-    // Attributes (EF00 for ESP)
-    partition_entry[48..56].copy_from_slice(&0xEF00u64.to_le_bytes());
-
-    // Partition name
-    let name = "EFI System Partition";
-    for (i, c) in name.encode_utf16().enumerate() {
-        if i < 36 * 2 {
-            partition_entry[56 + i] = c as u8;
-            partition_entry[56 + i + 1] = (c >> 8) as u8;
-        }
+    let esp_source = paths.efi_dir
+        .parent()
+        .unwrap_or_else(|| paths.efi_dir.as_path())
+        .to_path_buf();
+    let mut fat_image = Fat32Image::new(size_mb);
+    if esp_source.exists() {
+        populate_fat32_image(&mut fat_image, &esp_source).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
+        })?;
     }
+    let partition_bytes = fat_image
+        .finalize_with_offset((partition_start_lba * sector_size) as usize)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
+    let total_bytes = (total_sectors * sector_size) as usize;
+    let mut image = vec![0u8; total_bytes];
+    let partition_offset = (partition_start_lba * sector_size) as usize;
+    image[partition_offset..partition_offset + partition_bytes.len()]
+        .copy_from_slice(&partition_bytes);
+    write_single_gpt(&mut image, total_sectors, partition_start_lba, partition_end_lba);
+    std::fs::write(&img_path, &image)?;
 
-    file.write_all(&partition_entry)?;
-
-    // Write partition entries again at backup location
-    let backup_lba: u64 = total_sectors - 33;
-    file.seek(SeekFrom::End(-512))?;
-    file.write_all(&partition_entry)?;
-
-    // Write GPT header backup
-    file.seek(SeekFrom::End(-1024))?;
-    let mut gpt_backup = gpt.clone();
-    gpt_backup[548..556].copy_from_slice(&1u64.to_le_bytes()); // Current LBA
-    gpt_backup[556..564].copy_from_slice(&backup_lba.to_le_bytes()); // Backup LBA
-    gpt_backup[588..596].copy_from_slice(&backup_lba.to_le_bytes()); // Partition LBA
-    file.write_all(&gpt_backup)?;
-
-    println!("    Created GPT partitioned image (FAT32 needs to be formatted with mkfs.fat)");
-    println!("    Run: mkfs.fat -F 32 {} to format", img_path.display());
+    println!("    Created FAT32 ESP with a valid single-partition GPT.");
 
     Ok(img_path)
 }

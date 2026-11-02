@@ -14,6 +14,7 @@ pub use super::iso9660::IsoImage;
 pub use super::ntfs::NtfsImage;
 pub use super::partition::PartitionInfo;
 pub use super::qcow2::Qcow2Image;
+pub use super::refs::RefsImage;
 
 // =====================================================================
 // Image Format Enum
@@ -27,6 +28,8 @@ pub enum ImageFormat {
     Ntfs,
     Iso,
     Qcow2,
+    ReFS,
+    RamFS,
 }
 
 impl ImageFormat {
@@ -43,6 +46,8 @@ impl ImageFormat {
             "ntfs" => Some(ImageFormat::Ntfs),
             "iso" | "iso9660" => Some(ImageFormat::Iso),
             "qcow2" | "qcow" => Some(ImageFormat::Qcow2),
+            "refs" => Some(ImageFormat::ReFS),
+            "ramfs" => Some(ImageFormat::RamFS),
             _ => None,
         }
     }
@@ -54,6 +59,8 @@ impl ImageFormat {
             ImageFormat::Ntfs => "img",
             ImageFormat::Iso => "iso",
             ImageFormat::Qcow2 => "qcow2",
+            ImageFormat::ReFS => "img",
+            ImageFormat::RamFS => "img",
         }
     }
 
@@ -64,6 +71,8 @@ impl ImageFormat {
             ImageFormat::Ntfs => 512,
             ImageFormat::Iso => 700,
             ImageFormat::Qcow2 => 1024,
+            ImageFormat::ReFS => 512,
+            ImageFormat::RamFS => 896,
         }
     }
 }
@@ -76,6 +85,8 @@ impl std::fmt::Display for ImageFormat {
             ImageFormat::Ntfs => write!(f, "ntfs"),
             ImageFormat::Iso => write!(f, "iso"),
             ImageFormat::Qcow2 => write!(f, "qcow2"),
+            ImageFormat::ReFS => write!(f, "refs"),
+            ImageFormat::RamFS => write!(f, "ramfs"),
         }
     }
 }
@@ -139,6 +150,22 @@ pub fn create_image(
             let data = img.finalize()?;
             write_image(output, &data)?;
         }
+        ImageFormat::ReFS => {
+            let mut img = RefsImage::new(size_mb, 65536)?;
+            if let Some(src) = source {
+                populate_image(&mut img, src)?;
+            }
+            let data = img.finalize()?;
+            write_image(output, &data)?;
+        }
+        ImageFormat::RamFS => {
+            let mut img = Fat32Image::new(size_mb);
+            if let Some(src) = source {
+                populate_image(&mut img, src)?;
+            }
+            let data = img.finalize()?;
+            write_image(output, &data)?;
+        }
     }
 
     log::success(&format!("Image created: {}", output.display()));
@@ -181,8 +208,8 @@ pub fn create_image_with_pt(
     let fmt = ImageFormat::parse(fs)
         .ok_or_else(|| BuildError::InvalidFormat(format!("Unknown fs: {}", fs)))?;
     match fmt {
-        ImageFormat::Fat32 | ImageFormat::Ntfs | ImageFormat::Ext4 => {}
-        ImageFormat::Iso | ImageFormat::Qcow2 => {
+        ImageFormat::Fat32 | ImageFormat::Ntfs | ImageFormat::Ext4 | ImageFormat::ReFS => {}
+        ImageFormat::Iso | ImageFormat::Qcow2 | ImageFormat::RamFS => {
             return Err(BuildError::InvalidParam(format!(
                 "partition tables only apply to raw FS images (got {})",
                 fs
@@ -213,6 +240,7 @@ pub fn create_image_with_pt(
                     0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8,
                     0x47, 0x7D, 0xE4,
                 ], // Linux filesystem
+                ImageFormat::ReFS => SYSTEM_TYPE_GUID,
                 _ => unreachable!(),
             };
             // The GPT entry array occupies 32 sectors at LBA 34. The first
@@ -252,7 +280,14 @@ pub fn create_image_with_pt(
             }
             img.finalize()?
         }
-        ImageFormat::Iso | ImageFormat::Qcow2 => unreachable!(),
+        ImageFormat::ReFS => {
+            let mut img = RefsImage::new(size_mb, 65536)?;
+            if let Some(src) = source {
+                populate_image(&mut img, src)?;
+            }
+            img.finalize()?
+        }
+        ImageFormat::Iso | ImageFormat::Qcow2 | ImageFormat::RamFS => unreachable!(),
     };
 
     let fs_sectors = (fs_bytes.len() as u64) / sector_size;
@@ -641,7 +676,7 @@ pub fn open_with_format(bytes: &[u8], format: Option<&str>) -> Result<Box<dyn Fs
         Some("ntfs") => Ok(Box::new(NtfsImage::from_bytes(bytes)?)),
         Some("ext4") => Ok(Box::new(Ext4Image::from_bytes(bytes)?)),
         Some("iso") => Ok(Box::new(IsoImage::from_bytes(bytes)?)),
-        Some("refs") => Err(BuildError::ReFsNotImplemented),
+        Some("refs") => Ok(Box::new(RefsImage::from_bytes(bytes)?)),
         Some(other) => Err(BuildError::InvalidFormat(format!(
             "unsupported --format-fs: {} (expected fat32|ntfs|ext4|iso)",
             other
@@ -942,6 +977,10 @@ fn populate_image(img: &mut impl ImageWrite, source: &Path) -> Result<()> {
     walk_dir(img, source, "")
 }
 
+pub fn populate_fat32_image(img: &mut Fat32Image, source: &Path) -> Result<()> {
+    populate_image(img, source)
+}
+
 /// Populate an ISO image from a source directory
 fn populate_iso(img: &mut IsoImage, source: &Path) -> Result<()> {
     if !source.exists() {
@@ -989,6 +1028,16 @@ impl ImageWrite for NtfsImage {
     }
     fn write_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
         self.write_file(path, data).map(|_| ())
+    }
+}
+
+impl ImageWrite for RefsImage {
+    fn create_dir(&mut self, path: &str) -> Result<()> {
+        FsBackend::mkdir(self, path)
+    }
+
+    fn write_file(&mut self, path: &str, data: &[u8]) -> Result<()> {
+        FsBackend::write_file(self, path, data)
     }
 }
 
@@ -1135,6 +1184,11 @@ pub enum DualPartitionFs {
     Fat32EspNtfsSystem,
     /// ESP is FAT32 (mandatory), System partition is EXT4 (Linux-native).
     Fat32EspExt4System,
+    /// ESP is FAT32 (mandatory), System partition uses the project's ReFS
+    /// volume format. ReFS is a server filesystem and is read-only here.
+    Fat32EspRefsSystem,
+    /// Bootable FAT32 disk used to stage the RAM-backed combined volume.
+    Fat32RamFs,
 }
 
 impl DualPartitionFs {
@@ -1149,6 +1203,8 @@ impl DualPartitionFs {
             "fat32" | "fat32all" => Some(DualPartitionFs::Fat32All),
             "ntfs" => Some(DualPartitionFs::Fat32EspNtfsSystem),
             "ext4" => Some(DualPartitionFs::Fat32EspExt4System),
+            "refs" => Some(DualPartitionFs::Fat32EspRefsSystem),
+            "ramfs" => Some(DualPartitionFs::Fat32RamFs),
             _ => None,
         }
     }
@@ -1221,9 +1277,12 @@ pub fn create_dual_partition_image_with_fs(
     let sys_sectors = ((system_size_mb as u64) * 1024 * 1024) / sector_size;
     let sys_last_lba = sys_start_lba + sys_sectors - 1;
 
-    // The backup GPT header occupies the final LBA, so it must not overlap the
-    // last sector of the system partition.
-    let total_sectors = sys_last_lba + 2;
+    // Reserve the backup entry array and final backup header after the
+    // system partition. With 128 x 128-byte entries this adds 32 sectors
+    // plus one header LBA.
+    let backup_entry_bytes = 128u64 * 128;
+    let backup_entry_sectors = backup_entry_bytes.div_ceil(sector_size);
+    let total_sectors = sys_last_lba + backup_entry_sectors + 2;
 
     // Create ESP partition image with partition offset. The ESP is
     // always FAT32 (UEFI requirement).
@@ -1265,6 +1324,20 @@ pub fn create_dual_partition_image_with_fs(
             }
             sys_img.finalize()?
         }
+        DualPartitionFs::Fat32EspRefsSystem => {
+            let mut sys = RefsImage::new(system_size_mb, 65536)?;
+            if system_source.exists() {
+                populate_image(&mut sys, system_source)?;
+            }
+            sys.finalize()?
+        }
+        DualPartitionFs::Fat32RamFs => {
+            let mut sys = Fat32Image::new(system_size_mb);
+            if system_source.exists() {
+                populate_image(&mut sys, system_source)?;
+            }
+            sys.finalize()?
+        }
     };
 
     // Allocate buffer and copy partition data
@@ -1299,6 +1372,8 @@ pub fn create_dual_partition_image_with_fs(
     // data, EXT4 uses Linux filesystem.
     let sys_type_guid = match fs_choice {
         DualPartitionFs::Fat32EspExt4System => &LINUX_FS_TYPE_GUID,
+        DualPartitionFs::Fat32EspRefsSystem => &SYSTEM_TYPE_GUID,
+        DualPartitionFs::Fat32RamFs => &SYSTEM_TYPE_GUID,
         _ => &SYSTEM_TYPE_GUID,
     };
     crate::debug!("[DEBUG create_dual] writing GPT: total_sectors={}, esp_start={}, esp_last={}, sys_start={}, sys_last={}",
@@ -1318,6 +1393,56 @@ pub fn create_dual_partition_image_with_fs(
     write_image(output, &buf)?;
 
     Ok(())
+}
+
+/// Encode a raw disk image as a self-contained QCOW2 version 2 container.
+///
+/// The encoder uses 1 MiB clusters so the complete raw image can be addressed
+/// by a single L2 table. Clusters are fully allocated; this intentionally
+/// trades sparseness for a simple, standards-compliant image that QEMU can
+/// consume directly.
+pub fn encode_raw_as_qcow2(raw: &[u8]) -> Vec<u8> {
+    const CLUSTER_BITS: u32 = 20;
+    const CLUSTER_SIZE: usize = 1 << CLUSTER_BITS;
+    let cluster_size = CLUSTER_SIZE as u64;
+    let data_start = 5 * CLUSTER_SIZE as u64;
+    let file_size = data_start + raw.len() as u64;
+    let total_clusters = file_size.div_ceil(cluster_size);
+    let mut image = vec![0u8; (total_clusters * cluster_size) as usize];
+
+    let virtual_size = raw.len() as u64;
+    image[0..4].copy_from_slice(&0x5146_49FBu32.to_be_bytes());
+    image[4..8].copy_from_slice(&2u32.to_be_bytes());
+    image[8..16].copy_from_slice(&0u64.to_be_bytes());
+    image[16..20].copy_from_slice(&0u32.to_be_bytes());
+    image[20..24].copy_from_slice(&CLUSTER_BITS.to_be_bytes());
+    image[24..32].copy_from_slice(&virtual_size.to_be_bytes());
+    image[32..36].copy_from_slice(&0u32.to_be_bytes());
+    image[36..40].copy_from_slice(&1u32.to_be_bytes());
+    image[40..48].copy_from_slice(&(CLUSTER_SIZE as u64).to_be_bytes());
+    image[48..56].copy_from_slice(&(2 * CLUSTER_SIZE as u64).to_be_bytes());
+    image[56..60].copy_from_slice(&1u32.to_be_bytes());
+    image[60..64].copy_from_slice(&0u32.to_be_bytes());
+    image[64..72].copy_from_slice(&0u64.to_be_bytes());
+
+    let l2_offset = (4 * CLUSTER_SIZE) as u64;
+    image[CLUSTER_SIZE..CLUSTER_SIZE + 8].copy_from_slice(&l2_offset.to_be_bytes());
+    image[(2 * CLUSTER_SIZE)..(2 * CLUSTER_SIZE) + 8]
+        .copy_from_slice(&(3 * CLUSTER_SIZE as u64).to_be_bytes());
+
+    for cluster_index in 0..total_clusters {
+        let ref_offset = (3 * CLUSTER_SIZE) + cluster_index as usize * 2;
+        image[ref_offset..ref_offset + 2].copy_from_slice(&1u16.to_be_bytes());
+    }
+
+    let data_clusters = raw.len().div_ceil(CLUSTER_SIZE);
+    for cluster_index in 0..data_clusters {
+        let cluster_offset = data_start + (cluster_index as u64) * cluster_size;
+        let entry_offset = (4 * CLUSTER_SIZE) + cluster_index * 8;
+        image[entry_offset..entry_offset + 8].copy_from_slice(&cluster_offset.to_be_bytes());
+    }
+    image[data_start as usize..(data_start + raw.len() as u64) as usize].copy_from_slice(raw);
+    image
 }
 
 /// Write GPT with two partitions (ESP + System).
@@ -1429,6 +1554,73 @@ fn write_dual_gpt(
         backup_bytes[16..20].copy_from_slice(&backup_crc.to_le_bytes());
         buf[backup_hdr..backup_hdr + 92].copy_from_slice(&backup_bytes);
     }
+}
+
+/// Write a valid single-partition GPT containing one ESP.
+pub fn write_single_gpt(buf: &mut [u8], total_sectors: u64, esp_start: u64, esp_end: u64) {
+    buf[510] = 0x55;
+    buf[511] = 0xAA;
+    buf[446..450].fill(0);
+    buf[450] = 0xEE;
+    buf[451..454].fill(0);
+    buf[454..458].fill(0);
+    buf[458..462].copy_from_slice(&1u32.to_le_bytes());
+    buf[462..466].copy_from_slice(&((total_sectors - 1) as u32).to_le_bytes());
+    buf[466..470].fill(0);
+    buf[472..510].fill(0);
+
+    let hdr = 512usize;
+    buf[hdr..hdr + 8].copy_from_slice(b"EFI PART");
+    buf[hdr + 8..hdr + 12].copy_from_slice(&0x00010000u32.to_le_bytes());
+    buf[hdr + 12..hdr + 16].copy_from_slice(&92u32.to_le_bytes());
+    buf[hdr + 16..hdr + 20].copy_from_slice(&0u32.to_le_bytes());
+    buf[hdr + 20..hdr + 24].copy_from_slice(&0u32.to_le_bytes());
+    buf[hdr + 24..hdr + 32].copy_from_slice(&1u64.to_le_bytes());
+    buf[hdr + 32..hdr + 40].copy_from_slice(&(total_sectors - 1).to_le_bytes());
+    buf[hdr + 40..hdr + 48].copy_from_slice(&esp_start.to_le_bytes());
+    buf[hdr + 48..hdr + 56].copy_from_slice(&esp_end.to_le_bytes());
+    let guid = crate::fs::new_guid_v4();
+    buf[hdr + 56..hdr + 72].copy_from_slice(guid.as_bytes());
+    buf[hdr + 72..hdr + 80].copy_from_slice(&2u64.to_le_bytes());
+    buf[hdr + 80..hdr + 84].copy_from_slice(&128u32.to_le_bytes());
+    buf[hdr + 84..hdr + 88].copy_from_slice(&128u32.to_le_bytes());
+
+    let pent = 2usize * 512;
+    buf[pent..pent + 16].copy_from_slice(&ESP_TYPE_GUID);
+    let part_guid = crate::fs::new_guid_v4();
+    buf[pent + 16..pent + 32].copy_from_slice(part_guid.as_bytes());
+    buf[pent + 32..pent + 40].copy_from_slice(&esp_start.to_le_bytes());
+    buf[pent + 40..pent + 48].copy_from_slice(&esp_end.to_le_bytes());
+    buf[pent + 48..pent + 56].copy_from_slice(&0u64.to_le_bytes());
+    for (index, unit) in "EFI System Partition".encode_utf16().enumerate() {
+        let off = pent + 56 + index * 2;
+        buf[off..off + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+
+    let entries_total = 128 * 128;
+    let entries_crc = crc32(&buf[pent..pent + entries_total]);
+    buf[hdr + 88..hdr + 92].copy_from_slice(&entries_crc.to_le_bytes());
+
+    let mut header = buf[hdr..hdr + 92].to_vec();
+    header[16..20].copy_from_slice(&0u32.to_le_bytes());
+    buf[hdr + 16..hdr + 20].copy_from_slice(&crc32(&header).to_le_bytes());
+
+    let backup_hdr_lba = total_sectors - 1;
+    let backup_entries_lba = backup_hdr_lba - 32;
+    let backup_hdr = (backup_hdr_lba as usize) * 512;
+    let backup_entries = (backup_entries_lba as usize) * 512;
+    let (backup, primary) = buf.split_at_mut(backup_entries);
+    backup[0..entries_total].copy_from_slice(&primary[pent..pent + entries_total]);
+
+    let mut backup_header = buf[hdr..hdr + 92].to_vec();
+    backup_header[24..32].copy_from_slice(&backup_hdr_lba.to_le_bytes());
+    backup_header[32..40].copy_from_slice(&1u64.to_le_bytes());
+    backup_header[56..72].copy_from_slice(guid.as_bytes());
+    backup_header[72..80].copy_from_slice(&backup_entries_lba.to_le_bytes());
+    backup_header[16..20].copy_from_slice(&0u32.to_le_bytes());
+    let backup_crc = crc32(&backup_header);
+    backup_header[16..20].copy_from_slice(&backup_crc.to_le_bytes());
+    buf[backup_hdr..backup_hdr + 92].copy_from_slice(&backup_header);
 }
 
 // =====================================================================

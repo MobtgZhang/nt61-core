@@ -148,7 +148,7 @@ fn build_cli() -> Command {
                 .long("format-flag")
                 .value_name("FMT")
                 .default_value("fat32")
-                .help("Image format for --build all (fat32 | ntfs | ext4)"),
+                .help("Image format for --build all (fat32 | ntfs | ext4 | refs | qcow2 | ramfs)"),
         )
         .arg(
             Arg::new("size-mb")
@@ -175,7 +175,7 @@ fn build_cli() -> Command {
                 .short('f')
                 .long("format-fs")
                 .value_name("FS")
-                .help("Filesystem type for --format (fat32 | ntfs | ext4)"),
+                .help("Filesystem type for --format (fat32 | ntfs | ext4 | refs)"),
         )
         .arg(
             Arg::new("image")

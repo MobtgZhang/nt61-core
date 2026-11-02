@@ -21,6 +21,7 @@ pub mod ntfs;
 pub mod partition;
 pub mod qcow2;
 pub mod remove;
+pub mod refs;
 pub mod stubs;
 pub mod system;
 
@@ -62,6 +63,7 @@ pub use iso9660::IsoImage;
 pub use ntfs::NtfsImage;
 pub use partition::PartitionInfo;
 pub use qcow2::Qcow2Image;
+pub use refs::RefsImage;
 
 // Re-export error types
 pub use crate::error::{BuildError, Result};
