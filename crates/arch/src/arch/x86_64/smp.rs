@@ -436,7 +436,7 @@ pub unsafe extern "C" fn ap_entry() -> ! {
 pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     let ap_idx = ap_index as usize;
     if ap_idx >= tss::MAX_APS {
-        // // crate::kprintln!("[smp] ap_index {} out of range, parking", ap_index);
+    crate::boot_println!("[smp] ap_index {} out of range, parking", ap_index);
         loop {
             asm!("hlt");
         }
@@ -454,7 +454,7 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     let stack_base =
         crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, AP_STACK_SIZE) as u64;
     if stack_base == 0 {
-        // // crate::kprintln!("[smp] AP {} stack OOM, parking", ap_index);
+        crate::boot_println!("[smp] AP {} stack OOM, parking", ap_index);
         loop {
             asm!("hlt");
         }
@@ -470,7 +470,7 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     let (tss_ptr, tss_limit) = match tss::init_ap_tss(ap_idx, rsp0) {
         Some(v) => v,
         None => {
-            // // crate::kprintln!("[smp] AP {} TSS init failed, parking", ap_index);
+            crate::boot_println!("[smp] AP {} TSS init failed, parking", ap_index);
             loop {
                 asm!("hlt");
             }
@@ -485,7 +485,6 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     // 2. Initialise the local APIC. The BSP may have set the
     //    spurious-interrupt vector; each AP must re-enable it.
     #[cfg(target_arch = "x86_64")]
-    #[cfg(target_arch = "x86_64")]
     crate::hal::x86_64::apic::init_smp();
 
     // 3. Allocate a per-CPU area for this AP. This ensures each CPU
@@ -494,7 +493,7 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     #[cfg(target_arch = "x86_64")]
     let per_cpu_page = crate::arch::x86_64::syscall::allocate_per_cpu_area(ap_index as u32);
     if per_cpu_page == 0 {
-        // // crate::kprintln!("[smp] AP {} per-CPU area OOM, parking", ap_index);
+        crate::boot_println!("[smp] AP {} per-CPU area OOM, parking", ap_index);
         loop {
             asm!("hlt");
         }
@@ -503,9 +502,12 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     // 4. Install the per-CPU area as this CPU's GS base.
     //    This MUST be done before any gs:[] access.
     #[cfg(target_arch = "x86_64")]
-    #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::syscall::set_kernel_gs_base(per_cpu_page);
-    // // crate::kprintln!("[smp] AP {} GS_BASE set to 0x{:016x}", ap_index, per_cpu_page);
+    crate::boot_println!(
+        "[smp] AP {} GS_BASE set to 0x{:016x}",
+        ap_index,
+        per_cpu_page
+    );
 
     // 5. Hand control to the scheduler. `init_smp_this_cpu`
     //    allocates a Prcb, creates the idle thread, and sets up
@@ -548,8 +550,10 @@ pub fn smoke_test() -> bool {
     let _ = CPU_COUNT.load(Ordering::Relaxed);
 
     // Step 3: Try to parse MADT (will return false if ACPI not available)
-    let _madt_ok = parse_madt();
-    // _madt_ok is intentionally unused - reserved for future logging
+    let madt_ok = parse_madt();
+    if !madt_ok {
+        ok = false;
+    }
     // // kprintln!("    [SMP SMOKE] parse_madt() = {}", _madt_ok);
 
     // Step 4: After MADT parse, check if more CPUs are available
