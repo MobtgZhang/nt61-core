@@ -69,6 +69,6 @@ pub const SCAN_TO_ASCII: [u8; 128] = [
 // dispatch_command additional room, and the trailing padding was
 // extended to match.
 pub const CMD_STUB_SIZE: usize = 5632;
-pub const LSM_STUB_SIZE: usize = 256;
-pub const WINLOGON_STUB_SIZE: usize = 256;
-pub const USERINIT_STUB_SIZE: usize = 256;
+pub const LSM_STUB_SIZE: usize = 512;
+pub const WINLOGON_STUB_SIZE: usize = 512;
+pub const USERINIT_STUB_SIZE: usize = 512;

@@ -19,7 +19,8 @@
 
 use crate::codegen::*;
 use crate::strings::{
-    LSM_STUB_SIZE, SYS_POLL_KEY, SYS_PUTCHAR, SYS_SPAWN_SUBSYSTEM_PROC, WINLOGON_STUB_SIZE,
+    LSM_STUB_SIZE, SYS_POLL_KEY, SYS_PUTCHAR, SYS_SPAWN_SUBSYSTEM_PROC, USERINIT_STUB_SIZE,
+    WINLOGON_STUB_SIZE,
 };
 
 const LSM_BANNER: &[u8] = b"[LSM] entered, idling forever\r\n";
@@ -115,11 +116,11 @@ pub fn build_winlogon() -> Vec<u8> {
     patch_lea_disp32(&mut s, cs_lea_off, csrss_off);
     patch_lea_disp32(&mut s, ui_lea_off, userinit_off);
 
-    while s.data.len() < WINLOGON_STUB_SIZE {
+    while s.data.len() < USERINIT_STUB_SIZE {
         s.u8(0x90);
     }
     let mut bytes = s.finalize();
-    bytes.truncate(WINLOGON_STUB_SIZE);
+    bytes.truncate(USERINIT_STUB_SIZE);
     bytes
 }
 
