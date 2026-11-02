@@ -277,7 +277,7 @@ pub unsafe fn ki_deliver_apc(current_thread: *mut Ethread, delivery_mode: ApcMod
     let apc_state = &mut (*current_thread).kthread.apc_state;
 
     // Raise IRQL to APC_LEVEL
-    let _guard = irql::raise_irql(APC_LEVEL);
+    let _irql_guard = irql::CriticalRegion::enter();
 
     match delivery_mode {
         ApcMode::Kernel => {
@@ -510,6 +510,7 @@ pub unsafe fn queue_thread_apc(
             mode,
             context,
         );
+        (*thread).kthread.apc_state.apc_queue_flag = 1;
         ke_insert_queue_apc(apc_ptr, context, core::ptr::null_mut(), 0)
     }
 }
@@ -554,7 +555,7 @@ pub unsafe fn deliver_thread_apc(thread: *mut Ethread, kind: ApcKind) -> bool {
         }
 
         let entry = crate::ps::thread::apc_list_remove_head(head);
-        let apc_ptr = entry as *mut Apc;
+        let apc_ptr = (entry as *mut u8).sub(core::mem::offset_of!(Apc, list_entry)) as *mut Apc;
         (*apc_ptr).inserted.store(false, Ordering::Release);
 
         if let Some(routine_fn) = (*apc_ptr).routine {
@@ -636,10 +637,15 @@ pub unsafe extern "C" fn nt_queue_apc_thread(
 /// Note: ke_initialize_apc expects a kernel routine with signature `fn(*mut u8)`
 /// so we use a wrapper that just does nothing (the APC is already queued).
 unsafe extern "system" fn user_apc_kernel_routine(_context: *mut u8) {
-    // In a full implementation, this would:
-    // 1. Queue the user APC to be delivered when the thread returns to user mode
-    // 2. Set the user APC pending flag
-    // The actual delivery happens in ki_deliver_apc(UserApcMode)
+    // NT 6.1 (KiInitializeUserApc): the kernel routine for a user
+    // APC must set the thread's UserApcPending flag so the syscall
+    // return path checks it and invokes the user-mode callback.
+    // Without this, `nt_queue_apc_thread` queues an APC that is
+    // dequeued by `ki_deliver_apc` but the user-mode payload
+    // (normal_routine) is never invoked.
+    crate::ke::scheduler::with_current_thread(|ethread| {
+        ethread.kthread.apc_state.apc_queue_flag = 1;
+    });
 }
 
 /// Smoke test for the APC subsystem.

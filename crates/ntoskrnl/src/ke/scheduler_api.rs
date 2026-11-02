@@ -3,7 +3,6 @@
 // =============================================================================
 
 use alloc::string::String;
-use alloc::vec;
 use alloc::vec::Vec;
 
 #[derive(Debug, Clone)]
@@ -40,116 +39,8 @@ pub fn get_process_list() -> Vec<ProcessInfo> {
                 });
             }
         }
-        Err(_) => {
-            processes.push(ProcessInfo {
-                pid: 0,
-                name: String::from("System Idle Process"),
-                memory_usage: 8 * 1024,
-                cpu_time: 0,
-                session_id: 0,
-                status: String::from("Running"),
-                user_name: String::from("NT AUTHORITY\\SYSTEM"),
-                window_title: String::from("N/A"),
-                services: Vec::new(),
-            });
-
-            processes.push(ProcessInfo {
-                pid: 4,
-                name: String::from("System"),
-                memory_usage: 256 * 1024,
-                cpu_time: 0,
-                session_id: 0,
-                status: String::from("Running"),
-                user_name: String::from("NT AUTHORITY\\SYSTEM"),
-                window_title: String::from("N/A"),
-                services: Vec::new(),
-            });
-        }
+        Err(_) => {}
     }
-
-    processes.push(ProcessInfo {
-        pid: 264,
-        name: String::from("smss.exe"),
-        memory_usage: 512 * 1024, // 512 KB
-        cpu_time: 0,
-        session_id: 0,
-        status: String::from("Running"),
-        user_name: String::from("NT AUTHORITY\\SYSTEM"),
-        window_title: String::from("N/A"),
-        services: Vec::new(),
-    });
-
-    processes.push(ProcessInfo {
-        pid: 352,
-        name: String::from("csrss.exe"),
-        memory_usage: 2 * 1024 * 1024, // 2 MB
-        cpu_time: 0,
-        session_id: 0,
-        status: String::from("Running"),
-        user_name: String::from("NT AUTHORITY\\SYSTEM"),
-        window_title: String::from("N/A"),
-        services: Vec::new(),
-    });
-
-    processes.push(ProcessInfo {
-        pid: 400,
-        name: String::from("wininit.exe"),
-        memory_usage: 1024 * 1024, // 1 MB
-        cpu_time: 0,
-        session_id: 0,
-        status: String::from("Running"),
-        user_name: String::from("NT AUTHORITY\\SYSTEM"),
-        window_title: String::from("N/A"),
-        services: Vec::new(),
-    });
-
-    processes.push(ProcessInfo {
-        pid: 472,
-        name: String::from("services.exe"),
-        memory_usage: 4 * 1024 * 1024, // 4 MB
-        cpu_time: 0,
-        session_id: 0,
-        status: String::from("Running"),
-        user_name: String::from("NT AUTHORITY\\SYSTEM"),
-        window_title: String::from("N/A"),
-        services: vec![String::from("Dhcp"), String::from("Dnscache")],
-    });
-
-    processes.push(ProcessInfo {
-        pid: 488,
-        name: String::from("lsass.exe"),
-        memory_usage: 3 * 1024 * 1024, // 3 MB
-        cpu_time: 0,
-        session_id: 0,
-        status: String::from("Running"),
-        user_name: String::from("NT AUTHORITY\\SYSTEM"),
-        window_title: String::from("N/A"),
-        services: Vec::new(),
-    });
-
-    processes.push(ProcessInfo {
-        pid: 496,
-        name: String::from("winlogon.exe"),
-        memory_usage: 2 * 1024 * 1024, // 2 MB
-        cpu_time: 0,
-        session_id: 1,
-        status: String::from("Running"),
-        user_name: String::from("NT AUTHORITY\\SYSTEM"),
-        window_title: String::from("N/A"),
-        services: Vec::new(),
-    });
-
-    processes.push(ProcessInfo {
-        pid: 1024,
-        name: String::from("explorer.exe"),
-        memory_usage: 24 * 1024 * 1024, // 24 MB
-        cpu_time: 0,
-        session_id: 1,
-        status: String::from("Running"),
-        user_name: String::from("Administrator"),
-        window_title: String::from("Program Manager"),
-        services: Vec::new(),
-    });
 
     processes
 }
@@ -168,7 +59,10 @@ pub fn find_processes_by_name(name: &str) -> Vec<u32> {
 pub fn terminate_process(pid: u32) -> bool {
     use crate::ps::process_mgmt::terminate_process_by_pid;
 
-    if pid == 0 || pid == 4 || pid < 260 {
+    // NT blocks termination of the idle and system processes, not
+    // a magic PID cutoff. The process manager checks per-process
+    // critical flags (EPROCESS::BreakOnTermination) internally.
+    if pid == 0 || pid == 4 {
         return false;
     }
 

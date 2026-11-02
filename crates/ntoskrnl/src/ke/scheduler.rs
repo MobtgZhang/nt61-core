@@ -27,7 +27,7 @@ static SCHED_SWITCH_DIAG: AtomicU8 = AtomicU8::new(0);
 /// Kept in lockstep with the arch layers (see arch/aarch64/mod.rs):
 /// a scheduler limit below the arch limit silently truncates SMP
 /// bring-up, and one above it would index per-CPU arrays out of range.
-const MAX_CPUS: usize = 64;
+const MAX_CPUS: usize = 256;
 const MAX_IDLE_THREADS: usize = MAX_CPUS;
 
 /// Scheduler priority levels (Windows-compatible).
@@ -263,8 +263,19 @@ impl ListHead {
             if next.is_null() {
                 self.blink = core::ptr::null_mut();
             } else {
+                // NT 6.1: the next node's backlink must be cleared to
+                // the head's "no previous" sentinel (null here), NOT
+                // left dangling. The old code destroyed the interior
+                // node's backlink, so a later unlink of that node
+                // walked a corrupted chain.
                 (*next).blink = core::ptr::null_mut();
             }
+            // NT 6.1: the removed entry's flink/blink must be
+            // cleared (or set to a sentinel) so it can be safely
+            // re-inserted later without stale links causing a
+            // splice of the wrong sublist.
+            (*entry).flink = core::ptr::null_mut();
+            (*entry).blink = core::ptr::null_mut();
             Some(entry)
         }
     }
@@ -1097,9 +1108,14 @@ pub unsafe fn setup_bsp(thread: *mut Ethread) -> bool {
         // by `Scheduler`; it is dereferenced only through locked accessors.
         sched.cpus[0] = raw;
     }
+    let idle_ptr = create_thread_idle(0)
+        .map(|idle| idle as *mut crate::ps::thread::Ethread)
+        .unwrap_or(core::ptr::null_mut());
     if let Some(prcb) = sched.prcb_mut(0) {
+        if !idle_ptr.is_null() {
+            prcb.idle_thread = idle_ptr;
+        }
         prcb.current_thread = thread;
-        prcb.idle_thread = thread;
     }
     if sched.num_cpus == 0 {
         sched.num_cpus = 1;
@@ -1199,12 +1215,15 @@ pub unsafe fn add_ready(thread: *mut Ethread, priority: u8) {
         let affinity = (*thread).kthread.affinity_mask;
 
         // Check if home CPU is allowed by affinity
-        if (affinity & (1u64 << home_cpu)) != 0 {
+        if home_cpu < MAX_CPUS as u8 && (affinity & (1u64 << home_cpu)) != 0 {
             home_cpu as usize
         } else {
-            // Home CPU not in affinity mask, find first allowed CPU
-            // Default to current CPU
-            scheduler.current_cpu as usize
+            let allowed = affinity.trailing_zeros() as usize;
+            if allowed < MAX_CPUS {
+                allowed
+            } else {
+                scheduler.current_cpu as usize
+            }
         }
     };
 
@@ -1606,48 +1625,46 @@ pub fn tick() {
         // Advance the authoritative clock once per tick.
         crate::ke::time::advance_tick();
 
-        let mut scheduler = SCHEDULER.lock();
         // Use get_current_cpu() to get the real CPU ID from GS base
         let cpu = get_current_cpu();
+        let mut scheduler = SCHEDULER.lock();
 
         // Get per-CPU PRCB
         if let Some(ref mut prcb) = scheduler.prcb_mut(cpu) {
-            let remaining = prcb.quantum_remaining;
-
-            if remaining > 0 {
-                prcb.quantum_remaining = remaining - 1;
-
-                // When quantum reaches zero, trigger reschedule
-                if prcb.quantum_remaining == 0 {
-                    // // kprintln!("[SCHED] tick: quantum expired");
-
-                    // Unboost current thread's priority if boost has expired
-                    // This starts the decay process instead of instant drop
-                    if !prcb.current_thread.is_null() {
-                        ki_unboost_thread(prcb.current_thread);
-                    }
-
-                    // Reset quantum for next thread
-                    prcb.quantum_remaining = QUANTUM_DEFAULT;
-                    prcb.quantum_initial = QUANTUM_DEFAULT;
-                    // Do not swap context from the ISR: request a reschedule
-                    // and let the dispatcher run it at DISPATCH_LEVEL.
-                    drop(scheduler);
-                    request_reschedule(cpu);
-                } else {
-                    // Check for priority decay even when quantum hasn't expired.
-                    // This allows gradual decay during the thread's quantum.
-                    if !prcb.current_thread.is_null() {
-                        check_and_decay_priority(prcb.current_thread);
-                    }
-                }
+            let current = prcb.current_thread;
+            if current.is_null() {
+                irql::lower_irql(previous_irql);
+                drop(scheduler);
+                poll_services();
+                return;
+            }
+            let remaining = (*current).kthread.quantum_remaining;
+            if remaining == 0 {
+                irql::lower_irql(previous_irql);
+                drop(scheduler);
+                poll_services();
+                return;
+            }
+            let remaining = remaining.saturating_sub(1);
+            (*current).kthread.quantum_remaining = remaining;
+            prcb.quantum_remaining = remaining;
+            if remaining == 0 {
+                ki_unboost_thread(current);
+                let quantum_initial = (*current).kthread.quantum_initial;
+                (*current).kthread.quantum_remaining = quantum_initial;
+                prcb.quantum_remaining = quantum_initial;
+                prcb.quantum_initial = quantum_initial;
+                drop(scheduler);
+                request_reschedule(cpu);
+            } else {
+                check_and_decay_priority(current);
             }
         }
 
         irql::lower_irql(previous_irql);
-
-        poll_services();
     }
+
+    poll_services();
 }
 
 /// Drain network RX and advance long-lived kernel services.
@@ -1737,7 +1754,7 @@ pub fn idle_loop() -> ! {
 /// create an idle thread for a CPU.
 pub fn create_idle_thread() {
     let mut scheduler = SCHEDULER.lock();
-    let cpu_id = scheduler.num_cpus as u32;
+    let cpu_count = scheduler.num_cpus.max(1);
 
     if scheduler.num_idle_threads >= scheduler.idle_threads.len() {
         // // kprintln!("[SCHED] create_idle_thread: idle thread array full (num={})",
@@ -1745,23 +1762,24 @@ pub fn create_idle_thread() {
         return;
     }
 
-    // // kprintln!("[SCHED] create_idle_thread: creating for CPU {}", cpu_id);
-
-    match create_thread_idle(cpu_id) {
-        Some(idle) => {
-            let idx = scheduler.num_idle_threads;
-            scheduler.idle_threads[idx] = idle;
-            scheduler.num_idle_threads += 1;
-            if let Some(ref mut prcb) = scheduler.prcb_mut(0) {
-                prcb.idle_thread = idle;
-                prcb.current_thread = idle;
-                // // kprintln!("[SCHED] create_idle_thread: idle thread set for CPU 0, idle=0x{:x}", idle as *const Ethread as u64);
-            } else {
-                // // kprintln!("[SCHED] create_idle_thread: WARNING - CPU 0 PRCB not initialized");
-            }
+    for cpu_id in 0..cpu_count {
+        if scheduler.num_idle_threads >= scheduler.idle_threads.len() {
+            break;
         }
-        None => {
-            // // kprintln!("[SCHED] create_idle_thread: FAILED to create idle thread for CPU {}", cpu_id);
+
+        match crate::ps::thread::create_idle_thread(cpu_id as u32) {
+            Some(idle) => {
+                let idx = scheduler.num_idle_threads;
+                scheduler.idle_threads[idx] = idle;
+                scheduler.num_idle_threads += 1;
+                if let Some(ref mut prcb) = scheduler.prcb_mut(cpu_id as usize) {
+                    prcb.idle_thread = idle;
+                    if prcb.current_thread.is_null() {
+                        prcb.current_thread = idle;
+                    }
+                }
+            }
+            None => break,
         }
     }
 }
@@ -1792,23 +1810,22 @@ pub fn init_thread_quantum(_thread: *mut Ethread, quantum: Quantum) {
         Quantum::Long => (QUANTUM_FOREGROUND, QUANTUM_FOREGROUND),
     };
 
-    let mut scheduler = SCHEDULER.lock();
-    let cpu = scheduler.current_cpu as usize;
-    if let Some(ref mut prcb) = scheduler.prcb_mut(cpu) {
-        prcb.quantum_initial = initial;
-        prcb.quantum_remaining = remaining;
+    if !_thread.is_null() {
+        unsafe {
+            (*_thread).kthread.quantum_initial = initial;
+            (*_thread).kthread.quantum_remaining = remaining;
+        }
     }
 }
 
 /// Set quantum for current thread.
 pub fn set_thread_quantum(thread: *mut Ethread, quantum_ticks: u32) {
-    let mut scheduler = SCHEDULER.lock();
-    let cpu = scheduler.current_cpu as usize;
-    if let Some(ref mut prcb) = scheduler.prcb_mut(cpu) {
-        prcb.quantum_initial = quantum_ticks;
-        prcb.quantum_remaining = quantum_ticks;
+    if !thread.is_null() {
+        unsafe {
+            (*thread).kthread.quantum_initial = quantum_ticks;
+            (*thread).kthread.quantum_remaining = quantum_ticks;
+        }
     }
-    let _ = thread; // suppress unused warning
 }
 
 /// Get remaining quantum for current thread.
@@ -2020,7 +2037,7 @@ fn calculate_balance_threshold(avg_load: usize) -> usize {
 }
 
 /// Helper function to find a migratable thread in a CPU's queue
-fn find_migratable_thread(prcb: &Prcb) -> Option<(*mut Ethread, u8)> {
+fn find_migratable_thread(prcb: &Prcb, target_cpu: usize) -> Option<(*mut Ethread, u8)> {
     // Search from lower priorities first (prefer migrating lower priority threads)
     for prio in 0..32 {
         let queue = &prcb.ready_queues[prio];
@@ -2043,7 +2060,9 @@ fn find_migratable_thread(prcb: &Prcb) -> Option<(*mut Ethread, u8)> {
                 // Prefer migrating threads that:
                 // 1. Are not affinitized (can run anywhere)
                 // 2. Have multi-CPU affinity (can run on multiple CPUs)
-                if !is_affinitized || affinity.count_ones() > 1 {
+                let target_allowed = target_cpu < MAX_CPUS
+                    && (affinity & (1u64 << target_cpu)) != 0;
+                if target_allowed && (!is_affinitized || affinity.count_ones() > 1) {
                     return Some((ethread_ptr, prio as u8));
                 }
 
@@ -2115,7 +2134,9 @@ pub fn ki_balance_processor(target_cpu: u32) {
             // Attempt to migrate a thread from the most loaded CPU to the least loaded.
             // Use fine-grained per-queue locking to reduce contention.
             if let Some(ref mut max_prcb) = scheduler.prcb_mut(max_cpu) {
-                if let Some((thread, priority)) = find_migratable_thread(max_prcb) {
+                if let Some((thread, priority)) =
+                    find_migratable_thread(max_prcb, min_cpu)
+                {
                     let priority_idx = priority as usize;
 
                     // Lock the source queue first, then the target queue
@@ -2190,6 +2211,8 @@ pub fn ki_balance_processor(target_cpu: u32) {
                             min_prcb
                                 .ready_summary
                                 .fetch_or(1u32 << priority, Ordering::AcqRel);
+                            (*thread).kthread.queued_priority = priority;
+                            (*thread).kthread.queued_cpu = min_cpu as u16;
 
                             let _tid = (*thread).client_id.unique_thread;
                             // _tid is intentionally unused - reserved for future logging
@@ -2208,7 +2231,12 @@ pub fn ki_balance_processor(target_cpu: u32) {
 }
 
 /// Migrate a thread from one CPU to another (complete implementation)
-fn migrate_thread_locked(thread: *mut Ethread, from_cpu: usize, to_cpu: usize, _priority: u8) {
+fn migrate_thread_locked(
+    thread: *mut Ethread,
+    from_cpu: usize,
+    mut to_cpu: usize,
+    _priority: u8,
+) {
     if thread.is_null() || from_cpu >= MAX_CPUS {
         return;
     }
@@ -2219,10 +2247,9 @@ fn migrate_thread_locked(thread: *mut Ethread, from_cpu: usize, to_cpu: usize, _
         // Find first valid CPU from affinity
         let valid_cpu = affinity.trailing_zeros() as usize;
         if valid_cpu >= MAX_CPUS {
-            // // kprintln!("[SCHED] migrate_thread_locked: no valid target CPU for TID {}",
-            // //                      unsafe { (*thread).client_id.unique_thread });
             return;
         }
+        to_cpu = valid_cpu;
     }
 
     unsafe {
@@ -2290,7 +2317,9 @@ pub fn balance_load() {
             // //         );
 
             if let Some(ref mut max_prcb) = scheduler.prcb_mut(max_cpu) {
-                if let Some((thread, priority)) = find_migratable_thread(max_prcb) {
+                if let Some((thread, priority)) =
+                    find_migratable_thread(max_prcb, min_cpu)
+                {
                     // ke_sched P0-4: the per-CPU ready queues are guarded by
                     // lock_ready_queue everywhere else (add_ready, remove_ready,
                     // schedule, ki_balance_processor); balance_load mutated
@@ -2426,6 +2455,9 @@ pub unsafe fn ki_boost_thread(thread: *mut Ethread, boost_type: PriorityBoostTyp
             // Record boost timestamp for decay mechanism
             kthread.boost_time = get_ticks();
             kthread.decay_started = 1;
+            if kthread.queued_priority != 0xFF && remove_ready(thread) {
+                add_ready(thread, new_priority.clamp(0, 31) as u8);
+            }
             // // kprintln!(
             // //                 "[SCHED] KiBoostThread: TID {} priority {} -> {} (boost_type={:?}, boost={})",
             // //                 (*thread).client_id.unique_thread,

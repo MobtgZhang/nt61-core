@@ -30,7 +30,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::ke::irql::{self, Irql};
 use crate::ke::sync::Spinlock;
 use crate::mm::pool;
 
@@ -46,7 +45,12 @@ pub enum DpcImportance {
     Realtime = 3,
 }
 
-const MAX_DPCS: usize = 8;
+// NT 6.1 uses per-CPU DPC queues of unbounded depth. A single
+// global queue of 64 entries overflows instantly under any device
+// interrupt storm. 1024 entries with per-CPU targeting covers the
+// common interrupt-storm scenario without requiring heap
+// re-allocation during queue drain.
+const MAX_DPCS: usize = 1024;
 const DPC_SIZE: usize = core::mem::size_of::<Dpc>();
 
 /// DPC object.
@@ -223,13 +227,6 @@ pub unsafe fn ke_insert_queue_dpc(
         return false;
     }
 
-    // Check IRQL: must be at DISPATCH_LEVEL or lower
-    let current_irql = irql::get_current_irql();
-    if current_irql > Irql::DispatchLevel {
-        // Cannot queue DPC at IRQL > DISPATCH_LEVEL
-        return false;
-    }
-
     let arr = dpc_array();
     let mut found_slot = false;
     let _lock = dpc_lock().lock();
@@ -240,6 +237,7 @@ pub unsafe fn ke_insert_queue_dpc(
         if unsafe { is_all_zero(slot) } || !slot.inserted.load(Ordering::Relaxed) {
             // Copy the DPC to this slot
             core::ptr::copy_nonoverlapping(dpc, slot, 1);
+            slot.number = (*dpc).number;
             slot.inserted.store(true, Ordering::Release);
             slot.fired.store(false, Ordering::Relaxed);
             found_slot = true;
@@ -307,6 +305,7 @@ pub fn drain() -> usize {
     let arr = dpc_array();
     let mut fired = 0;
     let mut pending: [Option<(DpcRoutine, *mut u8)>; MAX_DPCS] = [const { None }; MAX_DPCS];
+    let current_cpu = crate::ke::scheduler::get_current_cpu();
 
     // Phase 1: collect pending DPCs while holding the lock. Mark each
     // slot fired so a concurrent drain cannot double-run a routine.
@@ -314,7 +313,11 @@ pub fn drain() -> usize {
         let _lock = dpc_lock().lock();
         for i in 0..MAX_DPCS {
             let slot = &arr[i];
-            if slot.inserted.load(Ordering::Relaxed) && !slot.fired.load(Ordering::Relaxed) {
+            let target_cpu = slot.number as usize;
+            if (target_cpu == 0 || target_cpu == current_cpu)
+                && slot.inserted.load(Ordering::Relaxed)
+                && !slot.fired.load(Ordering::Relaxed)
+            {
                 slot.fired.store(true, Ordering::Relaxed);
                 if let Some(r) = slot.routine {
                     pending[i] = Some((r, slot.context));
