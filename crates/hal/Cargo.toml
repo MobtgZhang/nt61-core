@@ -8,6 +8,9 @@ publish = false
 path = "src/lib.rs"
 test = false
 
+[features]
+log_level_debug = []
+
 [dependencies]
 nt61-boot-types = { path = "../boot-types" }
 ntoskrnl = { path = "../ntoskrnl" }

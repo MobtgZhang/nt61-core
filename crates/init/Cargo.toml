@@ -22,7 +22,7 @@ test = false
 
 [features]
 default = ["x86_64", "binary_panic", "alloc", "crypto_libs"]
-desktop = ["dep:nt61-desktop"]
+desktop = []
 std = []
 uefi_boot = []
 bios_boot = []
@@ -47,7 +47,6 @@ log_level_debug = ["log_level_info"]
 nt61-boot-types = { path = "../boot-types" }
 nt61-sync = { path = "../sync" }
 ntoskrnl = { path = "../ntoskrnl" }
-nt61-desktop = { path = "../../../nt61-desktop", optional = true }
 
 [dev-dependencies]
 tempfile = "3.8"

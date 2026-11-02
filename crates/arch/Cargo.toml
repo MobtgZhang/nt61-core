@@ -9,6 +9,9 @@ path = "src/lib.rs"
 test = false
 
 
+[features]
+binary_panic = []
+
 [dependencies]
 nt61-boot-types = { path = "../boot-types" }
 ntoskrnl = { path = "../ntoskrnl" }

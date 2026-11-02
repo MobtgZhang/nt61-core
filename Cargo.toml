@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/init",
+  "crates/arch",
   "crates/boot-types",
   "crates/sync",
   "crates/ntoskrnl",
@@ -53,7 +54,8 @@ panic = "abort"
 [profile.dev]
 opt-level = 0
 debug = false
-panic = "unwind"
+panic = "abort"
+
 
 
 [profile.uefi-dev]

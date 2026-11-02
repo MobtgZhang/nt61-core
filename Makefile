@@ -107,10 +107,10 @@ DISK_DEV_PCI := virtio-blk-pci
 # raw disk images we use the dual-step `if=none + -device ... -drive`
 # form so the disk controller and the disk itself can be referenced
 # by `id=hd0` regardless of which virtio device we end up attaching.
-DISK_FLAGS = $(if $(filter iso,$(FORMAT)),-cdrom $(ISO_IMG),-drive if=none,file=$(DISK_IMG),format=raw,id=hd0 -device $(DISK_DEV_PCI),drive=hd0)
+DISK_FLAGS = $(if $(filter iso,$(FORMAT)),-cdrom $(ISO_IMG),-drive if=none,file=$(DISK_IMG),format=$(if $(filter qcow2,$(FORMAT)),qcow2,raw),id=hd0 -device $(DISK_DEV_PCI),drive=hd0)
 
 # Disk image names — `=` for the same reason as above.
-DISK_IMG = $(IMAGES_DIR)/disk.img
+DISK_IMG = $(if $(filter qcow2,$(FORMAT)),$(IMAGES_DIR)/disk.qcow2,$(IMAGES_DIR)/disk.img)
 ISO_IMG = $(IMAGES_DIR)/nt61.iso
 SERIAL_LOG = $(IMAGES_DIR)/serial_$(ARCH)_$(FORMAT).log
 
@@ -124,14 +124,19 @@ VERIFY_DIR ?= build/verify-strict
 # ============================================================
 .PHONY: all build run run-serial run-gtk \
         build-ntfs build-fat32 build-ext4 build-iso \
+        build-refs build-qcow2 build-ramfs \
         test test-host test-qemu test-all test-pe \
         test-all-qemu test-all-fs-qemu test-arches-fs-qemu \
         make-ntfs-serial make-fat32-serial make-ext4-serial \
         run-x86_64 run-aarch64 run-riscv64 run-loongarch64 \
         run-x86_64-ntfs run-x86_64-fat32 run-x86_64-ext4 run-x86_64-iso \
+        run-x86_64-refs run-x86_64-qcow2 run-x86_64-ramfs \
         run-aarch64-ntfs run-aarch64-fat32 run-aarch64-ext4 run-aarch64-iso \
+        run-aarch64-refs run-aarch64-qcow2 run-aarch64-ramfs \
         run-riscv64-ntfs run-riscv64-fat32 run-riscv64-ext4 run-riscv64-iso \
+        run-riscv64-refs run-riscv64-qcow2 run-riscv64-ramfs \
         run-loongarch64-ntfs run-loongarch64-fat32 run-loongarch64-ext4 run-loongarch64-iso \
+        run-loongarch64-refs run-loongarch64-qcow2 run-loongarch64-ramfs \
         run-x86_64-ntfs-serial run-x86_64-fat32-serial run-x86_64-ext4-serial \
         run-aarch64-ntfs-serial run-aarch64-fat32-serial run-aarch64-ext4-serial \
         run-riscv64-ntfs-serial run-riscv64-fat32-serial run-riscv64-ext4-serial \
@@ -172,6 +177,18 @@ build-iso: FORMAT=iso
 build-iso:
 	$(BUILD_TOOL) --build iso --build-dir $(BLD) --format-flag iso --size-mb 64 --arch $(ARCH)
 
+build-refs: FORMAT=refs
+build-refs:
+	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag refs --size-mb 64 --arch $(ARCH)
+
+build-qcow2: FORMAT=qcow2
+build-qcow2:
+	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag qcow2 --size-mb 64 --arch $(ARCH)
+
+build-ramfs: FORMAT=ramfs
+build-ramfs:
+	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag ramfs --size-mb 64 --arch $(ARCH)
+
 # ============================================================
 # Arch-format specific build targets
 # ============================================================
@@ -210,6 +227,54 @@ build-loongarch64-fat32:
 
 build-loongarch64-ext4:
 	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/ext4 --format-flag ext4 --size-mb 64 --arch loongarch64
+
+build-x86_64-refs:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/refs --format-flag refs --size-mb 64 --arch x86_64
+
+build-x86_64-qcow2:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/qcow2 --format-flag qcow2 --size-mb 64 --arch x86_64
+
+build-x86_64-ramfs:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/ramfs --format-flag ramfs --size-mb 64 --arch x86_64
+
+build-aarch64-refs:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/refs --format-flag refs --size-mb 64 --arch aarch64
+
+build-aarch64-qcow2:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/qcow2 --format-flag qcow2 --size-mb 64 --arch aarch64
+
+build-aarch64-ramfs:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/ramfs --format-flag ramfs --size-mb 64 --arch aarch64
+
+build-riscv64-refs:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/refs --format-flag refs --size-mb 64 --arch riscv64
+
+build-riscv64-qcow2:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/qcow2 --format-flag qcow2 --size-mb 64 --arch riscv64
+
+build-riscv64-ramfs:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/ramfs --format-flag ramfs --size-mb 64 --arch riscv64
+
+build-loongarch64-refs:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/refs --format-flag refs --size-mb 64 --arch loongarch64
+
+build-loongarch64-qcow2:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/qcow2 --format-flag qcow2 --size-mb 64 --arch loongarch64
+
+build-loongarch64-ramfs:
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/ramfs --format-flag ramfs --size-mb 64 --arch loongarch64
+
+build-x86_64-iso:
+	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/x86_64/iso --format-flag iso --size-mb 64 --arch x86_64
+
+build-aarch64-iso:
+	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/aarch64/iso --format-flag iso --size-mb 64 --arch aarch64
+
+build-riscv64-iso:
+	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/riscv64/iso --format-flag iso --size-mb 64 --arch riscv64
+
+build-loongarch64-iso:
+	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/loongarch64/iso --format-flag iso --size-mb 64 --arch loongarch64
 
 # ============================================================
 # Firmware setup macros (per architecture)
@@ -388,7 +453,7 @@ define _run_x86_64
 	$(QEMU_X86) -machine q35 -m 8G -smp 4 \
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
-		$(if $(filter iso,$(FORMAT)),-cdrom $(ISO_IMG),-drive format=raw,file=$(DISK_IMG)) \
+		$(DISK_FLAGS) \
 		-boot $(if $(filter iso,$(FORMAT)),d,c) $(QEMU_NET_BRIDGE) \
 		-device virtio-keyboard-pci \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
@@ -427,8 +492,8 @@ define _run_riscv64
 		-bios /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
 		-drive if=pflash,format=raw,unit=0,file=$(EDK2_RISCV64_VIRT_PADDED) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
-		-drive if=none,file=$(DISK_IMG),format=raw,id=hd0 \
-		-device $(DISK_DEV_PCI),drive=hd0 -device ramfb \
+		$(DISK_FLAGS) \
+		-device ramfb \
 		-device qemu-xhci -device virtio-keyboard-pci \
 		$(QEMU_NET_BRIDGE) \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
@@ -628,6 +693,102 @@ run-loongarch64-iso: ARCH=loongarch64
 run-loongarch64-iso: FORMAT=iso
 run-loongarch64-iso: SERIAL_LOG=$(IMAGES_DIR)/serial_loongarch64_iso.log
 run-loongarch64-iso: build-loongarch64-iso
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_loongarch64)
+	$(call _run_loongarch64)
+
+run-x86_64-refs: ARCH=x86_64
+run-x86_64-refs: FORMAT=refs
+run-x86_64-refs: SERIAL_LOG=$(IMAGES_DIR)/serial_x86_64_refs.log
+run-x86_64-refs: build-x86_64-refs
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_x86_64)
+	$(call _run_x86_64)
+
+run-x86_64-qcow2: ARCH=x86_64
+run-x86_64-qcow2: FORMAT=qcow2
+run-x86_64-qcow2: SERIAL_LOG=$(IMAGES_DIR)/serial_x86_64_qcow2.log
+run-x86_64-qcow2: build-x86_64-qcow2
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_x86_64)
+	$(call _run_x86_64)
+
+run-x86_64-ramfs: ARCH=x86_64
+run-x86_64-ramfs: FORMAT=ramfs
+run-x86_64-ramfs: SERIAL_LOG=$(IMAGES_DIR)/serial_x86_64_ramfs.log
+run-x86_64-ramfs: build-x86_64-ramfs
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_x86_64)
+	$(call _run_x86_64)
+
+run-aarch64-refs: ARCH=aarch64
+run-aarch64-refs: FORMAT=refs
+run-aarch64-refs: SERIAL_LOG=$(IMAGES_DIR)/serial_aarch64_refs.log
+run-aarch64-refs: build-aarch64-refs
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_aarch64)
+	$(call _run_aarch64)
+
+run-aarch64-qcow2: ARCH=aarch64
+run-aarch64-qcow2: FORMAT=qcow2
+run-aarch64-qcow2: SERIAL_LOG=$(IMAGES_DIR)/serial_aarch64_qcow2.log
+run-aarch64-qcow2: build-aarch64-qcow2
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_aarch64)
+	$(call _run_aarch64)
+
+run-aarch64-ramfs: ARCH=aarch64
+run-aarch64-ramfs: FORMAT=ramfs
+run-aarch64-ramfs: SERIAL_LOG=$(IMAGES_DIR)/serial_aarch64_ramfs.log
+run-aarch64-ramfs: build-aarch64-ramfs
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_aarch64)
+	$(call _run_aarch64)
+
+run-riscv64-refs: ARCH=riscv64
+run-riscv64-refs: FORMAT=refs
+run-riscv64-refs: SERIAL_LOG=$(IMAGES_DIR)/serial_riscv64_refs.log
+run-riscv64-refs: build-riscv64-refs
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_riscv64)
+	$(call _run_riscv64)
+
+run-riscv64-qcow2: ARCH=riscv64
+run-riscv64-qcow2: FORMAT=qcow2
+run-riscv64-qcow2: SERIAL_LOG=$(IMAGES_DIR)/serial_riscv64_qcow2.log
+run-riscv64-qcow2: build-riscv64-qcow2
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_riscv64)
+	$(call _run_riscv64)
+
+run-riscv64-ramfs: ARCH=riscv64
+run-riscv64-ramfs: FORMAT=ramfs
+run-riscv64-ramfs: SERIAL_LOG=$(IMAGES_DIR)/serial_riscv64_ramfs.log
+run-riscv64-ramfs: build-riscv64-ramfs
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_riscv64)
+	$(call _run_riscv64)
+
+run-loongarch64-refs: ARCH=loongarch64
+run-loongarch64-refs: FORMAT=refs
+run-loongarch64-refs: SERIAL_LOG=$(IMAGES_DIR)/serial_loongarch64_refs.log
+run-loongarch64-refs: build-loongarch64-refs
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_loongarch64)
+	$(call _run_loongarch64)
+
+run-loongarch64-qcow2: ARCH=loongarch64
+run-loongarch64-qcow2: FORMAT=qcow2
+run-loongarch64-qcow2: SERIAL_LOG=$(IMAGES_DIR)/serial_loongarch64_qcow2.log
+run-loongarch64-qcow2: build-loongarch64-qcow2
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_loongarch64)
+	$(call _run_loongarch64)
+
+run-loongarch64-ramfs: ARCH=loongarch64
+run-loongarch64-ramfs: FORMAT=ramfs
+run-loongarch64-ramfs: SERIAL_LOG=$(IMAGES_DIR)/serial_loongarch64_ramfs.log
+run-loongarch64-ramfs: build-loongarch64-ramfs
 	@mkdir -p $(IMAGES_DIR)
 	$(call _setup_firmware_loongarch64)
 	$(call _run_loongarch64)
