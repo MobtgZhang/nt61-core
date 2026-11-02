@@ -113,19 +113,20 @@ pub fn create_wow64_thread(
         let thread = create_thread(process, 0)?;
 
         // 2. Allocate TEB32
-        let teb32 = allocate_teb32()?;
+        let (teb32, teb32_va) = allocate_teb32(process)?;
         // 3. Allocate 32-bit stack
         let stack_base = allocate_32bit_stack(DEFAULT_WOW64_STACK_SIZE)?;
         let stack_top = stack_base + DEFAULT_WOW64_STACK_SIZE;
 
         // 4. Initialize CONTEXT32 and retain its storage for the loader.
         let context = Box::new(init_thread_context32(start_address, parameter, stack_top));
-        let _context_ptr = Box::into_raw(context);
-        // _context_ptr is reserved for future use - thread context tracking
+        thread.wow64_context32 = Some(*context);
+        thread.wow64_start_address = start_address;
+        thread.wow64_stack_top = stack_top;
 
         // 5. Initialize TEB32
         {
-            { init_teb32(teb32, thread, process, stack_top) };
+            init_teb32(teb32, teb32_va, thread, process, stack_top);
             thread.set_wow64_teb32(teb32);
         }
 
@@ -133,10 +134,49 @@ pub fn create_wow64_thread(
     }
 }
 
-/// Allocate TEB32 for a Wow64 thread.
-pub fn allocate_teb32() -> Option<*mut Teb32> {
-    static mut TEB32_BUFFER: [u32; 0x1100 / 4] = [0; 0x1100 / 4];
-    Some(core::ptr::addr_of_mut!(TEB32_BUFFER).cast::<Teb32>())
+/// Allocate a per-thread TEB32.
+///
+/// The TEB has one kernel-side allocation and one 32-bit user-mode VA.
+/// The kernel allocation is mapped into the process so 32-bit code can
+/// reach its TEB through the WOW64 user segment.
+pub fn allocate_teb32(
+    process: &crate::ps::process::Eprocess,
+) -> Option<(*mut Teb32, ULONG32)> {
+    const TEB32_SIZE: usize = 0x1100;
+    const TEB32_PAGES: usize = (TEB32_SIZE + 0xFFF) / 0x1000;
+
+    let kernel_teb = crate::mm::pool::allocate_aligned(
+        crate::mm::pool::PoolType::NonPaged,
+        TEB32_SIZE,
+        0x1000,
+    ) as *mut Teb32;
+    if kernel_teb.is_null() {
+        return None;
+    }
+    unsafe { core::ptr::write_bytes(kernel_teb as *mut u8, 0, TEB32_SIZE) };
+
+    let user_va = wow64vas::allocate_heap(TEB32_SIZE as ULONG32)?;
+    let pml4 = process.pml4_phys;
+    for page in 0..TEB32_PAGES {
+        let kernel_page = unsafe { kernel_teb.cast::<u8>().add(page * 0x1000) };
+        let physical = match crate::mm::vm::virt_to_phys(kernel_page as u64) {
+            Some(pa) => pa,
+            None => {
+                unsafe { crate::mm::pool::free(kernel_teb.cast::<u8>()) };
+                return None;
+            }
+        };
+        let va = u64::from(user_va) + (page as u64) * 0x1000;
+        let flags = crate::mm::vas::PTE_RW | crate::mm::vas::PTE_US | crate::mm::vas::PTE_NX;
+        if crate::mm::vas::map_page_in_pml4(pml4, va, physical, flags)
+            != crate::mm::vas::MmStatus::Ok
+        {
+            unsafe { crate::mm::pool::free(kernel_teb.cast::<u8>()) };
+            return None;
+        }
+    }
+
+    Some((kernel_teb, user_va))
 }
 
 /// Allocate and attach a TEB32 to an existing WOW64 thread.
@@ -145,11 +185,20 @@ pub fn initialize_wow64_thread(
     process: &crate::ps::process::Eprocess,
     stack_top: ULONG32,
 ) -> Option<*mut Teb32> {
-    let teb32 = allocate_teb32()?;
-    unsafe { init_teb32(teb32, thread, process, stack_top) };
+    let (teb32, teb32_va) = allocate_teb32(process)?;
+    unsafe { init_teb32(teb32, teb32_va, thread, process, stack_top) };
     thread.set_wow64_teb32(teb32);
 
     Some(teb32)
+}
+
+/// Return the 32-bit user-mode address of a TEB32 allocated by
+/// [`allocate_teb32`].
+pub fn teb32_user_va(teb32: *mut Teb32) -> ULONG32 {
+    if teb32.is_null() {
+        return 0;
+    }
+    unsafe { (*teb32).self_ }
 }
 
 /// Allocate 32-bit user stack for a Wow64 thread.
@@ -215,6 +264,7 @@ fn init_thread_context32(
 /// Initialize TEB32 for a Wow64 thread.
 unsafe fn init_teb32(
     teb: *mut Teb32,
+    teb32_va: ULONG32,
     thread: &Ethread,
     _process: &crate::ps::process::Eprocess,
     stack_top: ULONG32,
@@ -223,7 +273,7 @@ unsafe fn init_teb32(
         return;
     }
 
-    let teb_addr = teb as ULONG32;
+    let teb_addr = teb32_va;
 
     // Initialize NT_TIB (Thread Information Block)
     (*teb).exception_list = 0xFFFFFFFF; // Initial SEH chain (no handlers)
@@ -292,17 +342,16 @@ pub enum Wow64ThreadState {
 
 /// Get the Wow64 state of a thread.
 pub fn get_wow64_thread_state(_thread: &Ethread) -> Wow64ThreadState {
-    // _thread is intentionally unused - reserved for future Wow64 extension lookup
-    // In a real implementation, check the thread's Wow64 extension
-    // For the stub, return NotPresent
-    Wow64ThreadState::NotPresent
+    if _thread.get_wow64_context32().is_some() {
+        Wow64ThreadState::Present
+    } else {
+        Wow64ThreadState::NotPresent
+    }
 }
 
 /// Check if a thread is a Wow64 thread.
 pub fn is_wow64_thread(_thread: &Ethread) -> bool {
-    // _thread is intentionally unused - reserved for future Wow64 extension lookup
-    // In a real implementation, check a flag in ETHREAD
-    false
+    _thread.is_wow64_thread()
 }
 
 // =============================================================================
@@ -310,16 +359,13 @@ pub fn is_wow64_thread(_thread: &Ethread) -> bool {
 // =============================================================================
 
 /// Get the CONTEXT32 for a Wow64 thread.
-pub fn get_thread_context32(_thread: &Ethread) -> Option<&Context32> {
-    // _thread is intentionally unused - reserved for future Wow64 extension lookup
-    // In a real implementation, get from the Wow64 extension
-    None
+pub fn get_thread_context32(thread: &Ethread) -> Option<&Context32> {
+    thread.get_wow64_context32()
 }
 
 /// Set the CONTEXT32 for a Wow64 thread.
-pub fn set_thread_context32(_thread: &mut Ethread, _context: &Context32) {
-    // _thread and _context are intentionally unused - reserved for future Wow64 extension
-    // In a real implementation, store in the Wow64 extension
+pub fn set_thread_context32(thread: &mut Ethread, context: &Context32) {
+    thread.set_wow64_context32(context.clone());
 }
 
 // =============================================================================

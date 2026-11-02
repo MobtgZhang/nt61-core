@@ -11,6 +11,14 @@ use crate::ke::sync::Spinlock;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+/// Stable accounting storage keyed by job id.
+pub(crate) static JOB_ACCOUNTING_TABLE: Spinlock<Vec<(u64, JobAccounting)>> =
+    Spinlock::new(Vec::new());
+
+/// Stable notification callbacks keyed by job id.
+pub(crate) static JOB_NOTIFICATION_TABLE: Spinlock<Vec<(u64, Option<JobNotificationCallback>)>> =
+    Spinlock::new(Vec::new());
+
 /// Job accounting information
 #[derive(Debug, Clone, Copy)]
 pub struct JobAccountingInfo {
@@ -166,39 +174,127 @@ impl Default for JobAccounting {
     }
 }
 
+impl Clone for JobAccounting {
+    fn clone(&self) -> Self {
+        self.snapshot()
+    }
+}
+
+impl JobAccounting {
+    fn snapshot(&self) -> Self {
+        Self {
+            info: Spinlock::new(self.get_info()),
+            read_operation_count: AtomicU64::new(self.read_operation_count.load(Ordering::Acquire)),
+            write_operation_count: AtomicU64::new(self.write_operation_count.load(Ordering::Acquire)),
+            other_operation_count: AtomicU64::new(self.other_operation_count.load(Ordering::Acquire)),
+            read_transfer_count: AtomicU64::new(self.read_transfer_count.load(Ordering::Acquire)),
+            write_transfer_count: AtomicU64::new(self.write_transfer_count.load(Ordering::Acquire)),
+            other_transfer_count: AtomicU64::new(self.other_transfer_count.load(Ordering::Acquire)),
+        }
+    }
+}
+
 /// Job object extensions
 impl JobObject {
+    /// Translate the Win32 JOB_OBJECT_LIMIT_* bits to internal enabled bits.
+    fn public_limit_flags(&self) -> u32 {
+        let internal = self.flags.load(Ordering::Acquire);
+        let mut public = 0;
+        if internal & job_flags::WORKING_SET_LIMIT_ENABLED != 0 {
+            public |= 0x1;
+        }
+        if internal & job_flags::MEMORY_LIMIT_ENABLED != 0 {
+            public |= 0x2;
+        }
+        if internal & job_flags::CPU_LIMIT_ENABLED != 0 {
+            public |= 0x8 | 0x10;
+        }
+        if internal & job_flags::PROCESS_LIMIT_ENABLED != 0 {
+            public |= 0x20;
+        }
+        public
+    }
+
+    /// Store Win32 limit-enable bits in the internal representation.
+    fn set_public_limit_flags(&self, public_flags: u32) {
+        if public_flags & 0x1 != 0 {
+            self.flags
+                .fetch_or(job_flags::WORKING_SET_LIMIT_ENABLED, Ordering::Release);
+        }
+        if public_flags & (0x2 | 0x4) != 0 {
+            if public_flags & 0x2 == 0 || self.process_memory_enforced.load(Ordering::Acquire) != 0
+            {
+                self.flags
+                    .fetch_or(job_flags::MEMORY_LIMIT_ENABLED, Ordering::Release);
+            }
+        }
+        if public_flags & (0x8 | 0x10) != 0 {
+            self.flags
+                .fetch_or(job_flags::CPU_LIMIT_ENABLED, Ordering::Release);
+        }
+        if public_flags & 0x20 != 0 {
+            self.flags
+                .fetch_or(job_flags::PROCESS_LIMIT_ENABLED, Ordering::Release);
+        }
+    }
+
     /// Add accounting information to job
     ///
     /// # Task 5.1: Resource accounting
-    pub fn add_accounting(&self, _accounting: &JobAccounting) {
-        // In full implementation, store accounting reference
+    pub fn add_accounting(&self, accounting: &JobAccounting) {
+        let cloned = accounting.snapshot();
+        let mut table = JOB_ACCOUNTING_TABLE.lock();
+        if let Some((_, stored)) = table.iter_mut().find(|(id, _)| *id == self.job_id) {
+            *stored = cloned;
+        } else {
+            table.push((self.job_id, cloned));
+        }
     }
 
     /// Get job accounting information
     pub fn get_accounting(&self) -> JobAccountingInfo {
-        // In full implementation, return actual accounting data
-        JobAccountingInfo::new()
+        JOB_ACCOUNTING_TABLE
+            .lock()
+            .iter()
+            .find(|(id, _)| *id == self.job_id)
+            .map(|(_, accounting)| accounting.get_info())
+            .unwrap_or_else(JobAccountingInfo::new)
     }
 
     /// Set notification callback
     ///
     /// # Task 5.2: Notification mechanism
-    pub fn set_notification_callback(&self, _callback: Option<JobNotificationCallback>) {
-        // In full implementation, store callback
+    pub fn set_notification_callback(&self, callback: Option<JobNotificationCallback>) {
+        let mut table = JOB_NOTIFICATION_TABLE.lock();
+        if let Some((_, stored)) = table.iter_mut().find(|(id, _)| *id == self.job_id) {
+            *stored = callback;
+        } else {
+            table.push((self.job_id, callback));
+        }
     }
 
     /// Trigger notification event
-    pub fn notify(&self, _event: JobNotificationEvent) {
-        // In full implementation, call registered callback
+    pub fn notify(&self, event: JobNotificationEvent) {
+        let callback = JOB_NOTIFICATION_TABLE
+            .lock()
+            .iter()
+            .find(|(id, _)| *id == self.job_id)
+            .and_then(|(_, callback)| *callback);
+        if let Some(callback) = callback {
+            callback(self.job_id, event);
+        }
     }
 
     /// Wait for all processes to terminate
     ///
     /// # Task 5.3: Process termination synchronization
     pub fn wait_for_termination(&self, _timeout_ms: u32) -> u32 {
-        // In full implementation, block until all processes exit
-        STATUS_SUCCESS
+        if self.active_process_count.load(Ordering::Acquire) == 0 {
+            STATUS_SUCCESS
+        } else {
+            self.notify(JobNotificationEvent::JobTerminating);
+            STATUS_QUOTA_EXCEEDED
+        }
     }
 
     /// Query job information
@@ -227,17 +323,17 @@ impl JobObject {
                 //   Affinity: usize
                 //   PriorityClass: u32
                 //   SchedulingClass: u32
-                let per_process_cpu = self.process_memory_enforced.load(Ordering::Acquire);
+                let per_process_cpu = self.cpu_time_limit.load(Ordering::Acquire);
                 let per_job_cpu = self.cpu_time_limit.load(Ordering::Acquire);
                 let min_ws = 0u64;
                 let max_ws = self.working_set_limit.load(Ordering::Acquire);
-                let limit_flags = self.flags.load(Ordering::Acquire);
+                let limit_flags = self.public_limit_flags();
                 let active_process_limit = self.process_limit.load(Ordering::Acquire);
                 let affinity = 0u64; // All processors
                 let priority_class = 0x20u32; // NORMAL_PRIORITY_CLASS
                 let scheduling_class = 0u32;
 
-                let mut buf = Vec::with_capacity(8 + 8 + 8 + 8 + 4 + 4 + 8 + 4 + 4);
+                let mut buf = Vec::with_capacity(56);
                 buf.extend_from_slice(&per_process_cpu.to_le_bytes());
                 buf.extend_from_slice(&per_job_cpu.to_le_bytes());
                 buf.extend_from_slice(&min_ws.to_le_bytes());
@@ -265,7 +361,7 @@ impl JobObject {
                 let per_process_cpu = self.process_memory_enforced.load(Ordering::Acquire);
                 let per_job_cpu = self.cpu_time_limit.load(Ordering::Acquire);
                 let max_ws = self.working_set_limit.load(Ordering::Acquire);
-                let limit_flags = self.flags.load(Ordering::Acquire);
+                let limit_flags = self.public_limit_flags();
                 let active_process_limit = self.process_limit.load(Ordering::Acquire);
 
                 buf.extend_from_slice(&per_process_cpu.to_le_bytes());
@@ -294,6 +390,7 @@ impl JobObject {
                 buf.extend_from_slice(&job_mem.to_le_bytes());
                 buf.extend_from_slice(&peak_proc.to_le_bytes());
                 buf.extend_from_slice(&0u64.to_le_bytes()); // peak job mem
+                buf.extend_from_slice(&0u64.to_le_bytes()); // x64 trailing pad
 
                 Ok(buf)
             }
@@ -304,7 +401,7 @@ impl JobObject {
     pub fn set_information(&self, info_class: JobInformationClass, data: &[u8]) -> u32 {
         match info_class {
             JobInformationClass::BasicLimitInformation => {
-                if data.len() < 40 {
+                if data.len() < 56 {
                     return STATUS_INVALID_PARAMETER;
                 }
 
@@ -342,7 +439,7 @@ impl JobObject {
                 if max_ws > 0 {
                     self.working_set_limit.store(max_ws, Ordering::Release);
                 }
-                self.flags.fetch_or(limit_flags, Ordering::Release);
+                self.set_public_limit_flags(limit_flags);
                 if active_process_limit > 0 {
                     self.process_limit
                         .store(active_process_limit, Ordering::Release);
@@ -397,67 +494,79 @@ pub enum JobInformationClass {
 
 /// Job inheritance - Task 5.4
 pub fn create_job_with_parent(parent_job_id: u64) -> Result<u64, u32> {
-    let child_id = create_job()?;
-
     let mut table = super::job::JOB_TABLE.lock();
 
-    let parent = table.iter().find(|j| j.job_id == parent_job_id);
-    let parent = match parent {
-        Some(p) => p as &JobObject as *const JobObject,
-        None => return Err(STATUS_INVALID_PARAMETER),
-    };
+    let (process_limit, memory_limit, cpu_limit, ui_limits) = {
+        let parent = table
+            .iter()
+            .find(|j| j.job_id == parent_job_id)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
 
-    let parent_ref = unsafe { &*parent };
-
-    // Enforce parent's child job limit.
-    let child_limit = parent_ref.child_job_limit.load(Ordering::Acquire);
-    if child_limit > 0 {
-        let active_children = parent_ref.active_child_count.load(Ordering::Acquire);
-        if active_children >= child_limit {
+        let child_limit = parent.child_job_limit.load(Ordering::Acquire);
+        if child_limit > 0
+            && parent.active_child_count.load(Ordering::Acquire) >= child_limit
+        {
             return Err(STATUS_QUOTA_EXCEEDED);
         }
-    }
+
+        let parent_flags = parent.flags.load(Ordering::Acquire);
+        (
+            (parent_flags & job_flags::PROCESS_LIMIT_ENABLED != 0)
+                .then(|| parent.process_limit.load(Ordering::Acquire))
+                .unwrap_or(0),
+            (parent_flags & job_flags::MEMORY_LIMIT_ENABLED != 0)
+                .then(|| parent.job_memory_limit.load(Ordering::Acquire))
+                .unwrap_or(0),
+            (parent_flags & job_flags::CPU_LIMIT_ENABLED != 0)
+                .then(|| parent.cpu_time_limit.load(Ordering::Acquire))
+                .unwrap_or(0),
+            parent.ui_restrictions.load(Ordering::Acquire),
+        )
+    };
+
+    let child_id = create_job()?;
+    table = super::job::JOB_TABLE.lock();
 
     // Initialise the child job with inherited limits.
-    if let Some(child) = table.iter_mut().find(|j| j.job_id == child_id) {
+    let child = table
+        .iter_mut()
+        .find(|j| j.job_id == child_id)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
         child.parent_job_id = parent_job_id;
         child.flags.fetch_or(job_flags::NESTED, Ordering::Release);
 
-        let parent_flags = parent_ref.flags.load(Ordering::Acquire);
-
         // Inherit process limit.
-        if parent_flags & job_flags::PROCESS_LIMIT_ENABLED != 0 {
-            let limit = parent_ref.process_limit.load(Ordering::Acquire);
-            child.process_limit.store(limit, Ordering::Release);
+        if process_limit > 0 {
+            child.process_limit.store(process_limit, Ordering::Release);
             child
                 .flags
                 .fetch_or(job_flags::PROCESS_LIMIT_ENABLED, Ordering::Release);
         }
 
         // Inherit job memory limit.
-        if parent_flags & job_flags::MEMORY_LIMIT_ENABLED != 0 {
-            let limit = parent_ref.job_memory_limit.load(Ordering::Acquire);
-            child.job_memory_limit.store(limit, Ordering::Release);
+        if memory_limit > 0 {
+            child.job_memory_limit.store(memory_limit, Ordering::Release);
             child
                 .flags
                 .fetch_or(job_flags::MEMORY_LIMIT_ENABLED, Ordering::Release);
         }
 
         // Inherit CPU time limit.
-        if parent_flags & job_flags::CPU_LIMIT_ENABLED != 0 {
-            let limit = parent_ref.cpu_time_limit.load(Ordering::Acquire);
-            child.cpu_time_limit.store(limit, Ordering::Release);
+        if cpu_limit > 0 {
+            child.cpu_time_limit.store(cpu_limit, Ordering::Release);
             child
                 .flags
                 .fetch_or(job_flags::CPU_LIMIT_ENABLED, Ordering::Release);
         }
 
         // Inherit UI restrictions.
-        let ui = parent_ref.ui_restrictions.load(Ordering::Acquire);
-        child.ui_restrictions.store(ui, Ordering::Release);
+        child.ui_restrictions.store(ui_limits, Ordering::Release);
 
-        // Track child in parent.
-        parent_ref.active_child_count.fetch_add(1, Ordering::AcqRel);
+    if let Some(parent) = table
+        .iter()
+        .find(|j| j.job_id == parent_job_id)
+    {
+        parent.active_child_count.fetch_add(1, Ordering::AcqRel);
     }
 
     Ok(child_id)
@@ -515,7 +624,7 @@ mod tests {
             .lock()
             .iter()
             .find(|j| j.job_id == parent_id)
-            .map(|j| j as *const JobObject)
+            .map(|j| &**j as *const JobObject)
             .unwrap();
         let parent_ref = unsafe { &*parent };
         parent_ref.set_process_limit(4);
@@ -535,14 +644,14 @@ mod tests {
             .lock()
             .iter()
             .find(|j| j.job_id == child_id)
-            .map(|j| j as *const JobObject)
+            .map(|j| &**j as *const JobObject)
             .unwrap();
         let child_ref = unsafe { &*child };
         let parent = crate::ps::job::JOB_TABLE
             .lock()
             .iter()
             .find(|j| j.job_id == parent_id)
-            .map(|j| j as *const JobObject)
+            .map(|j| &**j as *const JobObject)
             .unwrap();
         let parent_ref = unsafe { &*parent };
 
@@ -590,7 +699,7 @@ mod tests {
             .lock()
             .iter()
             .find(|j| j.job_id == parent_id)
-            .map(|j| j as *const JobObject)
+            .map(|j| &**j as *const JobObject)
             .unwrap();
         let parent_ref = unsafe { &*parent };
         parent_ref

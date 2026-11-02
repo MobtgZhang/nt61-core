@@ -13,7 +13,6 @@
 //!   * geoffchappell.com — WoW64 process creation
 
 use crate::libs::wow64::types::*;
-use crate::libs::wow64::wow64vas::WOW64_HEAP_VIRTUAL_ALLOC_BASE;
 use crate::ps::process::{create_process_full, Eprocess};
 use alloc::boxed::Box;
 
@@ -144,7 +143,12 @@ pub fn create_wow64_process(
 ) -> Option<&'static mut Eprocess> {
     let parent = parent_process.map(|process| process as *mut Eprocess);
     let process = create_process_full(image_path, parent)?;
-    initialize_wow64_process(process, image_path)
+    let pid = process.unique_process_id;
+    if initialize_wow64_process(process, image_path).is_none() {
+        crate::ps::process::terminate_process(pid, 0xC0000005u32 as i32);
+        return None;
+    }
+    crate::ps::process::get_by_pid(pid)
 }
 
 /// Initialize WOW64 process state after the native process object exists.
@@ -160,23 +164,25 @@ pub fn initialize_wow64_process(
     let entry_point = loaded_image.entry_point();
     let image_size = loaded_image.size_of_image;
 
+    map_wow64_image(process, &loaded_image)?;
+
     process.set_wow64_flag(true);
     process.set_wow64_peb32_va(PEB32_VIRTUAL_ADDRESS);
     process.user_image_base = u64::from(image_base);
     process.user_image_size = u64::from(image_size);
     process.user_rip = u64::from(entry_point);
 
-    let peb32 = Box::leak(Box::new(Peb32::default()));
+    let mut peb32_box = Box::new(Peb32::default());
+    let peb32 = &mut *peb32_box;
     let heap_base = crate::libs::wow64::wow64vas::allocate_heap(0x1000)?;
     unsafe {
         init_peb32(peb32, process);
         peb32.process_heap = heap_base;
-        peb32.teb = TEB32_BASE_ADDRESS;
-        peb32.teb32 = TEB32_BASE_ADDRESS;
     }
     process.wow64_peb32_ptr = peb32 as *mut Peb32 as u64;
 
-    let wow64vas = Box::leak(Box::new(Wow64VasState::new()));
+    let mut wow64vas_box = Box::new(Wow64VasState::new());
+    let wow64vas = &mut *wow64vas_box;
     process.wow64_vas_ptr = wow64vas as *mut Wow64VasState as u64;
 
     if !process.main_thread.is_null() {
@@ -188,7 +194,25 @@ pub fn initialize_wow64_process(
 
         unsafe {
             let thread = &mut *process.main_thread;
-            crate::ps::wow64_thread::initialize_wow64_thread(thread, process, stack_top)?;
+            let teb32 = crate::ps::wow64_thread::initialize_wow64_thread(
+                thread,
+                process,
+                stack_top,
+            );
+            let Some(teb32) = teb32 else {
+                drop(peb32_box);
+                drop(wow64vas_box);
+                cleanup_wow64_process_resources(
+                    process,
+                    heap_base,
+                    stack_top,
+                    None,
+                );
+                return None;
+            };
+            let teb32_va = crate::ps::wow64_thread::teb32_user_va(teb32);
+            (*peb32).teb = teb32_va;
+            (*peb32).teb32 = teb32_va;
             (*process.main_thread).kthread.context.user_rip = u64::from(entry_point);
             (*process.main_thread).kthread.context.user_rsp = u64::from(stack_top);
         }
@@ -198,7 +222,75 @@ pub fn initialize_wow64_process(
         process.user_rsp = u64::from(stack_top);
     }
 
+    Box::leak(peb32_box);
+    Box::leak(wow64vas_box);
     Some(process)
+}
+
+/// Return WOW64 allocations made before a failed initialization.
+fn cleanup_wow64_process_resources(
+    process: &mut Eprocess,
+    heap_base: u32,
+    stack_top: u32,
+    teb32: Option<*mut crate::libs::wow64::types::Teb32>,
+) {
+    crate::libs::wow64::wow64vas::free_heap(heap_base);
+    if stack_top != 0 {
+        crate::libs::wow64::wow64vas::free_stack(stack_top);
+    }
+    if let Some(teb32) = teb32 {
+        unsafe {
+            crate::mm::pool::free(teb32.cast::<u8>());
+        }
+    }
+    process.wow64_peb32_ptr = 0;
+    process.wow64_vas_ptr = 0;
+}
+
+/// Map a parsed PE32 image into the WOW64 process's user address space.
+///
+/// The PE loader keeps its image in a temporary kernel buffer. WOW64 code
+/// cannot execute from that buffer, so we allocate contiguous backing pages,
+/// copy the image into them, and map them at the image's preferred base.
+fn map_wow64_image(
+    process: &Eprocess,
+    image: &crate::loader::pe32::LoadedImage32,
+) -> Option<u64> {
+    const PAGE_SIZE: u64 = 0x1000;
+    let image_size = u64::from(image.size_of_image);
+    let page_count = image_size.div_ceil(PAGE_SIZE);
+    let physical_base = crate::mm::frame::allocate_pages(page_count)?;
+
+    let kernel_va = crate::mm::constants::KERNEL_DIRECT_MAP_BASE + physical_base;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            image.image_data.as_ptr(),
+            kernel_va as *mut u8,
+            image.image_data.len(),
+        );
+    }
+
+    let user_base = u64::from(image.base_address);
+    let flags = crate::mm::vas::PTE_RW | crate::mm::vas::PTE_US;
+    for page in 0..page_count {
+        let va = user_base + page * PAGE_SIZE;
+        let pa = physical_base + page * PAGE_SIZE;
+        if crate::mm::vas::map_page_in_pml4(process.pml4_phys, va, pa, flags)
+            != crate::mm::vas::MmStatus::Ok
+        {
+            if page != 0 {
+                let _ = crate::mm::vas::unmap_user_pages(
+                    process.pml4_phys,
+                    user_base,
+                    page * PAGE_SIZE,
+                );
+            }
+            crate::mm::frame::free_pages(physical_base, page_count);
+            return None;
+        }
+    }
+
+    Some(physical_base)
 }
 
 /// # Safety
@@ -214,7 +306,6 @@ unsafe fn init_peb32(peb: *mut Peb32, process: &Eprocess) {
     (*peb).image_base_address = process.user_image_base as u32;
     (*peb).being_debugged = 0; // Not being debugged initially
     (*peb).bit_field = 0;
-    (*peb).process_heap = WOW64_HEAP_VIRTUAL_ALLOC_BASE;
     (*peb).ldr = 0; // Will be set when ntdll32 is loaded
     (*peb).process_parameters = 0; // Will be set by RTL
 

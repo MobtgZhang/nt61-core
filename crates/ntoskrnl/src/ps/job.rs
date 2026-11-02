@@ -102,6 +102,9 @@ pub mod flags {
     /// Job enforces a process count limit
     pub const PROCESS_LIMIT_ENABLED: u32 = 0x0040;
 
+    /// Job enforces a working-set limit
+    pub const WORKING_SET_LIMIT_ENABLED: u32 = 0x0100;
+
     /// Job is nested under a parent job
     pub const NESTED: u32 = 0x0080;
 }
@@ -245,13 +248,16 @@ impl JobObject {
         // Set terminating flag
         self.flags.fetch_or(flags::TERMINATING, Ordering::Release);
 
-        let list = self.process_list.lock();
+        let process_ids = self.process_list.lock().clone();
 
-        for &_process_id in list.iter() {
-            // Terminate each process in the job with the specified exit code.
-            let _ = crate::ps::process_mgmt::terminate_process_by_pid(_process_id, true);
+        for process_id in process_ids {
+            let _ = crate::ps::process_mgmt::terminate_process_by_pid(process_id, true);
         }
 
+        // NT clears JOB_OBJECT_TERMINATION once all members have been
+        // terminated so the job can accept a new process.
+        self.flags
+            .fetch_and(!flags::TERMINATING, Ordering::Release);
         STATUS_SUCCESS
     }
 
@@ -379,7 +385,8 @@ impl JobObject {
 }
 
 /// Global job object table (simplified implementation)
-pub(crate) static JOB_TABLE: Spinlock<Vec<JobObject>> = Spinlock::new(Vec::new());
+pub(crate) static JOB_TABLE: Spinlock<Vec<alloc::boxed::Box<JobObject>>> =
+    Spinlock::new(Vec::new());
 pub(crate) static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
 /// create a new job object
@@ -388,7 +395,7 @@ pub(crate) static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
 /// This function is safe to call but allocates memory.
 pub fn create_job() -> Result<u64, u32> {
     let job_id = NEXT_JOB_ID.fetch_add(1, Ordering::Release);
-    let job = JobObject::new(job_id);
+    let job = alloc::boxed::Box::new(JobObject::new(job_id));
 
     let mut table = JOB_TABLE.lock();
     table.push(job);
@@ -396,10 +403,48 @@ pub fn create_job() -> Result<u64, u32> {
     Ok(job_id)
 }
 
+/// Set the CPU limit for a job by ID. The caller does not need to
+/// hold any lock — the table lock is acquired and released here.
+pub fn set_cpu_limit_by_id(job_id: u64, limit_100ns: u64) -> bool {
+    let mut table = JOB_TABLE.lock();
+    if let Some(job) = table.iter_mut().find(|j| j.job_id == job_id) {
+        job.set_cpu_limit(limit_100ns);
+        true
+    } else {
+        false
+    }
+}
+
+/// Set the memory limit for a job by ID. The caller does not need
+/// to hold any lock — the table lock is acquired and released here.
+pub fn set_memory_limit_by_id(job_id: u64, limit_bytes: u64) -> bool {
+    let mut table = JOB_TABLE.lock();
+    if let Some(job) = table.iter_mut().find(|j| j.job_id == job_id) {
+        job.set_memory_limit(limit_bytes);
+        true
+    } else {
+        false
+    }
+}
+
+/// Remove a terminated process from every job that references it.
+pub fn remove_process_from_all_jobs(process_id: u64) {
+    let table = JOB_TABLE.lock();
+    for job in table.iter() {
+        if job.contains_process(process_id) {
+            job.remove_process(process_id);
+        }
+    }
+}
+
 /// Open an existing job object by ID
 ///
 /// # Safety
 /// Returns a reference to the job if it exists.
+/// **WARNING**: the returned pointer is only valid while the
+/// `JOB_TABLE` lock is held and no `create_job` call can
+/// reallocate the underlying `Vec`. Prefer `set_cpu_limit_by_id`
+/// or `set_memory_limit_by_id` for programmatic access.
 pub fn open_job(job_id: u64) -> Option<*const JobObject> {
     let table = JOB_TABLE.lock();
     table

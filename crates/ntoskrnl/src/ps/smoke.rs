@@ -251,6 +251,16 @@ fn step4_create_user_process() -> bool {
         return false;
     }
 
+    // The smoke process is a test fixture, not a boot process. NT would
+    // remove it on NtTerminateProcess; do the same here so repeated smoke
+    // runs do not leave zombies in the process table.
+    if !super::process::terminate_process(test_pid, 0) {
+        return false;
+    }
+    if get_by_pid(test_pid).is_some() {
+        return false;
+    }
+
     crate::boot_println!("    User process PID={}, name={:?}", test_pid, base_name);
     true
 }

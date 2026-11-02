@@ -148,7 +148,7 @@ pub fn build_command_line(program: &[u8], argv: &[&[u8]], out: &mut [u8]) -> usi
         for (i, a) in argv.iter().enumerate().take(63) {
             pieces[i + 1] = a;
         }
-        argv.len() + 1
+        argv.len().min(63) + 1
     };
     for p in 0..piece_count {
         let arg = pieces[p];
