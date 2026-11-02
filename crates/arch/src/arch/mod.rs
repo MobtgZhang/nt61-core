@@ -381,8 +381,19 @@ pub fn page_is_mapped_in_root(root_pfn: u64, va: u64) -> bool {
 }
 
 #[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
-pub fn page_is_mapped_in_root(_root_pfn: u64, _va: u64) -> bool {
-    false
+pub fn page_is_mapped_in_root(root_pfn: u64, va: u64) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86_64::paging::page_is_mapped_in_root(root_pfn, va)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::paging::page_is_mapped_in_root(root_pfn, va)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        false
+    }
 }
 
 /// Unmap one page and return its physical address when available.
@@ -665,11 +676,11 @@ pub const fn serial_console_available() -> bool {
 
 /// Report whether the current platform supports blocking serial input.
 pub const fn serial_console_input_available() -> bool {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         true
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         false
     }
@@ -693,7 +704,11 @@ pub const fn supports_wow64() -> bool {
     {
         true
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        false
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         false
     }
@@ -809,6 +824,14 @@ pub fn hardware_random_u64() -> Option<u64> {
     #[cfg(target_arch = "x86_64")]
     return crate::arch::x86_64::cpu_flags::rdseed_u64()
         .or_else(crate::arch::x86_64::cpu_flags::rdrand_u64);
+    #[cfg(not(target_arch = "x86_64"))]
+    None
+}
+
+/// Return a hardware seed word, without falling back to a PRNG output.
+pub fn hardware_seed_u64() -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    return crate::arch::x86_64::cpu_flags::rdseed_u64();
     #[cfg(not(target_arch = "x86_64"))]
     None
 }
@@ -1135,10 +1158,7 @@ pub fn irql_state_restore(token: u64) {
 pub fn get_cpu_id() -> u32 {
     #[cfg(target_arch = "x86_64")]
     {
-        // Bootstrap CPU is 0. SMP bring-up will set up the per-CPU
-        // GS base via the APIC trampoline and read the APIC ID from
-        // there.
-        0
+        common::percpu::get_current_cpu_id()
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -1391,8 +1411,32 @@ pub fn seed_thread_stack(stack_top: u64, entry: u64, arg: u64) -> u64 {
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        let _ = (stack_top, entry, arg);
-        0
+        unsafe {
+            #[cfg(target_arch = "aarch64")]
+            {
+                aarch64::context_switch::seed_thread_frame(
+                    stack_top as *mut u64,
+                    entry,
+                    arg,
+                )
+            }
+            #[cfg(target_arch = "riscv64")]
+            {
+                riscv64::context_switch::seed_thread_frame(
+                    stack_top as *mut u64,
+                    entry,
+                    arg,
+                )
+            }
+            #[cfg(target_arch = "loongarch64")]
+            {
+                loongarch64::context_switch::seed_thread_frame(
+                    stack_top as *mut u64,
+                    entry,
+                    arg,
+                )
+            }
+        }
     }
 }
 
