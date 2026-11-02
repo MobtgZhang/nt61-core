@@ -2331,8 +2331,8 @@ pub fn start_boot_sequence() {
 /// single source of truth for the Win-7 boot ordering.
 pub fn run() {
     crate::rtl::windows_log::write_phase_header(11);
-    boot_println!("[SMSS::run] launching the user-mode command shell");
-    launch_cmd_shell();
+    boot_println!("[SMSS::run] starting the complete NT 6.1 boot sequence");
+    start_boot_sequence();
 }
 
 /// Start CSRSS for all sessions during boot
@@ -2567,26 +2567,29 @@ pub fn launch_cmd_shell() -> ! {
                         }
                     } else {
                         boot_println!("[BOOT]   ERROR: cmd.exe main_thread is NULL");
-                        loop {
-                            crate::arch::halt();
-                        }
+                        crate::ke::bugcheck::bugcheck(
+                            crate::ke::bugcheck::BugCheckCode::CriticalProcessDied,
+                        );
                     }
                 } else {
                     boot_println!("[BOOT]   ERROR: cmd.exe process not found in PID table");
-                    loop {
-                        crate::arch::halt();
-                    }
+                    crate::ke::bugcheck::bugcheck(
+                        crate::ke::bugcheck::BugCheckCode::CriticalProcessDied,
+                    );
                 }
             }
             Err(e) => {
                 boot_println!("[BOOT]   ERROR: Failed to launch cmd.exe: {:?}", e);
                 boot_println!("[BOOT]   System cannot proceed without a shell!");
 
-                // Fallback: Show error message
                 show_boot_error();
-                loop {
-                    crate::arch::halt();
-                }
+                crate::ke::bugcheck::bugcheck_with(
+                    crate::ke::bugcheck::BugCheckCode::ProcessInitializationFailed,
+                    0x534D5353,
+                    e as u64,
+                    0,
+                    0,
+                );
             }
         }
     }

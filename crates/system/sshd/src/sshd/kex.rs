@@ -12,6 +12,7 @@ use crate::crypto::csprng;
 use crate::crypto::hash::Sha256;
 use crate::crypto::rsa::{BigUint, RsaPrivateKey, RsaPublicKey};
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 // ====================================================================
@@ -338,12 +339,12 @@ pub struct Negotiated {
     pub host_key_algorithm: String,
 }
 
-/// Pick the first client-preferred match for a single algorithm slot.
+/// Pick the first server-preferred match for a single algorithm slot.
 fn negotiate_one(client_list: &[String], server_supported: &[&str]) -> Option<String> {
-    client_list
+    server_supported
         .iter()
-        .find(|client_alg| server_supported.iter().any(|s| s == client_alg))
-        .cloned()
+        .find(|server_alg| client_list.iter().any(|client_alg| client_alg == *server_alg))
+        .map(|server_alg| server_alg.to_string())
 }
 
 /// Negotiate all slots from the client KEXINIT name lists. The server
@@ -985,14 +986,14 @@ mod tests {
     }
 
     #[test]
-    fn negotiation_prefers_client_order_within_server_support() {
+    fn negotiation_prefers_server_order_within_client_support() {
         let mut w = WireWriter::new();
         w.put_u8(msg::KEXINIT);
         w.put_string(&[0u8; 16]);
         w.put_name_list(&[ALG_KEX_CURVE25519_SHA256]);
         w.put_name_list(&[ALG_HOSTKEY_SSH_RSA, ALG_HOSTKEY_RSA_SHA2_256]);
         let negotiated = negotiate(&w.into_vec()).unwrap();
-        assert_eq!(negotiated.host_key_algorithm, ALG_HOSTKEY_SSH_RSA);
+        assert_eq!(negotiated.host_key_algorithm, ALG_HOSTKEY_RSA_SHA2_256);
     }
 
     #[test]

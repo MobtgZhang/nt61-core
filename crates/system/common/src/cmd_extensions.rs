@@ -122,6 +122,7 @@ const REFERENCE_COMMANDS: &[&str] = &[
     "path",
     "perfmon",
     "popd",
+    "powercfg",
     "print",
     "prompt",
     "pubprn",
@@ -377,6 +378,7 @@ pub fn execute(command: &str, arguments: &str, cwd: &[u8]) -> bool {
         "ntbackup" => cmd_ntbackup(arguments),
         "ntdsutil" => cmd_ntdsutil(arguments),
         "perfmon" => cmd_perfmon(),
+        "powercfg" => cmd_powercfg(arguments),
         "print" => cmd_print(arguments),
         "pubprn" => cmd_pubprn(arguments),
         "rdpsign" => cmd_rdpsign(arguments),
@@ -2465,6 +2467,25 @@ fn cmd_ntdsutil(_arguments: &str) -> bool {
 
 fn cmd_perfmon() -> bool {
     output_line("PERFMON: performance monitor requires GUI subsystem support.");
+    false
+}
+
+fn cmd_powercfg(arguments: &str) -> bool {
+    let arguments = arguments.trim();
+    if arguments.is_empty()
+        || arguments.eq_ignore_ascii_case("/list")
+        || arguments.eq_ignore_ascii_case("/l")
+    {
+        output_line("Power Scheme GUID: 381b4222-f694-41f0-8235-6300d0c00000 (Balanced)");
+        output_line("Power Scheme GUID: 8c5e7fcd-e8bf-4a96-bd2a-26c2d8700f00 (High performance)");
+        output_line("Power Scheme GUID: a1841308-7741-4e40-bb5f-6b1e0a1d0000 (Power saver)");
+        return false;
+    }
+    if arguments.eq_ignore_ascii_case("/query") {
+        output_line("The current power scheme is Balanced.");
+        return false;
+    }
+    output_line("POWERCFG: only /list and /query are supported.");
     false
 }
 

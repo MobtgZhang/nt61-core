@@ -915,20 +915,27 @@ pub fn enumerate_services_by_state(state_filter: ServiceState) -> Vec<String> {
 // Service Database Lock
 // ============================================================================
 
+/// True while the service database is reserved by an external caller.
+static SERVICE_DATABASE_LOCK: Spinlock<bool> = Spinlock::new(false);
+
 /// Lock the service database for update
 pub fn lock_service_database() -> bool {
+    let mut reserved = SERVICE_DATABASE_LOCK.lock();
+    if *reserved {
+        return false;
+    }
     let state = SCM_STATE.lock();
     if !state.running {
         return false;
     }
-    // kprintln!("[SCM] Service database locked");
+    *reserved = true;
     true
 }
 
 /// Unlock the service database
 pub fn unlock_service_database() {
-    // kprintln!("[SCM] Service database unlocked");
-    drop(SCM_STATE.lock());
+    let mut reserved = SERVICE_DATABASE_LOCK.lock();
+    *reserved = false;
 }
 
 // ============================================================================

@@ -287,6 +287,9 @@ impl ActiveSession {
             }
         }
 
+        let leftover = self.banner_buffer.drain(..).collect::<Vec<u8>>();
+        self.transport.feed(&leftover);
+
         let mut banner = self.server_version.clone();
         banner.extend_from_slice(b"\r\n");
         io.push(&banner)?;
@@ -383,8 +386,16 @@ impl ActiveSession {
         let Some(keys) = self.derived_keys.take() else {
             return Err(TransportError::MalformedPacket);
         };
-        let c2s = DirectionState::new(&keys.client_to_server_key, &keys.client_to_server_mac);
-        let s2c = DirectionState::new(&keys.server_to_client_key, &keys.server_to_client_mac);
+        let c2s = DirectionState::new(
+            &keys.client_to_server_key,
+            &keys.client_to_server_iv,
+            &keys.client_to_server_mac,
+        );
+        let s2c = DirectionState::new(
+            &keys.server_to_client_key,
+            &keys.server_to_client_iv,
+            &keys.server_to_client_mac,
+        );
         self.transport.activate_keys(c2s, s2c);
         self.advance_state(SessionState::Encrypted);
         Ok(PayloadOutcome::Continue)

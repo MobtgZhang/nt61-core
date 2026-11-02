@@ -276,9 +276,13 @@ pub struct DirectionState {
 }
 
 impl DirectionState {
-    pub fn new(key: &[u8; CIPHER_KEY_LEN_AES256], mac_key: &[u8; MAC_LEN_HMAC_SHA2_256]) -> Self {
+    pub fn new(
+        key: &[u8; CIPHER_KEY_LEN_AES256],
+        iv: &[u8; 16],
+        mac_key: &[u8; MAC_LEN_HMAC_SHA2_256],
+    ) -> Self {
         Self {
-            cipher: Ctr::new_aes256(key, &[0u8; 16]),
+            cipher: Ctr::new_aes256(key, iv),
             mac_key: *mac_key,
         }
     }
@@ -527,12 +531,12 @@ mod tests {
         let s2c_mac = [0x44u8; MAC_LEN_HMAC_SHA2_256];
 
         sender.activate_keys(
-            DirectionState::new(&s2c_key, &s2c_mac),
-            DirectionState::new(&c2s_key, &c2s_mac),
+            DirectionState::new(&s2c_key, &[0u8; 16], &s2c_mac),
+            DirectionState::new(&c2s_key, &[0u8; 16], &c2s_mac),
         );
         receiver.activate_keys(
-            DirectionState::new(&c2s_key, &c2s_mac),
-            DirectionState::new(&s2c_key, &s2c_mac),
+            DirectionState::new(&c2s_key, &[0u8; 16], &c2s_mac),
+            DirectionState::new(&s2c_key, &[0u8; 16], &s2c_mac),
         );
 
         assert!(sender.is_encrypted());
@@ -629,12 +633,12 @@ mod tests {
         let mut tx = Transport::new();
         let mut rx = Transport::new();
         tx.activate_keys(
-            DirectionState::new(&key_bytes, &mac_bytes),
-            DirectionState::new(&key_bytes, &mac_bytes),
+            DirectionState::new(&key_bytes, &[0u8; 16], &mac_bytes),
+            DirectionState::new(&key_bytes, &[0u8; 16], &mac_bytes),
         );
         rx.activate_keys(
-            DirectionState::new(&key_bytes, &mac_bytes),
-            DirectionState::new(&key_bytes, &mac_bytes),
+            DirectionState::new(&key_bytes, &[0u8; 16], &mac_bytes),
+            DirectionState::new(&key_bytes, &[0u8; 16], &mac_bytes),
         );
 
         let mut wire = Vec::new();

@@ -45,6 +45,7 @@ pub mod sshd;
 
 /// Initialise the NT 6.1 system-server set.
 pub fn init() {
+    smss::init();
     csrss::init();
     wininit::init();
     winlogon::init();

@@ -40,7 +40,7 @@ use alloc::vec::Vec;
 const KERNEL_VERSION: &str = "6.1.7601";
 
 /// Command buffer size
-pub const CMD_BUFFER_SIZE: usize = 256;
+pub const CMD_BUFFER_SIZE: usize = 1024;
 
 /// Maximum entries to display in DIR
 const MAX_DIR_ENTRIES: usize = 64;
@@ -2871,6 +2871,28 @@ fn normalise_batch_text(buf: &[u8]) -> alloc::string::String {
 }
 
 impl BatchExecutor for CmdBatchExecutor {
+    fn file_exists(&self, path: &str) -> bool {
+        if path.trim().is_empty() {
+            return false;
+        }
+
+        if crate::fs::ntfs::is_mounted() {
+            let path_utf16 = command_path_utf16(path, &Cwd::new());
+            return crate::fs::ntfs::get_mounted_fs()
+                .and_then(|filesystem| crate::fs::ntfs::open_file(filesystem, &path_utf16, None))
+                .is_some();
+        }
+
+        if crate::fs::fat32::is_mounted() {
+            if let Some(filesystem) = crate::fs::fat32::get_mounted_fs() {
+                let short_name = crate::fs::fat32::name_to_83(path);
+                return crate::fs::fat32::find_file_in_root(filesystem, &short_name).is_some();
+            }
+        }
+
+        false
+    }
+
     fn read_file(&self, filename: &str) -> Result<String, BatError> {
         // Resolution order:
         //   1. Try the literal path (Windows-style with drive
@@ -2916,14 +2938,11 @@ impl BatchExecutor for CmdBatchExecutor {
     }
 
     fn execute_command(&mut self, command: &str) -> Result<u32, BatError> {
-        // Re-route to the interactive shell's command dispatcher.
-        // The kernel-side debug shell uses `ShellMode::SafeModeDebug`;
-        // the user-mode `cmd.exe` host does not invoke this path
-        // (it runs each batch line through its own dispatcher and
-        // never touches the kernel shell loop). SafeModeDebug is
-        // therefore the right transient mode — it carries the same
-        // prompt semantics as the kernel-side shell.
-        let mode = ShellMode::SafeModeCmd;
+        // Re-route to the full Ring-3 command dispatcher.  Batch
+        // files are user-mode cmd.exe work, so they must be able to
+        // reach the complete Windows command surface, not just the
+        // restricted Safe Mode shell subset.
+        let mode = ShellMode::Ring3;
         // Drop the error level into a sentinel before dispatch —
         // the inner command may overwrite it via SET ERRORLEVEL, but
         // we propagate the legacy behaviour by clearing on success.
@@ -3059,10 +3078,7 @@ pub fn run_batch_from_user_ptr(user_ptr: *const u8) -> Option<()> {
         serial_print(b"[CMD-A] user_ptr=null\r\n");
         return None;
     }
-    // Copy at most 256 bytes (matches the cmd.exe stub's buffer)
-    // and stop at the first NUL. We do not trust the user to
-    // provide a properly sized path — clamp aggressively.
-    let mut buf = [0u8; 256];
+    let mut buf = [0u8; 1024];
     let mut len = 0usize;
     serial_print(b"[CMD-A] copying user path byte-by-byte\r\n");
     if crate::mm::user_copy::copy_from_user(&mut buf, user_ptr as u64).is_err() {
