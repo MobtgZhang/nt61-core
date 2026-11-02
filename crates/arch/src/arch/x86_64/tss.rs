@@ -275,7 +275,7 @@ pub fn get_rsp0() -> u64 {
 // slot 0 is the BSP.
 
 /// Maximum number of APs we support.
-pub const MAX_APS: usize = 31;
+pub const MAX_APS: usize = 255;
 
 /// Per-CPU TSS pool. Slot `i` is the TSS for AP #i (BSP is in
 /// `TSS` above).
@@ -319,6 +319,10 @@ pub unsafe fn init_ap_tss(ap_index: usize, rsp0: u64) -> Option<(*mut Tss, u32)>
     tss.ist1 = stack_top;
     tss.ist2 = stack_top;
     tss.ist3 = stack_top;
+    tss.ist4 = stack_top;
+    tss.ist5 = stack_top;
+    tss.ist6 = stack_top;
+    tss.ist7 = stack_top;
     tss.io_bitmap_base = core::mem::size_of::<Tss>() as u16;
     Some((tss, core::mem::size_of::<Tss>() as u32))
 }

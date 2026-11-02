@@ -31,7 +31,7 @@ pub mod smp;
 pub mod syscall;
 pub mod syscall_handlers_validated;
 pub mod syscall_validation;
-pub use syscall::{syscall_numbers, syscall_nums, win7_sp1_syscalls};
+pub use syscall::{syscall_numbers, win7_sp1_syscalls};
 pub mod tss;
 pub mod user_entry;
 pub mod user_syscall;

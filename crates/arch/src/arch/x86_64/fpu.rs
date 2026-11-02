@@ -128,6 +128,15 @@ impl FpuState {
             core::ptr::write_bytes(self as *mut FpuState as *mut u8, 0, FPU_STATE_SIZE);
         }
 
+        // Set the FPU Control Word to NT 6.1's 0x133F (all x87
+        // exceptions masked, 53-bit precision, nearest rounding).
+        // The FCW occupies bytes 0-1 of the legacy region.
+        // FCW = 0 → every FP exception would trap immediately after
+        // XRSTOR; 0x133F is the value Windows 7 programs in the
+        // bootstrap FPU state.
+        self.legacy[0] = 0x3F; // Little-endian low byte of 0x133F
+        self.legacy[1] = 0x13; // Little-endian high byte of 0x133F
+
         // Set up XSAVE header for enabled features
         let mut features = XsaveFeature::X87 as u64 | XsaveFeature::SSE as u64;
         if enable_avx {
@@ -309,6 +318,20 @@ pub fn init() {
             );
         }
 
+        // XRSTOR only restores components present in XCR0. Programming the
+        // same mask used by the save/restore helpers keeps the AVX state
+        // component valid before the first XRSTOR is executed.
+        let xcr0 = get_xsave_features();
+        unsafe {
+            core::arch::asm!(
+                "xsetbv",
+                in("ecx") 0u32,
+                in("eax") xcr0 as u32,
+                in("edx") (xcr0 >> 32) as u32,
+                options(nostack, preserves_flags)
+            );
+        }
+
         // // kprintln!("    [FPU] XSAVE supported, AVX: {}", avx_supported);
     } else {
         // Fall back to legacy FXRSTOR/FXSAVE
@@ -328,6 +351,7 @@ fn check_xsave_support() -> bool {
     let ecx_val: u32;
     unsafe {
         core::arch::asm!(
+            "mov eax, 1",
             "push rbx",
             "cpuid",
             "mov {0:e}, ecx",
@@ -345,6 +369,7 @@ fn check_avx_support() -> bool {
     let ecx_val: u32;
     unsafe {
         core::arch::asm!(
+            "mov eax, 1",
             "push rbx",
             "cpuid",
             "mov {0:e}, ecx",
@@ -377,10 +402,11 @@ fn init_fpu_state() {
     // Initialize a clean state buffer on the stack
     let mut clean_state = FpuState::new();
 
-    // Initialize x87 FPU control word at offset 0x1C in legacy region
+    // Initialize x87 FPU control word at offset 0x00 in the legacy
+    // region; XRSTOR consumes this field from its documented location.
     // Standard init: 0x037F (precision full, rounding nearest, all masked)
     let fpu_cw: u16 = 0x037F;
-    clean_state.legacy[0x1C..0x1E].copy_from_slice(&fpu_cw.to_le_bytes());
+    clean_state.legacy[0x00..0x02].copy_from_slice(&fpu_cw.to_le_bytes());
 
     // Initialize x87 FPU status word to 0 (no exceptions)
     clean_state.legacy[0x18..0x1A].copy_from_slice(&0u16.to_le_bytes());

@@ -927,27 +927,35 @@ fn handle_page_fault(error_code: u64, tf: &TrapFrame) {
             // Fault resolved — iretq will retry the faulting instruction.
         }
         access_fault::FaultStatus::CheckVad => {
-            // // crate::kprintln!("[PF] va=0x{:016x} CheckVad (VAD lookup needed)", cr2);
-            // Kernel-mode VAD faults are typically fatal — halt.
-            loop {
-                unsafe {
-                    core::arch::asm!("hlt", options(nostack));
+            if tf.cs & 3 != 0 {
+                crate::ps::process::process_exit(0xC0000005);
+            } else {
+                loop {
+                    unsafe {
+                        core::arch::asm!("hlt", options(nostack));
+                    }
                 }
             }
         }
         access_fault::FaultStatus::AccessViolation => {
-            // // crate::kprintln!("[PF] FATAL: AccessViolation at va=0x{:016x}", cr2);
-            loop {
-                unsafe {
-                    core::arch::asm!("hlt", options(nostack));
+            if tf.cs & 3 != 0 {
+                crate::ps::process::process_exit(0xC0000005);
+            } else {
+                loop {
+                    unsafe {
+                        core::arch::asm!("hlt", options(nostack));
+                    }
                 }
             }
         }
         access_fault::FaultStatus::OutOfMemory => {
-            // // crate::kprintln!("[PF] FATAL: OutOfMemory at va=0x{:016x}", cr2);
-            loop {
-                unsafe {
-                    core::arch::asm!("hlt", options(nostack));
+            if tf.cs & 3 != 0 {
+                crate::ps::process::process_exit(0xC0000005);
+            } else {
+                loop {
+                    unsafe {
+                        core::arch::asm!("hlt", options(nostack));
+                    }
                 }
             }
         }

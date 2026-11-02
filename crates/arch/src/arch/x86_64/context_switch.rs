@@ -339,23 +339,11 @@ pub unsafe fn ki_swap_context(
         // 2. Perform the basic context switch
         swap_context(out_rsp, new_rsp);
 
-        // 2.5 Publish the new thread into the per-CPU
-        //     current_thread slot. After this point every
-        //     KeGetCurrentEthread() caller on this CPU sees the
-        //     thread that is actually running. Without this
-        //     publication, kernel code that switches to a new
-        //     thread via ki_swap_context would still observe the
-        //     previous thread's ETHREAD, leading to APC
-        //     mis-delivery and state corruption.
-        // This publication is intentionally CPU-local: it writes the
-        // current CPU's per-CPU current_thread slot. Once per-CPU areas are
-        // allocated per logical CPU rather than per package, the storage
-        // itself is already bounded to this CPU and no cross-CPU publication
-        // is required.
+        // 2. Publish the incoming thread and load its architectural
+        //    state before the context switch. Code after
+        //    `swap_context` runs on the resumed thread, so it must
+        //    not mutate scheduler-visible state.
         crate::arch::common::percpu::set_current_thread(new_thread);
-
-        // 3. After switching, restore FPU state for the new thread
-        // Note: This code is executed on the new thread's stack
         if !new_thread.is_null() {
             let fpu_state_ptr = (*new_thread).get_fpu_state_ptr();
             if !fpu_state_ptr.is_null() {
@@ -367,6 +355,9 @@ pub unsafe fn ki_swap_context(
                 fpu_restore(fpu_state_ptr);
             }
         }
+
+        // 3. Perform the basic context switch.
+        swap_context(out_rsp, new_rsp);
     }
 }
 
@@ -498,8 +489,12 @@ pub unsafe fn save_debug_registers(state: &mut DebugState) {
 #[inline(always)]
 pub unsafe fn restore_debug_registers(state: &DebugState) {
     // Clear DR7 first to disable all breakpoints before restoring addresses
-    // Use a register as intermediate since DR7 is a special register
-    core::arch::asm!("xor rax, rax; mov dr7, rax", options(nomem, nostack));
+    core::arch::asm!(
+        "xor eax, eax",
+        "mov dr7, rax",
+        lateout("rax") _,
+        options(nomem, nostack)
+    );
     core::arch::asm!(
         "mov dr0, {0}",
         "mov dr1, {1}",

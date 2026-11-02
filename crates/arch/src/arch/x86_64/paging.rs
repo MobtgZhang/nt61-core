@@ -81,6 +81,60 @@ pub fn walk_to_leaf(va: u64) -> Option<*mut MMPTE> {
     Some(pte)
 }
 
+/// Report whether `va` is mapped in the page root identified by
+/// `root_pfn` without switching CR3.
+pub fn page_is_mapped_in_root(root_pfn: u64, va: u64) -> bool {
+    let root_phys = pfn_to_phys(root_pfn);
+    if root_phys == 0 {
+        return false;
+    }
+
+    let pml4_idx = ((va >> 39) & 0x1FF) as usize;
+    let pml4e_val = match unsafe { read_table_entry(root_phys, pml4_idx) } {
+        Some(value) => value,
+        None => return false,
+    };
+    if (pml4e_val & 1) == 0 {
+        return false;
+    }
+    if pml4e_val & 0x80 != 0 {
+        return true;
+    }
+
+    let pdpt_phys = pml4e_val & 0x000F_FFFF_FFFF_F000;
+    let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
+    let pdpte_val = match unsafe { read_table_entry(pdpt_phys, pdpt_idx) } {
+        Some(value) => value,
+        None => return false,
+    };
+    if (pdpte_val & 1) == 0 {
+        return false;
+    }
+    if pdpte_val & 0x80 != 0 {
+        return true;
+    }
+
+    let pd_phys = pdpte_val & 0x000F_FFFF_FFFF_F000;
+    let pd_idx = ((va >> 21) & 0x1FF) as usize;
+    let pde_val = match unsafe { read_table_entry(pd_phys, pd_idx) } {
+        Some(value) => value,
+        None => return false,
+    };
+    if (pde_val & 1) == 0 {
+        return false;
+    }
+    if pde_val & 0x80 != 0 {
+        return true;
+    }
+
+    let pt_phys = pde_val & 0x000F_FFFF_FFFF_F000;
+    let pt_idx = ((va >> 12) & 0x1FF) as usize;
+    match unsafe { read_table_entry(pt_phys, pt_idx) } {
+        Some(pte_val) => (pte_val & 1) != 0,
+        None => false,
+    }
+}
+
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.

@@ -81,17 +81,11 @@ global_asm!(
 global_asm!(
 
     // ---- raw-bytes helper --------------------------------------------
-    // `emit_stub N` writes a 16-byte interrupt stub for vector N.
+    // `emit_stub N` writes an interrupt stub for vector N.
     //
-    // Layout (16 bytes total):
-    //   - 5 bytes: `mov edi, N` (opcode 0xB8 + N as u32)
-    //   - 5 bytes: `jmp rel32` to int_common_dispatch
-    //   - 6 bytes: NOP padding
-    //
-    // The vector number is passed in RDI rather than pushed on the
-    // stack so that `int_common_dispatch` can read it without
-    // having to skip a redundant slot. The CPU has already pushed
-    // its own frame (SS, RSP, RFLAGS, CS, RIP [, error_code]).
+    // The interrupted RDI is saved first, then the vector number is
+    // pushed above it.  The common dispatcher restores RDI from the
+    // saved slot before unwinding both bookkeeping slots.
     //
     // The label is declared `.global` so external C code (in
     // `arch::x86_64::idt`) can take its address when wiring up
@@ -105,15 +99,10 @@ global_asm!(
     ".macro emit_stub n",
     "  .global int_stub_\\n",
     "int_stub_\\n:",
+    "  push rdi",
     "  mov edi, \\n",
     "  push rdi",
     "  jmp int_common_dispatch",
-    "  nop",
-    "  nop",
-    "  nop",
-    "  nop",
-    "  nop",
-    "  nop",
     ".endm",
 
     // Vectors 0..=31 (CPU-defined exceptions).
@@ -215,8 +204,8 @@ global_asm!(
     // If the interrupt came from Ring 3, GS currently holds the user
     // GS base (zero in this bring-up).  Switch to the kernel GS base
     // before any handler can touch per-CPU data.  At common-entry RSP
-    // points at the vector slot pushed by int_stub_N; the CPU frame is
-    // therefore RIP at +0x08 and CS at +0x10.
+    // points at the vector slot pushed by int_stub_N; the saved RDI is
+    // immediately above it, followed by the CPU frame.
     "  cmp word ptr [rsp + 0x10], 0x2b",
     "  jne 6f",
     "  swapgs",
@@ -234,39 +223,20 @@ global_asm!(
     // function built for `x86_64-unknown-uefi` expects the first
     // argument in RCX, the second in RDX. So we pass vector via
     // RCX and &TrapFrame via RDX, NOT the SysV RDI/RSI convention.
-    "  mov rcx, [rsp + 0x78]",             // rcx = vector (pushed by int_stub)
+    "  mov rcx, [rsp + 0x80]",             // rcx = vector (pushed by int_stub)
     "  mov rdx, rsp",                      // rdx = &TrapFrame
     "  sub rsp, 0x20",                     // Win64 shadow space
     "  call dispatch_trap_frame",
     "  add rsp, 0x20",
-    // After 15 GPR pushes, the CPU frame sits above the GPRs:
+    // After 15 GPR pushes, the bookkeeping slots and CPU frame sit
+    // above the GPRs:
     //
-    //   For error-code vectors (8, 10, 11, 12, 13, 14, 17):
-    //     [rsp + 0x00..0x70] = 15 GPRs (rax..r15)
-    //     [rsp + 0x78]        = error_code
-    //     [rsp + 0x80]        = RIP
-    //     [rsp + 0x88]        = CS
-    //     [rsp + 0x90]        = RFLAGS
-    //     [rsp + 0x98]        = RSP
-    //     [rsp + 0xa0]        = SS
-    //
-    //   For non-error-code vectors:
-    //     [rsp + 0x00..0x70] = 15 GPRs (rax..r15)
-    //     [rsp + 0x78]        = RIP
-    //     [rsp + 0x80]        = CS
-    //     [rsp + 0x88]        = RFLAGS
-    //     [rsp + 0x90]        = RSP
-    //     [rsp + 0x98]        = SS
-    //
-    // iretq pops 5 values (RIP, CS, RFLAGS, RSP, SS). To leave the
-    // stack pointing at the right slot, we either:
-    //   - error-code: add 0x80 once (skip 0x78 GPRs + 0x08 error_code)
-    //   - non-error:  pop the 15 GPRs (0x78 bytes), leaving rsp at
-    //                 RIP naturally.
-    //
-    // The vector is stashed into r12 BEFORE the pops so we can drive
-    // the error-code skip logic. After `pop r12` it would be
-    // overwritten with the saved user/kernel r12.
+    // Both frame classes contain the vector slot directly above the
+    // 15 GPR slots, and the saved RDI is above the vector slot.
+    // Error-code vectors additionally contain the CPU error code above
+    // the saved RDI. Restore every pushed GPR and the caller's RDI on
+    // both paths; otherwise a resumable user-mode exception returns
+    // with garbage register state.
     "  mov r12, [rsp + 0x78]",             // r12 = vector
     "  mov rdi, r12",
     "  cmp rdi, 8",     "  je 2f",
@@ -278,14 +248,20 @@ global_asm!(
     "  cmp rdi, 17",    "  je 2f",
     "  jmp 1f",
     "2:",
-    "  add rsp, 0x88",                    // skip vector, error_code, and 15 GPRs
+    "  pop rax", "  pop rcx", "  pop rdx", "  pop rbx",
+    "  pop rbp", "  pop rsi", "  pop rdi",
+    "  pop r8", "  pop r9", "  pop r10", "  pop r11",
+    "  pop r12", "  pop r13", "  pop r14", "  pop r15",
+    "  mov rdi, [rsp + 0x08]",            // restore interrupted RDI
+    "  add rsp, 0x18",                    // skip vector, saved RDI, error code
     "  jmp 3f",
     "1:",
     "  pop rax", "  pop rcx", "  pop rdx", "  pop rbx",
     "  pop rbp", "  pop rsi", "  pop rdi",
     "  pop r8", "  pop r9", "  pop r10", "  pop r11",
     "  pop r12", "  pop r13", "  pop r14", "  pop r15",
-    "  add rsp, 0x08",                    // skip vector slot
+    "  mov rdi, [rsp + 0x08]",            // restore interrupted RDI
+    "  add rsp, 0x10",                    // skip vector and saved RDI
     "3:",
     // Restore the GS convention for the interrupted context.  Interrupt
     // entry performed swapgs only when CPL was 3, so perform the paired
@@ -331,6 +307,7 @@ global_asm!(
     // before swapgs would dereference absolute low memory instead
     // of the per-CPU area. swapgs does not touch GPRs.
     "  swapgs",
+    "  cli",
     "  mov gs:[0x0], rsp",                 // save user RSP
     "  mov rsp, gs:[0x8]",                 // switch to the kernel stack
     "  push {user_ss}",                    // 21: SS
@@ -383,14 +360,17 @@ global_asm!(
     "  add rsp, 0x38",                     // seven remaining slots
     "  mov rsp, gs:[0x0]",                 // restore user RSP
     "  swapgs",
-    // Restore selector registers without clobbering RAX, which now
-    // carries the dispatcher's return value back to user mode. R11 is
-    // consumed by `sysretq` as RFLAGS and is therefore free here.
-    "  mov r11, 0x23",
-    "  mov ds, r11",
-    "  mov es, r11",
-    "  mov fs, r11",
-    "  mov gs, r11",
+    // Validate RCX before SYSRET.  A non-canonical return RIP would
+    // fault at CPL0.  Redirect an invalid value to user address zero
+    // so the user #PF handler owns the failure.
+    "  mov r10, rcx",
+    "  shr r10, 47",
+    "  test r10, r10",
+    "  jz 6f",
+    "  cmp r10, 0x1ffff",
+    "  je 6f",
+    "  xor rcx, rcx",
+    "6:",
   "  sysretq",
 
     user_cs = const USER_CS as u64,
