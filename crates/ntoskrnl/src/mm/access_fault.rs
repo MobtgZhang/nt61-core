@@ -127,6 +127,12 @@ fn walk_user_page_table(va: u64) -> Option<*mut MMPTE> {
     let pml4_idx = ((va >> 39) & 0x1FF) as usize;
     let pml4e = unsafe { *((pml4_phys as *const MMPTE).add(pml4_idx)) };
 
+    // NT 6.1: intermediate entries for kernel VAs must be
+    // supervisor-only. Only user VAs (below 0x0000_8000_0000_0000)
+    // get the U bit. Without this check kernel PML4Es get US=1,
+    // weakening kernel-mode isolation.
+    let user_flags = if va < 0x0000_8000_0000_0000 { 0x4 } else { 0 };
+
     // PDPT - allocate if missing
     let pdpt_phys = if !pml4e.is_hardware() {
         // Allocate a new PDPT page
@@ -139,7 +145,7 @@ fn walk_user_page_table(va: u64) -> Option<*mut MMPTE> {
         // Install in PML4
         let pml4e_ptr = unsafe { (pml4_phys as *mut MMPTE).add(pml4_idx) };
         unsafe {
-            (*pml4e_ptr).set_hardware(phys, 0x7); // P=1, R/W=1, U=1
+            (*pml4e_ptr).set_hardware(phys, 0x3 | user_flags); // P=1, R/W=1, U=user?
         }
         phys
     } else {
@@ -165,15 +171,24 @@ fn walk_user_page_table(va: u64) -> Option<*mut MMPTE> {
     if pdpte.large() {
         return Some((pdpt_phys + pdpt_idx as u64 * 8) as *mut MMPTE);
     }
-    if !pdpte.is_hardware() {
-        // For now, return None to indicate the page is not
-        // present. A full implementation would allocate a PD
-        // page here.
-        return None;
-    }
+    let pd_phys = if !pdpte.is_hardware() {
+        // NT 6.1: a committed-but-unmapped region must allocate the
+        // missing PD page rather than returning ACCESS_VIOLATION.
+        let pd_pfn = pfn::allocate_pfn()?;
+        let pd_phys_new = crate::mm::pte::pfn_to_phys(pd_pfn);
+        unsafe {
+            core::ptr::write_bytes(pd_phys_new as *mut u8, 0, 4096);
+        }
+        let pdpte_ptr = (pdpt_phys + pdpt_idx as u64 * 8) as *mut MMPTE;
+        unsafe {
+            (*pdpte_ptr).set_hardware(pd_phys_new, 0x3 | user_flags);
+        }
+        pd_phys_new
+    } else {
+        pdpte.hardware_page_frame()
+    };
 
     // PD - the leaf for 2 MiB pages, or intermediate for 4 KiB pages
-    let pd_phys = pdpte.hardware_page_frame();
     let pd_idx = ((va >> 21) & 0x1FF) as usize;
     let pde = unsafe { *((pd_phys + pd_idx as u64 * 8) as *mut MMPTE) };
     // 2 MiB large page: the PD entry is the leaf.
@@ -205,7 +220,7 @@ fn resolve_pte(pte: MMPTE, va: u64, pte_ptr: *mut MMPTE, access: AccessFlags) ->
         return resolve_hardware(pte, va, pte_ptr, access);
     }
     if pte.is_transition() {
-        return resolve_transition(pte, va, pte_ptr);
+        return resolve_transition(pte, va, pte_ptr, access);
     }
     if pte.is_prototype() {
         return resolve_prototype(pte, va, pte_ptr, access);
@@ -232,56 +247,11 @@ fn resolve_hardware(pte: MMPTE, va: u64, pte_ptr: *mut MMPTE, access: AccessFlag
     if access.execute && pte.no_execute() {
         return FaultStatus::AccessViolation;
     }
-    // CRITICAL DIAGNOSTIC: Walk the entire page table for this VA
-    // and dump every level's NX bit.
-    {
-        let va_u = va;
-        let root = crate::mm::vas::current_root();
-        let pml4_idx = ((va_u >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((va_u >> 30) & 0x1FF) as usize;
-        let pd_idx = ((va_u >> 21) & 0x1FF) as usize;
-        let pt_idx = ((va_u >> 12) & 0x1FF) as usize;
-        unsafe {
-            let pml4e = core::ptr::read_volatile((root as *const u64).add(pml4_idx));
-            crate::boot_println!(
-                "[PF-DIAG] PML4[{}]=0x{:x} NX={}",
-                pml4_idx,
-                pml4e,
-                (pml4e >> 63) & 1
-            );
-            if pml4e & 1 != 0 {
-                let pdpt_phys = pml4e & 0x000F_FFFF_FFFF_F000;
-                let pdpte = core::ptr::read_volatile((pdpt_phys as *const u64).add(pdpt_idx));
-                crate::boot_println!(
-                    "[PF-DIAG] PDPT[{}]=0x{:x} NX={} PS={}",
-                    pdpt_idx,
-                    pdpte,
-                    (pdpte >> 63) & 1,
-                    (pdpte >> 7) & 1
-                );
-                if pdpte & 1 != 0 && pdpte & 0x80 == 0 {
-                    let pd_phys = pdpte & 0x000F_FFFF_FFFF_F000;
-                    let pde = core::ptr::read_volatile((pd_phys as *const u64).add(pd_idx));
-                    crate::boot_println!(
-                        "[PF-DIAG] PD[{}]=0x{:x} NX={} PS={}",
-                        pd_idx,
-                        pde,
-                        (pde >> 63) & 1,
-                        (pde >> 7) & 1
-                    );
-                    if pde & 1 != 0 && pde & 0x80 == 0 {
-                        let pt_phys = pde & 0x000F_FFFF_FFFF_F000;
-                        let pte_v = core::ptr::read_volatile((pt_phys as *const u64).add(pt_idx));
-                        crate::boot_println!(
-                            "[PF-DIAG] PT[{}]=0x{:x} NX={}",
-                            pt_idx,
-                            pte_v,
-                            (pte_v >> 63) & 1
-                        );
-                    }
-                }
-            }
-        }
+    // NT 6.1: a user-mode fault on a kernel page is an ACCESS_VIOLATION,
+    // not "handled" — without this check the faulting instruction retries
+    // forever because the PTE is present but supervisor-only.
+    if access.user && (pte.u_long & 0x4) == 0 {
+        return FaultStatus::AccessViolation;
     }
     // Present and permissions look right; the A/D bit must have been
     // missing — set them. (The CPU only sets A/D for some access
@@ -290,19 +260,6 @@ fn resolve_hardware(pte: MMPTE, va: u64, pte_ptr: *mut MMPTE, access: AccessFlag
         (*pte_ptr).set_accessed(true);
         if access.write {
             (*pte_ptr).set_dirty(true);
-        }
-        // Also force the entire PTE to NOT have NX. This is a
-        // workaround for an unknown bug where some entries in the
-        // cmd.exe page table are interpreted by the CPU as
-        // NX=1 despite showing NX=0 in the memory.
-        let val = (*pte_ptr).u_long;
-        if val & (1u64 << 63) != 0 {
-            (*pte_ptr).u_long = val & !(1u64 << 63);
-            crate::boot_println!(
-                "[PF] FORCED NX=0 for PTE=0x{:x} -> 0x{:x}",
-                val,
-                val & !(1u64 << 63)
-            );
         }
     }
     // CRITICAL: Flush ALL TLB entries by writing CR3 back to itself.
@@ -314,15 +271,6 @@ fn resolve_hardware(pte: MMPTE, va: u64, pte_ptr: *mut MMPTE, access: AccessFlag
     // x86_64 only — on aarch64 / riscv64 / loongarch64 TLB flush
     // is handled by each arch's `tlb_flush_all` helper.
     crate::arch::flush_tlb();
-    let cur_cr3_for_log: u64 = crate::arch::read_current_page_root();
-    crate::boot_println!(
-        "[PF] resolve_hardware: PTE=0x{:x} A={} D={} access.r={} access.w={} access.x={} -> Handled (CR3=0x{:x}, current_root=0x{:x})",
-        pte.raw(),
-        (pte.u_long >> 5) & 1,
-        (pte.u_long >> 6) & 1,
-        access.read, access.write, access.execute,
-        cur_cr3_for_log, crate::mm::vas::current_root()
-    );
     // Flush the TLB entry for this VA. Without this, the CPU can keep
     // using a stale cached translation (e.g. "page not present" from
     // a prior probe) and re-fault on iretq.
@@ -330,7 +278,7 @@ fn resolve_hardware(pte: MMPTE, va: u64, pte_ptr: *mut MMPTE, access: AccessFlag
     FaultStatus::Handled
 }
 
-fn resolve_transition(pte: MMPTE, _va: u64, pte_ptr: *mut MMPTE) -> FaultStatus {
+fn resolve_transition(pte: MMPTE, _va: u64, pte_ptr: *mut MMPTE, access: AccessFlags) -> FaultStatus {
     let pfn_no = pte.transition_pfn();
     // Transition -> hardware: pop the PFN off its current list
     // (standby/modified), promote the PTE.
@@ -338,6 +286,13 @@ fn resolve_transition(pte: MMPTE, _va: u64, pte_ptr: *mut MMPTE) -> FaultStatus 
     if let Some(entry) = db.entry(pfn_no) {
         unsafe {
             db.unlink_entry(entry, pfn_no);
+            // NT 6.1 (MiTransitionFault): after unlinking from
+            // standby/modified, the PFN state must become Active so
+            // it is no longer on any eviction list. Without this the
+            // page remains on the standby list while the user PTE
+            // claims it, letting the pager hand the same frame to
+            // another process.
+            (*entry).set_state(crate::mm::pfn::MMPFNSTATE::Active);
         }
     }
     drop(db);
@@ -349,7 +304,12 @@ fn resolve_transition(pte: MMPTE, _va: u64, pte_ptr: *mut MMPTE) -> FaultStatus 
     // delegate to the same routine.
     let new_bits = crate::mm::pte::mm_protect_to_pte_bits(pte_flags, true);
     // Clear the transition bit (bit 11) so this is now a hardware PTE.
-    let new_bits = (new_bits & !(1u64 << 11)) | 0x20 | 0x40; // A + D
+    // NT 6.1: only set the D bit on write faults; a read fault on a
+    // transition page must not dirty it.
+    let mut new_bits = (new_bits & !(1u64 << 11)) | 0x20; // A
+    if access.write {
+        new_bits |= 0x40; // D
+    }
     unsafe {
         (*pte_ptr).set_hardware(pa, new_bits);
     }
@@ -374,9 +334,28 @@ fn resolve_prototype(pte: MMPTE, va: u64, pte_ptr: *mut MMPTE, access: AccessFla
         return FaultStatus::AccessViolation;
     }
     let proto = unsafe { *proto_addr };
-    // Recurse: the prototype PTE may itself be hardware / transition
-    // / page-file / etc.
-    resolve_pte(proto, va, proto_addr as *mut MMPTE, access)
+    // NT 6.1 (MiResolveProtoPteFault): after resolving through the
+    // prototype PTE, the resolution must be *backfilled* into the
+    // user PTE that actually faulted, so subsequent accesses to the
+    // same address don't re-fault through the prototype chain every
+    // time.  We resolve through the prototype chain first, then copy
+    // the resulting hardware PTE into the user PTE slot.
+    let status = resolve_pte(proto, va, proto_addr as *mut MMPTE, access);
+    if status == FaultStatus::Handled && !pte_ptr.is_null() {
+        // The prototype PTE has been converted to a hardware PTE by
+        // the recursive call; copy the resolved mapping into the
+        // user's PTE so the next access doesn't fault again.
+        let resolved = unsafe { *proto_addr };
+        if resolved.is_hardware() {
+            unsafe {
+                *pte_ptr = resolved;
+            }
+            // Flush the TLB entry for the faulting VA so the retry
+            // sees the newly installed PTE.
+            crate::arch::invalidate_tlb(va);
+        }
+    }
+    status
 }
 
 fn resolve_demand_zero(va: u64, pte_ptr: *mut MMPTE, access: AccessFlags) -> FaultStatus {
@@ -430,7 +409,16 @@ fn resolve_demand_zero_inner(
     let pa = pfn_to_phys(pfn_no);
     //     // // // kprintln!("[DEMAND_ZERO_INNER] pte_ptr=0x{:x} pa=0x{:x}", pte_ptr as u64, pa);
     let mut pte_bits: u64 = 1; // P=1
-    if access.write {
+    // NT 6.1: the hardware R/W bit must honor the VAD's software
+    // protection, not just the fault type. A read-only VAD page
+    // must not become writable simply because a write fault occurred.
+    let vad_protection = if let Some(v) = vad {
+        u64::from(unsafe { (*v).protection.bits() })
+    } else {
+        0
+    };
+    let is_software_writable = vad_protection & 0x4 != 0;
+    if is_software_writable && access.write {
         pte_bits |= 0x2;
     }
     if access.user {
@@ -488,12 +476,26 @@ fn resolve_page_file(va: u64, pte_ptr: *mut MMPTE, access: AccessFlags) -> Fault
     };
     let pa = pfn_to_phys(pfn_no);
     let mut pte_bits: u64 = 1;
-    if access.write || prot & 0x4 != 0 {
+    // NT 6.1: the hardware R/W bit must come from the *software*
+    // protection bits (VAD), not from the fault type. A read-only
+    // committed page stays read-only after page-in; only if the
+    // software PTE says writable (bit 2 = MM_PAGE_WRITABLE) do we
+    // set the hardware write-enable bit. The faulting access itself
+    // must also be a write for the D bit to be meaningful.
+    let is_software_writable = prot & 0x4 != 0;
+    if is_software_writable {
         pte_bits |= 0x2;
     }
     pte_bits |= 0x4; // user
-    pte_bits |= 0x20 | 0x40;
-    pte_bits |= 1u64 << 63; // NX (we don't track exec bit in the 5-bit prot yet)
+    pte_bits |= 0x20; // A
+    if access.write {
+        pte_bits |= 0x40; // D (only on write faults)
+    }
+    // NT 6.1: NX is only forced for non-executable software pages.
+    // Code pages paged back in must remain executable.
+    if prot & 0x10 != 0 {
+        pte_bits |= 1u64 << 63; // NX (bit 4 = non-executable)
+    }
     unsafe {
         (*pte_ptr).set_hardware(pa, pte_bits);
     }

@@ -531,7 +531,9 @@ pub fn restore_s4_state() -> bool {
 
     // Update stats
     let stats = get_stats();
-    update_stats(stats.total_resumes, stats.total_hibernations + 1);
+    // NT 6.1: a *resume* increments `total_resumes`, not
+    // `total_hibernations`.  The old call had the arguments swapped.
+    update_stats(stats.total_resumes + 1, stats.total_hibernations);
 
     kprintln_info!("MEMORY", "Resume complete in {} ms", duration);
 

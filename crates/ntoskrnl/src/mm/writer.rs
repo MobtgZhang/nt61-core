@@ -53,11 +53,18 @@ pub fn tick() -> u64 {
         // returns early if the slot is invalid; this is fine for
         // the bootstrap, where many modified pages have no
         // reserved slot.
-        crate::mm::pagefile::write_modified_page(pfn_no);
-        // Move to standby.
-        let mut db = pfn::PFN_DB.lock();
-        db.standby(pfn_no, 0);
-        moved += 1;
+        let wrote_ok = crate::mm::pagefile::write_modified_page(pfn_no);
+        if wrote_ok {
+            // NT 6.1: only move the page to standby if the write
+            // succeeded. Moving a page whose contents were never
+            // flushed causes silent data loss when the frame is
+            // reused — the comment at 341-344 acknowledged this
+            // bug ("no real page file yet, so this just moves
+            // modified pages to standby").
+            let mut db = pfn::PFN_DB.lock();
+            db.standby(pfn_no, 0);
+            moved += 1;
+        }
     }
     moved
 }

@@ -105,6 +105,7 @@ pub struct BuddyAllocator {
     num_frames: u64,
     base_address: u64,
     free_frames: AtomicU64,
+    last_allocation_pages: u64,
     /// Has the allocator been initialised?
     initialised: bool,
 }
@@ -135,6 +136,7 @@ impl BuddyAllocator {
             base_address: 0,
             free_frames: AtomicU64::new(0),
             initialised: false,
+            last_allocation_pages: 0,
         }
     }
 
@@ -309,6 +311,7 @@ impl BuddyAllocator {
                 }
             }
             self.free_frames.fetch_sub(1u64 << order, Ordering::SeqCst);
+            self.last_allocation_pages = 1u64 << order;
             return Some(self.base_address + (cur_frame as u64) * 4096);
         }
         None
@@ -384,9 +387,9 @@ impl BuddyAllocator {
             if (buddy as u64) >= self.num_frames {
                 break;
             }
-            let on_list = unsafe {
-                let node = &*self.buddy_nodes.add(buddy as usize);
-                node.on_list
+            let on_list = {
+                let _lock = self.free_lists[cur_order].lock();
+                unsafe { (*self.buddy_nodes.add(buddy as usize)).on_list }
             };
             if on_list == 0 {
                 break;
@@ -455,7 +458,7 @@ fn remove_node(list: &mut FreeListHead, frame: u32, nodes: *mut BuddyNode) {
         node.prev = FREE_LIST_END;
         node.on_list = 0;
     }
-    list.count -= 1;
+    list.count = list.count.saturating_sub(1);
 }
 
 /// Global buddy allocator instance.
@@ -613,8 +616,9 @@ pub fn allocate_pages(count: u64) -> Option<u64> {
     let mut alloc = BUDDY_ALLOCATOR.lock();
     let result = alloc.allocate(count);
     if let Some(addr) = result {
+        let allocation_pages = alloc.last_allocation_pages;
         FREE_PAGES.fetch_sub(
-            count.min(FREE_PAGES.load(Ordering::SeqCst)),
+            allocation_pages.min(FREE_PAGES.load(Ordering::SeqCst)),
             Ordering::SeqCst,
         );
         // Keep the PFN allocator in sync: every frame this buddy hands
@@ -637,8 +641,10 @@ pub fn allocate_pages(count: u64) -> Option<u64> {
 /// Free `count` contiguous physical frames at `phys_addr`.
 pub fn free_pages(phys_addr: u64, count: u64) {
     let mut alloc = BUDDY_ALLOCATOR.lock();
+    let order = crate::mm::frame::order_of(count).min(MAX_BUDDY_ORDER - 1);
+    let allocation_pages = 1u64 << order;
     alloc.free(phys_addr, count);
-    FREE_PAGES.fetch_add(count, Ordering::SeqCst);
+    FREE_PAGES.fetch_add(allocation_pages, Ordering::SeqCst);
     // Mirror the allocation-side reservation into the PFN database so
     // a freed buddy block becomes allocatable through the PFN allocator
     // again instead of leaking as permanently Active.

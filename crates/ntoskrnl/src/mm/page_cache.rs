@@ -328,10 +328,20 @@ impl PageCache {
             self.evict_page()?;
         }
 
-        // create new page entry
+        // NT 6.1: reuse a freed slot if one exists instead of growing
+        // the Vec monotonically.  After `evict_page` marks a slot as
+        // Free, the next `insert` must fill it — otherwise the Vec
+        // grows without bound and `total_pages` drifts.
+        let idx = match self.pages.iter().position(|p| p.state == PageState::Free) {
+            Some(free_idx) => free_idx,
+            None => self.pages.len(),
+        };
         let page = CachedPage::new(key, pfn);
-        let idx = self.pages.len();
-        self.pages.push(page);
+        if idx == self.pages.len() {
+            self.pages.push(page);
+        } else {
+            self.pages[idx] = page;
+        }
         self.page_map.insert(key, idx);
         self.stats.total_pages.fetch_add(1, Ordering::Relaxed);
 
@@ -553,6 +563,13 @@ impl PageCache {
             }
             self.remove_from_lru(idx);
             self.page_map.remove(&key);
+            // NT 6.1: release the cached frame and mark the slot as
+            // Free so that a future `insert` can reuse it.  Without
+            // this, the PFN stays pinned in metadata and the slot is
+            // never reclaimed.
+            crate::mm::pfn::free_pfn(self.pages[idx].pfn);
+            self.pages[idx].state = PageState::Free;
+            self.pages[idx].pfn = 0;
             self.stats.total_pages.fetch_sub(1, Ordering::Relaxed);
         }
     }

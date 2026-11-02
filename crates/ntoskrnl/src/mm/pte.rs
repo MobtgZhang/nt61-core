@@ -151,7 +151,10 @@ impl MMPTE {
             | ((protection as u64) & 0x1F) << 5;
     }
     pub fn transition_pfn(&self) -> u64 {
-        (self.u_long >> 12) & 0x000F_FFFF
+        // NT 6.1: the transition-PTE PFN field is 36 bits wide (matching
+        // the 48-bit physical address stored by `set_transition`).  The
+        // old 20-bit mask silently truncated any PFN above 4 GiB.
+        (self.u_long >> 12) & 0x000F_FFFF_FFFF
     }
     pub fn transition_protection(&self) -> u32 {
         ((self.u_long >> 5) & 0x1F) as u32
@@ -216,14 +219,25 @@ impl MMPTE {
     }
 
     // -----------------------------------------------------------------
-    // Subsubsection
+    // Subsection (a file-backed segment pointer).  Distinguished from
+    // prototype PTEs by bit 11 (NT 6.1 x64: `Subsection` flag).
     // -----------------------------------------------------------------
     pub fn set_subsection(&mut self, subsection: u32, protection: u32) {
-        // P=0, proto=1 (bit 10), protection in bits 5..9
-        // Subsection address is in bits 12..59
-        self.u_long = ((subsection as u64) & 0x000F_FFFF_FFFF_F000)
+        // P=0, proto=1 (bit 10), subsection=1 (bit 11),
+        // protection in bits 5..9, subsection index in bits 12..43.
+        // The subsection index is a small integer (not a raw address),
+        // so we store it directly without the page-granular mask.
+        self.u_long = ((subsection as u64) & 0x0000_0FFF_FFFF)
             | (1u64 << 10)
+            | (1u64 << 11)
             | ((protection as u64) & 0x1F) << 5;
+    }
+    pub fn is_subsection(&self) -> bool {
+        // Bit 10 = prototype indicator, bit 11 = subsection indicator.
+        (self.u_long & 0x800) != 0 && (self.u_long & 0x400) != 0
+    }
+    pub fn subsection_index(&self) -> u32 {
+        (self.u_long >> 12) as u32 & 0x0000_0FFF
     }
 }
 

@@ -320,12 +320,6 @@ pub fn init(boot_info: &BootInfo) {
         }
     }
 
-    // Cap the chosen region to the static-bookkeeping bootstrap
-    // limit.  FRAME_TABLE_ENTRIES = 65536 frames = 256 MiB of RAM.
-    // The PFN database is allocated dynamically from this window.
-    if chosen_size > frame::BOOTSTRAP_REGION {
-        chosen_size = frame::BOOTSTRAP_REGION;
-    }
     // Round down to a 4 KiB boundary and make sure we have at
     // least 16 MiB.
     chosen_size &= !0xFFFu64;
@@ -339,9 +333,9 @@ pub fn init(boot_info: &BootInfo) {
     // for it. The buddy's static 64 MiB region is also what the
     // heap and pool are sized against, so keeping chosen_size
     // small keeps the bookkeeping in the BSS FRAME_TABLE.
-    const BOOTSTRAP_RAM: u64 = 512 * 1024 * 1024;
-    if chosen_size > BOOTSTRAP_RAM {
-        chosen_size = BOOTSTRAP_RAM;
+    const MAX_RAM_BYTES: u64 = 192 * 1024 * 1024 * 1024;
+    if chosen_size > MAX_RAM_BYTES {
+        chosen_size = MAX_RAM_BYTES;
     }
 
     // Widen the PFN DB so it covers the live CR3 PML4. OVMF
@@ -355,7 +349,7 @@ pub fn init(boot_info: &BootInfo) {
         let cr3_pfn_end = (cr3_phys >> 12) + 1;
         let chosen_end_pfn = (chosen_base / 4096) + (chosen_size / 4096);
         if cr3_pfn_end > chosen_end_pfn {
-            const MAX_PFN_DB_COVERAGE: u64 = 512 * 1024 * 1024;
+            const MAX_PFN_DB_COVERAGE: u64 = 192 * 1024 * 1024 * 1024;
             let base_pfn = chosen_base / 4096;
             let new_size = (cr3_pfn_end - base_pfn) * 4096;
             let aligned = (new_size + 0xFFF) & !0xFFF;
@@ -722,8 +716,15 @@ pub fn discover_ram(boot_info: &BootInfo) -> (u64, u64) {
         let mut best_size = BOOT_RAM_SIZE;
         for i in 0..n {
             let e = core::ptr::read_unaligned(entries.add(i));
-            // MemoryType::Usable == 1 (see enum above)
-            if e.memory_type != MemoryType::Usable as u32 {
+            // After ExitBootServices the UEFI memory types that may be
+            // consumed are conventional memory plus the reclaimable
+            // OS-specific types (9 and 10). The old dual discovery
+            // path accepted different sets depending on which loop ran.
+            if e.memory_type != MemoryType::Usable as u32
+                && e.memory_type != 7
+                && e.memory_type != 9
+                && e.memory_type != 10
+            {
                 continue;
             }
             // Skip the low 1 MiB (real-mode IVT, BDA, VGA).

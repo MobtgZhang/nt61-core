@@ -13,7 +13,7 @@
 
 use core::ptr;
 #[cfg(target_arch = "x86_64")]
-use core::sync::atomic::{AtomicU64, Ordering};
+use crate::ke::sync::Spinlock;
 
 #[cfg(target_arch = "x86_64")]
 use crate::mm::constants::MI_HYPERSPACE_INDEX;
@@ -58,15 +58,16 @@ fn hyperspace_pte(slot: u64) -> *mut MMPTE {
     unsafe { pt.add(slot as usize) }
 }
 
-/// Per-CPU next-free hyperspace slot. Bootstrap single CPU so we
-/// just use slot 0.
+/// Per-CPU hyperspace slot. NT gives every processor its own temporary
+/// mapping; this prevents concurrent mappers on different CPUs from
+/// aliasing the same PTE.
 #[cfg(target_arch = "x86_64")]
-static HYPERSPACE_NEXT: AtomicU64 = AtomicU64::new(0);
+static HYPERSPACE_LOCK: Spinlock<()> = Spinlock::new(());
 
 /// Map `pfn` at the next hyperspace slot and return the VA.
 #[cfg(target_arch = "x86_64")]
 pub fn map_hyperspace(pfn: u64) -> u64 {
-    let slot = HYPERSPACE_NEXT.fetch_add(1, Ordering::SeqCst) % HYPERSPACE_ENTRIES;
+    let slot = this_hyperspace_slot();
     let va = HYPERSPACE_BASE + slot * 4096;
     let pte_ptr = hyperspace_pte(slot);
     if pte_ptr.is_null() {
@@ -78,6 +79,13 @@ pub fn map_hyperspace(pfn: u64) -> u64 {
     }
     crate::mm::vas::invalidate_tlb(va);
     va
+}
+
+#[cfg(target_arch = "x86_64")]
+fn this_hyperspace_slot() -> u64 {
+    let cpu = crate::ke::scheduler::get_current_cpu() as u64;
+    let _guard = HYPERSPACE_LOCK.lock();
+    cpu % HYPERSPACE_ENTRIES
 }
 
 /// Non-x86 targets expose RAM through a boot-time physical identity
@@ -126,7 +134,6 @@ pub fn hyperspace_pointer(va: u64) -> *mut u8 {
 
 #[cfg(target_arch = "x86_64")]
 pub fn init() {
-    HYPERSPACE_NEXT.store(0, core::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(not(target_arch = "x86_64"))]

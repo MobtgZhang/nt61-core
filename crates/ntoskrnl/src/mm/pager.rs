@@ -320,18 +320,17 @@ fn get_standby_pages(max_count: usize) -> alloc::vec::Vec<u64> {
     let _ = &db;
     let _ = &db;
 
-    // Iterate through standby list to collect candidates
-    // In a real implementation, we'd have direct access to the list
+    // NT 6.1 pages out resident Active/Modified pages. Standby pages
+    // have already been removed from their address space; selecting
+    // them here made the pager repeatedly rewrite pages that no
+    // longer occupy the working set.
     for i in 0..1024u64 {
         if count >= max_count {
             break;
         }
         if let Some(entry) = db.entry(i) {
-            let priority = unsafe { (*entry).standby_priority() };
-            let _ = &priority;
-            let _ = &priority;
-            if priority < 0x10 {
-                // Low priority standby page
+            let state = unsafe { (*entry).state() };
+            if matches!(state, crate::mm::pfn::MMPFNSTATE::Active | crate::mm::pfn::MMPFNSTATE::Modified) {
                 result.push(i);
                 count += 1;
             }
@@ -538,11 +537,40 @@ fn pageout_single(candidate: &PageoutCandidate) -> bool {
 
     // write the page to the pagefile
     let wrote_ok = pagefile::write_page_to_disk(pfn, pagefile_no, offset);
-    // Use the standalone helper too so it isn't reported as
-    // "never used"; it doubles as a self-test on the pagefile-backed
-    // bookkeeping path that the writer/Mm subsystem depends on.
-    set_pagefile_backed(pfn, pagefile_no, offset);
     if wrote_ok {
+        // NT 6.1 (MiPageOut): after the page is written to the
+        // pagefile, the PTE must be converted from a hardware PTE
+        // to a software pagefile PTE, and the PFN must be placed on
+        // the standby list. Without this the page stays resident
+        // and the pagefile slot is orphaned (data written but never
+        // referenced again).
+        let db = pfn::PFN_DB.lock();
+        if let Some(entry) = db.entry(pfn) {
+            unsafe {
+                let pte_ptr = (*entry).pte_address;
+                if !pte_ptr.is_null() {
+                    // Convert the hardware PTE to a software
+                    // pagefile PTE referencing the slot we just
+                    // wrote.
+                    let old_pte = *pte_ptr;
+                    let protection = (old_pte.u_long >> 48) & 0x1F; // 5-bit software prot
+                    let mut new_pte: crate::mm::pte::MMPTE = core::mem::zeroed();
+                    new_pte.set_software_pagefile(
+                        pagefile_no as u32, offset, protection as u32,
+                    );
+                    pte_ptr.write_volatile(new_pte);
+                    crate::arch::flush_tlb();
+                }
+                // Move the PFN to the standby list so the frame
+                // becomes available for reallocation.
+                let entry_mut = entry;
+                (*entry_mut).set_state(crate::mm::pfn::MMPFNSTATE::Standby0);
+            }
+        }
+        drop(db);
+        // Flush the TLB for the PTE's VA — we don't have the VA
+        // directly, but the next CR3 switch will flush everything.
+        set_pagefile_backed(pfn, pagefile_no, offset);
         true
     } else {
         // Release the slot on failure

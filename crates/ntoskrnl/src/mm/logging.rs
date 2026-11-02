@@ -88,7 +88,11 @@ macro_rules! kprintln_mm {
     ($level:expr, $($arg:tt)*) => {
         if $level as u8
             <= $crate::mm::logging::MM_LOG_LEVEL.load(core::sync::atomic::Ordering::Relaxed)
-        {}
+        {
+            // Pass through to the standard kprintln! macro; the caller
+            // supplies a format string and arguments.
+            crate::kprintln!($($arg)*);
+        }
     };
 }
 
@@ -99,7 +103,9 @@ macro_rules! kprintln_mm_color {
     ($level:expr, $($arg:tt)*) => {
         if $level as u8
             <= $crate::mm::logging::MM_LOG_LEVEL.load(core::sync::atomic::Ordering::Relaxed)
-        {}
+        {
+            crate::kprintln!($($arg)*);
+        }
     };
 }
 
@@ -111,7 +117,7 @@ macro_rules! mm_log {
         if $level as u8
             <= $crate::mm::logging::MM_LOG_LEVEL.load(core::sync::atomic::Ordering::Relaxed)
         {
-            // // crate::kprintln!(concat!("[", $subsystem, "] ", $($arg)*));
+            crate::kprintln!(level: $level, subsystem: $subsystem, $($arg)*);
         }
     };
 }
@@ -143,50 +149,44 @@ pub fn print_settings() {
 // =============================================================================
 
 /// Log PFN-related operations
-pub fn log_pfn_alloc(_pfn: u64, _from_list: &str) {
-    // _pfn and _from_list are intentionally unused - reserved for future logging
+pub fn log_pfn_alloc(pfn: u64, from_list: &str) {
     if should_log(LogLevel::Debug) {
-        // // kprintln!("[PFN] Allocate: pfn={} from={}", _pfn, _from_list);
+        crate::kprintln!("[PFN] Allocate: pfn={} from={}", pfn, from_list);
     }
 }
 
 /// Log PFN free operations
-pub fn log_pfn_free(_pfn: u64) {
-    // _pfn is intentionally unused - reserved for future logging
+pub fn log_pfn_free(pfn: u64) {
     if should_log(LogLevel::Debug) {
-        // // kprintln!("[PFN] Free: pfn={}", _pfn);
+        crate::kprintln!("[PFN] Free: pfn={}", pfn);
     }
 }
 
 /// Log page fault information
-pub fn log_page_fault(_addr: u64, _fault_type: &str) {
-    // _addr and _fault_type are intentionally unused - reserved for future logging
+pub fn log_page_fault(addr: u64, fault_type: &str) {
     if should_log(LogLevel::Trace) {
-        // // kprintln!("[PF] Fault @ 0x{:016x}: {}", _addr, _fault_type);
+        crate::kprintln!("[PF] Fault @ 0x{:016x}: {}", addr, fault_type);
     }
 }
 
 /// Log VAS operations
-pub fn log_vas_operation(_op: &str, _va: u64) {
-    // _op and _va are intentionally unused - reserved for future logging
+pub fn log_vas_operation(op: &str, va: u64) {
     if should_log(LogLevel::Debug) {
-        // // kprintln!("[VAS] {}: va=0x{:016x}", _op, _va);
+        crate::kprintln!("[VAS] {}: va=0x{:016x}", op, va);
     }
 }
 
 /// Log self-map operations
-pub fn log_selfmap(_status: &str, _detail: u64) {
-    // _status and _detail are intentionally unused - reserved for future logging
+pub fn log_selfmap(status: &str, detail: u64) {
     if should_log(LogLevel::Debug) {
-        // // kprintln!("[SELF-MAP] {}: 0x{:016x}", _status, _detail);
+        crate::kprintln!("[SELF-MAP] {}: 0x{:016x}", status, detail);
     }
 }
 
 /// Log memory pressure events
-pub fn log_memory_pressure(_pressure: f32, _action: &str) {
-    // _pressure and _action are intentionally unused - reserved for future logging
+pub fn log_memory_pressure(pressure: f32, action: &str) {
     if should_log(LogLevel::Info) {
-        // // kprintln!("[MEM] Pressure {:.2}%: {}", _pressure, _action);
+        crate::kprintln!("[MEM] Pressure {:.2}%: {}", pressure, action);
     }
 }
 

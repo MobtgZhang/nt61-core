@@ -15,6 +15,7 @@
 //!   * WRK base/ntos/mm/section.c
 
 use super::pool::{self, PoolType};
+use super::vad::{VadEntry, VadProtection, VadType};
 use super::vas;
 use crate::ke::sync::Spinlock;
 use core::ptr;
@@ -236,7 +237,22 @@ pub fn destroy_section(section_index: usize) -> Result<(), i32> {
             return Ok(());
         }
 
+        // NT 6.1: destroy_section must not free the section while
+        // any views are still mapped, and must free the subsection
+        // chain (not just the control area). The old code leaked
+        // the subsection list and freed regardless of the view
+        // count.
         if !section.control_area.is_null() {
+            if (*section.control_area).number_of_mapped_views > 0 {
+                return Err(0xC000_0024u32 as i32); // STATUS_PROCESS_IS_TERMINATING — views still mapped
+            }
+            // Free the subsection chain before the control area.
+            let mut subsection = (*section.control_area).first_subsection;
+            while !subsection.is_null() {
+                let next = (*subsection).next_subsection;
+                pool::free(subsection as *mut u8);
+                subsection = next;
+            }
             pool::free(section.control_area as *mut u8);
         }
 
@@ -294,6 +310,26 @@ pub fn map_view(
             (*section.control_area).number_of_mapped_views += 1;
         }
 
+        // NT 6.1 records every mapped view in a VAD. The global
+        // allocator is only used before a process context exists, so
+        // keep its allocations in its own tree. This lets the current
+        // process VAD lookup find the reservation when it reuses the
+        // same global range during early boot.
+        let vad_ptr = pool::allocate_tagged(
+            PoolType::NonPaged,
+            core::mem::size_of::<VadEntry>(),
+            u32::from_le_bytes(*b"VadS"),
+        ) as *mut VadEntry;
+        if vad_ptr.is_null() {
+            free_address(base_address as usize);
+            return Err(0xC000_0017u32 as i32);
+        }
+        ptr::write(vad_ptr, VadEntry::new());
+        (*vad_ptr).set_range(base_address, base_address + actual_size);
+        (*vad_ptr).vad_type = VadType::VadNone;
+        (*vad_ptr).flags = crate::mm::vad::VadFlags::SEC_COMMIT;
+        (*vad_ptr).protection = VadProtection::READWRITE;
+
         Ok(base_address)
     }
 }
@@ -304,6 +340,25 @@ pub fn unmap_view(base_address: u64) -> Result<(), i32> {
     }
 
     free_address(base_address as usize);
+
+    // NT 6.1: unmap_view must decrement the control area's mapped
+    // view count. The old code freed the VA range without touching
+    // the count, so the count drifted upward forever.
+    // We scan all sections to find the one that owns this base
+    // address. In a full implementation, a VA-to-section reverse
+    // lookup table would be maintained; for now we scan.
+    for i in 0..MAX_SECTIONS {
+        if let Some(ptr) = get_section(i) {
+            unsafe {
+                if !(*ptr).control_area.is_null()
+                    && (*(*ptr).control_area).number_of_mapped_views > 0
+                {
+                    (*(*ptr).control_area).number_of_mapped_views -= 1;
+                    break;
+                }
+            }
+        }
+    }
 
     Ok(())
 }

@@ -165,13 +165,8 @@ pub fn is_kernel_address(va: u64) -> bool {
 /// equal to bit 47.
 #[inline]
 pub fn is_canonical(va: u64) -> bool {
-    let sign_bit = (va >> 47) & 1;
-    let _ = &sign_bit;
-    let _ = &sign_bit;
     let high_bits = va >> 48;
-    let _ = &high_bits;
-    let _ = &high_bits;
-    high_bits == sign_bit || high_bits == !sign_bit
+    high_bits == 0 || high_bits == 0xFFFF
 }
 
 /// Map a physical address range to a virtual address range
@@ -375,8 +370,62 @@ unsafe fn ensure_child_table(entry: u64, flags: u64) -> Result<*mut u64, &'stati
 /// This function modifies page tables and should only be called during
 /// early boot or when no threads are running.
 pub unsafe fn unmap_virtual(pml4: *mut u64, virt: u64, size: u64) -> Result<(), &'static str> {
-    // Simplified implementation
-    let _ = (pml4, virt, size);
+    if pml4.is_null() || !virt.is_multiple_of(PAGE_SIZE) {
+        return Err("unmap requires an aligned root and virtual address");
+    }
+    let mut offset = 0u64;
+    while offset < size {
+        let va = virt + offset;
+        let pml4e = pml4.add(pml4_index(va));
+        if *pml4e & PTE_PRESENT == 0 {
+            offset += PAGE_SIZE;
+            continue;
+        }
+        if *pml4e & PTE_HUGE != 0 {
+            *pml4e = 0;
+            offset += HUGE_PAGE_SIZE;
+            invlpg(va);
+            continue;
+        }
+        let pdpte_phys = *pml4e & PHYSICAL_ADDRESS_MASK;
+        let Some(pdpt) = table_virtual(pdpte_phys) else {
+            return Err("page directory pointer is outside the direct map");
+        };
+        let pdpte = pdpt.add(pdpt_index(va));
+        if *pdpte & PTE_PRESENT == 0 {
+            offset += PAGE_SIZE;
+            continue;
+        }
+        if *pdpte & PTE_HUGE != 0 {
+            *pdpte = 0;
+            offset += HUGE_PAGE_SIZE;
+            invlpg(va);
+            continue;
+        }
+        let pde_phys = *pdpte & PHYSICAL_ADDRESS_MASK;
+        let Some(pd) = table_virtual(pde_phys) else {
+            return Err("page directory is outside the direct map");
+        };
+        let pde = pd.add(pd_index(va));
+        if *pde & PTE_PRESENT == 0 {
+            offset += PAGE_SIZE;
+            continue;
+        }
+        if *pde & PTE_LARGE != 0 {
+            *pde = 0;
+            offset += LARGE_PAGE_SIZE;
+            invlpg(va);
+            continue;
+        }
+        let pt_phys = *pde & PHYSICAL_ADDRESS_MASK;
+        let Some(pt) = table_virtual(pt_phys) else {
+            return Err("page table is outside the direct map");
+        };
+        let pte = pt.add(pte_index(va));
+        *pte = 0;
+        offset += PAGE_SIZE;
+        invlpg(va);
+    }
     Ok(())
 }
 

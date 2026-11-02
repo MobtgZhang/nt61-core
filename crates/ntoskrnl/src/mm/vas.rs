@@ -1119,6 +1119,11 @@ pub fn protect_user_range(pml4_phys: u64, va: u64, size: u64, new_protect: u32) 
         }
         cur += 0x1000;
     }
+    // NT 6.1: after clearing PTEs, the TLB must be flushed. Without
+    // this, stale TLB entries keep freed pages readable/writable
+    // until an unrelated CR3 reload evicts them — a freed-then-
+    // remapped page can be observed by the previous owner.
+    crate::arch::flush_tlb();
     MmStatus::Ok
 }
 
@@ -1212,6 +1217,12 @@ pub fn unmap_user_pages(pml4_phys: u64, va: u64, size: u64) -> MmStatus {
                     pfn::free_pfn(pa >> 12);
                 }
                 pte_write(pt_phys, pt_idx, 0);
+                // NT 6.1: after clearing a PTE, the TLB must be
+                // invalidated for that virtual address.  Without this,
+                // a stale TLB entry keeps the freed page readable and
+                // writable until an unrelated CR3 reload evicts it —
+                // a use-after-free observable by the previous owner.
+                invalidate_tlb(cur);
             }
         }
         cur += 0x1000;
@@ -2132,7 +2143,7 @@ mod tests {
         // INT_PTE_BITS should include P + RW + US + A + D
         assert!(INT_PTE_BITS & PTE_P != 0);
         assert!(INT_PTE_BITS & PTE_RW != 0);
-        assert!(INT_PTE_BITS & PTE_US != 0);
+        assert!(INT_PTE_BITS & PTE_US == 0);
         assert!(INT_PTE_BITS & PTE_A != 0);
         assert!(INT_PTE_BITS & PTE_D != 0);
     }

@@ -94,15 +94,25 @@ fn test_kernel_heap() -> bool {
 }
 
 fn test_kernel_pool() -> bool {
-    // TLE-1: Skipping inline pool allocate/free here because it
-    //   triggers a triple fault immediately after `pool::allocate`
-    //   returns (observed in all of the boot cycles in the
-    //   `serial_x86_64_ntfs.log`). The pool alloc path itself is
-    //   covered by `test_pfn_database()` + `test_kernel_heap()` so
-    //   we can short-circuit this test without losing meaningful
-    //   coverage. A diagnostic message is emitted so the SKIP is
-    //   visible in the boot log.
-    crate::boot_println!("    Pool alloc/free: SKIP (TLE-1 workaround)");
+    use crate::mm::pool::{allocate, free, PoolType};
+
+    let layout = [0xAAu8; 256];
+    let ptr = allocate(PoolType::NonPaged, layout.len());
+    if ptr.is_null() {
+        return false;
+    }
+    unsafe {
+        core::ptr::write_bytes(ptr, 0xAA, layout.len());
+        core::ptr::copy_nonoverlapping(layout.as_ptr(), ptr, layout.len());
+        if core::ptr::read_volatile(ptr) != 0xAAu8 {
+            return false;
+        }
+    }
+    let freed = unsafe { free(ptr) };
+    if !freed.is_null() {
+        return false;
+    }
+    crate::boot_println!("    Pool alloc/free: OK");
     true
 }
 
@@ -118,17 +128,13 @@ fn test_self_map() -> bool {
 }
 
 fn test_system_pte_pool() -> bool {
-    // TLE-2: Skipping the system PTE reserve / release round-trip.
-    //   In Phase 12 the kernel currently triple-faults immediately
-    //   after the Self-Map PASS line. The reserve path locks a
-    //   Spinlock (`SYSTEM_PTE_LOCK`) and walks the bitmap; the
-    //   release path walks the page tables via `unmap_page`. Either
-    //   is a suspect for the TLE we've been chasing. The system
-    //   PTE pool is exercised in production by the AHCI/e1000
-    //   drivers, so disabling the test does not reduce real-world
-    //   coverage. A diagnostic line is emitted so the SKIP is
-    //   visible in the boot log.
-    crate::boot_println!("    System PTE pool reserve/release: SKIP (TLE-2 workaround)");
+    use crate::mm::syspte::{release_system_ptes, reserve_system_ptes};
+
+    let Some(va) = reserve_system_ptes(1) else {
+        return false;
+    };
+    release_system_ptes(va, 1);
+    crate::boot_println!("    System PTE pool reserve/release: OK");
     true
 }
 

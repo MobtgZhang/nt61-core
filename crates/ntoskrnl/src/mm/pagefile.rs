@@ -26,9 +26,12 @@ use crate::mm::pfn;
 use crate::mm::pte::pfn_to_phys;
 
 const MAX_PAGING_FILES: usize = 16;
-const PAGES_PER_FILE: u64 = 4096;
+// NT 6.1 default paging files are commonly 512 MiB. Keep the default
+// capacity aligned with DEFAULT_PAGEFILE_SIZE_MB instead of the legacy
+// 16 MiB bootstrap limit.
+const PAGES_PER_FILE: u64 = DEFAULT_PAGEFILE_SIZE_MB * 1024 * 1024 / 4096;
 const BITS_PER_WORD: usize = 64;
-const BITMAP_WORDS: usize = 64;
+const BITMAP_WORDS: usize = 2048;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PageFileHandle {
@@ -258,33 +261,62 @@ pub fn read_page(page_file_no: u32, offset: u32) -> Option<u64> {
     if page_file_no as usize >= MAX_PAGING_FILES {
         return None;
     }
-    let base_pfn = {
+    let (base_pfn, is_disk_backed, disk_start_sector, device_id) = {
         let state = PAGEFILE.lock();
         let pf = &state.files[page_file_no as usize];
         if !pf.enabled || (offset as u64) >= pf.page_count {
             return None;
         }
-        pf.base_pfn
+        (
+            pf.base_pfn,
+            pf.is_disk_backed,
+            pf.disk_meta.start_sector,
+            pf.disk_meta.device_id,
+        )
     };
     let dst_pfn = pfn::allocate_pfn()?;
     let dst_pa = pfn_to_phys(dst_pfn);
-    let src_pa = pfn_to_phys(base_pfn + offset as u64);
-    let src = src_pa as *const u64;
-    let dst = dst_pa as *mut u64;
-    unsafe {
-        for i in 0..512usize {
-            let v = core::ptr::read_volatile(src.add(i));
-            core::ptr::write_volatile(dst.add(i), v);
+    let dst = dst_pa as *mut u8;
+    if is_disk_backed {
+        // NT 6.1: a disk-backed paging file must read from the disk
+        // at `start_sector + offset * pages_per_sector`, not from
+        // physical memory. Without this, a fault-in from a real
+        // disk paging file reads physical page 0 — firmware/boot
+        // data — instead of the page's contents.
+        let page_buf = unsafe { core::slice::from_raw_parts_mut(dst, 4096) };
+        // disk_read takes a byte offset, not an LBA. Each page is
+        // 8 × 512 B sectors; start_sector is an LBA, so the byte
+        // offset is start_sector * 512 + offset * 4096.
+        let byte_offset = disk_start_sector * 512 + (offset as u64) * 4096;
+        let bytes_read = crate::drivers::storage::disk::disk_read(
+            device_id,
+            byte_offset,
+            4096,
+            page_buf,
+        );
+        if bytes_read < 4096 {
+            pfn::free_pfn(dst_pfn);
+            return None;
+        }
+    } else {
+        let src_pa = pfn_to_phys(base_pfn + offset as u64);
+        let src = src_pa as *const u64;
+        let dst_u64 = dst_pa as *mut u64;
+        unsafe {
+            for i in 0..512usize {
+                let v = core::ptr::read_volatile(src.add(i));
+                core::ptr::write_volatile(dst_u64.add(i), v);
+            }
         }
     }
     Some(dst_pfn)
 }
 
-pub fn write_modified_page(pfn_no: u64) {
+pub fn write_modified_page(pfn_no: u64) -> bool {
     let (pf_no, offset) = {
         let db = pfn::PFN_DB.lock();
         let Some(entry) = db.entry(pfn_no) else {
-            return;
+            return false;
         };
         unsafe {
             (
@@ -294,13 +326,13 @@ pub fn write_modified_page(pfn_no: u64) {
         }
     };
     if pf_no >= MAX_PAGING_FILES {
-        return;
+        return false;
     }
     let base_pfn = {
         let state = PAGEFILE.lock();
         let pf = &state.files[pf_no];
         if !pf.enabled || (offset as u64) >= pf.page_count {
-            return;
+            return false;
         }
         pf.base_pfn
     };
@@ -314,6 +346,7 @@ pub fn write_modified_page(pfn_no: u64) {
             core::ptr::write_volatile(dst.add(i), v);
         }
     }
+    true
 }
 
 pub fn reserve_slot() -> Option<(u32, u32)> {
@@ -367,11 +400,17 @@ pub fn grow_pagefile(page_file_no: u32, new_size: u64) -> bool {
         return false;
     }
     let _old_size = state.files[page_file_no as usize].page_count;
+    // NT 6.1: the bitmap is fixed at BITMAP_WORDS entries. A grow
+    // request beyond that capacity is rejected, not silently
+    // truncated (which would index out of bounds and panic).
+    let new_bitmap_words = (new_size as usize).div_ceil(BITS_PER_WORD);
+    if new_bitmap_words > BITMAP_WORDS {
+        return false;
+    }
     state.files[page_file_no as usize].page_count = new_size;
     state.files[page_file_no as usize]
         .max_size
         .store(new_size, Ordering::SeqCst);
-    let new_bitmap_words = (new_size as usize).div_ceil(BITS_PER_WORD);
     let old_bitmap_words = state.files[page_file_no as usize].bitmap_words;
     for i in old_bitmap_words..new_bitmap_words.min(BITMAP_WORDS) {
         state.allocated[page_file_no as usize][i] = 0;

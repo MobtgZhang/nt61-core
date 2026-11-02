@@ -258,13 +258,36 @@ pub fn decommit(base: u64, size: u64) -> Result<(), NTSTATUS> {
 
 /// Query information about a VA range.
 pub fn query(base: u64) -> Option<MemoryRegion> {
+    let pte = unsafe { crate::mm::vas::pte_address_of(base).read_volatile() };
+    if !pte.is_hardware() {
+        return Some(MemoryRegion {
+            base_address: base,
+            region_size: PAGE_SIZE,
+            allocation_base: base,
+            allocation_protect: 0,
+            state: state::MEM_FREE,
+            protect: 0,
+            type_: 0,
+        });
+    }
+
+    let mut protect = MemFlags::READ;
+    if pte.writable() {
+        protect = protect | MemFlags::WRITE;
+    }
+    if !pte.no_execute() {
+        protect = protect | MemFlags::EXECUTE;
+    }
+    if pte.user() {
+        protect = protect | MemFlags::USER;
+    }
     Some(MemoryRegion {
         base_address: base,
         region_size: PAGE_SIZE,
         allocation_base: base,
-        allocation_protect: (MemFlags::READ | MemFlags::WRITE).as_u32(),
+        allocation_protect: protect.as_u32(),
         state: state::MEM_COMMIT,
-        protect: (MemFlags::READ | MemFlags::WRITE).as_u32(),
+        protect: protect.as_u32(),
         type_: mem_type::MEM_PRIVATE,
     })
 }

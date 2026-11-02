@@ -173,6 +173,21 @@ pub fn perform_cow(va: u64) -> Result<(), u64> {
     let mut db = pfn::PFN_DB.lock();
     let old_pfn = pfn::phys_to_pfn(old_pa);
 
+    // NT 6.1: prototype PTEs are the canonical mapping for section
+    // pages. If this fault came through a prototype mapping, update
+    // it as well so future demand faults see the private copy.
+    if let Some(old_entry) = db.entry(old_pfn) {
+        unsafe {
+            let proto_pte = (*old_entry).u3.proto_pte_address;
+            if !proto_pte.is_null() {
+                let proto_pte = &mut *proto_pte;
+                proto_pte.set_hardware(new_pa, new_pte_bits & !0x200);
+                proto_pte.clear_copy_on_write();
+                proto_pte.set_dirty(true);
+            }
+        }
+    }
+
     // Decrement old page's share count
     if let Some(entry) = db.entry(old_pfn) {
         unsafe {

@@ -522,7 +522,13 @@ unsafe impl GlobalAlloc for KernelHeap {
                 || block_size < core::mem::size_of::<FreeBlock>()
                 || !self.is_in_heap_range(block_ptr as *mut u8, block_size)
             {
-                return;
+                crate::ke::bugcheck::bugcheck_with(
+                    crate::ke::bugcheck::BugCheckCode::BadPoolCaller,
+                    ptr as u64,
+                    magic as u64,
+                    block_size as u64,
+                    layout.size() as u64,
+                );
             }
             let lock_ref = &*self.heap_lock.get();
             let _guard = lock_ref.lock();

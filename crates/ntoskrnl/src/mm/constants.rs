@@ -280,7 +280,11 @@ pub const PTE_SW2: u64 = 1 << 10;
 pub const PTE_NX: u64 = 1u64 << 63;
 
 /// Standard kernel-side intermediate PTE bits: P + RW + US + A + D.
-pub const INT_PTE_BITS: u64 = PTE_P | PTE_RW | PTE_US | PTE_A | PTE_D;
+// NT 6.1: intermediate page-table entries (PML4E, PDPTE, PDE) are
+// supervisor-only. The U bit is deliberately NOT set — giving Ring 3
+// access to intermediate tables weakens kernel-mode isolation. Only
+// leaf PTEs for user pages carry PTE_US.
+pub const INT_PTE_BITS: u64 = PTE_P | PTE_RW | PTE_A | PTE_D;
 
 /// Self-map PTE bits: P + RW + A + D.
 pub const SELF_MAP_BITS: u64 = PTE_P | PTE_RW | PTE_A | PTE_D;
