@@ -138,7 +138,7 @@ pub fn init() {
 }
 
 /// Calculate UDP checksum (with pseudo-header)
-fn calculate_checksum(src_ip: u32, dst_ip: u32, udp_data: &[u8]) -> u16 {
+pub(crate) fn calculate_checksum(src_ip: u32, dst_ip: u32, udp_data: &[u8]) -> u16 {
     let pseudo = [
         (src_ip >> 24) as u8,
         (src_ip >> 16) as u8,
@@ -317,11 +317,16 @@ pub fn udp_input(src_ip: u32, dst_ip: u32, data: &[u8]) -> bool {
         None => return false,
     };
 
-    let payload = if data.len() > UDP_HDR_SIZE {
-        &data[UDP_HDR_SIZE..]
-    } else {
-        &[]
-    };
+    // RFC 768: the UDP length field counts the header plus payload and
+    // must describe the bytes actually present. Reject short datagrams
+    // and ignore trailing bytes rather than delivering them as payload.
+    let datagram_len = header.length as usize;
+    if datagram_len < UDP_HDR_SIZE || datagram_len > data.len() {
+        let mut stats = UDP_STATS.lock();
+        stats.datagrams_dropped += 1;
+        return false;
+    }
+    let payload = &data[UDP_HDR_SIZE..datagram_len];
 
     // RFC 768: a datagram is verified against its checksum unless the
     // sender left it 0 (legal only over IPv4). The recomputation runs

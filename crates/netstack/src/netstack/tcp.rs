@@ -196,7 +196,14 @@ pub struct TcpControlBlock {
     /// Retransmission
     pub retransmit_count: u8,
     pub last_send_time: u64,
+    /// Wall-clock timestamp of the most recent state transition, used for
+    /// terminal-state cleanup.
+    pub last_state_change_time: u64,
     pub in_retransmit: bool,
+    /// Sequence number occupied by a queued FIN, if any. A FIN consumes
+    /// one sequence number just as the SYN does, so it cannot be lost or
+    /// acknowledged implicitly by the next data byte.
+    pub snd_fin_seq: Option<u32>,
     /// Owning listening socket id. Set when this TCB is created as
     /// a child of `socket::listen`; once the 3-way handshake
     /// completes, the child is enqueued onto the parent's accept
@@ -235,7 +242,9 @@ impl TcpControlBlock {
             recover: 0,
             retransmit_count: 0,
             last_send_time: pit::get_system_time_ms(),
+            last_state_change_time: pit::get_system_time_ms(),
             in_retransmit: false,
+            snd_fin_seq: None,
             listen_socket_id: 0,
         }
     }
@@ -411,6 +420,22 @@ fn seq_after_or_equal(a: u32, b: u32) -> bool {
     a == b || a.wrapping_sub(b) < 0x8000_0000
 }
 
+/// Return the byte offset into `payload` that begins at the receiver's
+/// `rcv_nxt`, or `None` when the segment is entirely old or beyond the
+/// receive window. TCP accepts the un-received tail of a partial duplicate,
+/// drops segments that carry no new bytes, and refuses future data.
+#[inline]
+fn in_order_payload_offset(seq: u32, payload_len: usize, rcv_nxt: u32) -> Option<usize> {
+    let segment_end = seq.wrapping_add(payload_len as u32);
+    if seq_after(rcv_nxt, segment_end) {
+        return None;
+    }
+    if seq_after(seq, rcv_nxt) {
+        return None;
+    }
+    Some(rcv_nxt.wrapping_sub(seq) as usize)
+}
+
 /// Global TCB table
 static TCP_CONNECTIONS: Spinlock<Vec<TcpControlBlock>> = Spinlock::new(Vec::new());
 
@@ -491,7 +516,7 @@ pub fn init() {
 }
 
 /// Calculate TCP checksum
-fn calculate_tcp_checksum(src_ip: u32, dst_ip: u32, tcp_data: &[u8]) -> u16 {
+pub(crate) fn calculate_tcp_checksum(src_ip: u32, dst_ip: u32, tcp_data: &[u8]) -> u16 {
     // Pseudo-header
     let pseudo = [
         (src_ip >> 24) as u8,
@@ -813,11 +838,21 @@ fn handle_tcp_segment(
         TcpState::Established => {
             // Process incoming data
             if payload_len > 0 {
-                tcb.rx_buf.extend_from_slice(payload);
-                tcb.rcv_nxt += payload_len as u32;
-                // Wake any server thread parked on socket readiness
-                // now that receive data has landed in the RX buffer.
-                crate::netstack::socket::signal_readiness();
+                let Some(offset) = in_order_payload_offset(header.seq, payload_len, tcb.rcv_nxt)
+                else {
+                    // Duplicate, old, or out-of-order data is discarded and
+                    // an ACK carrying the next expected byte is sent back.
+                    send_segment(tcb, tcp_flags::ACK, tcb.snd_nxt, tcb.rcv_nxt, None);
+                    return false;
+                };
+                if offset < payload_len {
+                    let new_payload = &payload[offset..];
+                    tcb.rx_buf.extend_from_slice(new_payload);
+                    tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(new_payload.len() as u32);
+                    // Wake any server thread parked on socket readiness
+                    // now that receive data has landed in the RX buffer.
+                    crate::netstack::socket::signal_readiness();
+                }
             }
 
             // handle ACK
@@ -837,7 +872,9 @@ fn handle_tcp_segment(
             }
 
             // handle FIN
-            if flags & tcp_flags::FIN != 0 {
+            if flags & tcp_flags::FIN != 0
+                && header.seq.wrapping_add(payload_len as u32) == tcb.rcv_nxt
+            {
                 tcb.rcv_nxt += 1;
                 tcb.state = TcpState::CloseWait;
                 send_segment(tcb, tcp_flags::ACK, tcb.snd_nxt, tcb.rcv_nxt, None);
@@ -848,6 +885,7 @@ fn handle_tcp_segment(
                 tcb.rcv_nxt += 1;
                 if flags & tcp_flags::ACK != 0 {
                     tcb.snd_una = header.ack;
+                    tcb.last_state_change_time = pit::get_system_time_ms();
                     tcb.state = TcpState::TimeWait;
                 } else {
                     tcb.state = TcpState::Closing;
@@ -861,6 +899,7 @@ fn handle_tcp_segment(
         TcpState::FinWait2 => {
             if flags & tcp_flags::FIN != 0 {
                 tcb.rcv_nxt += 1;
+                tcb.last_state_change_time = pit::get_system_time_ms();
                 tcb.state = TcpState::TimeWait;
                 send_segment(tcb, tcp_flags::ACK, tcb.snd_nxt, tcb.rcv_nxt, None);
             }
@@ -871,6 +910,7 @@ fn handle_tcp_segment(
         TcpState::Closing => {
             if flags & tcp_flags::ACK != 0 && header.ack == tcb.snd_nxt {
                 tcb.snd_una = header.ack;
+                tcb.last_state_change_time = pit::get_system_time_ms();
                 tcb.state = TcpState::TimeWait;
             }
         }
@@ -1030,6 +1070,7 @@ pub fn close(socket_id: u32) -> bool {
         match tcb.state {
             TcpState::Established => {
                 tcb.state = TcpState::FinWait1;
+                tcb.snd_fin_seq = Some(tcb.snd_nxt);
                 send_segment(
                     tcb,
                     tcp_flags::FIN | tcp_flags::ACK,
@@ -1037,9 +1078,12 @@ pub fn close(socket_id: u32) -> bool {
                     tcb.rcv_nxt,
                     None,
                 );
+                tcb.snd_nxt = tcb.snd_nxt.wrapping_add(1);
             }
             TcpState::CloseWait => {
+                tcb.last_state_change_time = pit::get_system_time_ms();
                 tcb.state = TcpState::LastAck;
+                tcb.snd_fin_seq = Some(tcb.snd_nxt);
                 send_segment(
                     tcb,
                     tcp_flags::FIN | tcp_flags::ACK,
@@ -1047,9 +1091,12 @@ pub fn close(socket_id: u32) -> bool {
                     tcb.rcv_nxt,
                     None,
                 );
+                tcb.snd_nxt = tcb.snd_nxt.wrapping_add(1);
             }
             _ => {
-                tcb.state = TcpState::Closed;
+                if tcb.state == TcpState::SynSent {
+                    tcb.state = TcpState::Closed;
+                }
             }
         }
     }
@@ -1076,22 +1123,21 @@ pub fn send(socket_id: u32, data: &[u8]) -> Option<usize> {
     // on timeout (NET-3 fix).
     tcb.tx_buf.extend_from_slice(data);
 
-    // Snapshot the fields that send_segment needs, then send.
+    // Transmit only the newly queued data. `tx_buf` retains all
+    // unacknowledged bytes; transmitting it again here would duplicate the
+    // bytes preceding `snd_nxt` after a partial ACK.
     // The TCP_CONNECTIONS lock is held for the entire critical
     // section — send_segment does not take any lock internally,
     // so we do not need to drop and reacquire (NET-2 fix).
     let snd_nxt = tcb.snd_nxt;
     let rcv_nxt = tcb.rcv_nxt;
-
-    // Make a contiguous copy of the buffered data so we can pass a
-    // &[u8] slice to send_segment while still holding the &mut tcb.
-    let tx_snapshot: alloc::vec::Vec<u8> = tcb.tx_buf.to_vec();
+    let new_data: alloc::vec::Vec<u8> = data.to_vec();
     send_segment(
         tcb,
         tcp_flags::PSH | tcp_flags::ACK,
         snd_nxt,
         rcv_nxt,
-        Some(&tx_snapshot),
+        Some(&new_data),
     );
 
     // Advance snd_nxt but retain the payload until it is acknowledged;
@@ -1103,33 +1149,26 @@ pub fn send(socket_id: u32, data: &[u8]) -> Option<usize> {
 
 /// Receive data from a connection
 pub fn receive(socket_id: u32, buffer: &mut [u8]) -> Option<usize> {
-    let idx = {
-        let connections = TCP_CONNECTIONS.lock();
-        connections
-            .iter()
-            .position(|tcb| tcb.socket_id == socket_id)?
-    };
+    let mut connections = TCP_CONNECTIONS.lock();
+    let tcb = connections
+        .iter_mut()
+        .find(|tcb| tcb.socket_id == socket_id)?;
 
-    {
-        let mut connections = TCP_CONNECTIONS.lock();
-        let tcb = &mut connections[idx];
-
-        if tcb.state != TcpState::Established && tcb.state != TcpState::CloseWait {
-            return None;
-        }
-
-        if tcb.rx_buf.is_empty() {
-            return Some(0);
-        }
-
-        let copy_len = buffer.len().min(tcb.rx_buf.len());
-        buffer[..copy_len].copy_from_slice(&tcb.rx_buf[..copy_len]);
-
-        // Remove received data from buffer
-        tcb.rx_buf.drain(..copy_len);
-
-        Some(copy_len)
+    if tcb.state != TcpState::Established && tcb.state != TcpState::CloseWait {
+        return None;
     }
+
+    if tcb.rx_buf.is_empty() {
+        return Some(0);
+    }
+
+    let copy_len = buffer.len().min(tcb.rx_buf.len());
+    buffer[..copy_len].copy_from_slice(&tcb.rx_buf[..copy_len]);
+
+    // Remove received data from buffer
+    tcb.rx_buf.drain(..copy_len);
+
+    Some(copy_len)
 }
 
 /// Get TCP statistics
@@ -1144,11 +1183,33 @@ pub fn get_stats() -> TcpStats {
 /// This should be called periodically by the network stack
 pub fn check_retransmit_timers() {
     use crate::hal::common::pit;
+    const TCP_MSL_MS: u64 = 30_000;
     let now = pit::get_system_time_ms();
 
     let mut connections = TCP_CONNECTIONS.lock();
 
     for i in 0..connections.len() {
+        // Retire terminal states. TIME_WAIT is 2*MSL; LAST_ACK is
+        // removed after a conservative ACK retransmission interval.
+        let remove_socket_id = {
+            let tcb = &connections[i];
+            if tcb.state == TcpState::TimeWait
+                && now.saturating_sub(tcb.last_state_change_time) >= 2 * TCP_MSL_MS
+            {
+                Some(tcb.socket_id)
+            } else if tcb.state == TcpState::LastAck
+                && now.saturating_sub(tcb.last_state_change_time) >= u64::from(tcb.rto)
+            {
+                Some(tcb.socket_id)
+            } else {
+                None
+            }
+        };
+        if let Some(socket_id) = remove_socket_id {
+            connections.retain(|tcb| tcb.socket_id != socket_id);
+            continue;
+        }
+
         // Check if this connection needs retransmission
         let needs_retransmit = {
             let tcb = &connections[i];

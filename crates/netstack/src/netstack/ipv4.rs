@@ -310,6 +310,12 @@ fn dispatch_datagram(header: &Ipv4Header, payload: &[u8], _nic_type: NicType, _n
                 translated_payload[2..4].copy_from_slice(&icmp_checksum.to_be_bytes());
             } else if header.protocol == 6 || header.protocol == 17 {
                 rewrite_transport_destination_port(&mut translated_payload, internal_port);
+                rewrite_transport_checksum(
+                    &mut translated_payload,
+                    header.src_ip,
+                    internal_ip,
+                    header.protocol,
+                );
             }
             payload = &translated_payload;
         }
@@ -567,6 +573,29 @@ fn rewrite_transport_destination_port(payload: &mut [u8], port: u16) -> bool {
     true
 }
 
+/// Recompute a TCP/UDP checksum after address or port translation.
+fn rewrite_transport_checksum(
+    payload: &mut [u8],
+    src_ip: u32,
+    dst_ip: u32,
+    protocol: u8,
+) -> bool {
+    if protocol == 6 {
+        if payload.len() < 20 {
+            return false;
+        }
+        let checksum =
+            crate::netstack::tcp::calculate_tcp_checksum(src_ip, dst_ip, payload);
+        payload[16..18].copy_from_slice(&checksum.to_be_bytes());
+        return true;
+    }
+    if protocol == 17 && payload.len() >= 8 && payload[6..8] != [0, 0] {
+        let checksum = crate::netstack::udp::calculate_checksum(src_ip, dst_ip, payload);
+        payload[6..8].copy_from_slice(&checksum.to_be_bytes());
+    }
+    true
+}
+
 /// Send an IPv4 packet
 pub fn send_ipv4(src_ip: u32, dst_ip: u32, protocol: u8, payload: &[u8]) -> bool {
     if crate::netstack::ipsec::check_outbound_policy(src_ip, dst_ip, 0, 0, protocol)
@@ -625,6 +654,7 @@ pub fn send_ipv4(src_ip: u32, dst_ip: u32, protocol: u8, payload: &[u8]) -> bool
             if !rewrite_transport_source_port(&mut payload, nat_port) {
                 return false;
             }
+            rewrite_transport_checksum(&mut payload, public_ip, dst_ip, protocol);
             translated_payload = Some(payload);
             src_ip = nat_ip;
         }

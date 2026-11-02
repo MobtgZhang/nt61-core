@@ -100,7 +100,7 @@ fn encode_label(out: &mut Vec<u8>, label: &str) {
 
 /// Build a DNS query for `name` (e.g. "github.com") and `qtype`
 /// (1 = A, 28 = AAAA). Returns the on-wire datagram.
-fn build_query(name: &str, qtype: u16) -> Vec<u8> {
+fn build_query(name: &str, qtype: u16) -> (Vec<u8>, u16) {
     let mut out = Vec::with_capacity(64);
     let id = (QUERY_ID.fetch_add(1, Ordering::Relaxed) as u16).wrapping_add(1);
     out.extend_from_slice(&id.to_be_bytes());
@@ -117,7 +117,7 @@ fn build_query(name: &str, qtype: u16) -> Vec<u8> {
     out.push(0); // root label
     out.extend_from_slice(&qtype.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes()); // IN class
-    out
+    (out, id)
 }
 
 /// Skip one DNS name in a wire-format response, returning the new
@@ -154,8 +154,12 @@ fn skip_name(buf: &[u8], mut off: usize) -> Option<usize> {
 /// Parse a DNS response packet looking for an A record matching
 /// `qtype` and `qname`. Returns the first matching IPv4 address
 /// in network byte order, or None.
-fn parse_response(buf: &[u8], qtype: u16) -> Option<u32> {
+fn parse_response(buf: &[u8], qtype: u16, expected_id: u16) -> Option<u32> {
     if buf.len() < 12 {
+        return None;
+    }
+    let id = u16::from_be_bytes([buf[0], buf[1]]);
+    if id != expected_id || buf[2] & 0x80 == 0 {
         return None;
     }
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
@@ -234,7 +238,7 @@ pub fn resolve_af(name: &str, family: u16) -> Result<u32, DnsError> {
     let local_ip = ipif::get_outbound_ip().unwrap_or(0);
     let sock = udp::create_socket(local_port, local_ip).ok_or(DnsError::Other)?;
     let qtype: u16 = 1; // A
-    let datagram = build_query(name, qtype);
+    let (datagram, query_id) = build_query(name, qtype);
 
     // The DNS server is often on-link but not the gateway, so give
     // ARP one second to resolve before dropping the query.
@@ -268,7 +272,7 @@ pub fn resolve_af(name: &str, family: u16) -> Result<u32, DnsError> {
         }
         if let Some((src_ip, src_port, n)) = udp::receive(sock, &mut buf) {
             if src_ip == server && src_port == server_port && n >= 12 {
-                if let Some(ip) = parse_response(&buf[..n], qtype) {
+                if let Some(ip) = parse_response(&buf[..n], qtype, query_id) {
                     udp::close_socket(sock);
                     cache_insert(name, family, ip, 60_000);
                     return Ok(ip);

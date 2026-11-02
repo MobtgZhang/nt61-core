@@ -102,6 +102,9 @@ static ARP_CLOCK: AtomicU64 = AtomicU64::new(0);
 /// ARP cache timeout (in seconds)
 const ARP_CACHE_TIMEOUT: u64 = 300;
 
+/// Hard bound on dynamically learned cache entries.
+const ARP_CACHE_MAX: usize = 128;
+
 /// Initialize the ARP module
 pub fn init() {
     // Clear ARP cache
@@ -128,7 +131,17 @@ pub fn cache_add(ip: u32, mac: &[u8; 6]) {
         return;
     }
 
-    // Add new entry
+    // Add new entry, evicting the oldest dynamic entry if the cache is
+    // saturated. Static entries are never discarded by dynamic traffic.
+    if cache.len() >= ARP_CACHE_MAX {
+        if let Some(pos) = cache
+            .iter()
+            .position(|e| !e.static_entry)
+            .or_else(|| cache.iter().position(|e| e.static_entry))
+        {
+            cache.remove(pos);
+        }
+    }
     cache.push(ArpCacheEntry {
         ip,
         mac: *mac,

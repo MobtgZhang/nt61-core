@@ -443,8 +443,9 @@ pub fn ipv6_input(data: &[u8]) {
 
     drop(stats);
 
-    // handle extension headers (simplified - just skip for now)
-    let mut offset = IPV6_HEADER_SIZE;
+    // Handle extension headers. Offsets here are relative to `payload`
+    // (which starts immediately after the fixed IPv6 header).
+    let mut offset = 0usize;
     let mut next_header = header.next_header;
 
     while next_header == ExtensionHeaderType::HopByHopOptions as u8
@@ -472,7 +473,7 @@ pub fn ipv6_input(data: &[u8]) {
     // Process based on next header
     match next_header.into() {
         NextHeader::Icmpv6 => {
-            icmpv6_input(&header, offset, payload);
+            icmpv6_input(&header, IPV6_HEADER_SIZE + offset, payload);
         }
         NextHeader::Tcp => {
             // Call TCP handler (would need to be wired up)
