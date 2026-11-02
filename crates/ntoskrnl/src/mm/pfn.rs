@@ -330,14 +330,12 @@ impl PfnDatabase {
         base_pfn: PfnNumber,
         pfn_count: PfnNumber,
     ) {
+        // The free/standby lists use `blink == 0` as the "no previous
+        // entry" sentinel. PFN 0 is a real frame number, so if it
+        // were in the database the sentinel would be ambiguous.
+        // Clamp the lowest managed PFN to 1 so the sentinel is safe.
+        let base_pfn = if base_pfn == 0 { 1 } else { base_pfn };
         let bytes_needed = (pfn_count as usize) * core::mem::size_of::<MMPFN>();
-        crate::hal::serial::write_string_always("[mm] PFNDB bytes_needed=");
-        crate::mm::write_decimal_u64(bytes_needed as u64);
-        crate::hal::serial::write_string_always(" storage=");
-        crate::mm::write_decimal_u64(storage_bytes as u64);
-        crate::hal::serial::write_string_always(" ptr=0x");
-        crate::hal::serial::write_hex_u64_always(storage as u64);
-        crate::hal::serial::write_string_always("\r\n");
         // If storage is smaller than what the full pfn_count would
         // need, truncate pfn_count to whatever storage can hold.
         // This is the "memory-map lies, buddy is tight" fallback
@@ -349,37 +347,18 @@ impl PfnDatabase {
             pfn_count as usize
         };
         let usable_bytes = usable_pfns * core::mem::size_of::<MMPFN>();
-        crate::hal::serial::write_string_always("[mm] PFNDB usable_pfns=");
-        crate::mm::write_decimal_u64(usable_pfns as u64);
-        crate::hal::serial::write_string_always(" usable_bytes=");
-        crate::mm::write_decimal_u64(usable_bytes as u64);
-        crate::hal::serial::write_string_always("\r\n");
         // Zero the storage so the list state is consistent.
         unsafe {
             for zero_base in (0..usable_bytes).step_by(32 * 1024) {
                 let zero_end = core::cmp::min(zero_base + 32 * 1024, usable_bytes);
                 ptr::write_bytes(storage.add(zero_base), 0, zero_end - zero_base);
-                crate::hal::serial::write_string_always("[mm] PFNDB zero ");
-                crate::mm::write_decimal_u64(zero_end as u64);
-                crate::hal::serial::write_string_always("/");
-                crate::mm::write_decimal_u64(usable_bytes as u64);
-                crate::hal::serial::write_string_always("\r\n");
             }
         }
-        crate::hal::serial::write_string_always("[mm] PFNDB zeroed\r\n");
         self.pfn_array = storage as *mut MMPFN;
         self.pfn_count = usable_pfns as u64;
         self.lowest_pfn = base_pfn;
         self.highest_pfn = base_pfn.saturating_add(usable_pfns as u64);
         self.initialized = true;
-        // Inline verification — read back immediately.
-        crate::hal::serial::write_string_always("[mm] init verify: self=0x");
-        crate::hal::serial::write_hex_u64_always(self as *const PfnDatabase as u64);
-        crate::hal::serial::write_string_always(" lowest=");
-        crate::mm::write_decimal_u64(self.lowest_pfn);
-        crate::hal::serial::write_string_always(" count=");
-        crate::mm::write_decimal_u64(self.pfn_count);
-        crate::hal::serial::write_string_always("\r\n");
     }
 
     /// Convert a PFN to the address of its database entry.
@@ -425,6 +404,24 @@ impl PfnDatabase {
 
     // -- List operations ------------------------------------------------
 
+    /// Resolve a PFN number to its database entry, bugchecking
+    /// PFN_LIST_CORRUPT (0x4E) if the PFN is out of range. NT never
+    /// silently recovers from a corrupt free-list walk.
+    fn entry_or_bugcheck(&mut self, pfn: PfnNumber) -> *mut MMPFN {
+        match self.entry(pfn) {
+            Some(e) => e,
+            None => {
+                crate::ke::bugcheck::bugcheck_with(
+                    crate::ke::bugcheck::BugCheckCode::PfnListCorrupt,
+                    2,
+                    pfn,
+                    0,
+                    0,
+                );
+            }
+        }
+    }
+
     fn list_index_for(state: MMPFNSTATE, _priority: u8) -> usize {
         match state {
             MMPFNSTATE::Free => PFNL_FREE,
@@ -462,7 +459,7 @@ impl PfnDatabase {
         (*entry).u1.flink = head;
         (*entry).u1.blink = 0;
         if head != 0 {
-            let old = self.entry(head).expect("pfn in range");
+            let old = self.entry_or_bugcheck(head);
             (*old).u1.blink = pfn;
         }
         self.lists[list_idx].head = pfn;
@@ -487,19 +484,45 @@ impl PfnDatabase {
     /// # Safety
     ///
     /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-    pub unsafe fn unlink_entry(&mut self, entry: *mut MMPFN, _pfn: PfnNumber) {
+    pub unsafe fn unlink_entry(&mut self, entry: *mut MMPFN, pfn: PfnNumber) {
         let state = (*entry).state();
         let list_idx = Self::list_index_for(state, (*entry).standby_priority());
         let flink = (*entry).u1.flink;
         let blink = (*entry).u1.blink;
+        // NT bugchecks rather than unlinking an entry that is not
+        // provably owned by the list implied by its PFN state.
+        if pfn < self.lowest_pfn
+            || pfn >= self.highest_pfn
+            || self.lists[list_idx].head == 0
+            || self.lists[list_idx].count == 0
+            || (blink == 0 && self.lists[list_idx].head != pfn)
+            || (blink != 0
+                && {
+                    let prev = self.entry_or_bugcheck(blink);
+                    (*prev).u1.flink != pfn
+                })
+            || (flink != 0
+                && {
+                    let next = self.entry_or_bugcheck(flink);
+                    (*next).u1.blink != pfn
+                })
+        {
+            crate::ke::bugcheck::bugcheck_with(
+                crate::ke::bugcheck::BugCheckCode::PfnListCorrupt,
+                3,
+                pfn,
+                self.lists[list_idx].head,
+                blink,
+            );
+        }
         if blink != 0 {
-            let prev = self.entry(blink).expect("pfn in range");
+            let prev = self.entry_or_bugcheck(blink);
             (*prev).u1.flink = flink;
         } else {
             self.lists[list_idx].head = flink;
         }
         if flink != 0 {
-            let next = self.entry(flink).expect("pfn in range");
+            let next = self.entry_or_bugcheck(flink);
             (*next).u1.blink = blink;
         }
         self.lists[list_idx].count = self.lists[list_idx].count.saturating_sub(1);
@@ -534,7 +557,7 @@ impl PfnDatabase {
             return None;
         }
         let pfn = self.lists[PFNL_FREE].head;
-        let entry = self.entry(pfn).expect("pfn in range");
+        let entry = self.entry_or_bugcheck(pfn);
         unsafe {
             self.unlink_entry(entry, pfn);
             (*entry).set_state(MMPFNSTATE::Active);
@@ -548,7 +571,7 @@ impl PfnDatabase {
             return None;
         }
         let pfn = self.lists[PFNL_ZEROED].head;
-        let entry = self.entry(pfn).expect("pfn in range");
+        let entry = self.entry_or_bugcheck(pfn);
         unsafe {
             self.unlink_entry(entry, pfn);
             (*entry).set_state(MMPFNSTATE::Active);
@@ -562,7 +585,7 @@ impl PfnDatabase {
             return None;
         }
         let pfn = self.lists[PFNL_MODIFIED].head;
-        let entry = self.entry(pfn).expect("pfn in range");
+        let entry = self.entry_or_bugcheck(pfn);
         unsafe {
             self.unlink_entry(entry, pfn);
             (*entry).set_state(MMPFNSTATE::Active);
@@ -576,7 +599,7 @@ impl PfnDatabase {
             return None;
         }
         let pfn = self.lists[PFNL_MODIFIED_NW].head;
-        let entry = self.entry(pfn).expect("pfn in range");
+        let entry = self.entry_or_bugcheck(pfn);
         unsafe {
             self.unlink_entry(entry, pfn);
             (*entry).set_state(MMPFNSTATE::Active);
@@ -590,7 +613,7 @@ impl PfnDatabase {
         for i in (PFNL_STANDBY0..=PFNL_STANDBY7).rev() {
             if self.lists[i].head != 0 {
                 let pfn = self.lists[i].head;
-                let entry = self.entry(pfn).expect("pfn in range");
+                let entry = self.entry_or_bugcheck(pfn);
                 unsafe {
                     self.unlink_entry(entry, pfn);
                     (*entry).set_state(MMPFNSTATE::Active);
@@ -610,12 +633,21 @@ impl PfnDatabase {
     ///
     /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
     /// Iterator over a list starting at `head`.
-    pub unsafe fn iter_list(&self, head: PfnNumber, mut cb: impl FnMut(PfnNumber)) {
+    pub unsafe fn iter_list(&mut self, head: PfnNumber, mut cb: impl FnMut(PfnNumber)) {
         let mut current = head;
         let mut steps = 0u64;
         while current != 0 && steps < self.pfn_count {
             cb(current);
-            let entry = self.entry(current).expect("pfn in range");
+            let entry = match self.entry(current) {
+                Some(entry) => entry,
+                None => crate::ke::bugcheck::bugcheck_with(
+                    crate::ke::bugcheck::BugCheckCode::PfnListCorrupt,
+                    2,
+                    current,
+                    0,
+                    0,
+                ),
+            };
             current = (*entry).u1.flink;
             steps += 1;
         }
@@ -852,6 +884,10 @@ static mut PFN_BASE: PfnNumber = 0;
 /// range of physical memory. The size scales from 2 GiB
 /// (`~2 MiB` of metadata) to 192 GiB (`~384 MiB` of metadata).
 pub fn init(base_pfn: PfnNumber, pfn_count: PfnNumber) {
+    // The free/standby lists use `blink == 0` as the "no previous
+    // entry" sentinel. Clamp `base_pfn` to 1 so the sentinel is
+    // never ambiguous when PFN 0 would otherwise be in the database.
+    let base_pfn = if base_pfn == 0 { 1 } else { base_pfn };
     let bytes_needed = (pfn_count as usize) * core::mem::size_of::<MMPFN>();
     unsafe {
         PFN_COUNT = pfn_count;
@@ -910,84 +946,16 @@ pub fn init(base_pfn: PfnNumber, pfn_count: PfnNumber) {
         }
         crate::hal::serial::write_string_always("[mm] pfn::init: before db init\r\n");
         let mut db = PFN_DB.lock();
-        crate::hal::serial::write_string_always("[mm] db_ptr=0x");
-        crate::hal::serial::write_hex_u64_always(&mut *db as *mut PfnDatabase as u64);
-        crate::hal::serial::write_string_always(" pfn_db_static=0x");
-        crate::hal::serial::write_hex_u64_always(core::ptr::addr_of!(PFN_DB) as u64);
-        crate::hal::serial::write_string_always("\r\n");
-        // WORKAROUND: LoongArch64 `db.init()` via DerefMut passes self=0.
-        // Write the fields directly through a raw pointer to bypass the
-        // method-call overhead and any argument-passing issue.
-        let db_raw = &mut *db as *mut PfnDatabase;
-        crate::hal::serial::write_string_always("[mm] raw_init: db_raw=0x");
-        crate::hal::serial::write_hex_u64_always(db_raw as u64);
-        crate::hal::serial::write_string_always("\r\n");
         let usable_pfns = {
             let bytes_needed = (pfn_count as usize) * core::mem::size_of::<MMPFN>();
-            crate::hal::serial::write_string_always("[mm] raw_init: bytes_needed=");
-            crate::mm::write_decimal_u64(bytes_needed as u64);
-            crate::hal::serial::write_string_always(" storage_cap=");
-            crate::mm::write_decimal_u64(PFN_STORAGE_CAPACITY as u64);
-            crate::hal::serial::write_string_always(" pfn_count=");
-            crate::mm::write_decimal_u64(pfn_count);
-            crate::hal::serial::write_string_always("\r\n");
             if bytes_needed > PFN_STORAGE_CAPACITY {
                 PFN_STORAGE_CAPACITY / core::mem::size_of::<MMPFN>()
             } else {
                 pfn_count as usize
             }
         };
-        crate::hal::serial::write_string_always("[mm] raw_init: usable_pfns=");
-        crate::mm::write_decimal_u64(usable_pfns as u64);
-        crate::hal::serial::write_string_always(" storage_ptr=0x");
-        crate::hal::serial::write_hex_u64_always(PFN_STORAGE_PTR as u64);
-        crate::hal::serial::write_string_always("\r\n");
-        let storage_local = PFN_STORAGE_PTR;
-        crate::hal::serial::write_string_always("[mm] read_test: byte0=0x");
-        crate::hal::serial::write_hex_u64_always(*storage_local as u64);
-        crate::hal::serial::write_string_always("\r\n");
-        crate::hal::serial::write_string_always("[mm] write_test...\r\n");
-        *storage_local = 0;
-        crate::hal::serial::write_string_always("[mm] write_test ok\r\n");
-        // Zero the PFN storage (the part db.init() would have done).
-        let usable_bytes = usable_pfns * core::mem::size_of::<MMPFN>();
-        let mut zero_base: usize = 0;
-        while zero_base < usable_bytes {
-            storage_local.add(zero_base).write_volatile(0);
-            zero_base += 1;
-            if zero_base.is_multiple_of(64 * 1024) {
-                crate::hal::serial::write_string_always("[mm] zero@");
-                crate::mm::write_decimal_u64(zero_base as u64);
-                crate::hal::serial::write_string_always("\r\n");
-            }
-        }
-        crate::hal::serial::write_string_always("[mm] PFNDB zeroed\r\n");
-        (*db_raw).pfn_array = PFN_STORAGE_PTR as *mut MMPFN;
-        (*db_raw).pfn_count = usable_pfns as u64;
-        (*db_raw).lowest_pfn = base_pfn;
-        (*db_raw).highest_pfn = base_pfn.saturating_add(usable_pfns as u64);
-        (*db_raw).initialized = true;
-        crate::hal::serial::write_string_always("[mm] raw_init done\r\n");
-        crate::hal::serial::write_string_always("[mm] pfn::init: db init done\r\n");
-        // Diagnostic: verify the PfnDatabase fields were written.
-        crate::hal::serial::write_string_always("[mm] PFNDB init check: lowest=");
-        crate::mm::write_decimal_u64(db.lowest_pfn);
-        crate::hal::serial::write_string_always(" highest=");
-        crate::mm::write_decimal_u64(db.highest_pfn);
-        crate::hal::serial::write_string_always(" count=");
-        crate::mm::write_decimal_u64(db.pfn_count);
-        crate::hal::serial::write_string_always(" init=");
-        crate::mm::write_decimal_u64(db.initialized as u64);
-        crate::hal::serial::write_string_always(" pfn_array=0x");
-        crate::hal::serial::write_hex_u64_always(db.pfn_array as u64);
-        crate::hal::serial::write_string_always("\r\n");
+        db.init(PFN_STORAGE_PTR, PFN_STORAGE_USED, base_pfn, usable_pfns as u64);
         db.seed_free(base_pfn, usable_pfns as u64);
-        crate::hal::serial::write_string_always("[mm] pfn::init: seed done\r\n");
-        crate::hal::serial::write_string_always("[mm] PFN_COUNT=");
-        crate::mm::write_decimal_u64(pfn_count);
-        crate::hal::serial::write_string_always(" FREE_AFTER_SEED=");
-        crate::mm::write_decimal_u64(db.free_count());
-        crate::hal::serial::write_string_always("\r\n");
     }
 
     // The heap was allocated from the buddy before this PFN database
@@ -1021,52 +989,20 @@ pub fn allocate_pfn() -> Option<PfnNumber> {
         db.allocate_pfn(pfn);
         return Some(pfn);
     }
-    // Self-heal: the free list head is 0 but the count claims there
-    // are entries. Walk the database to find Free entries and rebuild
-    // the list.
-    let mut free_count = 0u64;
-    for pfn in db.lowest_pfn..db.highest_pfn {
-        if let Some(entry) = db.entry(pfn) {
-            unsafe {
-                if (*entry).state() == MMPFNSTATE::Free {
-                    free_count += 1;
-                }
-            }
-        }
-    }
-    crate::hal::serial::write_string_always("[PFN] OUT_OF_PFNS: self-heal free_in_db=0x");
-    crate::hal::serial::write_hex_u64(free_count);
-    crate::hal::serial::write_string_always(" free_list_count=0x");
-    crate::hal::serial::write_hex_u64(db.lists[PFNL_FREE].count);
-    crate::hal::serial::write_string_always("\r\n");
-    if free_count > 0 {
-        // Try to repair the list by re-inserting all free entries.
-        // First reset the list.
-        db.lists[PFNL_FREE].head = 0;
-        db.lists[PFNL_FREE].count = 0;
-        for pfn in db.lowest_pfn..db.highest_pfn {
-            if let Some(entry) = db.entry(pfn) {
-                unsafe {
-                    if (*entry).state() == MMPFNSTATE::Free {
-                        (*entry).u1.flink = 0;
-                        (*entry).u1.blink = 0;
-                        db.insert_head_entry(entry, pfn);
-                    }
-                }
-            }
-        }
-        crate::hal::serial::write_string_always("[PFN] self-heal: rebuilt free list, head=0x");
-        crate::hal::serial::write_hex_u64(db.lists[PFNL_FREE].head);
-        crate::hal::serial::write_string_always(" count=0x");
-        crate::hal::serial::write_hex_u64(db.lists[PFNL_FREE].count);
-        crate::hal::serial::write_string_always("\r\n");
-        // Retry the allocation.
-        if let Some(pfn) = db.pop_free() {
-            db.allocate_pfn(pfn);
-            return Some(pfn);
-        }
-    }
-    None
+    // NT bugchecks PFN_LIST_CORRUPT (0x4E) when the free list is
+    // internally inconsistent. Self-healing masks corruption and can
+    // rebuild the list over live pages. Pass the free-list head and
+    // count as bugcheck parameters 1/2 for diagnosis.
+    let head = db.lists[PFNL_FREE].head;
+    let count = db.lists[PFNL_FREE].count;
+    drop(db);
+    crate::ke::bugcheck::bugcheck_with(
+        crate::ke::bugcheck::BugCheckCode::PfnListCorrupt,
+        1,
+        head as u64,
+        count,
+        0,
+    );
 }
 
 /// Allocate a contiguous range of `count` PFNs. Falls back to
@@ -1346,14 +1282,11 @@ pub fn get_standby_pages(max_count: usize) -> alloc::vec::Vec<PfnNumber> {
     // lowest_pfn internally, so the scan must start at db.lowest_pfn
     // (index 0 would look up a PFN below the database range and never
     // find any standby page).
-    let max_scan = db.total_count().min(1024) as usize;
-    let mut scanned = 0usize;
     for pfn in db.lowest_pfn..db.highest_pfn {
-        if scanned >= max_scan || result.len() >= max_count {
+        if result.len() >= max_count {
             break;
         }
         if let Some(entry_ptr) = db.entry(pfn) {
-            scanned += 1;
             let entry = unsafe { &*entry_ptr };
             let state = entry.state();
             if state.is_standby() {
@@ -1366,9 +1299,14 @@ pub fn get_standby_pages(max_count: usize) -> alloc::vec::Vec<PfnNumber> {
 
 /// Set a PFN as pagefile-backed.
 pub fn set_pagefile_backed(pfn: PfnNumber, pagefile_no: u32, offset: u32) {
-    if let Some(entry_ptr) = get_entry(pfn) {
+    let db = PFN_DB.lock();
+    if let Some(entry_ptr) = db.entry(pfn) {
         unsafe {
             let entry = &mut *entry_ptr;
+            let state = entry.state();
+            if state != MMPFNSTATE::Active && state != MMPFNSTATE::Modified {
+                return;
+            }
             entry.u3.flags.paging_file = pagefile_no;
             entry.u3.flags.paging_file_offset = offset;
         }

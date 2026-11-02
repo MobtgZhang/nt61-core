@@ -101,6 +101,12 @@ impl PoolType {
 /// Pool header flags.
 pub const BLOCK_FREED: u8 = 0x01;
 
+/// NT validates pool blocks through header ownership metadata. This
+/// signature is not a security boundary, but it is enough to reject the
+/// common `free(random_pointer)` case before reading `block_size` and
+/// corrupting adjacent pool lists.
+pub const POOL_HEADER_SIGNATURE: u32 = 0x4E545050;
+
 /// Pool header (aligned to 8 bytes on x86).
 #[repr(C)]
 #[repr(align(32))]
@@ -130,6 +136,16 @@ pub struct PoolHeader {
 impl PoolHeader {
     pub const HEADER_SIZE: usize = core::mem::size_of::<PoolHeader>();
     pub const BLOCK_VALID: u8 = 0x00;
+
+    pub fn has_signature(&self) -> bool {
+        u32::from(self.reserved[0]) | (u32::from(self.reserved[1]) << 16)
+            == POOL_HEADER_SIGNATURE
+    }
+
+    pub fn set_signature(&mut self) {
+        self.reserved[0] = (POOL_HEADER_SIGNATURE & 0xFFFF) as u16;
+        self.reserved[1] = ((POOL_HEADER_SIGNATURE >> 16) & 0xFFFF) as u16;
+    }
 
     /// Check if this block has been freed (double-free detection).
     pub fn is_freed(&self) -> bool {
@@ -277,6 +293,7 @@ fn alloc_raw(total_size: usize, pool_type: PoolType, tag: u32) -> *mut u8 {
             let header = ptr.sub(PoolHeader::HEADER_SIZE) as *mut PoolHeader;
             (*header).previous_size = 0;
             (*header).pool_tag = tag;
+            (*header).set_signature();
         }
         // The freelist path also needs to update the authoritative
         // PoolDescriptor stats (was previously leaking allocations
@@ -326,6 +343,7 @@ fn alloc_raw(total_size: usize, pool_type: PoolType, tag: u32) -> *mut u8 {
         (*header).pool_tag = tag;
         (*header).allocator_back_trace_index = 0;
         (*header).reserved = [0; 3];
+        (*header).set_signature();
     }
 
     let descriptor = if pool_type.is_paged() {
@@ -463,6 +481,22 @@ pub unsafe fn free(ptr: *mut u8) -> *mut u8 {
         let header_ptr = ptr.sub(PoolHeader::HEADER_SIZE);
         let header = &mut *(header_ptr as *mut PoolHeader);
 
+        if !header.has_signature() || header.block_size == 0 {
+            crate::kprintln!(
+                level: crate::rtl::logging::LogLevel::Error,
+                subsystem: "POOL",
+                "BAD POOL FREE at 0x{:x} (invalid header)",
+                ptr as u64
+            );
+            crate::ke::bugcheck::bugcheck_with(
+                crate::ke::bugcheck::BugCheckCode::BadPoolCaller,
+                0x1,
+                ptr as u64,
+                0,
+                0,
+            );
+        }
+
         // Check for double-free vulnerability
         if header.is_freed() {
             // NT treats a double free as pool corruption. Returning here would
@@ -560,6 +594,21 @@ pub unsafe fn free_with_tag(ptr: *mut u8, tag: u32) -> *mut u8 {
         unsafe {
             let header_ptr = ptr.sub(PoolHeader::HEADER_SIZE);
             let header = &*(header_ptr as *const PoolHeader);
+            if !header.has_signature() || header.block_size == 0 {
+                crate::kprintln!(
+                    level: crate::rtl::logging::LogLevel::Error,
+                    subsystem: "POOL",
+                    "BAD POOL FREE WITH TAG at 0x{:x} (invalid header)",
+                    ptr as u64
+                );
+                crate::ke::bugcheck::bugcheck_with(
+                    crate::ke::bugcheck::BugCheckCode::BadPoolCaller,
+                    0x8,
+                    ptr as u64,
+                    0,
+                    tag as u64,
+                );
+            }
             if header.pool_tag != tag {
                 // A mismatched tag means the caller is freeing an allocation
                 // through the wrong ownership contract. Windows reports this

@@ -76,6 +76,10 @@ impl VadFlags {
 pub struct VadProtection(u8);
 
 impl VadProtection {
+    pub const fn bits(&self) -> u8 {
+        self.0
+    }
+
     pub const NO_ACCESS: Self = Self(0);
     pub const READONLY: Self = Self(1);
     pub const EXECUTE: Self = Self(2);
@@ -201,9 +205,7 @@ impl VadTree {
     ///   x   T3  =>  T1  y
     ///  / \             / \
     /// T1  T2          T2  T3
-    fn rotate_right_locked(&self, y: *mut VadEntry) {
-        let mut root_guard = self.root.lock();
-        let root_ptr: &mut *mut VadEntry = &mut root_guard;
+    fn rotate_right_locked(&self, y: *mut VadEntry, root_ptr: &mut *mut VadEntry) {
         unsafe {
             let x = (*y).left;
             let _ = &x;
@@ -245,9 +247,7 @@ impl VadTree {
     ///   T1  y   =>  x   T3
     ///      / \     / \
     ///     T2 T3  T1  T2
-    fn rotate_left_locked(&self, x: *mut VadEntry) {
-        let mut root_guard = self.root.lock();
-        let root_ptr: *mut *mut VadEntry = &mut *root_guard;
+    fn rotate_left_locked(&self, x: *mut VadEntry, root_ptr: &mut *mut VadEntry) {
         unsafe {
             let y = (*x).right;
             let _ = &y;
@@ -284,7 +284,7 @@ impl VadTree {
 
     /// Left-Right double rotation: left rotate at child, then right rotate at parent.
     /// Used for Left-Right imbalance case.
-    fn rotate_left_right_locked(&self, node: *mut VadEntry) {
+    fn rotate_left_right_locked(&self, node: *mut VadEntry, root_ptr: &mut *mut VadEntry) {
         // SAFETY: caller must hold `self.lock`.
         unsafe {
             let child = (*node).left;
@@ -295,10 +295,10 @@ impl VadTree {
             let _ = &old_child_balance;
 
             // Left rotate at child
-            self.rotate_left_locked(child);
+            self.rotate_left_locked(child, root_ptr);
 
             // Right rotate at node
-            self.rotate_right_locked(node);
+            self.rotate_right_locked(node, root_ptr);
 
             // After LR: if old child balance was -1, node becomes +1
             if old_child_balance == -1 {
@@ -309,7 +309,7 @@ impl VadTree {
 
     /// Right-Left double rotation: right rotate at child, then left rotate at parent.
     /// Used for Right-Left imbalance case.
-    fn rotate_right_left_locked(&self, node: *mut VadEntry) {
+    fn rotate_right_left_locked(&self, node: *mut VadEntry, root_ptr: &mut *mut VadEntry) {
         // SAFETY: caller must hold `self.lock`.
         unsafe {
             let child = (*node).right;
@@ -320,10 +320,10 @@ impl VadTree {
             let _ = &old_child_balance;
 
             // Right rotate at child
-            self.rotate_right_locked(child);
+            self.rotate_right_locked(child, root_ptr);
 
             // Left rotate at node
-            self.rotate_left_locked(node);
+            self.rotate_left_locked(node, root_ptr);
 
             // After RL: if old child balance was +1, node becomes -1
             if old_child_balance == 1 {
@@ -339,7 +339,7 @@ impl VadTree {
     ///   x   T3  =>  T1  y
     ///  / \             / \
     /// T1  T2          T2  T3
-    fn rotate_right(&mut self, y: *mut VadEntry) {
+    fn rotate_right(&self, y: *mut VadEntry) {
         unsafe {
             let x = (*y).left;
             let _ = &x;
@@ -373,7 +373,7 @@ impl VadTree {
     }
 
     /// Left rotation at node `x`. Used for Right-Right imbalance.
-    fn rotate_left(&mut self, x: *mut VadEntry) {
+    fn rotate_left(&self, x: *mut VadEntry) {
         unsafe {
             let y = (*x).right;
             let _ = &y;
@@ -407,7 +407,7 @@ impl VadTree {
     }
 
     /// Left-Right double rotation. Used for Left-Right imbalance.
-    fn rotate_left_right(&mut self, node: *mut VadEntry) {
+    fn rotate_left_right(&self, node: *mut VadEntry) {
         unsafe {
             let child = (*node).left;
             let _ = &child;
@@ -426,7 +426,7 @@ impl VadTree {
     }
 
     /// Right-Left double rotation. Used for Right-Left imbalance.
-    fn rotate_right_left(&mut self, node: *mut VadEntry) {
+    fn rotate_right_left(&self, node: *mut VadEntry) {
         unsafe {
             let child = (*node).right;
             let _ = &child;
@@ -448,7 +448,7 @@ impl VadTree {
     /// Walks up from the changed node, updating balance factors and
     /// performing rotations as needed until the tree is balanced.
     /// For insertion: continue up while balance factor is ±1 (height changed).
-    fn rebalance_insert(&mut self, mut node: *mut VadEntry) {
+    fn rebalance_insert_locked(&self, mut node: *mut VadEntry, root_ptr: &mut *mut VadEntry) {
         unsafe {
             let mut parent = (*node).parent;
             while !parent.is_null() {
@@ -470,9 +470,9 @@ impl VadTree {
                     let _ = &left_child;
                     let _ = &left_child;
                     if !left_child.is_null() && (*left_child).balance_factor <= 0 {
-                        self.rotate_right(parent);
+                        self.rotate_right_locked(parent, root_ptr);
                     } else {
-                        self.rotate_left_right(parent);
+                        self.rotate_left_right_locked(parent, root_ptr);
                     }
                     return;
                 } else if new_balance == 2 {
@@ -480,9 +480,9 @@ impl VadTree {
                     let _ = &right_child;
                     let _ = &right_child;
                     if !right_child.is_null() && (*right_child).balance_factor >= 0 {
-                        self.rotate_left(parent);
+                        self.rotate_left_locked(parent, root_ptr);
                     } else {
-                        self.rotate_right_left(parent);
+                        self.rotate_right_left_locked(parent, root_ptr);
                     }
                     return;
                 }
@@ -496,7 +496,7 @@ impl VadTree {
     /// Rebalance the tree after a deletion.
     /// For deletion: after rebalancing at a node, if balance factor is ±1,
     /// the subtree height is unchanged and we can stop.
-    fn rebalance_delete_locked(&self, node: *mut VadEntry) {
+    fn rebalance_delete_locked(&self, node: *mut VadEntry, root_ptr: &mut *mut VadEntry) {
         // SAFETY: caller must hold `self.lock`.
         unsafe {
             let mut current = node;
@@ -504,9 +504,17 @@ impl VadTree {
 
             while !parent.is_null() {
                 if current == (*parent).left {
-                    (*parent).balance_factor -= 1;
-                } else {
+                    // NT 6.1 (AVL delete): deletion in the left
+                    // child *decreases* the left subtree height, so
+                    // the parent's balance factor must *increase* by
+                    // 1 (right-heavy). The old code decremented it,
+                    // causing the tree to degrade toward imbalance.
                     (*parent).balance_factor += 1;
+                } else {
+                    // Deletion in the right child *decreases* the
+                    // right subtree height, so the parent's balance
+                    // factor must *decrease* by 1 (left-heavy).
+                    (*parent).balance_factor -= 1;
                 }
 
                 let new_balance = (*parent).balance_factor;
@@ -524,9 +532,9 @@ impl VadTree {
                     let _ = &left_child;
                     let _ = &left_child;
                     if !left_child.is_null() && (*left_child).balance_factor <= 0 {
-                        self.rotate_right_locked(parent);
+                        self.rotate_right_locked(parent, root_ptr);
                     } else {
-                        self.rotate_left_right_locked(parent);
+                        self.rotate_left_right_locked(parent, root_ptr);
                     }
                     // After deletion rebalancing, stop
                     return;
@@ -536,9 +544,9 @@ impl VadTree {
                     let _ = &right_child;
                     let _ = &right_child;
                     if !right_child.is_null() && (*right_child).balance_factor >= 0 {
-                        self.rotate_left_locked(parent);
+                        self.rotate_left_locked(parent, root_ptr);
                     } else {
-                        self.rotate_right_left_locked(parent);
+                        self.rotate_right_left_locked(parent, root_ptr);
                     }
                     // After deletion rebalancing, stop
                     return;
@@ -607,12 +615,15 @@ impl VadTree {
         let parent = vad.parent;
         let _ = &parent;
         let _ = &parent;
-        drop(root_guard);
-
-        // Rebalance for insertion (uses different logic than deletion)
+        // NT 6.1: the lock must remain held while rebalancing.
+        // Dropping it here allows two concurrent inserts to
+        // rebalance the same unlocked tree and corrupt balance
+        // factors/children. The guard `root_guard` is dropped at
+        // end of scope, so `rebalance_insert` runs under the lock.
         if !parent.is_null() {
-            self.rebalance_insert(parent);
+            self.rebalance_insert_locked(parent, root_ptr);
         }
+        drop(root_guard);
 
         Ok(())
     }
@@ -710,7 +721,7 @@ impl VadTree {
 
         // Rebalance for deletion (uses different logic than insertion)
         if !rebalance_from.is_null() {
-            self.rebalance_delete_locked(rebalance_from);
+            self.rebalance_delete_locked(rebalance_from, root_ptr);
         }
 
         self.node_count.fetch_sub(1, Ordering::Relaxed);
@@ -888,6 +899,7 @@ impl VadTree {
     pub unsafe fn merge_adjacent(&mut self, mut vad: *mut VadEntry) {
         let mut root_guard = self.root.lock();
         unsafe {
+            let root_ptr = &mut root_guard;
             // Check predecessor (left sibling)
             let mut pred = self.find_predecessor(vad);
             while !pred.is_null() && (*pred).vad_type != VadType::VadNone {
@@ -897,17 +909,12 @@ impl VadTree {
                 {
                     // Merge: extend predecessor's range
                     (*pred).ending_vpn = (*vad).ending_vpn;
-                    // Unlink vad
-                    if (*vad).parent.is_null() {
-                        *root_guard = (*vad).right;
-                    } else if (*(*vad).parent).left == vad {
-                        (*(*vad).parent).left = (*vad).right;
-                    } else {
-                        (*(*vad).parent).right = (*vad).right;
-                    }
-                    if !(*vad).right.is_null() {
-                        (*(*vad).right).parent = (*vad).parent;
-                    }
+                    // NT 6.1: when unlinking a node from the AVL tree,
+                    // the left subtree must not be orphaned. Replace
+                    // the node with its in-order successor (which has
+                    // no left child by definition) so the left subtree
+                    // stays reachable.
+                    self.remove_node_locked(vad, root_ptr);
                     // Free the merged node
                     self.free_vad(vad);
                     self.node_count.fetch_sub(1, Ordering::Relaxed);
@@ -928,17 +935,7 @@ impl VadTree {
                 {
                     // Merge: extend current node's range
                     (*vad).ending_vpn = (*succ).ending_vpn;
-                    // Unlink successor
-                    if (*succ).parent.is_null() {
-                        *root_guard = (*succ).right;
-                    } else if (*(*succ).parent).left == succ {
-                        (*(*succ).parent).left = (*succ).right;
-                    } else {
-                        (*(*succ).parent).right = (*succ).right;
-                    }
-                    if !(*succ).right.is_null() {
-                        (*(*succ).right).parent = (*succ).parent;
-                    }
+                    self.remove_node_locked(succ, root_ptr);
                     // Free the merged node
                     self.free_vad(succ);
                     self.node_count.fetch_sub(1, Ordering::Relaxed);
@@ -1233,8 +1230,6 @@ impl VadTree {
     /// * `Some((start, end))` - The gap boundaries, or
     /// * `None` - No suitable gap found
     pub fn find_gap(&self, desired_base: u64, size: u64) -> Option<(u64, u64)> {
-        let _guard = self.root.lock();
-
         // Use checked arithmetic to avoid overflow when size is near u64::MAX.
         let aligned_size = size.checked_add(0xFFF)?.wrapping_add(0) & !0xFFF;
 
@@ -1351,8 +1346,6 @@ impl VadTree {
     /// respecting existing gaps. It returns the first available address
     /// after all existing VADs.
     pub fn find_end_gap(&self, start: u64, size: u64) -> Option<(u64, u64)> {
-        let _guard = self.root.lock();
-
         // Use checked arithmetic to avoid overflow when size is near u64::MAX.
         let aligned_size = size.checked_add(0xFFF)?.wrapping_add(0) & !0xFFF;
 
