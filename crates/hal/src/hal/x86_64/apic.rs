@@ -547,13 +547,8 @@ pub fn send_ipi(target_apic_id: u32, vector: u8, mode: IpiDeliveryMode) {
     write_lapic(lapic_reg::ICR_HIGH, icr_high);
     write_lapic(lapic_reg::ICR_LOW, icr_low);
 
-    // Spin until the ICR is idle (bit 12 = delivery status).
-    for _ in 0..1000 {
-        if read_lapic(lapic_reg::ICR_LOW) & (1 << 12) == 0 {
-            return;
-        }
-        core::hint::spin_loop();
-    }
+    // Do not poll the ICR delivery-status bit (bit 12): under TCG it
+    // never clears and the MMIO polling loop can deadlock the VM.
 }
 
 /// Broadcast an IPI to every CPU in the system.
@@ -563,12 +558,7 @@ pub fn broadcast_ipi(vector: u8, mode: IpiDeliveryMode) {
     icr_low |= icr_low::LEVEL_ASSERT | icr_low::ALL_INCL_SELF;
     write_lapic(lapic_reg::ICR_HIGH, 0);
     write_lapic(lapic_reg::ICR_LOW, icr_low);
-    for _ in 0..1000 {
-        if read_lapic(lapic_reg::ICR_LOW) & (1 << 12) == 0 {
-            return;
-        }
-        core::hint::spin_loop();
-    }
+    // Same: no ICR bit-12 polling (TCG never clears it).
 }
 
 // =====================================================================

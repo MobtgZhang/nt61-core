@@ -44,6 +44,23 @@ impl ReentrantLock {
         self.depth.store(1, Ordering::Relaxed);
         ReentrantGuard { lock: self }
     }
+
+    /// Non-blocking acquisition. Returns `None` when the lock is currently
+    /// held by another CPU. Used by panic paths so a fault on a CPU that
+    /// already holds the UART lock can never deadlock the machine.
+    pub fn try_lock(&self) -> Option<ReentrantGuard<'_>> {
+        let cpu = crate::arch::common::percpu::get_current_cpu_id() as usize;
+        if self.depth.load(Ordering::Relaxed) > 0 && self.owner.load(Ordering::Relaxed) == cpu {
+            self.depth.fetch_add(1, Ordering::Relaxed);
+            return Some(ReentrantGuard { lock: self });
+        }
+        self.lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        self.owner.store(cpu, Ordering::Relaxed);
+        self.depth.store(1, Ordering::Relaxed);
+        Some(ReentrantGuard { lock: self })
+    }
 }
 
 impl Default for ReentrantLock {

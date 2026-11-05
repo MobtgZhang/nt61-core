@@ -18,6 +18,13 @@ pub fn lock_uart_tx() -> crate::hal::common::relock::ReentrantGuard<'static> {
     UART_TX_LOCK.lock()
 }
 
+/// Try to acquire the global UART transmit lock without blocking.
+/// Used by panic paths: when another CPU holds the lock we emit
+/// unlocked rather than deadlocking the machine.
+pub fn try_lock_uart_tx() -> Option<crate::hal::common::relock::ReentrantGuard<'static>> {
+    UART_TX_LOCK.try_lock()
+}
+
 #[cfg(target_arch = "x86_64")]
 pub use crate::hal::x86_64::serial::*;
 

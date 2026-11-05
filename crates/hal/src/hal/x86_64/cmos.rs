@@ -241,7 +241,11 @@ pub fn hal_query_real_time_clock() -> Option<TimeFields> {
     //   1 PM – 11 PM    → 13..23
     if !hour_24 {
         hour = if hour == 12 {
-            if pm_flag != 0 { 12 } else { 0 }
+            if pm_flag != 0 {
+                12
+            } else {
+                0
+            }
         } else if pm_flag != 0 {
             hour + 12
         } else {

@@ -127,11 +127,26 @@ pub fn write_string_always(s: &str) {
     }
     #[cfg(not(test))]
     {
-        let _tx_guard = crate::hal::common::serial::lock_uart_tx();
-        for c in s.bytes() {
-            write_char_port(COM1_PORT, c);
+        match crate::hal::common::serial::try_lock_uart_tx() {
+            Some(_tx_guard) => {
+                for c in s.bytes() {
+                    write_char_unlocked(COM1_PORT, c);
+                }
+            }
+            None => {
+                // Panic path: the lock is held by another CPU (possibly
+                // halted mid-print). Emit unlocked rather than deadlock.
+                for c in s.bytes() {
+                    write_char_unlocked(COM1_PORT, c);
+                }
+            }
         }
     }
+}
+
+fn write_char_unlocked(port: u16, c: u8) {
+    while (inb(port + UART_REG_LSR) & LSR_TRANSMIT_EMPTY) == 0 {}
+    outb(port + UART_REG_DATA, c);
 }
 
 /// Hex-dump a 64-bit value to the serial port. The other

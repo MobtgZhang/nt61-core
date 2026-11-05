@@ -424,6 +424,18 @@ fn put_byte_vga(b: u8) {
     // read the current cursor position via a single IN
     // instruction pair against the CRT controller registers.
     let (mut x, mut y) = unsafe { read_cursor() };
+    // The legacy CRTC cursor registers are firmware-owned state: a
+    // graphics-mode handoff (GOP/vGPU) or BIOS can leave a position
+    // past the 80x25 text window. Trusting it unchecked makes
+    // write_cell fault at an unmapped address — and the fault
+    // handler itself prints through this console, so the fault loops
+    // silently forever. Clamp to the visible window instead.
+    if x >= VGA_COLS as u16 {
+        x = 0;
+    }
+    if y >= VGA_ROWS as u16 {
+        y = (VGA_ROWS - 1) as u16;
+    }
     match b {
         b'\n' => {
             // LF — move down one row, scroll if needed

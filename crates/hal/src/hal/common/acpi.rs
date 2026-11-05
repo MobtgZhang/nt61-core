@@ -1097,8 +1097,7 @@ pub fn parse_srat() -> bool {
                     let proximity = fadt_read_u32(entry_va, 2);
                     // ACPI SRAT Type 0: APIC ID is u8 at offset 6;
                     // Flags is u32 at offset 10.
-                    let apic_id =
-                        unsafe { ptr::read_volatile(entry_va.add(6)) } as u32;
+                    let apic_id = unsafe { ptr::read_volatile(entry_va.add(6)) } as u32;
                     let flags = fadt_read_u32(entry_va, 10);
                     if flags & 1 != 0 {
                         info.processors[info.processor_count] = SratProcessor {

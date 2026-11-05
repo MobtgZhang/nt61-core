@@ -190,6 +190,42 @@ pub fn set_pixel(x: u32, y: u32, color: u32) {
     }
 }
 
+/// Read a packed RGB pixel. Returns `None` for inactive or unusual
+/// framebuffer formats so callers can fall back to opaque drawing.
+pub fn get_pixel(x: u32, y: u32) -> Option<u32> {
+    if !FB_ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let w = FB_WIDTH.load(Ordering::Relaxed);
+    let h = FB_HEIGHT.load(Ordering::Relaxed);
+    if x >= w || y >= h {
+        return None;
+    }
+    let pitch = FB_PITCH.load(Ordering::Relaxed) as usize;
+    let bpp = FB_BPP.load(Ordering::Relaxed) as usize;
+    let addr = FB_ADDR.load(Ordering::Relaxed) as usize;
+    let offset = y as usize * pitch + (x as usize * bpp / 8);
+    let pointer = (addr + offset) as *const u8;
+    unsafe {
+        match bpp {
+            32 => {
+                let value = core::ptr::read_volatile(pointer as *const u32);
+                Some(color32(
+                    (value & 0xFF) as u8,
+                    ((value >> 8) & 0xFF) as u8,
+                    ((value >> 16) & 0xFF) as u8,
+                ))
+            }
+            24 => Some(color32(
+                core::ptr::read_volatile(pointer),
+                core::ptr::read_volatile(pointer.add(1)),
+                core::ptr::read_volatile(pointer.add(2)),
+            )),
+            _ => None,
+        }
+    }
+}
+
 /// Fill the entire framebuffer with a single colour.
 pub fn clear(color: u32) {
     if !FB_ACTIVE.load(Ordering::Relaxed) {
