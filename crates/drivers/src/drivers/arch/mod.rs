@@ -413,12 +413,8 @@ pub fn init_machine_specific_drivers() {
 pub fn init_machine_specific_buses() {
     #[cfg(target_arch = "x86_64")]
     {
-        crate::hal::serial::write_string("D:acpi_start\r\n");
         crate::drivers::bus::acpi_bus::init();
-        crate::hal::serial::write_string("D:acpi_done\r\n");
-        crate::hal::serial::write_string("D:usb_bus_start\r\n");
         crate::drivers::bus::usb_bus::init();
-        crate::hal::serial::write_string("D:usb_bus_done\r\n");
     }
     #[cfg(not(target_arch = "x86_64"))]
     {}

@@ -941,8 +941,7 @@ fn execute_command(c: &mut XhciController, trb: XhciTrb) -> Result<u32, &'static
     unsafe {
         core::ptr::write_volatile(ring_ptr.add(enqueue_idx), trb);
     }
-    let trb_phys = c.cmd_ring.phys
-        + (enqueue_idx as u64) * core::mem::size_of::<XhciTrb>() as u64;
+    let trb_phys = c.cmd_ring.phys + (enqueue_idx as u64) * core::mem::size_of::<XhciTrb>() as u64;
     c.cmd_ring.enqueue_idx = (enqueue_idx + 1) % c.cmd_ring.size;
     if c.cmd_ring.enqueue_idx == 0 {
         c.cmd_ring.cycle_bit = !c.cmd_ring.cycle_bit;
@@ -1301,11 +1300,8 @@ pub fn control_transfer(
 fn init_event_ring(c: &mut XhciController) -> Result<(), &'static str> {
     const EVENT_TRBS: usize = 32;
     const EVENT_BYTES: usize = EVENT_TRBS * core::mem::size_of::<XhciTrb>();
-    let ptr = crate::mm::pool::allocate_aligned(
-        crate::mm::pool::PoolType::NonPaged,
-        EVENT_BYTES,
-        64,
-    );
+    let ptr =
+        crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, EVENT_BYTES, 64);
     if ptr.is_null() {
         return Err("xHCI: event ring allocation failed");
     }
@@ -1338,8 +1334,7 @@ fn init_event_ring(c: &mut XhciController) -> Result<(), &'static str> {
 /// Allocate and program the Device Context Base Address Array.
 fn init_dcbaa(c: &mut XhciController) -> Result<(), &'static str> {
     let bytes = ((c.max_slots as usize) + 1) * core::mem::size_of::<u64>();
-    let virt =
-        crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, bytes, 64);
+    let virt = crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, bytes, 64);
     if virt.is_null() {
         return Err("xHCI: DCBAA allocation failed");
     }
@@ -1360,21 +1355,14 @@ fn init_dcbaa(c: &mut XhciController) -> Result<(), &'static str> {
 fn init_command_ring(c: &mut XhciController) -> Result<(), &'static str> {
     const COMMAND_TRBS: usize = 64;
     let bytes = COMMAND_TRBS * core::mem::size_of::<XhciTrb>();
-    let virt = crate::mm::pool::allocate_aligned(
-        crate::mm::pool::PoolType::NonPaged,
-        bytes,
-        64,
-    );
+    let virt = crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, bytes, 64);
     if virt.is_null() {
         return Err("xHCI: command ring allocation failed");
     }
     unsafe {
         core::ptr::write_bytes(virt, 0, bytes);
         let last = virt as *mut XhciTrb;
-        core::ptr::write_volatile(
-            last.add(COMMAND_TRBS - 1),
-            XhciTrb::link(virt as u64, true),
-        );
+        core::ptr::write_volatile(last.add(COMMAND_TRBS - 1), XhciTrb::link(virt as u64, true));
     }
     c.cmd_ring.phys = virt as u64;
     c.cmd_ring.virt = virt as u64;

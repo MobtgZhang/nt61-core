@@ -34,10 +34,7 @@ pub fn register_driver(
     STATUS_SUCCESS
 }
 
-pub unsafe extern "efiapi" fn dispatch_success(
-    _device_object: *mut u8,
-    _irp: *mut u8,
-) -> i32 {
+pub unsafe extern "efiapi" fn dispatch_success(_device_object: *mut u8, _irp: *mut u8) -> i32 {
     STATUS_SUCCESS
 }
 

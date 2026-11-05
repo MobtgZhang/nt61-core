@@ -535,23 +535,13 @@ fn start_port(base: u64, port_offset: u64) -> bool {
 /// low LBA at bytes 4..6, high LBA at bytes 8..10, and the sector count in
 /// bytes 12/13. Keeping this helper in one place prevents the command and
 /// count fields from being moved into reserved bytes again.
-unsafe fn write_h2d_register_fis(
-    fis: *mut u8,
-    command: u8,
-    lba: u64,
-    sector_count: u16,
-) {
+unsafe fn write_h2d_register_fis(fis: *mut u8, command: u8, lba: u64, sector_count: u16) {
     write_h2d_register_fis_raw(fis, command, lba, sector_count);
 }
 
 /// Build a 5-dword H2D FIS where `command` is the raw command byte.
 /// FPDMA QUEUED callers use this to encode the NCQ tag and count-1.
-unsafe fn write_h2d_register_fis_raw(
-    fis: *mut u8,
-    command: u8,
-    lba: u64,
-    sector_count: u16,
-) {
+unsafe fn write_h2d_register_fis_raw(fis: *mut u8, command: u8, lba: u64, sector_count: u16) {
     core::ptr::write_volatile(fis.add(0), 0x27);
     core::ptr::write_volatile(fis.add(1), 0x80);
     core::ptr::write_volatile(fis.add(2), command);
@@ -884,9 +874,9 @@ pub fn read_sector(channel: usize, port: usize, lba: u32, buf: &mut [u8]) -> boo
     let guard = AHCI_GLOBAL_LOCK.lock();
     let ctrl = unsafe { (*core::ptr::addr_of_mut!(AHCI_CONTROLLERS)).get_mut(channel) };
     let result = match ctrl {
-        Some(Some(controller)) if controller.initialised => {
-            unsafe { ahci_read_sector(controller, port, lba, buf) }
-        }
+        Some(Some(controller)) if controller.initialised => unsafe {
+            ahci_read_sector(controller, port, lba, buf)
+        },
         _ => false,
     };
     drop(guard);
@@ -989,12 +979,7 @@ pub unsafe fn ahci_read_sector_pio(
     );
 
     // Set up FIS buffer (H2D register FIS)
-    write_h2d_register_fis(
-        cmd_table_virt,
-        ATA_CMD_READ_PIO_EXT,
-        lba as u64,
-        1,
-    );
+    write_h2d_register_fis(cmd_table_virt, ATA_CMD_READ_PIO_EXT, lba as u64, 1);
 
     // Set up PRD for data buffer at offset 128 (256 bytes per PRD entry)
     core::ptr::write_volatile(cmd_table_virt.add(128) as *mut u32, dma_phys as u32);
@@ -1172,12 +1157,7 @@ unsafe fn ahci_read_sector(
     );
 
     // Set up H2D Register FIS
-    write_h2d_register_fis(
-        cmd_table_virt,
-        ATA_CMD_READ_DMA_EXT,
-        lba as u64,
-        1,
-    );
+    write_h2d_register_fis(cmd_table_virt, ATA_CMD_READ_DMA_EXT, lba as u64, 1);
 
     // Set up PRD
     core::ptr::write_volatile(cmd_table_virt.add(128) as *mut u32, dma_phys as u32);
@@ -1573,12 +1553,7 @@ pub unsafe fn ahci_dma_write_sectors(
 
     // H2D Register FIS with WRITE DMA EXT (0x35)
     let fis_virt = cmd_table_virt;
-    write_h2d_register_fis(
-        fis_virt,
-        ATA_CMD_WRITE_DMA_EXT,
-        lba,
-        sectors as u16,
-    );
+    write_h2d_register_fis(fis_virt, ATA_CMD_WRITE_DMA_EXT, lba, sectors as u16);
 
     stop_port(mmio, port_offset);
     mmio_write32(
@@ -1740,9 +1715,9 @@ pub fn write_sector(channel: usize, port: usize, lba: u32, buf: &[u8]) -> bool {
     let guard = AHCI_GLOBAL_LOCK.lock();
     let ctrl = unsafe { (*core::ptr::addr_of_mut!(AHCI_CONTROLLERS)).get_mut(channel) };
     let result = match ctrl {
-        Some(Some(controller)) if controller.initialised => {
-            unsafe { ahci_write_sector(controller, port, lba, buf) }
-        }
+        Some(Some(controller)) if controller.initialised => unsafe {
+            ahci_write_sector(controller, port, lba, buf)
+        },
         _ => false,
     };
     drop(guard);
@@ -1841,12 +1816,7 @@ pub unsafe fn ahci_write_sector_pio(
     );
 
     // Set up H2D FIS
-    write_h2d_register_fis(
-        cmd_table_virt,
-        ATA_CMD_WRITE_PIO_EXT,
-        lba as u64,
-        1,
-    );
+    write_h2d_register_fis(cmd_table_virt, ATA_CMD_WRITE_PIO_EXT, lba as u64, 1);
 
     // Set up PRD
     core::ptr::write_volatile(cmd_table_virt.add(128) as *mut u32, dma_phys as u32);
@@ -2016,12 +1986,7 @@ unsafe fn ahci_write_sector(ctrl: &mut AhciController, port: usize, lba: u32, bu
     );
 
     // Set up H2D Register FIS
-    write_h2d_register_fis(
-        cmd_table_virt,
-        ATA_CMD_WRITE_DMA_EXT,
-        lba as u64,
-        1,
-    );
+    write_h2d_register_fis(cmd_table_virt, ATA_CMD_WRITE_DMA_EXT, lba as u64, 1);
 
     // Set up PRD
     core::ptr::write_volatile(cmd_table_virt.add(128) as *mut u32, dma_phys as u32);
@@ -2499,7 +2464,12 @@ pub unsafe fn ncq_submit_command(
         ATA_CMD_READ_FPDMA_QUEUED
     };
     let raw_command = ata_cmd | ((tag & 0x07) << 3);
-    write_h2d_register_fis_raw(cmd_table_virt, raw_command, lba, sectors.saturating_sub(1) as u16);
+    write_h2d_register_fis_raw(
+        cmd_table_virt,
+        raw_command,
+        lba,
+        sectors.saturating_sub(1) as u16,
+    );
 
     // Clear stale SError before submitting.
     mmio_write32(mmio, (port_offset + PORT_SERR as u64) as u32, 0xFFFF_FFFF);

@@ -411,9 +411,7 @@ pub fn send(nic_idx: usize, data: &[u8]) -> bool {
         desc.length = copy_len as u16;
         desc.cmd = (TCMD_EOP | TCMD_IFCS | TCMD_RS) as u8;
         desc.status = 0;
-        core::sync::atomic::compiler_fence(
-            core::sync::atomic::Ordering::Release,
-        );
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
 
         // Advance TX tail pointer
         n.tx_next = (n.tx_next + 1) % 32;

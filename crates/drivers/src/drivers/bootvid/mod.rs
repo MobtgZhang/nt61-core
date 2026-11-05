@@ -150,10 +150,20 @@ fn font_face() -> Option<&'static nt61_fonts::FontFace> {
 /// the embedded face metrics so the layout tracks the font rather
 /// than a hard-coded pixel count.
 fn glyph_cell_width() -> u32 {
-    font_face()
+    // Cache the metric: the fontdue glyph lookup must run exactly
+    // once per boot (repeated lookups on the same face hit a hash
+    // path that can spin forever when the heap is fragmented).
+    static CACHED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let cached = CACHED.load(core::sync::atomic::Ordering::Acquire);
+    if cached != 0 {
+        return cached;
+    }
+    let r = font_face()
         .and_then(|face| face.metrics('M', FONT_HEIGHT))
         .map(|metrics| ((metrics.advance_width + 0.5) as u32).max(1))
-        .unwrap_or(FALLBACK_CELL_WIDTH)
+        .unwrap_or(FALLBACK_CELL_WIDTH);
+    CACHED.store(r, core::sync::atomic::Ordering::Release);
+    r
 }
 
 /// Initialise bootvid. If `init_from_framebuffer` was called

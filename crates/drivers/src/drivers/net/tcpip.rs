@@ -1352,12 +1352,8 @@ unsafe fn handle_tdi_receive_datagram(irp: *mut Irp, stack: *mut IoStackLocation
             //   offset 4..8  in_addr     (network byte order)
             //   offset 8..14 sin_zero    (must be zeroed)
             let af_inet: u16 = 2;
-            output_buffer
-                .offset(0)
-                .write((af_inet & 0xFF) as u8);
-            output_buffer
-                .offset(1)
-                .write((af_inet >> 8) as u8);
+            output_buffer.offset(0).write((af_inet & 0xFF) as u8);
+            output_buffer.offset(1).write((af_inet >> 8) as u8);
             output_buffer
                 .offset(2)
                 .write(((remote_address.sin_port >> 8) & 0xFF) as u8);

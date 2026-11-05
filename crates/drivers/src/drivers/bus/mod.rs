@@ -33,9 +33,7 @@ pub fn init() {
     // DRIVER_TABLE stays empty, find_driver() always returns None and
     // start_all_pending() becomes a no-op, so no device is ever bound.
     pnp::init();
-    crate::hal::serial::write_string("D:pci_start\r\n");
     pci_bus::init();
-    crate::hal::serial::write_string("D:pci_done\r\n");
     crate::drivers::arch::init_machine_specific_buses();
 }
 

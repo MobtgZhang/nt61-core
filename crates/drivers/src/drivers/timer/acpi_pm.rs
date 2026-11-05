@@ -36,7 +36,8 @@ pub fn init() {
     // `FADT::pm_timer_length` field; if it is 0 we treat the
     // timer as 24-bit, otherwise we trust the firmware's value.
     let sig: [u8; 4] = *b"FACP";
-    if let Some(hdr) = acpi::find_table(&sig) {
+    let hdr = acpi::find_table(&sig);
+    if let Some(hdr) = hdr {
         unsafe {
             // The FADT is 116 bytes (ACPI 1.0) or longer. The
             // `pm_tmr_blk` field is at offset 0x68 in the 1.0

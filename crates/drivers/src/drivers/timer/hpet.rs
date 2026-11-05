@@ -43,35 +43,42 @@ pub fn count() -> usize {
 
 /// Look up the HPET table in the ACPI tables and initialise it.
 pub fn init() {
-    crate::hal::serial::write_string("HPET1\n");
     let sig: [u8; 4] = *b"HPET";
     let hdr = acpi::find_table(&sig);
-    crate::hal::serial::write_string("HPET2\n");
     if let Some(hdr) = hdr {
-        crate::hal::serial::write_string("HPET3\n");
-        // HPET table is bigger than the standard 36-byte header.
-        // The address is at offset 0x10 in the table body.
+        // HPET table layout (ACPI spec): 36-byte generic header,
+        // then event_timer_block_id (u32) at 0x24, and the GAS
+        // (generic address structure) at 0x28. For system memory
+        // the 64-bit physical base address is at offset 0x2C.
         unsafe {
-            let body_va = (hdr as *const u8).add(0x10);
-            let base_lo = core::ptr::read_volatile(body_va as *const u32);
-            let base_hi = core::ptr::read_volatile(body_va.add(4) as *const u32);
-            let base = ((base_hi as u64) << 32) | (base_lo as u64);
-            crate::hal::serial::write_string("HPET4\n");
-            if let Some(mmio) = crate::mm::syspte::map_io_space(base & !0xFFF, 4) {
-                crate::hal::serial::write_string("HPET5\n");
-                let cap_id = core::ptr::read_volatile((mmio + REG_CAP_ID) as *const u32);
-                crate::hal::serial::write_string("HPET6\n");
-                let period_fs = core::ptr::read_volatile((mmio + REG_CAP_ID + 4) as *const u32);
-                crate::hal::serial::write_string("HPET7\n");
-                let freq_hz = 1_000_000_000_000_000u64 / (period_fs as u64);
-                let h = Hpet {
-                    phys_base: base,
-                    cap: cap_id,
-                    freq_hz: freq_hz as u32,
-                    initialised: true,
-                };
-                push_hpet(h);
+            let gas_va = (hdr as *const u8).add(0x28);
+            let addr_space = core::ptr::read_volatile(gas_va as *const u8);
+            // Only system memory (0) is supported.
+            if addr_space != 0 {
+                return;
             }
+            let addr_va = gas_va.add(4);
+            let base_lo = core::ptr::read_volatile(addr_va as *const u32);
+            let base_hi = core::ptr::read_volatile(addr_va.add(4) as *const u32);
+            let base = ((base_hi as u64) << 32) | (base_lo as u64);
+            // Sanity-check the base: must be a plausible MMIO
+            // address, never 0 or inside low RAM.
+            if base < 0x1000 || base > 0xFFFF_FFFF_FFFF_0000 {
+                return;
+            }
+            let Some(mmio) = crate::mm::syspte::map_io_space(base & !0xFFF, 4) else {
+                return;
+            };
+            let cap_id = core::ptr::read_volatile((mmio + REG_CAP_ID) as *const u32);
+            let period_fs = core::ptr::read_volatile((mmio + REG_CAP_ID + 4) as *const u32);
+            let freq_hz = 1_000_000_000_000_000u64 / (period_fs as u64);
+            let h = Hpet {
+                phys_base: base,
+                cap: cap_id,
+                freq_hz: freq_hz as u32,
+                initialised: true,
+            };
+            push_hpet(h);
         }
     }
     // kprintln!("      HPET: {} timer(s) initialised", count());

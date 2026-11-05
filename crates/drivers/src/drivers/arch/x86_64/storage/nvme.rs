@@ -1057,11 +1057,8 @@ fn identify_controller(c: &mut NvmeController) -> bool {
     unsafe {
         // Allocate buffer for identify data
         let buf_size = 4096;
-        let buf = crate::mm::pool::allocate_aligned(
-            crate::mm::pool::PoolType::NonPaged,
-            buf_size,
-            4096,
-        );
+        let buf =
+            crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, buf_size, 4096);
         if buf.is_null() {
             // kprintln!("[NVMe] Failed to allocate identify buffer");
             return false;
@@ -1348,7 +1345,12 @@ pub fn read_sectors(controller: usize, nsid: u32, lba: u64, buffer: &mut [u8]) -
 
     let chunk_sectors = 4096 / 512;
     for (chunk, offset) in buffer.chunks_mut(4096).enumerate() {
-        if !read_nvme_chunk(controller, nsid, lba + (chunk * chunk_sectors) as u64, offset) {
+        if !read_nvme_chunk(
+            controller,
+            nsid,
+            lba + (chunk * chunk_sectors) as u64,
+            offset,
+        ) {
             return false;
         }
     }
@@ -1367,11 +1369,8 @@ fn read_nvme_chunk(controller: usize, nsid: u32, lba: u64, buffer: &mut [u8]) ->
         }
 
         let buf_size = buffer.len();
-        let buf = crate::mm::pool::allocate_aligned(
-            crate::mm::pool::PoolType::NonPaged,
-            buf_size,
-            4096,
-        );
+        let buf =
+            crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, buf_size, 4096);
         if buf.is_null() {
             return false;
         }
@@ -1407,7 +1406,12 @@ pub fn write_sectors(controller: usize, nsid: u32, lba: u64, buffer: &[u8]) -> b
 
     let chunk_sectors = 4096 / 512;
     for (chunk, offset) in buffer.chunks(4096).enumerate() {
-        if !write_nvme_chunk(controller, nsid, lba + (chunk * chunk_sectors) as u64, offset) {
+        if !write_nvme_chunk(
+            controller,
+            nsid,
+            lba + (chunk * chunk_sectors) as u64,
+            offset,
+        ) {
             return false;
         }
     }
@@ -1426,11 +1430,8 @@ fn write_nvme_chunk(controller: usize, nsid: u32, lba: u64, buffer: &[u8]) -> bo
         }
 
         let buf_size = buffer.len();
-        let buf = crate::mm::pool::allocate_aligned(
-            crate::mm::pool::PoolType::NonPaged,
-            buf_size,
-            4096,
-        );
+        let buf =
+            crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, buf_size, 4096);
         if buf.is_null() {
             return false;
         }

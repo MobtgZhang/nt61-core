@@ -706,59 +706,80 @@ pub fn init() {
         return;
     }
     trace("virtio-input: probe begin\r\n");
-    for pci_dev in pci::enumerate() {
-        virtio_trace_fmt!(
-            "virtio-input: pci {:02x}:{:02x}.{:02x} vendor={:04x} device={:04x}\r\n",
-            pci_dev.bus,
-            pci_dev.device,
-            pci_dev.function,
-            pci_dev.vendor_id,
-            pci_dev.device_id
-        );
-        if pci_dev.vendor_id != VENDOR_VIRTIO
-            || (pci_dev.device_id != DEVICE_INPUT_MODERN
-                && pci_dev.device_id != DEVICE_INPUT_LEGACY)
-        {
-            continue;
+    // The virtio keyboard may not yet be visible to PCI enumeration on
+    // some boot paths (device enumeration racing with bus bring-up),
+    // which left the system without any input device. Retry the probe a
+    // few times before giving up.
+    for attempt in 0..4 {
+        let mut candidate_seen = false;
+        for pci_dev in pci::enumerate() {
+            virtio_trace_fmt!(
+                "virtio-input: pci {:02x}:{:02x}.{:02x} vendor={:04x} device={:04x}\r\n",
+                pci_dev.bus,
+                pci_dev.device,
+                pci_dev.function,
+                pci_dev.vendor_id,
+                pci_dev.device_id
+            );
+            if pci_dev.vendor_id != VENDOR_VIRTIO
+                || (pci_dev.device_id != DEVICE_INPUT_MODERN
+                    && pci_dev.device_id != DEVICE_INPUT_LEGACY)
+            {
+                continue;
+            }
+            candidate_seen = true;
+            // Memory/BAR access must be enabled before any BAR read.
+            enable_pci_decode(pci_dev);
+
+            let Some((common_cap, notify_cap, isr_cap, multiplier)) = decode_pci_caps(pci_dev)
+            else {
+                trace("virtio-input: cap decode FAILED\r\n");
+                continue;
+            };
+            let Some(common) = map_region(pci_dev, &common_cap) else {
+                trace("virtio-input: common cfg map FAILED\r\n");
+                continue;
+            };
+            let Some(notify) = map_region(pci_dev, &notify_cap) else {
+                trace("virtio-input: notify map FAILED\r\n");
+                continue;
+            };
+            let Some(isr) = map_region(pci_dev, &isr_cap) else {
+                trace("virtio-input: isr map FAILED\r\n");
+                continue;
+            };
+            virtio_trace_fmt!(
+                "virtio-input: caps common={:p} notify={:p} isr={:p} mult={}\r\n",
+                common,
+                notify,
+                isr,
+                multiplier
+            );
+
+            let Some(queue) = initialise_queue(common) else {
+                trace("virtio-input: queue init FAILED\r\n");
+                continue;
+            };
+            let Some(device) = allocate_device(notify, isr, multiplier, queue) else {
+                trace("virtio-input: device alloc FAILED\r\n");
+                continue;
+            };
+            DEVICE.store(device, Ordering::Release);
+            trace("virtio-input: keyboard ATTACHED\r\n");
+            return;
         }
-        // Memory/BAR access must be enabled before any BAR read.
-        enable_pci_decode(pci_dev);
-
-        let Some((common_cap, notify_cap, isr_cap, multiplier)) = decode_pci_caps(pci_dev) else {
-            trace("virtio-input: cap decode FAILED\r\n");
-            continue;
-        };
-        let Some(common) = map_region(pci_dev, &common_cap) else {
-            trace("virtio-input: common cfg map FAILED\r\n");
-            continue;
-        };
-        let Some(notify) = map_region(pci_dev, &notify_cap) else {
-            trace("virtio-input: notify map FAILED\r\n");
-            continue;
-        };
-        let Some(isr) = map_region(pci_dev, &isr_cap) else {
-            trace("virtio-input: isr map FAILED\r\n");
-            continue;
-        };
-        virtio_trace_fmt!(
-            "virtio-input: caps common={:p} notify={:p} isr={:p} mult={}\r\n",
-            common,
-            notify,
-            isr,
-            multiplier
-        );
-
-        let Some(queue) = initialise_queue(common) else {
-            trace("virtio-input: queue init FAILED\r\n");
-            continue;
-        };
-        let Some(device) = allocate_device(notify, isr, multiplier, queue) else {
-            trace("virtio-input: device alloc FAILED\r\n");
-            continue;
-        };
-        DEVICE.store(device, Ordering::Release);
-        trace("virtio-input: keyboard ATTACHED\r\n");
-        break;
+        if attempt + 1 < 4 {
+            // Brief settle delay between probe attempts so a bus that is
+            // still coming up has time to publish its devices.
+            for _ in 0..2_000_000 {
+                core::hint::spin_loop();
+            }
+        }
+        if candidate_seen {
+            // A device was present but failed bring-up; re-probing would
+            // re-map its MMIO regions, so stop here.
+            break;
+        }
     }
     if DEVICE.load(Ordering::Acquire).is_null() {
         trace("virtio-input: no virtio keyboard found\r\n");
@@ -770,10 +791,14 @@ pub fn init() {
 /// unconditional early-serial sink so they are visible even when
 /// the boot display suppresses the standard log channels.
 fn trace(message: &str) {
+    // Bring-up diagnostics are only visible with the debug log level;
+    // release boots keep the serial log free of probe noise.
     #[cfg(feature = "log_level_debug")]
-    crate::arch::boot::early_write_str(message.as_bytes());
+    crate::hal::serial::write_string_always(message);
     #[cfg(not(feature = "log_level_debug"))]
-    let _ = message;
+    {
+        let _ = message;
+    }
 }
 
 pub fn is_present() -> bool {
@@ -914,7 +939,16 @@ fn initialise_queue(mmio: *mut u8) -> Option<Queue> {
         return None;
     }
 
-    let mut queue = allocate_queue(QUEUE_SIZE)?;
+    let mut queue = {
+        match allocate_queue(QUEUE_SIZE) {
+            Some(q) => {
+                q
+            }
+            None => {
+                return None;
+            }
+        }
+    };
     write_u16(mmio, REG_QUEUE_SIZE, QUEUE_SIZE);
     write_u32(mmio, REG_QUEUE_DESC_LO, queue.descriptor_physical as u32);
     write_u32(
@@ -932,7 +966,7 @@ fn initialise_queue(mmio: *mut u8) -> Option<Queue> {
 
     // Pre-fill the available ring BEFORE the queue goes live so the
     // device has somewhere to write events from the first interrupt.
-    for _ in 0..QUEUE_SIZE {
+    for _fill in 0..QUEUE_SIZE {
         if let Some(index) = add_event_buffer(&mut queue) {
             push_available(&queue, index);
         }
@@ -999,7 +1033,16 @@ fn allocate_queue(size: u16) -> Option<Queue> {
         };
         (*queue.available).index = AtomicU16::new(0);
         (*queue.used).index = AtomicU16::new(0);
-        queue.descriptor_physical = translate(allocation as u64)?;
+        queue.descriptor_physical = {
+            match translate(allocation as u64) {
+                Some(p) => {
+                    p
+                }
+                None => {
+                    return None;
+                }
+            }
+        };
         queue.avail_offset = descriptor_bytes as u64;
         queue.used_offset = (descriptor_bytes + available_bytes) as u64;
         for index in 0..count as u16 {
