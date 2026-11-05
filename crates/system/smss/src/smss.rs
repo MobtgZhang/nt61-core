@@ -57,6 +57,9 @@ pub const PID_USERINIT: u64 = 0xA00;
 pub const PID_LSM: u64 = 1280;
 /// CMD process ID
 pub const PID_CMD: u64 = 0x1F10;
+pub const PID_EXPLORER: u64 = 0x1F20;
+/// LogonUI process ID (Session 1 welcome screen).
+pub const PID_LOGONUI: u64 = 0x1F30;
 
 /// Session IDs
 pub const SESSION_0: u32 = 0;
@@ -579,16 +582,12 @@ pub unsafe fn init_teb(ethread: *mut crate::ps::thread::Ethread) -> *mut crate::
 ///
 /// Returns the PEB pointer.
 pub unsafe fn init_peb(process: *mut crate::ps::process::Eprocess) -> *mut crate::ps::process::peb {
-    boot_println!("[SMSS] init_peb enter");
-    crate::hal::serial::write_string_always("[SMSS] peb enter\r\n");
     // Allocate a page for the PEB.
     let result = crate::mm::vas::alloc_zeroed_page_for_vas();
-    crate::hal::serial::write_string_always("[SMSS] peb alloc\r\n");
     if result.is_none() {
         return core::ptr::null_mut();
     }
     let peb_phys = result.unwrap();
-    boot_println!("[SMSS] init_peb peb allocated");
 
     // The PEB lives at a fixed location in user address space:
     // Windows x64 places the PEB in the canonical user half. The former
@@ -603,10 +602,8 @@ pub unsafe fn init_peb(process: *mut crate::ps::process::Eprocess) -> *mut crate
 
     let pml4_phys = unsafe { (*process).page_table_pml4 };
     if pml4_phys == 0 {
-        boot_println!("[SMSS] init_peb invalid PML4");
         return core::ptr::null_mut();
     }
-    boot_println!("[SMSS] init_peb pml4=0x{:x}", pml4_phys);
 
     let map_result = crate::mm::vas::map_page_in_pml4(
         pml4_phys,
@@ -615,38 +612,25 @@ pub unsafe fn init_peb(process: *mut crate::ps::process::Eprocess) -> *mut crate
         crate::mm::vas::PTE_RW | crate::mm::vas::PTE_US,
     );
     if map_result != crate::mm::vas::MmStatus::Ok {
-        boot_println!("[SMSS] init_peb PEB map failed");
         return core::ptr::null_mut();
     }
-    boot_println!("[SMSS] init_peb PEB mapped");
 
     // The user heap and process parameters are initialized through their
     // user VAs; those helpers perform short process-root attaches.
-    crate::hal::serial::write_string_always("[SMSS] peb mapped\r\n");
     let heap_base = crate::userspace::kernel32::heap::init_user_heap(pml4_phys);
-    crate::hal::serial::write_string_always("[SMSS] peb heap done\r\n");
     if heap_base == 0 {
-        boot_println!("[SMSS] init_peb user heap failed");
         return core::ptr::null_mut();
     }
-    crate::hal::serial::write_string_always("[SMSS] init_peb pre-session\r\n");
-    crate::hal::serial::write_string_always("[SMSS] init_peb post-session\r\n");
 
     let session_id = unsafe { (*process).session_id };
-    crate::hal::serial::write_string_always("[SMSS] init_peb process pointers enter\r\n");
-    boot_println!("[SMSS] init_peb before process parameters");
-    crate::hal::serial::write_string_always("[SMSS] init_peb after heap pointers enter\r\n");
     let params = init_process_parameters(process, session_id);
-    crate::hal::serial::write_string_always("[SMSS] init_peb params returned\r\n");
     boot_println!(
         "[SMSS] init_peb process parameters returned 0x{:x}",
         params as u64
     );
     if params.is_null() {
-        boot_println!("[SMSS] init_peb process parameters failed");
         return core::ptr::null_mut();
     }
-    boot_println!("[SMSS] init_peb parameters mapped");
 
     crate::mm::vas::refresh_kernel_mappings(pml4_phys);
     let previous_root = crate::mm::vas::attach_process(pml4_phys);
@@ -719,22 +703,17 @@ fn init_process_parameters(
     const PARAMS_BASE: u64 = 0x0000_7FFF_B000_0000;
     const PARAMS_SIZE: u64 = 0x1000;
 
-    crate::hal::serial::write_string_always("[SMSS] init_process_parameters enter\r\n");
     let pml4_phys = unsafe { (*process).pml4_phys };
-    crate::hal::serial::write_string_always("[SMSS] init_process_parameters pml4 read\r\n");
     if pml4_phys == 0 {
-        boot_println!("[SMSS] init_process_parameters: invalid pml4");
         return core::ptr::null_mut();
     }
 
     // Allocate a page for process parameters.
     let result = crate::mm::vas::alloc_zeroed_page_for_vas();
     if result.is_none() {
-        boot_println!("[SMSS] init_process_parameters: page allocation failed");
         return core::ptr::null_mut();
     }
     let params_phys = result.unwrap();
-    crate::hal::serial::write_string_always("[SMSS] init_process_parameters page allocated\r\n");
 
     let map_result = crate::mm::vas::map_page_in_pml4(
         pml4_phys,
@@ -751,13 +730,9 @@ fn init_process_parameters(
         );
         return core::ptr::null_mut();
     }
-    crate::hal::serial::write_string_always("[SMSS] init_process_parameters mapped\r\n");
 
-    crate::hal::serial::write_string_always("[SMSS] init_process_parameters refresh enter\r\n");
     crate::mm::vas::refresh_kernel_mappings(pml4_phys);
-    crate::hal::serial::write_string_always("[SMSS] init_process_parameters refresh done\r\n");
     let previous_root = crate::mm::vas::attach_process(pml4_phys);
-    crate::hal::serial::write_string_always("[SMSS] init_process_parameters attach done\r\n");
 
     let params_va = PARAMS_BASE;
     let params_phys_va = params_phys;
@@ -1348,7 +1323,6 @@ pub fn load_and_create_process(
     base_pid: u64,
 ) -> Result<SystemExeLoadResult, ExeLoadError> {
     unsafe {
-        crate::hal::serial::write_string_always("[SMSS] load enter\r\n");
         boot_println!(
             "[SMSS] load_and_create_process: path={} name={} session={} pid=0x{:x}",
             disk_path,
@@ -1358,47 +1332,35 @@ pub fn load_and_create_process(
         );
 
         // Step 1: read the PE file from the mounted disk
-        boot_println!("[SMSS] Reading PE from disk...");
         let pe_data = match read_pe_from_disk(disk_path) {
             Some(data) => {
-                boot_println!("[SMSS] pe_data acquired, len={}", data.len());
                 data
             }
             None => {
-                boot_println!("[SMSS] Failed to read {} from disk", disk_path);
                 return Err(ExeLoadError::FileNotFound);
             }
         };
-        crate::hal::serial::write_string_always("[SMSS] after disk read\r\n");
-        crate::hal::serial::write_string_always("[SMSS] before parse\r\n");
 
-        boot_println!("[SMSS] Read {} bytes for {}", pe_data.len(), process_name);
 
         // Step 2: Parse PE headers to get entry point and image base
         let (entry_point, _preferred_base) = match parse_pe_headers(&pe_data) {
             Some(result) => result,
             None => {
-                boot_println!("[SMSS] Failed to parse PE headers for {}", process_name);
                 return Err(ExeLoadError::InvalidPe);
             }
         };
-        crate::hal::serial::write_string_always("[SMSS] after parse\r\n");
 
-        boot_println!("[SMSS] PE parsed: entry=0x{:016x}", entry_point);
 
         // Step 3: create the process using the PE data
         let pid = base_pid;
-        crate::hal::serial::write_string_always("[SMSS] before create\r\n");
         let process =
             match crate::ps::process::create_user_process(&pe_data, pid, Some(entry_point)) {
                 Some(p) => p as *mut crate::ps::process::Eprocess,
                 None => {
-                    crate::hal::serial::write_string_always("[SMSS] create failed\r\n");
                     boot_println!("[SMSS] Failed to create process {}", process_name);
                     return Err(ExeLoadError::ProcessCreationFailed);
                 }
             };
-        crate::hal::serial::write_string_always("[SMSS] after create\r\n");
 
         boot_println!(
             "[SMSS] Created process {} with PID 0x{:x}",
@@ -1420,11 +1382,9 @@ pub fn load_and_create_process(
         }
 
         // Step 5: Load the PE into the process's address space using the loader
-        crate::hal::serial::write_string_always("[SMSS] before loader\r\n");
         let mapping = match crate::loader::load_into_user_address_space(pml4_phys, &pe_data) {
             Some(mapping) => mapping,
             None => {
-                crate::hal::serial::write_string_always("[SMSS] loader FAILED\r\n");
                 boot_println!(
                     "[SMSS] Failed to load PE into address space for {}",
                     process_name
@@ -1432,7 +1392,6 @@ pub fn load_and_create_process(
                 return Err(ExeLoadError::LoadFailed);
             }
         };
-        crate::hal::serial::write_string_always("[SMSS] loader ok\r\n");
 
         boot_println!(
             "[SMSS] Loaded PE into process {}: base=0x{:x} entry=0x{:x} size=0x{:x}",
@@ -1452,7 +1411,6 @@ pub fn load_and_create_process(
             (*process).user_image_size = mapping.image_size;
         }
         let peb = init_peb(process);
-        crate::hal::serial::write_string_always("[SMSS] peb done\r\n");
         if peb.is_null() {
             boot_println!("[SMSS] Failed to initialize PEB for {}", process_name);
             return Err(ExeLoadError::LoadFailed);
@@ -1566,10 +1524,8 @@ pub fn spawn_user_subsystem(user_path_ptr: *const u8) -> Option<u64> {
 /// `tools/src/fs/build.rs` (`build_csrss_pe`, `build_wininit_pe`,
 /// `build_services_pe`, `build_lsass_pe`).
 pub fn read_pe_from_disk(path: &str) -> Option<core::mem::ManuallyDrop<Vec<u8>>> {
-    crate::hal::serial::write_string_always("[SMSS] read disk enter\r\n");
     boot_println!("[SMSS] read_pe_from_disk: path={}", path);
     let fs_type = crate::fs::detect_system_partition_type();
-    crate::hal::serial::write_string_always("[SMSS] read disk type\r\n");
     // Probe the system partition to pick the right FS driver.
     match fs_type {
         crate::fs::FsType::Fat32 => {
@@ -1872,7 +1828,6 @@ fn read_pe_from_ntfs_impl(
 /// fails — caller (`read_pe_from_disk`) decides what to do
 /// (fall back to the in-memory PE generator).
 fn read_pe_from_ext2(path: &str) -> Option<core::mem::ManuallyDrop<Vec<u8>>> {
-    crate::hal::serial::write_string_always("[SMSS] ext2 enter\r\n");
     boot_println!("[SMSS] read_pe_from_ext2: path={}", path);
 
     if !crate::fs::ext2::is_mounted() {
@@ -1889,9 +1844,7 @@ fn read_pe_from_ext2(path: &str) -> Option<core::mem::ManuallyDrop<Vec<u8>>> {
     };
 
     let data = {
-        crate::hal::serial::write_string_always("[SMSS] ext2 before read\r\n");
         let result = unsafe { crate::fs::ext2::read_whole_file(fs, path) };
-        crate::hal::serial::write_string_always("[SMSS] ext2 after read\r\n");
         match result {
             Ok(v) => v,
             Err(e) => {
@@ -1904,13 +1857,10 @@ fn read_pe_from_ext2(path: &str) -> Option<core::mem::ManuallyDrop<Vec<u8>>> {
             }
         }
     };
-    crate::hal::serial::write_string_always("[SMSS] ext2 data ok\r\n");
     if data.len() < 2 || data[0] != b'M' || data[1] != b'Z' {
-        crate::hal::serial::write_string_always("[SMSS] ext2 MZ bad\r\n");
         boot_println!("[SMSS] ext2/3/4 read {} bytes, MZ bad", data.len());
         return None;
     }
-    crate::hal::serial::write_string_always("[SMSS] ext2 MZ ok\r\n");
     boot_println!("[SMSS] ext2/3/4: read {} bytes, MZ OK", data.len());
     Some(core::mem::ManuallyDrop::new(data))
 }
@@ -2316,6 +2266,39 @@ pub fn start_boot_sequence() {
     launch_cmd_shell();
 }
 
+/// Run the complete Windows 7 logon chain, then transfer control to
+/// the user shell. Desktop mode intentionally uses the same Session
+/// 0/Session 1 phases as command-prompt mode; only the final shell
+/// differs.
+pub fn start_desktop_boot_sequence() -> ! {
+    boot_println!("[BOOT] ============================================");
+    boot_println!("[BOOT] Windows 7 Boot Sequence (Desktop Mode)");
+    boot_println!("[BOOT] ============================================");
+
+    boot_println!("[BOOT] Phase 1: Initializing Session Manager...");
+    phase1_initialize();
+
+    boot_println!("[BOOT] Phase 2: Creating Sessions...");
+    phase2_create_sessions();
+
+    boot_println!("[BOOT] Phase 3: Starting Subsystems...");
+    phase3_start_subsystems();
+
+    crate::rtl::windows_log::write_phase_header(12);
+    boot_println!("    SUBSYSTEMS: csrss / wininit / services / lsass");
+
+    boot_println!("[BOOT] Phase 4: Starting WinInit...");
+    phase4_start_wininit();
+
+    boot_println!("[BOOT] Phase 5: Starting Session 1 Logon...");
+    phase5_start_logon();
+
+    crate::rtl::windows_log::write_phase_header(13);
+    boot_println!("    EXPLORER: explorer.exe Ring-3 entry");
+    *BOOT_COMPLETE.lock() = true;
+    launch_logonui_then_explorer();
+}
+
 /// Canonical Windows-7 boot orchestrator entry point.
 ///
 /// Drives every phase of the user-mode boot chain end-to-end:
@@ -2587,6 +2570,193 @@ pub fn launch_cmd_shell() -> ! {
                     crate::ke::bugcheck::BugCheckCode::ProcessInitializationFailed,
                     0x534D5353,
                     e as u64,
+                    0,
+                    0,
+                );
+            }
+        }
+    }
+}
+
+/// Desktop-mode boot chain completion: run the Windows-7 logon UI
+/// first, then hand the desktop to Explorer. This mirrors the real
+/// NT 6.1 flow (winlogon -> LogonUI.exe -> LSASS -> userinit ->
+/// explorer.exe): SMSS creates both Session-1 images here, arms the
+/// kernel logon handoff, and dispatches LogonUI into Ring 3. When
+/// the user presses ENTER, LogonUI exits and `process_exit` enters
+/// Ring 3 for the already-created explorer.exe image.
+pub fn launch_logonui_then_explorer() -> ! {
+    unsafe {
+        crate::hal::serial::write_string_always("[LOGONUI] enter\r\n");
+        boot_println!("[BOOT]   Loading explorer.exe from disk (pending handoff)...");
+
+        // Step 1: create explorer.exe now, but do NOT dispatch it. Its
+        // (pml4, rip, rsp) is parked in the kernel logon-handoff slot
+        // and `process_exit` will enter Ring 3 for it once LogonUI exits.
+        let explorer_result =
+            load_and_create_process("C:\\Windows\\System32\\explorer.exe", "explorer.exe", SESSION_1, PID_EXPLORER);
+        match explorer_result {
+            Ok(result) => {
+                if let Some(process) = crate::ps::process::get_by_pid(PID_EXPLORER) {
+                    let root = { (*process).pml4_phys };
+                    let rip = { (*process).user_rip };
+                    let rsp = { (*process).user_rsp };
+                    crate::ps::process::set_logon_handoff(root, rip, rsp);
+                    let main_thread = { (*process).main_thread };
+                    if !main_thread.is_null() {
+                        crate::ps::process::set_logon_handoff_thread(main_thread as u64);
+                    }
+                    boot_println!(
+                        "[BOOT]   explorer.exe pending (root=0x{:x} RIP=0x{:x} RSP=0x{:x})",
+                        root, rip, rsp
+                    );
+                    let _ = result;
+                } else {
+                    boot_println!("[BOOT]   ERROR: explorer.exe process not found");
+                    crate::ke::bugcheck::bugcheck(
+                        crate::ke::bugcheck::BugCheckCode::CriticalProcessDied,
+                    );
+                }
+            }
+            Err(error) => {
+                boot_println!("[BOOT]   ERROR: Failed to load explorer.exe: {:?}", error);
+                show_boot_error();
+                crate::ke::bugcheck::bugcheck_with(
+                    crate::ke::bugcheck::BugCheckCode::ProcessInitializationFailed,
+                    0x45435350,
+                    error as u64,
+                    0,
+                    0,
+                );
+            }
+        }
+
+        boot_println!("[BOOT]   Loading logonui.exe from disk...");
+        let logonui_result =
+            load_and_create_process("C:\\Windows\\System32\\logonui.exe", "logonui.exe", SESSION_1, PID_LOGONUI);
+        match logonui_result {
+            Ok(result) => {
+                boot_println!("[BOOT]   logonui.exe loaded successfully (PID 0x{:x})", result.pid);
+                if let Some(process) = crate::ps::process::get_by_pid(PID_LOGONUI) {
+                    let process_pointer = process as *mut crate::ps::process::Eprocess;
+                    let main_thread = { (*process_pointer).main_thread };
+                    if !main_thread.is_null() {
+                        let root_table_phys = { (*process_pointer).pml4_phys };
+                        let user_rip = { (*process_pointer).user_rip };
+                        let user_rsp = { (*process_pointer).user_rsp };
+                        boot_println!(
+                            "[BOOT]   Dispatching logonui.exe into Ring 3 (root=0x{:x} RIP=0x{:x} RSP=0x{:x})",
+                            root_table_phys, user_rip, user_rsp
+                        );
+                        crate::hal::text_console::clear();
+                        crate::drivers::bootvid::vid_clear_black();
+                        crate::drivers::bootvid::vid_set_cursor_position(0, 0);
+                        crate::hal::serial::write_string_always("[LOGONUI] enter ring3\r\n");
+                        crate::ke::scheduler::setup_bsp(main_thread);
+                        crate::arch::common::user_entry::enter_first_user_thread(
+                            root_table_phys,
+                            user_rip,
+                            user_rsp,
+                        );
+                    } else {
+                        boot_println!("[BOOT]   ERROR: logonui.exe main_thread is NULL");
+                        crate::ke::bugcheck::bugcheck(
+                            crate::ke::bugcheck::BugCheckCode::CriticalProcessDied,
+                        );
+                    }
+                } else {
+                    boot_println!("[BOOT]   ERROR: logonui.exe process not found in PID table");
+                    crate::ke::bugcheck::bugcheck(
+                        crate::ke::bugcheck::BugCheckCode::CriticalProcessDied,
+                    );
+                }
+            }
+            Err(error) => {
+                boot_println!("[BOOT]   WARNING: Failed to launch logonui.exe: {:?}", error);
+                boot_println!("[BOOT]   Falling back to direct explorer dispatch");
+                crate::ps::process::clear_logon_handoff();
+                launch_explorer_shell();
+            }
+        }
+    }
+}
+
+/// Launch the Windows 7 Explorer shell after the Session 1 logon
+/// chain has completed. This is the Desktop-mode equivalent of
+/// `launch_cmd_shell`, and is the only process that draws the
+/// Progman desktop and `Shell_TrayWnd`.
+pub fn launch_explorer_shell() -> ! {
+    unsafe {
+        crate::hal::serial::write_string_always("[EXPLORER] enter\r\n");
+        boot_println!("[BOOT]   Loading explorer.exe from disk...");
+
+        let disk_path = "C:\\Windows\\System32\\explorer.exe";
+        let process_name = "explorer.exe";
+        let base_pid = PID_EXPLORER;
+
+        match load_and_create_process(disk_path, process_name, SESSION_1, base_pid) {
+            Ok(result) => {
+                crate::hal::serial::write_string_always("[EXPLORER] load ok\r\n");
+                boot_println!("[BOOT]   explorer.exe loaded successfully");
+                boot_println!("[BOOT]   Process ID: 0x{:x}", result.pid);
+                boot_println!("[BOOT]   Entry Point: 0x{:016x}", result.entry_point);
+                boot_println!("[BOOT]   Image Base: 0x{:016x}", result.image_base);
+
+                if let Some(process) = crate::ps::process::get_by_pid(result.pid) {
+                    crate::hal::serial::write_string_always("[EXPLORER] process found\r\n");
+                    let process_pointer = process as *mut crate::ps::process::Eprocess;
+                    let main_thread = { (*process_pointer).main_thread };
+                    if !main_thread.is_null() {
+                        crate::hal::serial::write_string_always("[EXPLORER] main thread ok\r\n");
+                        crate::ke::scheduler::setup_bsp(main_thread);
+                        let root_table_phys = { (*process_pointer).pml4_phys };
+                        let user_rip = { (*process_pointer).user_rip };
+                        let user_rsp = { (*process_pointer).user_rsp };
+                        crate::hal::serial::write_string_always("[EXPLORER] root=");
+                        crate::hal::serial::write_hex_u64_always(root_table_phys);
+                        crate::hal::serial::write_string_always(" rip=");
+                        crate::hal::serial::write_hex_u64_always(user_rip);
+                        crate::hal::serial::write_string_always(" rsp=");
+                        crate::hal::serial::write_hex_u64_always(user_rsp);
+                        crate::hal::serial::write_string_always("\r\n");
+                        boot_println!(
+                            "[BOOT]   Dispatching explorer.exe into Ring 3 (root=0x{:x} RIP=0x{:x} RSP=0x{:x})",
+                            root_table_phys,
+                            user_rip,
+                            user_rsp
+                        );
+                        crate::hal::serial::write_string_always("[EXPLORER] clear console\r\n");
+                        crate::hal::text_console::clear();
+                        crate::drivers::bootvid::vid_clear_black();
+                        crate::drivers::bootvid::vid_set_cursor_position(0, 0);
+                        crate::hal::serial::write_string_always("[EXPLORER] enter ring3\r\n");
+                        crate::arch::common::user_entry::enter_first_user_thread(
+                            root_table_phys,
+                            user_rip,
+                            user_rsp,
+                        );
+                    } else {
+                        boot_println!("[BOOT]   ERROR: explorer.exe main_thread is NULL");
+                        crate::ke::bugcheck::bugcheck(
+                            crate::ke::bugcheck::BugCheckCode::CriticalProcessDied,
+                        );
+                    }
+                } else {
+                    boot_println!("[BOOT]   ERROR: explorer.exe process not found in PID table");
+                    crate::ke::bugcheck::bugcheck(
+                        crate::ke::bugcheck::BugCheckCode::CriticalProcessDied,
+                    );
+                }
+            }
+            Err(error) => {
+                boot_println!("[BOOT]   ERROR: Failed to launch explorer.exe: {:?}", error);
+                boot_println!("[BOOT]   System cannot proceed without the user shell!");
+
+                show_boot_error();
+                crate::ke::bugcheck::bugcheck_with(
+                    crate::ke::bugcheck::BugCheckCode::ProcessInitializationFailed,
+                    0x45435350,
+                    error as u64,
                     0,
                     0,
                 );

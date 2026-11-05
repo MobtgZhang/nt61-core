@@ -123,6 +123,7 @@ pub fn init() {
         }
     }
 
+    crate::hal::serial::write_string_always("[NET-ETHIF] discovery done\r\n");
     // Register e1000 interfaces
     let e1000_count = net::e1000::count();
     for i in 0..e1000_count {

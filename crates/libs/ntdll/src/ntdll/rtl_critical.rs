@@ -79,7 +79,9 @@ pub unsafe extern "C" fn rtl_enter_critical_section(
     }
 
     let lock_ptr = &cs.lock_count as *const i32 as *mut AtomicI32;
-    let spin_count = cs.spin_count.max(CRITICAL_SECTION_DEFAULT_SPIN_COUNT as usize);
+    let spin_count = cs
+        .spin_count
+        .max(CRITICAL_SECTION_DEFAULT_SPIN_COUNT as usize);
     let mut spins = 0usize;
 
     loop {

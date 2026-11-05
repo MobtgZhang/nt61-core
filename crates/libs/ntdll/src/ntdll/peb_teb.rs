@@ -177,10 +177,7 @@ pub unsafe extern "C" fn rtl_set_thread_error_mode(_mode: u32, _old_mode: *mut u
             .unwrap_or(0);
     }
 
-    if let Some(entry) = modes
-        .iter_mut()
-        .find(|entry| entry.thread_id == thread_id)
-    {
+    if let Some(entry) = modes.iter_mut().find(|entry| entry.thread_id == thread_id) {
         entry.mode = _mode;
     } else {
         modes.push(ThreadErrorMode {

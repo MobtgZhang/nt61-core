@@ -574,18 +574,12 @@ fn rewrite_transport_destination_port(payload: &mut [u8], port: u16) -> bool {
 }
 
 /// Recompute a TCP/UDP checksum after address or port translation.
-fn rewrite_transport_checksum(
-    payload: &mut [u8],
-    src_ip: u32,
-    dst_ip: u32,
-    protocol: u8,
-) -> bool {
+fn rewrite_transport_checksum(payload: &mut [u8], src_ip: u32, dst_ip: u32, protocol: u8) -> bool {
     if protocol == 6 {
         if payload.len() < 20 {
             return false;
         }
-        let checksum =
-            crate::netstack::tcp::calculate_tcp_checksum(src_ip, dst_ip, payload);
+        let checksum = crate::netstack::tcp::calculate_tcp_checksum(src_ip, dst_ip, payload);
         payload[16..18].copy_from_slice(&checksum.to_be_bytes());
         return true;
     }

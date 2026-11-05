@@ -319,14 +319,9 @@ pub fn query(base: u32) -> Option<Wow64MemoryBasicInformation32> {
     let aligned_base = align_to_page_down(base);
     let vas = WOW64_VAS.lock();
     // Look up the allocation record for this address.
-    let entry = vas
-        .allocations
-        .iter()
-        .find(|entry| {
-            entry.in_use
-                && base >= entry.base
-                && base < entry.base.wrapping_add(entry.size)
-        });
+    let entry = vas.allocations.iter().find(|entry| {
+        entry.in_use && base >= entry.base && base < entry.base.wrapping_add(entry.size)
+    });
 
     if let Some(entry) = entry {
         Some(Wow64MemoryBasicInformation32 {
@@ -435,8 +430,7 @@ pub fn read_memory(
     scratch.resize(size as usize, 0);
     crate::mm::user_copy::copy_from_user(&mut scratch, base_address as u64)
         .map_err(|s| s as u32)?;
-    crate::mm::user_copy::copy_to_user(buffer as u64, &scratch)
-        .map_err(|s| s as u32)?;
+    crate::mm::user_copy::copy_to_user(buffer as u64, &scratch).map_err(|s| s as u32)?;
 
     Ok(size)
 }
@@ -459,10 +453,8 @@ pub fn write_memory(
 
     let mut scratch = alloc::vec::Vec::with_capacity(size as usize);
     scratch.resize(size as usize, 0);
-    crate::mm::user_copy::copy_from_user(&mut scratch, buffer as u64)
-        .map_err(|s| s as u32)?;
-    crate::mm::user_copy::copy_to_user(base_address as u64, &scratch)
-        .map_err(|s| s as u32)?;
+    crate::mm::user_copy::copy_from_user(&mut scratch, buffer as u64).map_err(|s| s as u32)?;
+    crate::mm::user_copy::copy_to_user(base_address as u64, &scratch).map_err(|s| s as u32)?;
 
     Ok(size)
 }

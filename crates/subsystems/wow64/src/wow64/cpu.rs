@@ -443,19 +443,13 @@ pub fn emulate_far_call(
     // Push old EIP first, then old CS.  The resulting stack layout is
     // [ESP]=CS, [ESP+4]=EIP, matching an x86 far-call return frame.
     let esp = cpu_state.context32.esp;
-    if crate::mm::user_copy::write_user_object(
-        esp.wrapping_sub(4) as u64,
-        &cpu_state.context32.eip,
-    )
-    .is_err()
+    if crate::mm::user_copy::write_user_object(esp.wrapping_sub(4) as u64, &cpu_state.context32.eip)
+        .is_err()
     {
         return Err(CpuError::ProtectionFault);
     }
-    if crate::mm::user_copy::write_user_object(
-        esp.wrapping_sub(8) as u64,
-        &cpu_state.context32.cs,
-    )
-    .is_err()
+    if crate::mm::user_copy::write_user_object(esp.wrapping_sub(8) as u64, &cpu_state.context32.cs)
+        .is_err()
     {
         return Err(CpuError::ProtectionFault);
     }

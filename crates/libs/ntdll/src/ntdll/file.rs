@@ -620,7 +620,9 @@ fn file_open_common(
 
         let irp = crate::io::allocate_irp(1);
         if irp.is_null() {
-            { free_file_object(file_object) };
+            {
+                free_file_object(file_object)
+            };
             return (STATUS_NO_MEMORY, None, 0);
         }
         {
@@ -649,7 +651,9 @@ fn file_open_common(
 
         let status = crate::io::io_call_driver(device, irp);
         if status < 0 {
-            { free_file_object(file_object) };
+            {
+                free_file_object(file_object)
+            };
             return (status, None, 0);
         }
 
@@ -659,18 +663,24 @@ fn file_open_common(
             let fcb = { (*file_object).fcb } as *mut crate::fs::ntfs::NtfsHandle;
             let target_is_dir = { (*fcb).is_directory };
             if is_directory && !target_is_dir {
-                { free_file_object(file_object) };
+                {
+                    free_file_object(file_object)
+                };
                 return (STATUS_NOT_A_DIRECTORY, None, 0);
             }
             if is_non_directory && target_is_dir {
-                { free_file_object(file_object) };
+                {
+                    free_file_object(file_object)
+                };
                 return (STATUS_FILE_IS_A_DIRECTORY, None, 0);
             }
         }
 
         let handle = alloc_handle(HandleKind::File, file_object as u64);
         if handle.is_null() {
-            { free_file_object(file_object) };
+            {
+                free_file_object(file_object)
+            };
             return (STATUS_NO_MEMORY, None, 0);
         }
         record_share_entry(handle, path_u16, desired_access, share_access);

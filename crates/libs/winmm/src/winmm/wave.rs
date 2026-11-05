@@ -13,8 +13,7 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 use spin::{Mutex, Once};
 
 use crate::drivers::audio::audio_core::{
-    AudioDeviceManager, AudioFormat as CoreAudioFormat, StreamDirection,
-    VolumeControl,
+    AudioDeviceManager, AudioFormat as CoreAudioFormat, StreamDirection, VolumeControl,
 };
 
 /// Wave format tags
@@ -115,11 +114,15 @@ impl WaveFormatEx {
 
     /// Validate format
     pub fn is_valid(&self) -> bool {
-        self.channels > 0 && self.channels <= 8 &&
-        self.samples_per_sec >= 8000 && self.samples_per_sec <= 192000 &&
-        (self.bits_per_sample == 8 || self.bits_per_sample == 16 ||
-         self.bits_per_sample == 20 || self.bits_per_sample == 24 ||
-         self.bits_per_sample == 32)
+        self.channels > 0
+            && self.channels <= 8
+            && self.samples_per_sec >= 8000
+            && self.samples_per_sec <= 192000
+            && (self.bits_per_sample == 8
+                || self.bits_per_sample == 16
+                || self.bits_per_sample == 20
+                || self.bits_per_sample == 24
+                || self.bits_per_sample == 32)
     }
 }
 
@@ -422,7 +425,8 @@ pub fn wave_out_open(
 
     // create audio stream
     let core_format = format.to_core_format();
-    let stream_id = manager.create_stream(device_id_actual, StreamDirection::Output, core_format)
+    let stream_id = manager
+        .create_stream(device_id_actual, StreamDirection::Output, core_format)
         .ok_or(MMSYSERR_NOMEM)?;
 
     // create wave handle
@@ -541,10 +545,8 @@ pub fn wave_out_write(handle: u32, header: *mut WaveHdr) -> u32 {
         }
 
         // write data to audio driver
-        let _data_slice = core::slice::from_raw_parts(
-            (*header).data,
-            (*header).buffer_length as usize,
-        );
+        let _data_slice =
+            core::slice::from_raw_parts((*header).data, (*header).buffer_length as usize);
 
         // Convert to i16 samples for AC'97
         if out_handle.format.bits_per_sample == 16 {
@@ -552,10 +554,8 @@ pub fn wave_out_write(handle: u32, header: *mut WaveHdr) -> u32 {
                 (*header).data as *const i16,
                 (*header).buffer_length as usize / 2,
             );
-            let written = crate::drivers::audio::write_pcm_samples(
-                samples,
-                out_handle.format.channels as u8,
-            );
+            let written =
+                crate::drivers::audio::write_pcm_samples(samples, out_handle.format.channels as u8);
             (*header).bytes_recorded = (written * 2) as u32;
         }
 
@@ -744,7 +744,8 @@ pub fn wave_in_open(
 
     // create audio stream
     let core_format = format.to_core_format();
-    let stream_id = manager.create_stream(device_id_actual, StreamDirection::Input, core_format)
+    let stream_id = manager
+        .create_stream(device_id_actual, StreamDirection::Input, core_format)
         .ok_or(MMSYSERR_NOMEM)?;
 
     // create wave handle

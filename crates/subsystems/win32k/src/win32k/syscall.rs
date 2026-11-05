@@ -510,15 +510,9 @@ pub extern "C" fn nt_gdi_line_to(frame: &SyscallFrame) -> u64 {
 
             if !surface.is_null() {
                 // Simple line drawing - use Bresenham's algorithm
-                let success =
-                    crate::libs::win32k::gdi_ops::draw_line(
-                        surface,
-                        start_x,
-                        start_y,
-                        x,
-                        y,
-                        pen_color,
-                    );
+                let success = crate::libs::win32k::gdi_ops::draw_line(
+                    surface, start_x, start_y, x, y, pen_color,
+                );
                 let _ = &success;
                 // Update the DC's current position to the line end.
                 dc.cur_x = x;

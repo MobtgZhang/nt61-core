@@ -272,7 +272,12 @@ pub unsafe extern "C" fn enter_critical_section(cs: *mut CriticalSection) {
                     loop {
                         if (*cs)
                             .lock
-                            .compare_exchange_weak(0, thread_id, Ordering::Acquire, Ordering::Relaxed)
+                            .compare_exchange_weak(
+                                0,
+                                thread_id,
+                                Ordering::Acquire,
+                                Ordering::Relaxed,
+                            )
                             .is_ok()
                         {
                             (*cs).recursion_count = 1;

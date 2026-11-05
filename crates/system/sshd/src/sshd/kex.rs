@@ -343,7 +343,11 @@ pub struct Negotiated {
 fn negotiate_one(client_list: &[String], server_supported: &[&str]) -> Option<String> {
     server_supported
         .iter()
-        .find(|server_alg| client_list.iter().any(|client_alg| client_alg == *server_alg))
+        .find(|server_alg| {
+            client_list
+                .iter()
+                .any(|client_alg| client_alg == *server_alg)
+        })
         .map(|server_alg| server_alg.to_string())
 }
 

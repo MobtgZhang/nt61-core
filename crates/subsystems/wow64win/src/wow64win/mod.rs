@@ -258,16 +258,9 @@ pub unsafe extern "C" fn wow64_win32k_syscall(
     // Dispatch through the shadow SSDT (win32k service table).
     // Win32k syscalls have high nibble 0x1 in the real NT6.1 layout.
     let shadow_syscall_num = 0x1000u32 | (syscall_id & 0xFFF);
-    let result = crate::ke::shadow_ssdt::dispatch_shadow_service(
-        shadow_syscall_num,
-        &frame,
-    );
+    let result = crate::ke::shadow_ssdt::dispatch_shadow_service(shadow_syscall_num, &frame);
 
-    crate::wow64_klog!(
-        "Win32k syscall {} returned 0x{:x}",
-        syscall_id,
-        result
-    );
+    crate::wow64_klog!("Win32k syscall {} returned 0x{:x}", syscall_id, result);
 
     result as ULONG32
 }

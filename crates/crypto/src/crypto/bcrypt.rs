@@ -203,7 +203,11 @@ pub unsafe extern "C" fn bcrypt_get_property(
             if algorithm.is_empty() {
                 return STATUS_INVALID_HANDLE;
             }
-            if algorithm == algorithm::DES3 { 8 } else { 16 }
+            if algorithm == algorithm::DES3 {
+                8
+            } else {
+                16
+            }
         }
         _ => return STATUS_NOT_SUPPORTED,
     };

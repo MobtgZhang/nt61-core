@@ -93,14 +93,8 @@ pub unsafe extern "C" fn wow64_allocate_virtual_memory32(
         )
     };
     if status >= 0 {
-        let _ = crate::mm::user_copy::write_user_object(
-            base_address as u64,
-            &(base as u32),
-        );
-        let _ = crate::mm::user_copy::write_user_object(
-            region_size as u64,
-            &(size as u32),
-        );
+        let _ = crate::mm::user_copy::write_user_object(base_address as u64, &(base as u32));
+        let _ = crate::mm::user_copy::write_user_object(region_size as u64, &(size as u32));
     }
     status as u32
 }
@@ -161,10 +155,7 @@ pub unsafe extern "C" fn wow64_free_virtual_memory32(
         )
     };
     if status >= 0 && region_size != 0 {
-        let _ = crate::mm::user_copy::write_user_object(
-            region_size as u64,
-            &(size as u32),
-        );
+        let _ = crate::mm::user_copy::write_user_object(region_size as u64, &(size as u32));
     }
     status as u32
 }
@@ -230,19 +221,10 @@ pub unsafe extern "C" fn wow64_protect_virtual_memory32(
         )
     };
     if status >= 0 {
-        let _ = crate::mm::user_copy::write_user_object(
-            base_address as u64,
-            &(base as u32),
-        );
-        let _ = crate::mm::user_copy::write_user_object(
-            region_size as u64,
-            &(size as u32),
-        );
+        let _ = crate::mm::user_copy::write_user_object(base_address as u64, &(base as u32));
+        let _ = crate::mm::user_copy::write_user_object(region_size as u64, &(size as u32));
         if old_protect != 0 {
-            let _ = crate::mm::user_copy::write_user_object(
-                old_protect as u64,
-                &old_protect_value,
-            );
+            let _ = crate::mm::user_copy::write_user_object(old_protect as u64, &old_protect_value);
         }
     }
     status as u32
@@ -296,10 +278,7 @@ pub unsafe extern "C" fn wow64_query_virtual_memory32(
     let required_size = core::mem::size_of::<Wow64MemoryBasicInformation32>() as u32;
     if buffer == 0 || buffer_size < required_size {
         if return_length != 0 {
-            let _ = crate::mm::user_copy::write_user_object(
-                return_length as u64,
-                &required_size,
-            );
+            let _ = crate::mm::user_copy::write_user_object(return_length as u64, &required_size);
         }
         return STATUS_BUFFER_TOO_SMALL;
     }

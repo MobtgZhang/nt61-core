@@ -7,9 +7,9 @@
 #![allow(deprecated)]
 
 extern crate alloc;
+use crate::ke::sync::Spinlock;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::ke::sync::Spinlock;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[repr(transparent)]
@@ -230,9 +230,7 @@ pub unsafe extern "C" fn crypt_create_hash(
     };
 
     let handle = HASH_COUNTER.fetch_add(1, Ordering::Relaxed);
-    HASHES
-        .lock()
-        .push((handle, HashContext { alg_id, state }));
+    HASHES.lock().push((handle, HashContext { alg_id, state }));
     *hash = handle;
     1 // TRUE
 }
@@ -252,7 +250,9 @@ pub unsafe extern "C" fn crypt_hash_data(
 
     let input = core::slice::from_raw_parts(data, data_len as usize);
     let mut hashes = HASHES.lock();
-    let Some((_, context)) = hashes.iter_mut().find(|(entry_hash, _)| *entry_hash == hash)
+    let Some((_, context)) = hashes
+        .iter_mut()
+        .find(|(entry_hash, _)| *entry_hash == hash)
     else {
         return 0;
     };
@@ -281,7 +281,9 @@ pub unsafe extern "C" fn crypt_get_hash_param(
     }
 
     let mut hashes = HASHES.lock();
-    let Some((_, context)) = hashes.iter_mut().find(|(entry_hash, _)| *entry_hash == hash)
+    let Some((_, context)) = hashes
+        .iter_mut()
+        .find(|(entry_hash, _)| *entry_hash == hash)
     else {
         return 0;
     };

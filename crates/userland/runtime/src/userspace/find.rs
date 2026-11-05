@@ -117,5 +117,9 @@ pub unsafe fn find_main(argc: i32, argv: *const *const u8) -> i32 {
             crate::kprintln!("{}", match_count);
         }
     }
-    if total_matches == 0 { 1 } else { 0 }
+    if total_matches == 0 {
+        1
+    } else {
+        0
+    }
 }

@@ -281,10 +281,7 @@ pub fn apply_base_relocations_to_image(image: &mut [u8], raw: &[u8], delta: i64)
 
     // The .reloc directory itself is usually inside .rdata (a section
     // the file maps 1:1), so resolve it through the section table.
-    let size_of_optional_header = u16::from_le_bytes([
-        raw[cof_off + 16],
-        raw[cof_off + 17],
-    ]);
+    let size_of_optional_header = u16::from_le_bytes([raw[cof_off + 16], raw[cof_off + 17]]);
     let section_table = opt_off + size_of_optional_header as usize;
     let mut cur = match rva_to_file_offset(raw, section_table, number_of_sections, reloc_rva) {
         Some(offset) => offset,
@@ -543,12 +540,8 @@ pub fn build_user_stack(_pml4: u64, _teb_va: u64, _image_path: &str) -> Result<u
         let phys = crate::mm::pfn::allocate_pfn().ok_or(STATUS_NO_MEMORY)?;
         let phys = crate::mm::pte::pfn_to_phys(phys);
         let page_va = USER_STACK_TOP - index * 0x1000;
-        let result = vas::map_page_in_pml4(
-            _pml4,
-            page_va,
-            phys,
-            pte::PTE_P | pte::PTE_RW | pte::PTE_US,
-        );
+        let result =
+            vas::map_page_in_pml4(_pml4, page_va, phys, pte::PTE_P | pte::PTE_RW | pte::PTE_US);
         if result != vas::MmStatus::Ok {
             return Err(STATUS_NO_MEMORY);
         }
