@@ -52,15 +52,13 @@ fn hex_decode(text: &str) -> Option<alloc::vec::Vec<u8>> {
 }
 
 /// Standard PE CheckSum algorithm (CheckSumMappedFile): sum every u16
-/// word with the stored checksum field zeroed, fold the carry, then
-/// add the file length.
+/// word with the entire stored 4-byte checksum field excluded, fold
+/// the carry, then add the file length.
 fn pe_file_checksum(image: &[u8], checksum_field_off: usize) -> u32 {
     let mut sum: u64 = 0;
     let mut i = 0;
     while i + 2 <= image.len() {
-        let word = if i == checksum_field_off {
-            0
-        } else if i + 2 == checksum_field_off {
+        let word = if i == checksum_field_off || i == checksum_field_off + 2 {
             0
         } else {
             u32::from(image[i]) | (u32::from(image[i + 1]) << 8)

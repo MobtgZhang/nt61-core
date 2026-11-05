@@ -132,7 +132,7 @@ impl BcdStore {
         let mut store = Self::new();
 
         // Entry 0: Windows 7 (default — Desktop mode: no log,
-        // animation, then Ring 3 cmd.exe; future: desktop GUI)
+        // animation, then Session-1 explorer.exe).
         store.entries[0] = Some(BootEntry {
             guid: wellknown::ENTRY_WINDOWS_7,
             description: StaticStr::from_str("Windows 7"),

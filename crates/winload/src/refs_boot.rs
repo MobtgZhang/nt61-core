@@ -92,12 +92,18 @@ fn find_refs_partition_start_lba(
     if &gpt_header[0..8] != b"EFI PART" {
         return None;
     }
-    let partition_entry_count =
-        u32::from_le_bytes([gpt_header[80], gpt_header[81], gpt_header[82], gpt_header[83]])
-            as usize;
-    let partition_entry_size =
-        u32::from_le_bytes([gpt_header[84], gpt_header[85], gpt_header[86], gpt_header[87]])
-            as usize;
+    let partition_entry_count = u32::from_le_bytes([
+        gpt_header[80],
+        gpt_header[81],
+        gpt_header[82],
+        gpt_header[83],
+    ]) as usize;
+    let partition_entry_size = u32::from_le_bytes([
+        gpt_header[84],
+        gpt_header[85],
+        gpt_header[86],
+        gpt_header[87],
+    ]) as usize;
     let partition_entry_lba = u64::from_le_bytes([
         gpt_header[72],
         gpt_header[73],
@@ -117,8 +123,8 @@ fn find_refs_partition_start_lba(
 
     // Microsoft basic-data GUID (same for NTFS and ReFS)
     const BASIC_DATA_GUID: [u8; 16] = [
-        0xA0, 0x88, 0x2D, 0x83, 0xEB, 0xD1, 0xCD, 0x41, 0xB7, 0x96, 0x21, 0xE3, 0x66, 0x65,
-        0xFF, 0xCC,
+        0xA0, 0x88, 0x2D, 0x83, 0xEB, 0xD1, 0xCD, 0x41, 0xB7, 0x96, 0x21, 0xE3, 0x66, 0x65, 0xFF,
+        0xCC,
     ];
 
     for i in 0..partition_entry_count {
@@ -155,11 +161,7 @@ fn read_refs_file(
 ) -> Option<Vec<u8>> {
     let mut index = alloc::vec![0u8; 4096];
     block
-        .read_blocks(
-            media_id,
-            partition_start_lba + REFS_INDEX_LBA,
-            &mut index,
-        )
+        .read_blocks(media_id, partition_start_lba + REFS_INDEX_LBA, &mut index)
         .ok()?;
 
     // Normalise path: strip leading '\', '/', and drive letter

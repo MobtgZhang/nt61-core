@@ -45,8 +45,8 @@ impl NtfsBoot {
         // Positive = 2^val clusters. Negative = 2^|val| bytes.
         let mft_raw = buf[0x40] as i8;
         let mft_record_size: u32 = if mft_raw >= 0 {
-            let cluster_bytes = (sectors_per_cluster as u32)
-                .checked_mul(bytes_per_sector as u32)?;
+            let cluster_bytes =
+                (sectors_per_cluster as u32).checked_mul(bytes_per_sector as u32)?;
             cluster_bytes.checked_shl(mft_raw as u32)?
         } else {
             1u32.checked_shl(-mft_raw as u32)?
@@ -645,6 +645,7 @@ fn read_data_stream(
                         &record,
                         off,
                         standard_run_offset,
+                        off + attr_len,
                         real_size,
                     ) {
                         return Some(data);
@@ -671,6 +672,7 @@ fn read_data_stream(
                         &record,
                         off,
                         builder_run_offset,
+                        off + attr_len,
                         builder_real_size,
                     ) {
                         return Some(data);
@@ -734,12 +736,17 @@ fn parse_ntfs_runs(
             return None;
         }
         let header = data[rp];
-        if header == 0 {
+        if header == 0 || header == 0xFF {
             break;
         }
         let len_len = (header & 0x0F) as usize;
         let off_len = ((header >> 4) & 0x0F) as usize;
-        if len_len == 0 || rp + 1 + len_len + off_len > run_end || rp + 1 + len_len + off_len > data.len() {
+        if len_len == 0
+            || len_len > 8
+            || off_len > 8
+            || rp + 1 + len_len + off_len > run_end
+            || rp + 1 + len_len + off_len > data.len()
+        {
             return None;
         }
         let mut len_bytes = [0u8; 8];
@@ -785,13 +792,13 @@ fn read_nonresident_runs(
     data: &[u8],
     attr_off: usize,
     run_offset: usize,
+    run_end: usize,
     real_size: u64,
 ) -> Option<alloc::vec::Vec<u8>> {
     const MAX_BOOT_FILE_SIZE: u64 = 256 * 1024 * 1024;
     if real_size == 0 || real_size > MAX_BOOT_FILE_SIZE {
         return None;
     }
-    let run_end = data.len();
     let runs = parse_ntfs_runs(data, attr_off + run_offset, run_end)?;
     let sectors_per_cluster = ntfs.sectors_per_cluster as u64;
     let mut out = alloc::vec![0u8; real_size as usize];
@@ -802,12 +809,12 @@ fn read_nonresident_runs(
             return None;
         }
         write_pos = start as usize;
-        let byte_count = cluster_count.saturating_mul(ntfs.sectors_per_cluster as u64)
+        let byte_count = cluster_count
+            .saturating_mul(ntfs.sectors_per_cluster as u64)
             .saturating_mul(512);
         if first_lcn == 0 {
-            write_pos = write_pos.saturating_add(
-                byte_count.min(out.len() as u64 - write_pos as u64) as usize,
-            );
+            write_pos = write_pos
+                .saturating_add(byte_count.min(out.len() as u64 - write_pos as u64) as usize);
             continue;
         }
         let sector_count = cluster_count.saturating_mul(sectors_per_cluster);
@@ -825,8 +832,7 @@ fn read_nonresident_runs(
         if take > bytes.len() {
             return None;
         }
-        out[write_pos..write_pos + take as usize]
-            .copy_from_slice(&bytes[..take as usize]);
+        out[write_pos..write_pos + take as usize].copy_from_slice(&bytes[..take as usize]);
         write_pos += take as usize;
         if write_pos == out.len() {
             break;

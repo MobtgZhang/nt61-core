@@ -45,9 +45,7 @@ fn find_mbr_fat32_partition(reader: &dyn SectorReader) -> Option<u64> {
         if matches!(kind, 0x06 | 0x0B | 0x0C | 0x0E) {
             let first_lba = u32::from_le_bytes(entry[8..12].try_into().ok()?) as u64;
             let boot_sector = reader.read_sectors(first_lba, 1)?;
-            if boot_sector.len() >= SECTOR_SIZE
-                && boot_sector.get(82..90) == Some(b"FAT32   ")
-            {
+            if boot_sector.len() >= SECTOR_SIZE && boot_sector.get(82..90) == Some(b"FAT32   ") {
                 return Some(first_lba);
             }
         }
@@ -100,9 +98,7 @@ fn find_gpt_fat32_partition(reader: &dyn SectorReader) -> Option<u64> {
             continue;
         }
         let boot_sector = reader.read_sectors(first_lba, 1)?;
-        if boot_sector.len() < SECTOR_SIZE
-            || boot_sector.get(82..90) != Some(b"FAT32   ")
-        {
+        if boot_sector.len() < SECTOR_SIZE || boot_sector.get(82..90) != Some(b"FAT32   ") {
             continue;
         }
         return Some(first_lba);
@@ -214,7 +210,8 @@ fn next_cluster(
     let sector = fat_offset / sector_size;
     let byte = fat_offset % sector_size;
     for fat_index in 0..geometry.fat_count {
-        let fat_lba = partition_start_lba + geometry.reserved_sectors as u64
+        let fat_lba = partition_start_lba
+            + geometry.reserved_sectors as u64
             + u64::from(fat_index) * u64::from(geometry.fat_sectors);
         let Some(fat) = reader.read_sectors(fat_lba + sector as u64, 1) else {
             continue;
@@ -406,8 +403,7 @@ fn read_file_data(
     if entry.size as usize > MAX_BOOT_FILE_BYTES {
         return None;
     }
-    let cluster_size =
-        geometry.sectors_per_cluster as usize * geometry.sector_size as usize;
+    let cluster_size = geometry.sectors_per_cluster as usize * geometry.sector_size as usize;
     let mut output = Vec::with_capacity(entry.size as usize);
     let mut remaining = entry.size as usize;
     let mut cluster = entry.cluster;

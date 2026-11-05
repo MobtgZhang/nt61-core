@@ -507,9 +507,9 @@ impl PE32HeaderInfo {
     /// Convert an RVA to a file offset.
     pub fn rva_to_file_offset(&self, rva: u32) -> Option<u32> {
         for section in &self.section_headers {
-            let section_end = section.virtual_address.checked_add(
-                section.virtual_size.max(section.size_of_raw_data),
-            )?;
+            let section_end = section
+                .virtual_address
+                .checked_add(section.virtual_size.max(section.size_of_raw_data))?;
             if rva >= section.virtual_address && rva < section_end {
                 let offset_in_section = rva - section.virtual_address;
                 return section.pointer_to_raw_data.checked_add(offset_in_section);

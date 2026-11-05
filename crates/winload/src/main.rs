@@ -100,13 +100,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 mod arch;
 mod ext4_boot;
-mod refs_boot;
 mod fat32_boot;
 mod fat_lfn;
 mod gop_display;
 pub mod logging;
 pub mod ntfs_boot;
 mod pe;
+mod refs_boot;
 mod verify;
 
 static EXIT_BOOT_SERVICES_DONE: AtomicBool = AtomicBool::new(false);
@@ -133,7 +133,10 @@ static HYBRID_ALLOCATOR: HybridAllocator = HybridAllocator;
 
 impl HybridAllocator {
     fn backend_alloc(layout: Layout) -> (*mut u8, u64) {
-        if ntoskrnl::mm::heap::KERNEL_HEAP.configured_region().is_some() {
+        if ntoskrnl::mm::heap::KERNEL_HEAP
+            .configured_region()
+            .is_some()
+        {
             let ptr = unsafe { ntoskrnl::mm::heap::KERNEL_HEAP.alloc(layout) };
             (ptr, HYBRID_ORIGIN_KERNEL)
         } else {
@@ -207,8 +210,8 @@ unsafe impl GlobalAlloc for HybridAllocator {
     }
 }
 
-use nt61_boot_types::boot_types::{DeviceRange, DeviceTreeHardware};
 use nt61_boot_types::boot_types::{BootInfo, BOOTINFO_MAX_HIVES};
+use nt61_boot_types::boot_types::{DeviceRange, DeviceTreeHardware};
 use nt61_loader::loader;
 use uefi::boot::{allocate_pages, AllocateType, MemoryType};
 use uefi::mem::memory_map::MemoryAttribute;
@@ -662,16 +665,6 @@ const EFI_FB_MAILBOX_TABLE_GUID: EfiGuid = EfiGuid([
     0x9d, 0x0f, 0x7e, 0x8a, 0x8d, 0x21, 0x4f, 0x7f, 0x98, 0x7f, 0x3c, 0x9d, 0x0c, 0x5f, 0x4b, 0x61,
 ]);
 
-/// ACPI 2.0+ RSDP table GUID (all UEFI firmwares install this).
-const EFI_ACPI_20_TABLE_GUID: EfiGuid = EfiGuid([
-    0xc8, 0xe8, 0x68, 0x88, 0xa5, 0x1c, 0xbd, 0x4b, 0xa0, 0x24, 0x69, 0xa0, 0xc9, 0x9c, 0x02, 0x91,
-]);
-
-/// ACPI 1.0 RSDP table GUID (fallback for ancient firmwares).
-const EFI_ACPI_TABLE_GUID: EfiGuid = EfiGuid([
-    0x32, 0x2d, 0x9d, 0xeb, 0x88, 0x2d, 0xd8, 0x11, 0x9a, 0x41, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d,
-]);
-
 /// FDT Client protocol exposed by EDK2 on generic ARM64 virtual machines.
 #[repr(C)]
 #[unsafe_protocol("e11faca0-4710-4c8e-a7a2-01baa2591b4c")]
@@ -927,23 +920,17 @@ fn capture_device_tree() {
 /// fallback. The kernel consumes `BootInfo.acpi_rsdp` during
 /// Phase 1 to resolve MCFG / FADT / MADT through `find_table`.
 fn capture_acpi_rsdp() {
-    let Some(system_table) = uefi::table::system_table_raw() else {
-        debug_println!("[LOADER] [WARN] ACPI capture: system table unavailable");
-        return;
-    };
-    let table = unsafe { &*(system_table.as_ptr() as *const EfiSystemTable) };
-    let entries = unsafe {
-        core::slice::from_raw_parts(table.configuration_table, table.number_of_table_entries)
-    };
-    let rsdp = entries
-        .iter()
-        .find(|entry| entry.vendor_guid == EFI_ACPI_20_TABLE_GUID)
-        .or_else(|| {
-            entries
-                .iter()
-                .find(|entry| entry.vendor_guid == EFI_ACPI_TABLE_GUID)
-        })
-        .map(|entry| entry.vendor_table as u64);
+    let rsdp = uefi::system::with_config_table(|entries| {
+        entries
+            .iter()
+            .find(|entry| entry.guid == uefi::table::cfg::ConfigTableEntry::ACPI2_GUID)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| entry.guid == uefi::table::cfg::ConfigTableEntry::ACPI_GUID)
+            })
+            .map(|entry| entry.address as u64)
+    });
     match rsdp {
         Some(rsdp_phys) if rsdp_phys != 0 => {
             let persistent = unsafe { &mut *core::ptr::addr_of_mut!(PERSISTENT) };
@@ -2846,7 +2833,11 @@ fn capture_esp_partition() {
     pd.esp_image_size = total_ok.saturating_mul(block_size as u64);
     pd.esp_block_size = block_size as u32;
     pd.esp_partition_lba = 0; // partition-relative LBA; full ESP starts at 0
-    pd.esp_partition_sectors = if first_err.is_some() { total_ok } else { total_blocks };
+    pd.esp_partition_sectors = if first_err.is_some() {
+        total_ok
+    } else {
+        total_blocks
+    };
     // Save the BlockIO media_id so capture_system_partition can
     // recognise the ESP handle and pick a different partition as
     // the system partition (works even when system is FAT32 too).
@@ -3611,7 +3602,7 @@ fn build_boot_info(kernel_pa: u64, kernel_size: u64) -> BootInfo {
 
     BootInfo {
         magic: BootInfo::MAGIC,
-        version: 1,
+        version: BootInfo::VERSION,
         kernel_physical_base: kernel_pa,
         kernel_virtual_base: 0xFFFF_8000_0000_0000,
         kernel_size,
@@ -4262,7 +4253,7 @@ fn os_loader_run() -> ! {
         }
     };
     let stack_top = stack_base + (stack_pages * 4096) as u64;
-    let bi_ptr = core::ptr::addr_of!(KERNEL_BOOT_INFO) as u64;
+    let mut bi_ptr = core::ptr::addr_of!(KERNEL_BOOT_INFO) as u64;
 
     debug_println!(
         "[LOADER] jumping to kernel, bi_ptr=0x{:x} sp=0x{:x} boot_mode={}",
@@ -4338,6 +4329,34 @@ fn os_loader_run() -> ! {
         trampoline_addr
     );
 
+    // Copy the completed BootInfo into runtime-services memory. The
+    // winload image is not guaranteed to survive ExitBootServices, and
+    // losing this copy makes the kernel validate against defaults and
+    // lose the framebuffer, filesystem mirrors, and boot mode.
+    let runtime_boot_info_pages =
+        core::mem::size_of::<BootInfo>().div_ceil(_PAGE_SIZE as usize);
+    let runtime_boot_info_base = allocate_pages(
+        AllocateType::AnyPages,
+        MemoryType::RUNTIME_SERVICES_DATA,
+        runtime_boot_info_pages,
+    )
+    .unwrap_or_else(|status| panic!("[WINLOAD] runtime BootInfo allocation failed: {status:?}"));
+    let runtime_boot_info = runtime_boot_info_base.as_ptr() as u64;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(KERNEL_BOOT_INFO) as *const u8,
+            runtime_boot_info_base.as_ptr() as *mut u8,
+            core::mem::size_of::<BootInfo>(),
+        );
+    }
+    debug_println!(
+        "[WINLOAD] L09: runtime BootInfo copy=0x{:x} size={} pages={}",
+        runtime_boot_info,
+        core::mem::size_of::<BootInfo>(),
+        runtime_boot_info_pages
+    );
+    bi_ptr = runtime_boot_info;
+
     // =====================================================================
     // Phase L10 — ExitBootServices(image_handle, map_key)
     // =====================================================================
@@ -4385,9 +4404,7 @@ fn os_loader_run() -> ! {
     if fresh_entries > 0 {
         let pd = unsafe { &*core::ptr::addr_of_mut!(PERSISTENT) };
         for (idx, entry) in pd.memory_map.iter().take(fresh_entries).enumerate() {
-            if entry.base <= 0x0000000000010200
-                && entry.base + entry.length > 0x0000000000010200
-            {
+            if entry.base <= 0x0000000000010200 && entry.base + entry.length > 0x0000000000010200 {
                 uefi::println!(
                     "[WINLOAD] L10 map[{}] base=0x{:x} len=0x{:x} type={}",
                     idx,
@@ -4409,14 +4426,11 @@ fn os_loader_run() -> ! {
     // pulled out of the system table below) takes that raw
     // pointer, so we unwrap it.
     let handle_ptr: *mut core::ffi::c_void = uefi::boot::image_handle().as_ptr();
-    uefi::println!(
-        "[WINLOAD] L10 image_handle=0x{:x}",
-        handle_ptr as u64
-    );
+    uefi::println!("[WINLOAD] L10 image_handle=0x{:x}", handle_ptr as u64);
     uefi::println!("[WINLOAD] L10 calling ExitBootServices");
     unsafe {
-        let st = uefi::table::system_table_raw()
-            .expect("system table not set for ExitBootServices");
+        let st =
+            uefi::table::system_table_raw().expect("system table not set for ExitBootServices");
         let bt = st.as_ref().boot_services;
         debug_assert!(!bt.is_null());
         let bt_ref = &*bt;
@@ -4483,7 +4497,7 @@ fn os_loader_run() -> ! {
         kernel_entry_rva_l03,
         ki_va,
         stack_top,
-        core::ptr::addr_of!(KERNEL_BOOT_INFO) as u64
+        bi_ptr
     );
     debug_println!(
         "[WINLOAD] L11: jumping to disk ntoskrnl.exe at 0x{:x} entry=0x{:x} stack_top=0x{:x}",
@@ -4496,7 +4510,7 @@ fn os_loader_run() -> ! {
     unsafe {
         arch::current::launch_kernel(
             stack_top,
-            core::ptr::addr_of!(KERNEL_BOOT_INFO) as u64,
+            bi_ptr,
             ki_va,
         );
     }

@@ -36,7 +36,8 @@ impl core::fmt::Display for AcpiError {
 }
 
 fn checksum(data: &[u8], checksum: u8) -> bool {
-    data.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) == checksum.wrapping_neg()
+    let _ = checksum;
+    data.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) == 0
 }
 
 /// # Safety

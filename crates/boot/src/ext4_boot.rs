@@ -142,8 +142,7 @@ fn read_inode(
     let sectors_per_block = (ext4.block_size / 512) as u64;
     let descriptor_offset = group.checked_mul(64)?;
     let descriptor_lba = partition_start_lba
-        + ((ext4.first_data_block + 1) as u64)
-            .checked_mul(sectors_per_block)?
+        + ((ext4.first_data_block + 1) as u64).checked_mul(sectors_per_block)?
         + u64::from(descriptor_offset / 512);
     let mut descriptor_sector = [0u8; 512];
     if block_io
@@ -157,18 +156,13 @@ fn read_inode(
         return None;
     }
     let descriptor = &descriptor_sector[descriptor_offset_in_sector..];
-    let inode_table_block = u32::from_le_bytes([
-        descriptor[8],
-        descriptor[9],
-        descriptor[10],
-        descriptor[11],
-    ]);
+    let inode_table_block =
+        u32::from_le_bytes([descriptor[8], descriptor[9], descriptor[10], descriptor[11]]);
     if inode_table_block == 0 {
         return None;
     }
-    let inode_table_lba = partition_start_lba
-        + (inode_table_block as u64)
-            .checked_mul(sectors_per_block)?;
+    let inode_table_lba =
+        partition_start_lba + (inode_table_block as u64).checked_mul(sectors_per_block)?;
 
     let block_in_table = (local * (ext4.inode_size as u32)) / ext4.block_size;
     // inode_table_lba is the absolute disk LBA of the inode table
@@ -229,9 +223,9 @@ fn read_extents(
     let mut next_logical = 0usize;
 
     let process_extent = |entry: (u32, u32, u32),
-                              out: &mut Vec<u8>,
-                              bytes_left: &mut usize,
-                              next_logical: &mut usize|
+                          out: &mut Vec<u8>,
+                          bytes_left: &mut usize,
+                          next_logical: &mut usize|
      -> Option<bool> {
         let (ee_block, ee_len_word, start_word) = entry;
         let unwritten = ee_len_word & 0x8000 != 0;
@@ -330,7 +324,12 @@ fn read_extents(
                     leaf[e_off + 10],
                     leaf[e_off + 11],
                 ]);
-                if !process_extent((e_w0, e_w1, e_w2), &mut out, &mut bytes_left, &mut next_logical)? {
+                if !process_extent(
+                    (e_w0, e_w1, e_w2),
+                    &mut out,
+                    &mut bytes_left,
+                    &mut next_logical,
+                )? {
                     break;
                 }
             }

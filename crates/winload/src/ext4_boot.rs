@@ -133,8 +133,7 @@ fn read_inode(
     let sectors_per_block = (ext4.block_size / 512) as u64;
     let descriptor_offset = group.checked_mul(64)?;
     let descriptor_lba = partition_start_lba
-        + ((ext4.first_data_block + 1) as u64)
-            .checked_mul(sectors_per_block)?
+        + ((ext4.first_data_block + 1) as u64).checked_mul(sectors_per_block)?
         + u64::from(descriptor_offset / 512);
     let mut descriptor_sector = [0u8; 512];
     if block_io
@@ -148,17 +147,13 @@ fn read_inode(
         return None;
     }
     let descriptor = &descriptor_sector[descriptor_offset_in_sector..];
-    let inode_table_block = u32::from_le_bytes([
-        descriptor[8],
-        descriptor[9],
-        descriptor[10],
-        descriptor[11],
-    ]);
+    let inode_table_block =
+        u32::from_le_bytes([descriptor[8], descriptor[9], descriptor[10], descriptor[11]]);
     if inode_table_block == 0 {
         return None;
     }
-    let inode_table_lba = partition_start_lba
-        + (inode_table_block as u64).checked_mul(sectors_per_block)?;
+    let inode_table_lba =
+        partition_start_lba + (inode_table_block as u64).checked_mul(sectors_per_block)?;
 
     let block_in_table = (local * (ext4.inode_size as u32)) / ext4.block_size;
     let sectors_per_block = (ext4.block_size / 512) as u64;
@@ -190,10 +185,7 @@ fn parse_inode(inode: &[u8]) -> Option<(u64, [u32; 15])> {
         i_block[i] =
             u32::from_le_bytes([inode[off], inode[off + 1], inode[off + 2], inode[off + 3]]);
     }
-    Some((
-        u64::from(i_size_lo) | (u64::from(i_size_hi) << 32),
-        i_block,
-    ))
+    Some((u64::from(i_size_lo) | (u64::from(i_size_hi) << 32), i_block))
 }
 
 /// Walk an inode's extent tree and return the bytes of the file's data.
@@ -249,8 +241,7 @@ fn read_extents(
             let unwritten = (w1 & 0x8000) != 0;
             let ee_len = (w1 & 0x7FFF) as u32;
             if unwritten {
-                let take =
-                    core::cmp::min(ee_len as usize * ext4.block_size as usize, bytes_left);
+                let take = core::cmp::min(ee_len as usize * ext4.block_size as usize, bytes_left);
                 out.extend(core::iter::repeat_n(0u8, take));
                 bytes_left = bytes_left.saturating_sub(take);
                 next_logical += take;

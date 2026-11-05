@@ -129,7 +129,7 @@ use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
 use uefi::proto::console::text::{Key, ScanCode};
 use uefi::proto::media::file::{Directory, File, FileAttribute, FileInfo, FileMode, RegularFile};
 use uefi::proto::media::fs::SimpleFileSystem;
-use uefi::runtime::{VariableAttributes, VariableVendor};
+use uefi::runtime::VariableVendor;
 use uefi::CString16;
 
 use crate::font::BitmapFont;
@@ -299,17 +299,6 @@ fn write_fb_mailbox(info: &FramebufferInfo) {
         uefi::println!("[BOOTMGR] framebuffer mailbox allocation failed");
     }
 
-    let attributes = VariableAttributes::NON_VOLATILE
-        | VariableAttributes::BOOTSERVICE_ACCESS
-        | VariableAttributes::RUNTIME_ACCESS;
-    let result =
-        uefi::runtime::set_variable(FB_VARIABLE_NAME, &FB_VARIABLE_VENDOR, attributes, &payload);
-    if let Err(status) = result {
-        debug_println!(
-            "  [BOOTMGR] framebuffer variable write failed: {:?}",
-            status
-        );
-    }
     debug_println!(
         "  [BOOTMGR] Framebuffer mailbox written: base=0x{:x} {}x{} stride={}",
         info.base,
@@ -2157,7 +2146,9 @@ fn probe_system_partition_present() -> bool {
     for handle in handles.iter() {
         if matches!(
             probe_partition_type(*handle),
-            PartitionType::Ntfs { .. } | PartitionType::Refs { .. } | PartitionType::Ext4 { .. }
+            PartitionType::Ntfs { .. }
+                | PartitionType::Refs { .. }
+                | PartitionType::Ext4 { .. }
                 | PartitionType::Fat
         ) {
             return true;
@@ -2185,7 +2176,10 @@ fn read_refs_boot_file_for(
         .read_blocks(media_id, partition_start_lba + 16, &mut index)
         .is_err()
     {
-        debug_println!("[REFS] failed to read directory index at LBA {}", partition_start_lba + 16);
+        debug_println!(
+            "[REFS] failed to read directory index at LBA {}",
+            partition_start_lba + 16
+        );
         return None;
     }
 
@@ -2235,8 +2229,7 @@ fn read_refs_boot_file_for(
             let total_sectors = file_len.div_ceil(512);
             while sector_off < total_sectors {
                 let count = CHUNK_SECTORS.min(total_sectors - sector_off);
-                let chunk_end =
-                    ((sector_off + count) as usize * 512).min(data.len());
+                let chunk_end = ((sector_off + count) as usize * 512).min(data.len());
                 let chunk_start = sector_off as usize * 512;
                 let chunk = &mut data[chunk_start..chunk_end];
                 if block_io
@@ -2780,7 +2773,14 @@ fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
     // Use the PE header's preferred image_base so all RIP-relative
     // references resolve correctly. If the firmware cannot honor it,
     // apply the relocations table.
-    let load_base: u64 = opt.image_base;
+    // OVMF's default QEMU profile rejects executable allocations
+    // above 4 GiB. Keep the PE ImageBase as the relocation reference,
+    // but load the image into conventional memory and apply .reloc.
+    let load_base: u64 = if opt.image_base >= 0x1_0000_0000 {
+        0x0400_0000
+    } else {
+        opt.image_base
+    };
     let image_size = aligned_size as usize;
 
     debug_println!(
@@ -3628,9 +3628,9 @@ fn apply_mft_update_sequence_fixups(record: &mut [u8]) -> bool {
     if record.len() < 512 || &record[0..4] != b"FILE" {
         return false;
     }
-    let usa_offset = u16::from_le_bytes([record[0x2A], record[0x2B]]) as usize;
-    let usa_count = u16::from_le_bytes([record[0x2C], record[0x2D]]) as usize;
-    if usa_offset < 0x30 || usa_count < 2 {
+    let usa_offset = u16::from_le_bytes([record[4], record[5]]) as usize;
+    let usa_count = u16::from_le_bytes([record[6], record[7]]) as usize;
+    if usa_count < 2 || usa_offset < 8 {
         return false;
     }
     let fixups_end = usa_offset + usa_count * 2;
@@ -3651,8 +3651,7 @@ fn apply_mft_update_sequence_fixups(record: &mut [u8]) -> bool {
             .try_into()
             .map(u16::from_le_bytes)
             .unwrap_or(0);
-        let expected = sequence_number.wrapping_add(fixup_index as u16);
-        if stored != expected {
+        if stored != sequence_number {
             return false;
         }
         record[protected_offset..protected_offset + 2].copy_from_slice(original);
@@ -4133,10 +4132,7 @@ fn read_data_stream(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
                 let mut p = off + run_off;
                 const MAX_BOOT_STREAM_BYTES: u64 = 256 * 1024 * 1024;
                 if real_size > MAX_BOOT_STREAM_BYTES {
-                    debug_println!(
-                        "[NTFS-RUN] stream too large: real_size={}",
-                        real_size
-                    );
+                    debug_println!("[NTFS-RUN] stream too large: real_size={}", real_size);
                     return None;
                 }
                 let mut out: Vec<u8> = alloc::vec![0u8; real_size as usize];
@@ -4213,10 +4209,7 @@ fn read_data_stream(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
                         .read_blocks(media.media_id(), disk_lba, &mut data)
                         .is_err()
                     {
-                        debug_println!(
-                            "[NTFS-RUN]   read_blocks FAILED for disk_lba={}",
-                            disk_lba
-                        );
+                        debug_println!("[NTFS-RUN]   read_blocks FAILED for disk_lba={}", disk_lba);
                         return None;
                     }
                     let copy_len = data.len();

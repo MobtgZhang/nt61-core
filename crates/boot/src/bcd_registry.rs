@@ -153,18 +153,17 @@ fn read_u16(data: &[u8], off: usize) -> Option<u16> {
     Some(u16::from_le_bytes([data[off], data[off + 1]]))
 }
 
-/// Compute header checksum: xor of dwords [0, 0x1FC) (127 dwords)
+/// Compute the standard REGF header checksum: XOR of dwords [0, 0x1FC).
 fn compute_header_checksum(data: &[u8]) -> u32 {
-    let mut sum = 0u64;
-    for offset in (0x20..0x3FC).step_by(4) {
-        if offset == 0x1FC {
-            continue;
-        }
-        sum = sum.wrapping_add(u64::from(u32::from_le_bytes(
-            data[offset..offset + 4].try_into().unwrap_or_default(),
-        )));
+    let mut sum = 0u32;
+    for offset in (0..0x1FC).step_by(4) {
+        sum ^= u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .unwrap_or_default(),
+        );
     }
-    ((sum >> 32).wrapping_add(sum & 0xFFFF_FFFF)) as u32
+    sum
 }
 
 /// Decode a registry value name. Short names (<=64 bytes) are ASCII encoded,
