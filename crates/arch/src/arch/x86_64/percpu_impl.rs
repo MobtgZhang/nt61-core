@@ -117,20 +117,8 @@ pub unsafe extern "Rust" fn __percpu_init(cpu_id: u32) -> u64 {
 
     // Install as GS base for this CPU.
     //
-    // Install the per-CPU area only into IA32_GS_BASE. IA32_KERNEL_GS_BASE
-    // stays zero so that `swapgs` in the syscall/trap entry stubs actually
-    // switches to a *different* base on the way out to Ring 3. Writing the
-    // same value to both MSRs would make swapgs a no-op and expose the
-    // kernel per-CPU area to user mode.
-    //
-    // After init (we are in the kernel): gs:[off] = &PER_CPU_0+off
-    // via IA32_GS_BASE.
-    //
-    // The first_user_enter trampoline performs a `swapgs` immediately
-    // before its iretq, so the user-mode gs: will access the
-    // (zero) KERNEL_GS_BASE rather than the kernel per-cpu area.
     wrmsr(IA32_GS_BASE, page);
-    wrmsr(IA32_KERNEL_GS_BASE, 0);
+    wrmsr(IA32_KERNEL_GS_BASE, page);
 
     // Verify the MSR was written correctly
     if rdmsr(IA32_GS_BASE) != page {

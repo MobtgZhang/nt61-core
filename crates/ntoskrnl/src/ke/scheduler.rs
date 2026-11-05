@@ -19,7 +19,8 @@ use crate::ke::irql::{self, Irql};
 use crate::ke::sync::Spinlock;
 use crate::ps::thread::{create_idle_thread as create_thread_idle, Ethread, KThreadState};
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::ptr::null_mut as atomic_null_mut;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering};
 
 static SCHED_SWITCH_DIAG: AtomicU8 = AtomicU8::new(0);
 
@@ -92,7 +93,6 @@ pub struct ThreadQuantum {
 }
 
 /// Ready queue for each priority level.
-#[repr(C)]
 // =============================================================================
 // Extended PRCB structures for Windows 7 x64 compatibility (P2-3)
 // =============================================================================
@@ -871,6 +871,25 @@ static SCHEDULER: Spinlock<Scheduler> = Spinlock::new(Scheduler::new());
 static SMP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 
+/// Lock-free mirror of Scheduler::cpus for hot read-only paths.
+///
+/// A PRCB pointer is published here (Release) only after that PRCB has
+/// been fully initialized, so readers that acquire the pointer can safely
+/// touch ready_summary without holding the global scheduler lock.
+/// Pointers are never replaced after publication, so the only race is
+/// "not yet published" versus "published", which the load order handles.
+static PRCB_PTRS: [AtomicPtr<Prcb>; MAX_CPUS] =
+    [const { AtomicPtr::new(atomic_null_mut()) }; MAX_CPUS];
+
+/// Raw PRCB pointer for hot paths that already hold the per-(CPU,
+/// priority) queue lock. The pointer is stable after publication.
+fn prcb_ptr(cpu: usize) -> *mut Prcb {
+    if cpu >= MAX_CPUS {
+        return core::ptr::null_mut();
+    }
+    PRCB_PTRS[cpu].load(Ordering::Acquire)
+}
+
 // Per-CPU dispatcher locks for improved SMP scalability
 // Each CPU has its own lock for local scheduler operations,
 // reducing contention compared to a single global lock.
@@ -1107,6 +1126,7 @@ pub unsafe fn setup_bsp(thread: *mut Ethread) -> bool {
         // SAFETY: the pool allocation is initialized in place and owned
         // by `Scheduler`; it is dereferenced only through locked accessors.
         sched.cpus[0] = raw;
+        PRCB_PTRS[0].store(raw, Ordering::Release);
     }
     let idle_ptr = create_thread_idle(0)
         .map(|idle| idle as *mut crate::ps::thread::Ethread)
@@ -1174,11 +1194,32 @@ pub fn init_smp(cpu_count: u32) {
         }
         scheduler.cpus[i] = raw;
         scheduler.num_cpus = i + 1;
-        if scheduler.num_idle_threads < scheduler.idle_threads.len() {
+        PRCB_PTRS[i].store(raw, Ordering::Release);
+
+        // Pre-create this CPU's idle thread on the BSP, exactly like
+        // KeStartAllProcessors does in Windows 7: the idle ETHREAD
+        // must exist before the AP wakes up. When the AP later runs
+        // init_smp_this_cpu it reuses the published thread instead of
+        // allocating from a pool that is already under pressure.
+        // KeStartAllProcessors semantics: pre-create the idle ETHREAD
+        // on the BSP when the System process already exists. During
+        // early kernel init the System process is not created yet, so
+        // fall back to the AP creating its own idle thread inside
+        // init_smp_this_cpu (the previous behavior).
+        if crate::ps::process::get_by_pid(crate::ps::process::PID_SYSTEM).is_some() {
             if let Some(idle) = create_thread_idle(i as u32) {
-                let idx = scheduler.num_idle_threads;
-                scheduler.idle_threads[idx] = idle;
-                scheduler.num_idle_threads += 1;
+                if scheduler.num_idle_threads < scheduler.idle_threads.len() {
+                    let slot = scheduler.num_idle_threads;
+                    scheduler.idle_threads[slot] = idle;
+                    scheduler.num_idle_threads += 1;
+                }
+                // SAFETY: raw was just allocated and initialized above.
+                unsafe {
+                    (*raw).idle_thread = idle;
+                    if (*raw).current_thread.is_null() {
+                        (*raw).current_thread = idle;
+                    }
+                }
             }
         }
     }
@@ -1205,8 +1246,6 @@ pub unsafe fn add_ready(thread: *mut Ethread, priority: u8) {
     }
     let priority = priority.min(31);
 
-    let mut scheduler = SCHEDULER.lock();
-
     // Determine target CPU based on thread affinity
     let target_cpu = unsafe {
         // If thread has a specific affinity, use its home CPU
@@ -1222,32 +1261,38 @@ pub unsafe fn add_ready(thread: *mut Ethread, priority: u8) {
             if allowed < MAX_CPUS {
                 allowed
             } else {
-                scheduler.current_cpu as usize
+                get_current_cpu()
             }
         }
     };
 
-    // Same lock protocol as `ki_balance_processor`: the scheduler lock is
-    // held first, then the per-(CPU, priority) queue lock. Without this
-    // guard the queue could be mutated here while a balancing CPU mutated
-    // the very same queue under the queue lock.
+    // The global scheduler lock is NOT taken here: the per-(CPU, priority)
+    // queue lock is what actually serializes list mutations, and every
+    // queue mutator (schedule(), ki_balance_processor(), remove_ready())
+    // holds the same queue lock. Taking the global lock here serialized
+    // every thread enqueue across all CPUs and dominated 4-CPU boot time.
     let _queue_guard = match lock_ready_queue(target_cpu, priority as usize) {
         Some(g) => g,
         None => return,
     };
 
+    // SAFETY: prcb_ptr returns a PRCB published after full initialization;
+    // the queue lock gives exclusive access to the (cpu, priority) queue
+    // and ready_summary is atomic.
     if SMP_INITIALIZED.load(Ordering::SeqCst) && target_cpu < MAX_CPUS {
         // Add to per-CPU PRCB ready queue
-        if let Some(ref mut prcb) = scheduler.prcb_mut(target_cpu) {
+        let prcb = prcb_ptr(target_cpu);
+        if !prcb.is_null() {
             let entry_ptr = unsafe {
                 core::ptr::addr_of_mut!((*thread).kthread.global_thread_list_entry)
                     as *mut ListEntry
             };
-            prcb.ready_queues[priority as usize].add_tail(entry_ptr);
-            // Update ready summary bitmask for fast priority check
-            // Update ready summary atomically
-            prcb.ready_summary
-                .fetch_or(1u32 << priority, Ordering::AcqRel);
+            unsafe {
+                (*prcb).ready_queues[priority as usize].add_tail(entry_ptr);
+                (*prcb)
+                    .ready_summary
+                    .fetch_or(1u32 << priority, Ordering::AcqRel);
+            }
 
             // Record where the thread was queued (ke_sched P0-4):
             // remove_ready must look in the same queue even if the
@@ -1267,20 +1312,20 @@ pub unsafe fn add_ready(thread: *mut Ethread, priority: u8) {
     }
 
     // Fallback for single-CPU mode: use CPU 0's queue if available
-    if let Some(ref mut prcb) = scheduler.prcb_mut(0) {
-        let entry_ptr = unsafe {
-            core::ptr::addr_of_mut!((*thread).kthread.global_thread_list_entry) as *mut ListEntry
-        };
-        prcb.ready_queues[priority as usize].add_tail(entry_ptr);
-        // Update ready summary atomically
-        prcb.ready_summary
-            .fetch_or(1u32 << priority, Ordering::AcqRel);
-        // Record the queue location (see the per-CPU path above).
+    let prcb = prcb_ptr(0);
+    if !prcb.is_null() {
         unsafe {
+            let entry_ptr = core::ptr::addr_of_mut!((*thread).kthread.global_thread_list_entry)
+                as *mut ListEntry;
+            (*prcb).ready_queues[priority as usize].add_tail(entry_ptr);
+            // Update ready summary atomically
+            (*prcb)
+                .ready_summary
+                .fetch_or(1u32 << priority, Ordering::AcqRel);
+            // Record the queue location (see the per-CPU path above).
             (*thread).kthread.queued_priority = priority;
             (*thread).kthread.queued_cpu = 0;
         }
-        // // kprintln!("[SCHED] add_ready: fallback to CPU 0, priority {}", priority);
     }
 }
 
@@ -1314,22 +1359,23 @@ pub unsafe fn remove_ready(thread: *mut Ethread) -> bool {
         return false;
     }
 
-    let mut scheduler = SCHEDULER.lock();
-
     // Same lock protocol as `add_ready` and `ki_balance_processor`.
     let _queue_guard = match lock_ready_queue(target_cpu, priority) {
         Some(g) => g,
         None => return false,
     };
 
+    // SAFETY: like add_ready, the queue lock alone serializes this queue;
+    // the PRCB pointer is stable after publication.
     // Search for the thread in the target CPU's ready queue
     if target_cpu < MAX_CPUS {
-        if let Some(ref mut prcb) = scheduler.prcb_mut(target_cpu) {
-            let queue = &mut prcb.ready_queues[priority];
+        let prcb = prcb_ptr(target_cpu);
+        if !prcb.is_null() {
+            let queue = unsafe { &mut (*prcb).ready_queues[priority] };
             let mut entry_ptr = queue.head;
 
             while !entry_ptr.is_null() {
-                unsafe {
+                    unsafe {
                     // Compare entry pointers - queue stores pointers to global_thread_list_entry
                     let thread_list_ptr =
                         core::ptr::addr_of!((*thread).kthread.global_thread_list_entry)
@@ -1358,7 +1404,8 @@ pub unsafe fn remove_ready(thread: *mut Ethread) -> bool {
 
                         // Update ready_summary atomically if queue is now empty
                         if queue.is_empty() {
-                            prcb.ready_summary
+                            (*prcb)
+                                .ready_summary
                                 .fetch_and(!(1u32 << priority), Ordering::AcqRel);
                         }
 
@@ -1741,7 +1788,25 @@ pub fn idle_loop() -> ! {
         // interrupt was never dispatched. Service pending work before
         // idling.
         let cpu = get_current_cpu();
-        if has_pending_reschedule(cpu) {
+        // Desktop-mode logon handoff: when LogonUI exits, SMSS parks a
+        // ready explorer.exe image. Dispatch it here from the idle
+        // thread's clean context - the same setup_bsp + direct Ring-3
+        // transfer the SMSS launch path uses.
+        let mut handoff = None;
+        if cpu == 0 {
+            handoff = crate::ps::process::take_logon_handoff();
+        }
+        if let Some((root, rip, rsp, thread)) = handoff {
+            crate::hal::serial::write_string_always("SCHED: dispatching explorer from handoff\r\n");
+            if thread != 0 {
+                unsafe {
+                    setup_bsp(thread as *mut Ethread);
+                }
+            }
+            unsafe {
+                crate::arch::common::user_entry::enter_first_user_thread(root, rip, rsp);
+            }
+        } else if has_pending_reschedule(cpu) {
             dispatch_pending_reschedule();
         } else if has_work() {
             schedule();
@@ -1753,7 +1818,9 @@ pub fn idle_loop() -> ! {
 
 /// create an idle thread for a CPU.
 pub fn create_idle_thread() {
+    crate::hal::serial::write_string_always("[DBG] create_idle_thread enter\r\n");
     let mut scheduler = SCHEDULER.lock();
+    crate::hal::serial::write_string_always("[DBG] create_idle locked\r\n");
     let cpu_count = scheduler.num_cpus.max(1);
 
     if scheduler.num_idle_threads >= scheduler.idle_threads.len() {
@@ -1876,6 +1943,7 @@ pub fn is_smp_enabled() -> bool {
 
 /// Initialise per-CPU state for the current CPU (BSP or AP).
 pub fn init_smp_this_cpu(cpu_id: u32) {
+    crate::hal::serial::write_string_always("[DBG] init_smp_this_cpu enter\r\n");
     // An out-of-range CPU id is an arch-layer bug: clamping it onto an
     // existing slot would run two CPUs on one PRCB, letting both write
     // the same scheduler state. Fail loudly instead.
@@ -1889,28 +1957,36 @@ pub fn init_smp_this_cpu(cpu_id: u32) {
             0,
         );
     }
-    let mut sched = SCHEDULER.lock();
     let idx = cpu_id as usize;
 
-    if sched.prcb(idx).is_none() {
-        let raw = crate::mm::pool::allocate(
-            crate::mm::pool::PoolType::NonPaged,
-            core::mem::size_of::<Prcb>(),
-        ) as *mut Prcb;
-        if raw.is_null() {
-            // // kprintln!("[FATAL] init_smp_this_cpu: PRCB pool allocation failed for CPU {}", cpu_id);
-            // // kprintln!("[FATAL] Per-CPU initialization failed - cannot continue");
-            // Per-CPU PRCB allocation failure is also fatal
-            crate::ke::bugcheck::bugcheck_with(
-                crate::ke::bugcheck::BugCheckCode::ProcessInitializationFailed,
-                0x6B,          // PROCESS_INITIALIZATION_FAILURE
-                cpu_id as u64, // CPU ID
-                core::mem::size_of::<Prcb>() as u64,
-                0,
-            );
-            // NOTE: bugcheck_with() does not return
-        }
+    // Allocate and fully initialize the PRCB and the idle thread BEFORE
+    // taking the scheduler lock. Two APs run this concurrently; if either
+    // allocated from the paged/nonpaged pool while holding SCHEDULER, the
+    // pair could form an ABBA deadlock (SCHEDULER -> pool lock vs pool
+    // lock -> SCHEDULER), freezing every later scheduler operation.
+    // PRCB_PTRS is the lock-free publication mirror, so checking it first
+    // also makes re-init a no-op without touching the global lock.
+    let raw = if PRCB_PTRS[idx].load(Ordering::Acquire).is_null() {
+        crate::hal::serial::write_string_always("[DBG] ap prcb alloc enter\r\n");
         unsafe {
+            let raw = crate::mm::pool::allocate(
+                crate::mm::pool::PoolType::NonPaged,
+                core::mem::size_of::<Prcb>(),
+            ) as *mut Prcb;
+            crate::hal::serial::write_string_always("[DBG] ap prcb alloc done\r\n");
+            if raw.is_null() {
+                // // kprintln!("[FATAL] init_smp_this_cpu: PRCB pool allocation failed for CPU {}", cpu_id);
+                // // kprintln!("[FATAL] Per-CPU initialization failed - cannot continue");
+                // Per-CPU PRCB allocation failure is also fatal
+                crate::ke::bugcheck::bugcheck_with(
+                    crate::ke::bugcheck::BugCheckCode::ProcessInitializationFailed,
+                    0x6B,          // PROCESS_INITIALIZATION_FAILURE
+                    cpu_id as u64, // CPU ID
+                    core::mem::size_of::<Prcb>() as u64,
+                    0,
+                );
+                // NOTE: bugcheck_with() does not return
+            }
             (*raw).processor_number = idx as u8;
             (*raw).dispatcher_lock = 0;
             (*raw).ready_summary.store(0, Ordering::Relaxed);
@@ -1921,25 +1997,59 @@ pub fn init_smp_this_cpu(cpu_id: u32) {
             }
             (*raw).quantum_remaining = QUANTUM_DEFAULT;
             (*raw).quantum_initial = QUANTUM_DEFAULT;
+            raw
         }
+    } else {
+        // Already published (e.g. BSP-created PRCB): reuse it.
+        PRCB_PTRS[idx].load(Ordering::Acquire)
+    };
+
+    // The BSP pre-created this CPU's idle thread in init_smp
+    // (KeStartAllProcessors semantics); only allocate a fallback when
+    // it is missing (e.g. CPU count discovered late).
+    let pre_created = unsafe {
+    if (*raw).idle_thread.is_null() {
+        None
+    } else {
+        // SAFETY: the idle thread was published by init_smp and is
+        // exclusively owned by this PRCB.
+        Some(&mut *(*raw).idle_thread)
+    }
+    };
+    let idle = if pre_created.is_none() {
+        crate::hal::serial::write_string_always("[DBG] ap idle create enter\r\n");
+        let idle = create_thread_idle(idx as u32);
+        crate::hal::serial::write_string_always("[DBG] ap idle create done\r\n");
+        idle
+    } else {
+        crate::hal::serial::write_string_always("[DBG] ap idle reused\r\n");
+        pre_created
+    };
+
+    let mut sched = SCHEDULER.lock();
+    crate::hal::serial::write_string_always("[DBG] init_smp locked\r\n");
+
+    if sched.prcb(idx).is_none() {
         sched.cpus[idx] = raw;
+        PRCB_PTRS[idx].store(raw, Ordering::Release);
     }
 
     if sched.num_cpus <= idx {
         sched.num_cpus = idx + 1;
     }
-    if sched.num_idle_threads < sched.idle_threads.len() {
-        if let Some(idle) = create_thread_idle(idx as u32) {
+    if let Some(idle) = idle {
+        if sched.num_idle_threads < sched.idle_threads.len() {
             let i = sched.num_idle_threads;
             sched.idle_threads[i] = idle;
             sched.num_idle_threads += 1;
-            if let Some(prcb) = sched.prcb_mut(idx) {
-                prcb.idle_thread = idle;
-                prcb.current_thread = idle;
-            }
+        }
+        if let Some(prcb) = sched.prcb_mut(idx) {
+            prcb.idle_thread = idle;
+            prcb.current_thread = idle;
         }
     }
     drop(sched);
+    crate::hal::serial::write_string_always("[DBG] init_smp done\r\n");
 
     // Install the kernel GS base for this CPU and clear the
     // per-CPU current_thread/current_process slots. Done via
@@ -2060,8 +2170,8 @@ fn find_migratable_thread(prcb: &Prcb, target_cpu: usize) -> Option<(*mut Ethrea
                 // Prefer migrating threads that:
                 // 1. Are not affinitized (can run anywhere)
                 // 2. Have multi-CPU affinity (can run on multiple CPUs)
-                let target_allowed = target_cpu < MAX_CPUS
-                    && (affinity & (1u64 << target_cpu)) != 0;
+                let target_allowed =
+                    target_cpu < MAX_CPUS && (affinity & (1u64 << target_cpu)) != 0;
                 if target_allowed && (!is_affinitized || affinity.count_ones() > 1) {
                     return Some((ethread_ptr, prio as u8));
                 }
@@ -2134,9 +2244,7 @@ pub fn ki_balance_processor(target_cpu: u32) {
             // Attempt to migrate a thread from the most loaded CPU to the least loaded.
             // Use fine-grained per-queue locking to reduce contention.
             if let Some(ref mut max_prcb) = scheduler.prcb_mut(max_cpu) {
-                if let Some((thread, priority)) =
-                    find_migratable_thread(max_prcb, min_cpu)
-                {
+                if let Some((thread, priority)) = find_migratable_thread(max_prcb, min_cpu) {
                     let priority_idx = priority as usize;
 
                     // Lock the source queue first, then the target queue
@@ -2231,12 +2339,7 @@ pub fn ki_balance_processor(target_cpu: u32) {
 }
 
 /// Migrate a thread from one CPU to another (complete implementation)
-fn migrate_thread_locked(
-    thread: *mut Ethread,
-    from_cpu: usize,
-    mut to_cpu: usize,
-    _priority: u8,
-) {
+fn migrate_thread_locked(thread: *mut Ethread, from_cpu: usize, mut to_cpu: usize, _priority: u8) {
     if thread.is_null() || from_cpu >= MAX_CPUS {
         return;
     }
@@ -2317,9 +2420,7 @@ pub fn balance_load() {
             // //         );
 
             if let Some(ref mut max_prcb) = scheduler.prcb_mut(max_cpu) {
-                if let Some((thread, priority)) =
-                    find_migratable_thread(max_prcb, min_cpu)
-                {
+                if let Some((thread, priority)) = find_migratable_thread(max_prcb, min_cpu) {
                     // ke_sched P0-4: the per-CPU ready queues are guarded by
                     // lock_ready_queue everywhere else (add_ready, remove_ready,
                     // schedule, ki_balance_processor); balance_load mutated
@@ -2404,11 +2505,18 @@ pub fn request_context_switch() {
 
 /// Check if current CPU has work to do
 pub fn has_work() -> bool {
-    let scheduler = SCHEDULER.lock();
     let cpu = get_current_cpu();
 
     if cpu < MAX_CPUS {
-        if let Some(prcb) = scheduler.prcb(cpu) {
+        // Lock-free: read the published PRCB pointer directly. This path
+        // runs on every idle-loop iteration on every CPU, so taking the
+        // global scheduler lock here serializes all of SMP idle time.
+        let prcb = PRCB_PTRS[cpu].load(Ordering::Acquire);
+        if !prcb.is_null() {
+            // SAFETY: the pointer is published only after the PRCB is fully
+            // initialized and is never replaced afterwards; the PRCB itself
+            // is owned by the scheduler for the lifetime of the kernel.
+            let prcb = unsafe { &*prcb };
             return prcb.ready_summary.load(Ordering::Acquire) != 0;
         }
     }

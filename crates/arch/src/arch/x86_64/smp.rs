@@ -26,11 +26,83 @@ use crate::hal::common::acpi::{madt_info, parse_madt};
 #[cfg(target_arch = "x86_64")]
 use crate::hal::x86_64::apic::{apic_read, apic_write, lapic_reg};
 #[cfg(target_arch = "x86_64")]
-use crate::hal::x86_64::hpet;
 use crate::mm::frame;
-use crate::mm::syspte;
 
 static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
+/// Self-contained 16-bit -> 32-bit -> 64-bit AP startup blob.
+///
+/// The blob is position-independent and is written to the fixed,
+/// conventional physical page TRAMPOLINE_PHYS (0x70000) so the SIPI
+/// vector is a constant (0x70). A fixed address also lets the 64-bit
+/// tail use plain rip-relative loads and a runtime-patched `call`.
+///
+/// Parameter block (physical, identity-mapped):
+///   0x500 null GDT entry
+///   0x508 32-bit CS  (selector 0x08)
+///   0x510 data       (selector 0x10)
+///   0x518 64-bit CS  (selector 0x18)
+///   0x520 GDTR (16-bit limit 31, 32-bit base 0x500)
+///   0x528 u32 kernel CR3 (PML4 physical address)
+///   Trampoline page offsets (physical 0x70530+), read by the blob in
+///   64-bit mode via rip-relative loads:
+///   0x530 u64 per-AP stack top   (re-written before each SIPI)
+///   0x538 u64 per-AP 1-based index (re-written before each SIPI)
+///   0x540 u64 absolute &ap_entry_long
+///   0x548 u32 arrival handshake (AP writes its 1-based index here)
+#[rustfmt::skip]
+/// AP startup blob stage 1: 16-bit real mode at 0x70000. Loads the
+/// parameter GDT (GDTR at 0x520), enables protected mode, and
+/// far-jumps to stage 2 at linear 0x70100.
+#[rustfmt::skip]
+const BLOB_STAGE1: [u8; 0x18] = [
+    0xFA, 0x0F, 0x01, 0x16, 0x20, 0x05, 0x0F, 0x20, 0xC0, 0x66, 0x83, 0xC8,
+    0x01, 0x0F, 0x22, 0xC0, 0x66, 0xEA, 0x00, 0x01, 0x07, 0x00, 0x08, 0x00,
+];
+
+/// AP startup blob stage 2: 32-bit protected mode at linear
+/// 0x70100 (paging off, linear == physical). Enables PAE + long
+/// mode (EFER.LME), turns on paging while preserving PE, then
+/// far-jumps to stage 3 at 0x70200.
+#[rustfmt::skip]
+const BLOB_STAGE2: [u8; 0x3B] = [
+    0x0F, 0x20, 0xE0, 0x66, 0x83, 0xC8, 0x20, 0x0F, 0x22, 0xE0, 0x66, 0xB8,
+    0x10, 0x00, 0x8E, 0xD8, 0x8E, 0xC0, 0x8E, 0xD0, 0xA1, 0x28, 0x05, 0x00,
+    0x00, 0x0F, 0x22, 0xD8, 0xB9, 0x80, 0x00, 0x00, 0xC0, 0x0F, 0x32, 0x66,
+    0x0D, 0x00, 0x05, 0x0F, 0x30, 0x0F, 0x20, 0xC0, 0x0D, 0x00, 0x00, 0x00,
+    0x80, 0x0F, 0x22, 0xC0, 0xEA, 0x00, 0x02, 0x07, 0x00, 0x18, 0x00,
+];
+
+/// AP startup blob stage 3: 64-bit long mode at linear 0x70200
+/// with the kernel CR3 active (low memory is identity-mapped).
+/// Loads the per-AP stack (0x70530) and index (0x70538) via
+/// rip-relative loads, then jumps through the absolute pointer at
+/// 0x70540 into ap_entry_long.
+#[rustfmt::skip]
+const BLOB_STAGE3: [u8; 0x24] = [
+    0x66, 0xB8, 0x10, 0x00, 0x66, 0x8E, 0xD8, 0x66, 0x8E, 0xC0, 0x66, 0x8E,
+    0xD0, 0x48, 0x8B, 0x25, 0x1C, 0x03, 0x00, 0x00, 0x48, 0x8B, 0x3D, 0x1D,
+    0x03, 0x00, 0x00, 0xFF, 0x25, 0x1F, 0x03, 0x00, 0x00, 0xF4, 0xEB, 0xFE,
+];
+
+
+
+/// Copy the three blob stages into the trampoline page at their
+/// fixed offsets: stage 1 -> 0x000, stage 2 -> 0x100, stage 3 -> 0x200.
+/// The far jumps use full linear addresses (0x70100 / 0x70200), so
+/// every copy site must install all three stages together.
+fn install_blob_stages(code: *mut u8) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(BLOB_STAGE1.as_ptr(), code, BLOB_STAGE1.len());
+        core::ptr::copy_nonoverlapping(BLOB_STAGE2.as_ptr(), code.add(0x100), BLOB_STAGE2.len());
+        core::ptr::copy_nonoverlapping(BLOB_STAGE3.as_ptr(), code.add(0x200), BLOB_STAGE3.len());
+    }
+}
+
+/// Fixed low-memory trampoline page (4 KiB aligned, < 1 MiB so the
+/// SIPI vector can address it) and the parameter block in the BIOS
+/// data area. Both are identity-mapped into the kernel page table.
+const TRAMPOLINE_PHYS: u64 = 0x0007_0000;
+const PARAM_PHYS: u64 = 0x0000_0500;
 
 // Per-CPU GDT storage for APs.
 // Each AP accesses its own index during sequential boot initialization.
@@ -59,6 +131,31 @@ static mut AP_GDTS: [gdt::PerCpuGdt; tss::MAX_APS] = [const {
 /// Number of detected CPUs.
 pub fn cpu_count() -> u32 {
     CPU_COUNT.load(Ordering::Relaxed)
+}
+
+/// Always-visible serial print of prefix + hex value + suffix. Uses
+/// early_write_str, which is visible even in release builds where
+/// boot_println! is compiled out.
+fn smp_print_hex(prefix: &[u8], val: u64, suffix: &[u8]) {
+    crate::arch::boot::early_write_str(prefix);
+    let mut tmp = [0u8; 16];
+    let mut tl = 0;
+    if val == 0 {
+        tmp[tl] = b'0';
+        tl += 1;
+    }
+    let mut n = val;
+    while n > 0 && tl < 16 {
+        let d = (n & 0xF) as u8;
+        tmp[tl] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        tl += 1;
+        n >>= 4;
+    }
+    for i in 0..tl / 2 {
+        tmp.swap(i, tl - 1 - i);
+    }
+    crate::arch::boot::early_write_str(&tmp[..tl]);
+    crate::arch::boot::early_write_str(suffix);
 }
 
 /// # Safety
@@ -92,86 +189,56 @@ pub unsafe fn smp_boot_aps(pml4_pfn: u64) {
     // PRCB because it may run concurrently with the BSP.
     crate::ke::scheduler::init_smp(u32::from(info.lapic_count));
     crate::arch::boot::early_write_str(b"[SMP] prcb_ok\r\n");
+    smp_print_hex(b"[SMP] lapic_count=", info.lapic_count as u64, b"\r\n");
 
     if info.lapic_count <= 1 {
+        crate::arch::boot::early_write_str(b"[SMP] single-apic-exit\r\n");
         // // kprintln!("[smp] only BSP detected, running single-CPU");
         CPU_COUNT.store(1, Ordering::SeqCst);
         return;
     }
-    // // kprintln!("[smp] {} LAPICs found, starting APs", info.lapic_count);
-    // Allocate a 4 KiB page for the trampoline and copy the
-    // trampoline code there. The page must be in low memory
-    // (≤ 1 MiB) so the SIPI vector reaches it. We borrow a
-    // page from the buddy and identity-map it. If the
-    // trampoline symbols are missing (static build that
-    // didn't include the AP assembly) we still parse the
-    // MADT but skip the bring-up.
-    extern "C" {
-        static _trampoline_start: u8;
-        static _trampoline_end: u8;
-    }
-    let tramp_len = unsafe {
-        (_trampoline_end as *const u8 as usize)
-            .saturating_sub(_trampoline_start as *const u8 as usize)
-    };
-    crate::arch::boot::early_write_str(b"[SMP] tramp_len_read\r\n");
-    if tramp_len == 0 || tramp_len > 4096 {
-        // // kprintln!("[smp] no AP trampoline linked, BSP-only");
+    // Identity-map the fixed trampoline page and the parameter
+    // block page, then install the blob, GDT, GDTR and kernel CR3.
+    // Identity-map (VA == PA) every page the AP touches before it can
+    // map anything for itself. The AP runs with the kernel CR3 and has
+    // no IDT, so a single missing mapping means an immediate page fault
+    // -> triple fault -> reset loop that never reaches ap_entry_long.
+    // syspte::map_io_space is NOT enough: it installs a mapping at a
+    // SYSTEM_PTE VA, not at the physical address the trampoline and
+    // blob access linearly.
+    if !crate::arch::identity_map_region(TRAMPOLINE_PHYS, 0x1000) {
+        crate::arch::boot::early_write_str(b"[SMP] map_trampoline_failed\r\n");
         CPU_COUNT.store(1, Ordering::SeqCst);
         return;
     }
-    let trampoline_phys = match frame::allocate_pages(1) {
-        Some(p) => p,
-        None => {
-            // // kprintln!("[smp] OOM allocating trampoline, single-CPU mode");
-            CPU_COUNT.store(1, Ordering::SeqCst);
-            return;
-        }
-    };
-    crate::arch::boot::early_write_str(b"[SMP] tramp_alloc\r\n");
-    // Clamp to the 4-bit address limit documented by Intel —
-    // 0x000..0xFF8 in steps of 0x1000. The top bits of the
-    // page's 4-bit address go into the upper nibble of the
-    // SIPI ICR.
-    //
-    // SIPI vector format: the ICR low word contains the vector
-    // in bits 12-15 (the vector is the page frame number).
-    // So we only need the page to be addressable by those bits,
-    // i.e., phys_addr >= 0x1000 (above the first 4KB).
-    if trampoline_phys < 0x1000 {
-        // // kprintln!("[smp] trampoline phys 0x{:x} too low for SIPI (need >= 0x1000)", trampoline_phys);
+    if !crate::arch::identity_map_region(PARAM_PHYS & !0xFFF, 0x1000) {
+        crate::arch::boot::early_write_str(b"[SMP] map_param_failed\r\n");
         CPU_COUNT.store(1, Ordering::SeqCst);
         return;
     }
-    // Identity-map the trampoline page in the kernel page table
-    // (so the long-mode portion of the trampoline can execute
-    // out of it).
-    // FIX 2.6: Check for mapping failure
-    if syspte::map_io_space(trampoline_phys, 1).is_none() {
-        // // kprintln!("[smp] failed to identity-map trampoline page, single-CPU mode");
+    // LAPIC MMIO: the AP enables its local APIC before it allocates
+    // its per-CPU area, so the canonical 0xFEE00000 page must already
+    // be identity-mapped in the kernel CR3.
+    if !crate::arch::identity_map_region(0xFEE0_0000, 0x1000) {
+        crate::arch::boot::early_write_str(b"[SMP] map_lapic_failed\r\n");
         CPU_COUNT.store(1, Ordering::SeqCst);
         return;
     }
-    crate::arch::boot::early_write_str(b"[SMP] tramp_mapped\r\n");
-    // Copy the trampoline.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            _trampoline_start as *const u8,
-            trampoline_phys as *mut u8,
-            tramp_len,
-        );
-    }
-    crate::arch::boot::early_write_str(b"[SMP] tramp_copied\r\n");
-    // Patch the trampoline's PML4 and per-AP slots in the SIPI
-    // page. We patch *after* the copy so the changes are made
-    // to the destination (the kernel's copy at `trampoline_phys`)
-    // rather than the source.
-    //
-    // For each AP we set a unique per-AP stack and an index so
-    // the trampoline can pass them to `ap_entry_long`.
+    // Re-map and software-enable the BSP LAPIC in the *current* (final)
+    // kernel page tables. `apic::init()` ran before the switch to the
+    // final CR3; its SYSTEM_PTE mapping does not survive that switch,
+    // leaving the LAPIC software-disabled so every INIT/SIPI the BSP
+    // sends is silently dropped and the APs never wake up.
+    crate::hal::x86_64::apic::init_smp();
+    smp_print_hex(
+        b"[smp] svr=0x",
+        crate::hal::x86_64::apic::apic_read(crate::hal::x86_64::apic::lapic_reg::SVR) as u64,
+        b"\r\n",
+    );
     let ap_stack_phys = match frame::allocate_pages(1) {
         Some(p) => p,
         None => {
+            crate::arch::boot::early_write_str(b"[SMP] ap_stack_alloc_failed\r\n");
             // // kprintln!("[smp] OOM allocating per-AP stack, single-CPU mode");
             CPU_COUNT.store(1, Ordering::SeqCst);
             return;
@@ -182,69 +249,131 @@ pub unsafe fn smp_boot_aps(pml4_pfn: u64) {
     let ap_stack_top = ap_stack_phys + 4096;
     // Identity-map the AP stack in the kernel page table.
     // FIX 2.6: Check for mapping failure
-    if syspte::map_io_space(ap_stack_phys, 1).is_none() {
+    if !crate::arch::identity_map_region(ap_stack_phys, 0x1000) {
+        crate::arch::boot::early_write_str(b"[SMP] map_ap_stack_failed\r\n");
         // // kprintln!("[smp] failed to identity-map AP stack page, single-CPU mode");
         CPU_COUNT.store(1, Ordering::SeqCst);
         return;
     }
-    crate::arch::boot::early_write_str(b"[SMP] tramp_patched\r\n");
-    // FIX 2.6: Validate SIPI vector is valid
-    let sipi_vector = ((trampoline_phys >> 12) & 0xFF) as u8;
-    if sipi_vector == 0 {
-        // // kprintln!("[smp] trampoline_phys too low for SIPI vector");
-        CPU_COUNT.store(1, Ordering::SeqCst);
-        return;
-    }
-    // Patch the trampoline page with the PML4, the AP stack,
-    // and an initial AP index. (We do this once; for multiple
-    // APs we patch again before each SIPI.)
+    // Install the trampoline blob, GDT, GDTR and kernel CR3 into
+    // the identity-mapped low-memory pages.
     unsafe {
-        // The destination of these static pointers is in the
-        // kernel image, but `copy_nonoverlapping` already copied
-        // their bytes into the SIPI page. Derive offsets from the
-        // linked blob and patch the copy.
-        extern "C" {
-            static mut _trampoline_pml4: u32;
-            static mut _trampoline_ap_stack: u64;
-            static mut _trampoline_ap_index: u64;
-        }
-        let p = trampoline_phys as *mut u8;
-        let base = _trampoline_start as *const u8 as usize;
-        let pml4_off = (core::ptr::addr_of!(_trampoline_pml4) as usize) - base;
-        let stack_off = (core::ptr::addr_of!(_trampoline_ap_stack) as usize) - base;
-        let index_off = (core::ptr::addr_of!(_trampoline_ap_index) as usize) - base;
-        // CR3 requires the page-table base address, not its frame number.
+        let code = TRAMPOLINE_PHYS as *mut u8;
+        let param = PARAM_PHYS as *mut u8;
+        // Copy the position-independent blob.
+        install_blob_stages(code);
+        // Store the absolute 64-bit entry address at page offset 0x540;
+        // the blob's `jmp [rip+disp32]` loads it. A rel32 call cannot
+        // span from the low trampoline into the higher-half kernel.
+        let ap_entry: unsafe extern "C" fn(u64) -> ! = ap_entry_long;
+        core::ptr::write_volatile(code.add(0x540) as *mut u64, ap_entry as u64);
+        // GDT: null / 32-bit CS / data / 64-bit CS.
+        core::ptr::write_volatile(param.add(0x08) as *mut u64, 0x00CF_9A00_0000_FFFF);
+        core::ptr::write_volatile(param.add(0x10) as *mut u64, 0x00CF_9200_0000_FFFF);
+        core::ptr::write_volatile(param.add(0x18) as *mut u64, 0x00AF_9A00_0000_FFFF);
+        // GDTR at 0x520: 16-bit limit + 32-bit base.
+        core::ptr::write_volatile(param.add(0x20) as *mut u16, 31);
+        core::ptr::write_volatile(param.add(0x22) as *mut u32, PARAM_PHYS as u32);
+        // CR3 wants the page-table base address, not the PFN.
         core::ptr::write_volatile(
-            p.add(pml4_off) as *mut u32,
+            param.add(0x28) as *mut u32,
             ((pml4_pfn & 0x000F_FFFF_FFFF) * 0x1000) as u32,
         );
-        core::ptr::write_volatile(p.add(stack_off) as *mut u64, ap_stack_top);
-        core::ptr::write_volatile(p.add(index_off) as *mut u64, 0);
+        // Diagnostics: verify the blob landed and log the patched-in
+        // entry pointer so a bad patch is visible in the serial log.
+        smp_print_hex(b"[smp] entry=0x", ap_entry as u64, b" cr3=0x");
+        smp_print_hex(b"", ((pml4_pfn & 0x000F_FFFF_FFFF) * 0x1000) as u64, b" stack=0x");
+        smp_print_hex(b"", ap_stack_top, b"\r\n");
     }
     // Bring up each AP.
     let mut brought_up: u32 = 1;
     for i in 1..info.lapic_count as usize {
-        crate::arch::boot::early_write_str(b"[SMP] ap_begin\r\n");
         let apic_id = info.lapic_ids[i];
-        // Patch the AP index in the SIPI page for this AP.
+        // Patch the per-AP parameters in the trampoline page. The blob
+        // reads them via rip-relative loads inside the trampoline page.
         unsafe {
-            let p = trampoline_phys as *mut u8;
-            extern "C" {
-                static _trampoline_ap_index: u64;
-            }
-            let src_index = core::ptr::addr_of!(_trampoline_ap_index) as *const u8;
-            let index_off = (src_index as usize) - (_trampoline_start as *const u8 as usize);
-            core::ptr::write_volatile((p.add(index_off)) as *mut u64, i as u64);
+            let code = TRAMPOLINE_PHYS as *mut u8;
+            // Re-install the full blob right before every SIPI. The
+            // trampoline page lives in low conventional memory that
+            // earlier boots have seen scribbled between the initial
+            // copy and the AP wake-up; re-copying is cheap and makes
+            // the AP entry path self-healing.
+            install_blob_stages(code);
+            let ap_entry: unsafe extern "C" fn(u64) -> ! = ap_entry_long;
+            core::ptr::write_volatile(code.add(0x540) as *mut u64, ap_entry as u64);
+            // Per-AP stack top (page offset 0x530) and 1-based index
+            // (page offset 0x538): exactly what the blob reads.
+            core::ptr::write_volatile(code.add(0x530) as *mut u64, ap_stack_top);
+            core::ptr::write_volatile(code.add(0x538) as *mut u64, i as u64);
+            // Clear the arrival handshake before waking this AP.
+            core::ptr::write_volatile(code.add(0x548) as *mut u32, 0);
         }
-        if !start_ap(apic_id, trampoline_phys) {
+        if !start_ap(apic_id, TRAMPOLINE_PHYS) {
             // // kprintln!("[smp] AP lapic_id={} failed to start", apic_id);
             continue;
         }
-        crate::arch::boot::early_write_str(b"[SMP] ap_started\r\n");
-        // FIX 2.7: Add acknowledgment delay and verification
-        // Wait for AP to acknowledge by entering ap_entry_long
-        delay_ms(5);
-        brought_up += 1;
+        // Wait for the AP to arrive in ap_entry_long: it writes its
+        // 1-based index into the handshake slot at page offset 0x548.
+        let handshake = (TRAMPOLINE_PHYS + 0x548) as *const u32;
+        let mut arrived = false;
+        // TCG is slow: give each AP up to 5 s to traverse the
+        // trampoline and reach ap_entry_long before giving up.
+        // TCG is slow and any MMIO access (HPET) inside this loop
+        // grabs the QEMU BQL and starves the main loop so the HPET
+        // counter never advances - a hard deadlock. Wait by pure
+        // bounded pause spinning instead: no clocks, no MMIO.
+        for _ in 0..200_000_000u64 {
+            if core::ptr::read_volatile(handshake) == (i as u32) + 1 {
+                arrived = true;
+                break;
+            }
+            unsafe {
+                core::arch::asm!("pause");
+            }
+        }
+        if !arrived {
+        smp_print_hex(b"[smp] AP handshake timeout idx=", i as u64, b" val=");
+        smp_print_hex(b"", core::ptr::read_volatile(handshake) as u64, b"\r\n");
+            // Retry ONLY when the handshake is still zero (the AP never
+            // left the trampoline). A non-zero value means the AP is
+            // already running ap_entry_long: re-sending the SIPI would
+            // restart it from scratch and re-allocate its 64 KiB stack
+            // and per-CPU area, wasting NonPaged pool (a real OOM source
+            // during SMP bring-up).
+            if core::ptr::read_volatile(handshake) == 0 {
+                unsafe {
+                    let code = TRAMPOLINE_PHYS as *mut u8;
+                    install_blob_stages(code);
+                    let ap_entry: unsafe extern "C" fn(u64) -> ! = ap_entry_long;
+                    core::ptr::write_volatile(code.add(0x540) as *mut u64, ap_entry as u64);
+                    core::ptr::write_volatile(code.add(0x530) as *mut u64, ap_stack_top);
+                    core::ptr::write_volatile(code.add(0x538) as *mut u64, i as u64);
+                    core::ptr::write_volatile(code.add(0x548) as *mut u32, 0);
+                }
+                start_ap(apic_id, TRAMPOLINE_PHYS);
+                for _ in 0..400_000_000u64 {
+                    if core::ptr::read_volatile(handshake) == (i as u32) + 1 {
+                        arrived = true;
+                        break;
+                    }
+                    unsafe {
+                        core::arch::asm!("pause");
+                    }
+                }
+                if arrived {
+                    smp_print_hex(b"[smp] AP retry ok idx=", i as u64, b"\r\n");
+                } else {
+                    smp_print_hex(b"[smp] AP retry timeout idx=", i as u64, b"\r\n");
+                }
+            } else {
+                // The AP is already up (its handshake raced with our
+                // timeout) - treat it as arrived.
+                arrived = true;
+            }
+        }
+        if arrived {
+            brought_up += 1;
+        }
     }
     CPU_COUNT.store(brought_up, Ordering::SeqCst);
     // // kprintln!("[smp] {} CPU(s) up", brought_up);
@@ -254,40 +383,35 @@ pub unsafe fn smp_boot_aps(pml4_pfn: u64) {
 /// success (the AP is presumed up; we don't yet have a way to
 /// confirm). `apic_id` is the LAPIC ID from the MADT.
 fn start_ap(apic_id: u8, trampoline_phys: u64) -> bool {
-    // 1. INIT IPI.
-    send_ipi(apic_id, 0x0000_5000); // INIT, no shorthand
-    delay_ms(10);
+    // 1. INIT IPI. Delivery mode lives in ICR bits 8-10: INIT = 100b
+    // = 4 << 8 = 0x400, plus the level bit (bit 14) for the assert
+    // phase => 0x4500. (An earlier value of 0x5000 decoded as
+    // delivery=FIXED/vector=0 and never reset the AP.)
+    send_ipi(apic_id, 0x0000_4500); // INIT, level assert, no shorthand
+    spin_delay(10 * 200_000);
     // 2. First SIPI.
     let sipi = 0x0000_0600 | ((trampoline_phys >> 12) & 0xFF) as u32;
     send_ipi(apic_id, sipi);
-    delay_ms(1);
+    spin_delay(1 * 200_000);
     // 3. Second SIPI.
     send_ipi(apic_id, sipi);
-    delay_ms(1);
+    spin_delay(1 * 200_000);
+    // Diagnostics: read back LAPIC ID, ESR and ICR after the SIPIs so a
+    // dropped start-up IPI (illegal vector, non-existent destination,
+    // pending delivery status) is visible on the serial log instead of
+    // manifesting only as a silent handshake timeout.
+    smp_print_hex(b"[smp] apic id=0x", apic_read(0x020) as u64, b" esr=0x");
+    smp_print_hex(b"", apic_read(0x280) as u64, b" icr=0x");
+    smp_print_hex(b"", apic_read(0x300) as u64, b"\r\n");
     true
 }
 
-/// Approximate millisecond delay by spinning on the HPET
-/// counter. The HPET is calibrated at HAL init time.
-fn delay_ms(ms: u32) {
+/// Bounded busy-wait: spin `loops` times with `pause`. Deliberately
+/// clockless - under TCG any MMIO access in a tight loop deadlocks
+/// against the QEMU BQL, so SMP bring-up must never touch a timer.
+fn spin_delay(loops: u64) {
     use core::arch::asm;
-    let freq = hpet::hpet_freq_hz();
-    if freq == 0 {
-        // Coarse fallback.
-        for _ in 0..(ms as u64 * 200_000) {
-            unsafe {
-                asm!("pause");
-            }
-        }
-        return;
-    }
-    let start = hpet::counter();
-    let target = ms as u64 * freq / 1000;
-    loop {
-        let now = hpet::counter();
-        if now.wrapping_sub(start) >= target {
-            break;
-        }
+    for _ in 0..loops {
         unsafe {
             asm!("pause");
         }
@@ -297,132 +421,10 @@ fn delay_ms(ms: u32) {
 fn send_ipi(apic_id: u8, icr_low: u32) {
     apic_write(lapic_reg::ICR_HIGH, ((apic_id as u32) << 24) & 0xFF000000);
     apic_write(lapic_reg::ICR_LOW, icr_low);
-    // Spin until the IPI completes (delivery status bit 12 = 0).
-    for _ in 0..10000 {
-        let v = apic_read(lapic_reg::ICR_LOW);
-        if v & 0x1000 == 0 {
-            break;
-        }
-        unsafe {
-            asm!("pause");
-        }
-    }
-}
-
-extern "C" {
-    static _trampoline_start: u8;
-    static _trampoline_end: u8;
-    fn _ap_entry();
-}
-
-// ---------------------------------------------------------------------------
-// AP startup trampoline (16-bit → 64-bit long mode)
-//
-// This blob is copied into a 4 KiB page by `smp_boot_aps` and
-// used as the SIPI target.  When the SIPI arrives, the AP is
-// in 16-bit real mode with CS:IP = 0:trampoline_phys.  It
-// loads a tiny GDT, enables protected mode, enables long
-// mode, then jumps to the kernel's `ap_entry` in 64-bit code.
-//
-// Layout (4 KiB, ≤ 256 bytes actually used):
-//   [16-bit entry, CS:IP=0:trampoline_phys]
-//     cli
-//     lgdt  [trampoline_gdt_ptr]
-//     mov eax, cr0
-//     or  eax, 1                     ; enter protected mode
-//     mov cr0, eax
-//     jmp 0x08:.Lpm                  ; far jump to 32-bit code
-//   [32-bit code, .Lpm]
-//     mov eax, cr4
-//     or  eax, (1<<5)                ; PAE
-//     mov cr4, eax
-//     mov eax, [trampoline_pml4]     ; kernel's PML4 physical address
-//     mov cr3, eax
-//     mov ecx, 0xC0000080            ; IA32_EFER
-//     rdmsr
-//     or  eax, (1<<8) | (1<<10)      ; LME, LMA
-//     wrmsr
-//     mov eax, cr0
-//     or  eax, (1<<31)               ; PG
-//     mov cr0, eax
-//     jmp 0x18:.Llm                  ; far jump to 64-bit code
-//   [64-bit code, .Llm]
-//     mov ax, 0x20                   ; data selector
-//     mov ds, ax / es, ax / ss, ax
-//     mov rsp, [trampoline_ap_stack] ; per-AP stack from low memory
-//     mov rdi, [trampoline_ap_index] ; 1..N
-//     call _ap_entry_long
-//     hlt; jmp .
-//   [trampoline_gdt_ptr, gdt (24 bytes: null/32CS/64CS/DS),
-//    pml4_paddr, ap_stack_paddr, ap_index]
-// The AP trampoline is included from a separate .S file because the
-// LLVM integrated assembler that powers `global_asm!` is pickier
-// about mixed `.code16`/`.code32`/`.code64` sequences than GNU AS.
-// On the UEFI build the kernel code is not linked, so we still need
-// to provide stub symbols for the linker to resolve. We do that
-// with weak stubs in the UEFI case below.
-
-#[cfg(not(target_os = "uefi"))]
-core::arch::global_asm!(include_str!("smp_trampoline.S"), options(att_syntax),);
-
-// Provide weak symbols so the UEFI build (which doesn't link the
-// trampoline) can still resolve the references from smp.rs.
-// We use .section and proper alignment to ensure PIC-compatible symbols.
-#[cfg(target_os = "uefi")]
-core::arch::global_asm!(
-    ".weak _trampoline_start",
-    ".weak _trampoline_end",
-    ".weak _trampoline_pml4",
-    ".weak _trampoline_ap_stack",
-    ".weak _trampoline_ap_index",
-    ".weak _ap_entry_long",
-    ".balign 8",
-    "_trampoline_start: .quad 0",
-    "_trampoline_end: .quad 0",
-    ".balign 4",
-    "_trampoline_pml4: .long 0",
-    ".balign 8",
-    "_trampoline_ap_stack: .quad 0",
-    "_trampoline_ap_index: .quad 0",
-    "_ap_entry_long: ret",
-);
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Patch the trampoline with the kernel's PML4 physical address
-/// and the per-AP stack/index. The trampoline is copied into a
-/// 4 KiB low-memory page by `smp_boot_aps`; the caller's
-/// pointers here are in the *original* trampoline buffer, but
-/// we only use them as values to write — the bytes are then
-/// placed in the SIPI page by the caller.
-///
-/// Currently unused: `smp_boot_aps` patches the SIPI page
-/// in-line using offsets derived from the trampoline base.
-/// Retained because the next phase will need it for per-AP
-/// initialisation order (PML4 ready before LAPIC ID is
-/// published), at which point it will be wired up.
-pub unsafe fn patch_trampoline(pml4_paddr: u64, ap_stack: u64, ap_index: u64) {
-    extern "C" {
-        static mut _trampoline_pml4: u32;
-        static mut _trampoline_ap_stack: u64;
-        static mut _trampoline_ap_index: u64;
-    }
-    core::ptr::write_volatile(&raw mut _trampoline_pml4, pml4_paddr as u32);
-    core::ptr::write_volatile(&raw mut _trampoline_ap_stack, ap_stack);
-    core::ptr::write_volatile(&raw mut _trampoline_ap_index, ap_index);
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Stub: would be the AP entry point. The trampoline would set up
-/// its own GDT/IDT/TSS and call into the scheduler.
-#[no_mangle]
-pub unsafe extern "C" fn ap_entry() -> ! {
-    loop {
-        asm!("hlt");
-    }
+    // Do NOT poll the ICR delivery-status bit (bit 12): under TCG it
+    // never clears, and the MMIO read inside the polling loop grabs
+    // the BQL and can deadlock the whole VM. The IPI is delivered
+    // asynchronously by hardware regardless of that status bit.
 }
 
 /// # Safety
@@ -436,7 +438,7 @@ pub unsafe extern "C" fn ap_entry() -> ! {
 pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     let ap_idx = ap_index as usize;
     if ap_idx >= tss::MAX_APS {
-    crate::boot_println!("[smp] ap_index {} out of range, parking", ap_index);
+        smp_print_hex(b"[smp] ap_index out of range: ", ap_index, b"\r\n");
         loop {
             asm!("hlt");
         }
@@ -454,7 +456,7 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     let stack_base =
         crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, AP_STACK_SIZE) as u64;
     if stack_base == 0 {
-        crate::boot_println!("[smp] AP {} stack OOM, parking", ap_index);
+        smp_print_hex(b"[smp] AP stack OOM idx=", ap_index, b"\r\n");
         loop {
             asm!("hlt");
         }
@@ -470,7 +472,7 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     let (tss_ptr, tss_limit) = match tss::init_ap_tss(ap_idx, rsp0) {
         Some(v) => v,
         None => {
-            crate::boot_println!("[smp] AP {} TSS init failed, parking", ap_index);
+            smp_print_hex(b"[smp] AP TSS init failed idx=", ap_index, b"\r\n");
             loop {
                 asm!("hlt");
             }
@@ -493,7 +495,7 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     #[cfg(target_arch = "x86_64")]
     let per_cpu_page = crate::arch::x86_64::syscall::allocate_per_cpu_area(ap_index as u32);
     if per_cpu_page == 0 {
-        crate::boot_println!("[smp] AP {} per-CPU area OOM, parking", ap_index);
+        smp_print_hex(b"[smp] AP per-CPU area OOM idx=", ap_index, b"\r\n");
         loop {
             asm!("hlt");
         }
@@ -503,10 +505,17 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     //    This MUST be done before any gs:[] access.
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::syscall::set_kernel_gs_base(per_cpu_page);
-    crate::boot_println!(
-        "[smp] AP {} GS_BASE set to 0x{:016x}",
-        ap_index,
-        per_cpu_page
+    smp_print_hex(b"[smp] AP GS_BASE idx=", ap_index, b" val=0x");
+    smp_print_hex(b"", per_cpu_page, b"\r\n");
+    // Signal the BSP that this AP made it into long mode. The
+    // handshake slot lives in the identity-mapped trampoline page
+    // (offset 0x548) and stores the 1-based AP index. APs boot
+    // sequentially under BSP control, so a single slot suffices.
+    // Kept after the GS_BASE print so the serial log distinguishes
+    // "blob reached long mode" from "identity map missing".
+    core::ptr::write_volatile(
+        (TRAMPOLINE_PHYS + 0x548) as *mut u32,
+        (ap_index as u32).wrapping_add(1),
     );
 
     // 5. Hand control to the scheduler. `init_smp_this_cpu`
@@ -514,14 +523,6 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     //    the per-CPU current_thread/current_process slots.
     crate::ke::scheduler::init_smp_this_cpu(ap_index as u32);
     crate::ke::scheduler::idle_loop()
-}
-
-fn _use_ap() {
-    let _ = _ap_entry as *const ();
-    unsafe {
-        let _ = _trampoline_start as *const u8;
-        let _ = _trampoline_end as *const u8;
-    }
 }
 
 /// SMP smoke test.

@@ -10,8 +10,8 @@
 //
 //! Reference: geoffchappell.com, Vergilius Project, ReactOS/WRK reverse engineering
 
-pub use crate::ke::sync::DispatcherHeader;
 use crate::ke::scheduler::QUANTUM_DEFAULT;
+pub use crate::ke::sync::DispatcherHeader;
 use crate::ps::process::{Eprocess, ListEntry};
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -174,7 +174,7 @@ pub struct Kthread {
     // === 0x26C: Per-thread scheduling quantum ===
     // These fields occupy previously reserved KTHREAD bytes. They do not
     // alter any documented NT field offset or the deterministic 0x380 size.
-    pub quantum_initial: u32, // 0x26C
+    pub quantum_initial: u32,   // 0x26C
     pub quantum_remaining: u32, // 0x270
 
     // === Padding to KTHREAD size ===
@@ -1405,6 +1405,9 @@ pub fn create_idle_thread(cpu_id: u32) -> Option<&'static mut Ethread> {
     let process = match crate::ps::process::get_by_pid(crate::ps::process::PID_SYSTEM) {
         Some(p) => p,
         None => {
+            crate::hal::serial::write_string_always(
+                "[FATAL] create_idle_thread: System process not found\r\n",
+            );
             // // kprintln!("[FATAL] create_idle_thread: System process (PID {}) not found!",
             // //                      crate::ps::process::PID_SYSTEM);
             // // kprintln!("[FATAL] Cannot create idle thread without System process");
@@ -1429,6 +1432,9 @@ pub fn create_idle_thread(cpu_id: u32) -> Option<&'static mut Ethread> {
     ) as *mut Ethread;
 
     if thread.is_null() {
+        crate::hal::serial::write_string_always(
+            "[FATAL] create_idle_thread: ETHREAD pool allocation failed\r\n",
+        );
         // // kprintln!("[FATAL] create_idle_thread: Cannot allocate ETHREAD for CPU {}", cpu_id);
         // // kprintln!("[FATAL] Idle thread is required for scheduler operation");
         // // kprintln!("[FATAL] System cannot continue without idle thread");
@@ -1459,9 +1465,7 @@ pub fn create_idle_thread(cpu_id: u32) -> Option<&'static mut Ethread> {
         // Idle threads run in System process context and use the common
         // TID allocator so their IDs cannot collide with user threads.
         let tid = NEXT_TID.fetch_add(1, Ordering::SeqCst);
-        (*thread)
-            .client_id
-            .set(crate::ps::process::PID_SYSTEM, tid);
+        (*thread).client_id.set(crate::ps::process::PID_SYSTEM, tid);
         (*thread)
             .kthread
             .client_id
@@ -1507,8 +1511,7 @@ pub unsafe fn terminate(thread: *mut Ethread, _exit_code: u32) {
 
         // Remove from the process thread list so the scheduler and
         // `find_thread_in_process` no longer see the terminated thread.
-        let entry =
-            core::ptr::addr_of_mut!((*thread).kthread.global_thread_list_entry);
+        let entry = core::ptr::addr_of_mut!((*thread).kthread.global_thread_list_entry);
         if !(*entry).flink.is_null() && !(*entry).blink.is_null() {
             let flink = (*entry).flink;
             let blink = (*entry).blink;

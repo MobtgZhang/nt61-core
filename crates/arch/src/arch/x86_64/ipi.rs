@@ -9,7 +9,7 @@
 //!   IPI vectors are allocated in the high range (0xF0-0xFF) to avoid
 //!   conflicts with hardware IRQs.
 
-use crate::hal::x86_64::apic::{apic_read, apic_write, lapic_reg};
+use crate::hal::x86_64::apic::{apic_write, lapic_reg};
 use crate::ke::sync::Spinlock;
 use alloc::collections::VecDeque;
 use core::arch::asm;
@@ -96,25 +96,9 @@ pub fn send_ipi(target_apic_id: u32, vector: IpiVector) {
 
 /// Send IPI with custom delivery mode
 pub fn send_ipi_raw(target_apic_id: u32, vector: u32, delivery_mode: IpiDeliveryMode) {
-    // Wait for any pending IPI to complete
-    // Bit 12 of ICR_LOW is the delivery status bit
-    let mut timeout = 10000;
-    while timeout > 0 {
-        let icr_low = apic_read(lapic_reg::ICR_LOW);
-        if (icr_low & (1 << 12)) == 0 {
-            break;
-        }
-        timeout -= 1;
-        unsafe {
-            asm!("pause", options(nostack, preserves_flags));
-        }
-    }
-
-    if timeout == 0 {
-        // Timeout waiting for IPI completion
-        return;
-    }
-
+    // Do not poll the ICR delivery-status bit (bit 12): under TCG it
+    // never clears and the MMIO read inside the loop grabs the QEMU
+    // BQL and can deadlock the VM. Delivery happens asynchronously.
     // write destination APIC ID to ICR high (bits 56-63)
     apic_write(lapic_reg::ICR_HIGH, (target_apic_id & 0xFF) << 24);
 
@@ -140,23 +124,7 @@ pub fn broadcast_ipi(vector: IpiVector) {
 
 /// Broadcast IPI with custom delivery mode
 pub fn broadcast_ipi_raw(vector: u32, delivery_mode: IpiDeliveryMode) {
-    // Wait for any pending IPI to complete
-    let mut timeout = 10000;
-    while timeout > 0 {
-        let icr_low = apic_read(lapic_reg::ICR_LOW);
-        if (icr_low & (1 << 12)) == 0 {
-            break;
-        }
-        timeout -= 1;
-        unsafe {
-            asm!("pause", options(nostack, preserves_flags));
-        }
-    }
-
-    if timeout == 0 {
-        return;
-    }
-
+    // Same TCG constraint as send_ipi_raw: never poll ICR bit 12.
     // Use destination shorthand: all excluding self (bits 18-19 = 11)
     let icr_low = vector
         | ((delivery_mode as u32) << 8)
