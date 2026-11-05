@@ -41,6 +41,7 @@ members = [
   "crates/boot-driver",
   "crates/userland/cmd",
   "crates/tools",
+  "crates/desktop",
   "crates/tools/cmd-stub-gen",
 ]
 

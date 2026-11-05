@@ -819,7 +819,7 @@ run-x86_64-ntfs-serial: build-x86_64-ntfs
 	@mkdir -p $(IMAGES_DIR)
 	$(call _setup_firmware_x86_64)
 	@echo "Launching QEMU (x86_64/ntfs) with GTK + serial log..."
-	@timeout $(TIMEOUT)s $(QEMU_X86) -machine q35 -m 8G -smp 4 \
+	@timeout $(TIMEOUT)s $(QEMU_X86) -machine q35 -m 8G -smp 4 -d int,cpu_reset -D /tmp/qemu_int_x64.log \
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		-drive format=raw,file=$(DISK_IMG) \
@@ -1161,6 +1161,10 @@ test-host:
 	@echo ""
 	@echo "Running nt61-tools tests..."
 	cargo test -p nt61-tools -- --nocapture
+
+test-desktop:
+	@echo "Running desktop shell and resource tests..."
+	cargo test -p nt61-desktop -- --nocapture
 
 test-pe:
 	@echo "Running PE validation tests..."
