@@ -746,14 +746,29 @@ impl Fat32ImageBuilder {
             // Long name: truncated base + ~N suffix
             let truncated: String = filtered_base.chars().take(6).collect();
             let suffix = format!("~{}", self.sfn_counter);
-            let base_bytes = truncated.to_uppercase().into_bytes();
-            sfn[..base_bytes.len()].copy_from_slice(&base_bytes);
-            sfn[6..6 + suffix.len()].copy_from_slice(suffix.as_bytes());
             self.sfn_counter += 1;
+            let base_bytes = truncated.to_uppercase().into_bytes();
+
+            // Fit "base~N" into the first 8 bytes: shrink the base so the
+            // suffix (keeping at least "~") always fits, and cap the suffix
+            // itself so it can never exceed the 8-byte name field.
+            let mut suffix_bytes = suffix.as_bytes();
+            if suffix_bytes.len() > 7 {
+                suffix_bytes = &suffix_bytes[..7];
+            }
+            let mut base_bytes = base_bytes;
+            if base_bytes.len() + suffix_bytes.len() > 8 {
+                base_bytes.truncate(8 - suffix_bytes.len());
+            }
+            sfn[..base_bytes.len()].copy_from_slice(&base_bytes);
+            sfn[8 - suffix_bytes.len()..8].copy_from_slice(suffix_bytes);
         }
 
         if let Some(e) = filtered_ext {
-            let ext_bytes = e.to_uppercase().into_bytes();
+            // 8.3 allows at most 3 extension bytes; truncate defensively so
+            // the write below can never go out of bounds.
+            let ext_full = e.to_uppercase().into_bytes();
+            let ext_bytes = &ext_full[..ext_full.len().min(3)];
             sfn[8..8 + ext_bytes.len()].copy_from_slice(&ext_bytes);
         }
 

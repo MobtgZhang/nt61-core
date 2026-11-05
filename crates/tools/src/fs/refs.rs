@@ -52,11 +52,9 @@ impl RefsImage {
                 "missing ReFS boot-sector OEM id".into(),
             ));
         }
-        let signature = u64::from_le_bytes(
-            data[0x1000..0x1008]
-                .try_into()
-                .map_err(|_| BuildError::ImageCreateFailed("ReFS superblock signature is malformed".into()))?,
-        );
+        let signature = u64::from_le_bytes(data[0x1000..0x1008].try_into().map_err(|_| {
+            BuildError::ImageCreateFailed("ReFS superblock signature is malformed".into())
+        })?);
         if signature != 0x52647366 {
             return Err(BuildError::ImageCreateFailed(
                 "missing ReFS superblock signature".into(),
@@ -200,7 +198,8 @@ impl RefsImage {
         block[32..36].copy_from_slice(&512u32.to_le_bytes());
         block[36..40].copy_from_slice(&0u32.to_le_bytes());
         block[40..44].copy_from_slice(&((self.cluster_size / 512) as u32).to_le_bytes());
-        block[80..88].copy_from_slice(&(self.size_bytes / u64::from(self.cluster_size)).to_le_bytes());
+        block[80..88]
+            .copy_from_slice(&(self.size_bytes / u64::from(self.cluster_size)).to_le_bytes());
         let _ = total_sectors;
         block
     }
@@ -267,8 +266,7 @@ impl RefsImage {
                 });
             }
             let entry = self.entries.iter().find(|e| &e.path == path).unwrap();
-            image[start_byte as usize..(start_byte + bytes) as usize]
-                .copy_from_slice(&entry.data);
+            image[start_byte as usize..(start_byte + bytes) as usize].copy_from_slice(&entry.data);
         }
         let _ = partition_offset_bytes;
         Ok(image)

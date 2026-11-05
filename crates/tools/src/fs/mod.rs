@@ -10,6 +10,8 @@
 
 pub mod backend;
 pub mod build;
+#[path = "elf_to_pe.rs"]
+pub mod elf_to_pe;
 pub mod copy;
 pub mod dir;
 pub mod esp;
@@ -20,8 +22,8 @@ pub mod iso9660;
 pub mod ntfs;
 pub mod partition;
 pub mod qcow2;
-pub mod remove;
 pub mod refs;
+pub mod remove;
 pub mod stubs;
 pub mod system;
 

@@ -73,7 +73,6 @@ static NTFS_MOUNTED: Spinlock<bool> = Spinlock::new(false);
 pub mod pagefile;
 
 /// NTFS boot sector
-#[repr(C)]
 #[repr(C, packed(1))]
 pub struct NtfsBootSector {
     // Jump instruction (3 bytes)
@@ -4784,8 +4783,7 @@ pub fn smoke_test() -> bool {
     boot_data[13] = 8; // sectors per cluster
     boot_data[40..48].copy_from_slice(&1000u64.to_le_bytes()); // total sectors
     boot_data[48..56].copy_from_slice(&786432u64.to_le_bytes()); // MFT LCN
-    boot_data[0x44..0x4C]
-        .copy_from_slice(&0x1234567890ABCDEFu64.to_le_bytes()); // serial
+    boot_data[0x44..0x4C].copy_from_slice(&0x1234567890ABCDEFu64.to_le_bytes()); // serial
 
     let boot = unsafe { &*(boot_data.as_ptr() as *const NtfsBootSector) };
 
@@ -5074,25 +5072,59 @@ pub fn read_journal_records(
         let mut record_offset =
             u32::from_le_bytes([page[16], page[17], page[18], page[19]]) as usize;
         while record_offset + LOG_RECORD_HEADER_SIZE <= LOG_PAGE_SIZE {
-            let record_length = u16::from_le_bytes([
-                page[record_offset + 36],
-                page[record_offset + 37],
-            ]) as u32;
+            let record_length =
+                u16::from_le_bytes([page[record_offset + 36], page[record_offset + 37]]) as u32;
             let total_size = LOG_RECORD_HEADER_SIZE + record_length as usize;
             if record_offset + total_size > LOG_PAGE_SIZE {
                 break;
             }
             let header = LogRecordHeader {
-                this_lsn: u64::from_le_bytes(page[record_offset..record_offset + 8].try_into().unwrap_or_default()),
-                previous_lsn: u64::from_le_bytes(page[record_offset + 8..record_offset + 16].try_into().unwrap_or_default()),
-                client_undo_lsn: u64::from_le_bytes(page[record_offset + 16..record_offset + 24].try_into().unwrap_or_default()),
-                client_id: u32::from_le_bytes(page[record_offset + 24..record_offset + 28].try_into().unwrap_or_default()),
-                record_type: u16::from_le_bytes(page[record_offset + 28..record_offset + 30].try_into().unwrap_or_default()),
-                transaction_id: u32::from_le_bytes(page[record_offset + 30..record_offset + 34].try_into().unwrap_or_default()),
-                flags: u16::from_le_bytes(page[record_offset + 34..record_offset + 36].try_into().unwrap_or_default()),
+                this_lsn: u64::from_le_bytes(
+                    page[record_offset..record_offset + 8]
+                        .try_into()
+                        .unwrap_or_default(),
+                ),
+                previous_lsn: u64::from_le_bytes(
+                    page[record_offset + 8..record_offset + 16]
+                        .try_into()
+                        .unwrap_or_default(),
+                ),
+                client_undo_lsn: u64::from_le_bytes(
+                    page[record_offset + 16..record_offset + 24]
+                        .try_into()
+                        .unwrap_or_default(),
+                ),
+                client_id: u32::from_le_bytes(
+                    page[record_offset + 24..record_offset + 28]
+                        .try_into()
+                        .unwrap_or_default(),
+                ),
+                record_type: u16::from_le_bytes(
+                    page[record_offset + 28..record_offset + 30]
+                        .try_into()
+                        .unwrap_or_default(),
+                ),
+                transaction_id: u32::from_le_bytes(
+                    page[record_offset + 30..record_offset + 34]
+                        .try_into()
+                        .unwrap_or_default(),
+                ),
+                flags: u16::from_le_bytes(
+                    page[record_offset + 34..record_offset + 36]
+                        .try_into()
+                        .unwrap_or_default(),
+                ),
                 record_length: record_length as u16,
-                attribute_type: u32::from_le_bytes(page[record_offset + 38..record_offset + 42].try_into().unwrap_or_default()),
-                transaction_commit_lsn: u64::from_le_bytes(page[record_offset + 42..record_offset + 50].try_into().unwrap_or_default()),
+                attribute_type: u32::from_le_bytes(
+                    page[record_offset + 38..record_offset + 42]
+                        .try_into()
+                        .unwrap_or_default(),
+                ),
+                transaction_commit_lsn: u64::from_le_bytes(
+                    page[record_offset + 42..record_offset + 50]
+                        .try_into()
+                        .unwrap_or_default(),
+                ),
             };
             if header.this_lsn >= start_lsn && header.this_lsn <= end_lsn {
                 records.push(header);
@@ -5154,10 +5186,8 @@ pub fn write_journal_record(
         let mut record_offset =
             u32::from_le_bytes([page[16], page[17], page[18], page[19]]) as usize;
         while record_offset + LOG_RECORD_HEADER_SIZE <= LOG_PAGE_SIZE {
-            let record_length = u16::from_le_bytes([
-                page[record_offset + 36],
-                page[record_offset + 37],
-            ]) as usize;
+            let record_length =
+                u16::from_le_bytes([page[record_offset + 36], page[record_offset + 37]]) as usize;
             let total_size = LOG_RECORD_HEADER_SIZE + record_length;
             if record_offset + total_size > LOG_PAGE_SIZE {
                 break;

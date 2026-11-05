@@ -1857,7 +1857,7 @@ impl NtfsImage {
         let sectors_per_record = mft_record_size / 512;
         let fixup_offset = 48usize;
         let fixup_size = sectors_per_record + 1;
-        let attributes_offset = fixup_offset + fixup_size * 2;
+        let attributes_offset = (fixup_offset + fixup_size * 2).next_multiple_of(8);
 
         // Build the 48-byte MFT record header as a fixed-size array first.
         // This avoids any issues with Vec::extend_from_slice.
