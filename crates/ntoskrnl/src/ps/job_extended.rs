@@ -185,8 +185,12 @@ impl JobAccounting {
         Self {
             info: Spinlock::new(self.get_info()),
             read_operation_count: AtomicU64::new(self.read_operation_count.load(Ordering::Acquire)),
-            write_operation_count: AtomicU64::new(self.write_operation_count.load(Ordering::Acquire)),
-            other_operation_count: AtomicU64::new(self.other_operation_count.load(Ordering::Acquire)),
+            write_operation_count: AtomicU64::new(
+                self.write_operation_count.load(Ordering::Acquire),
+            ),
+            other_operation_count: AtomicU64::new(
+                self.other_operation_count.load(Ordering::Acquire),
+            ),
             read_transfer_count: AtomicU64::new(self.read_transfer_count.load(Ordering::Acquire)),
             write_transfer_count: AtomicU64::new(self.write_transfer_count.load(Ordering::Acquire)),
             other_transfer_count: AtomicU64::new(self.other_transfer_count.load(Ordering::Acquire)),
@@ -503,9 +507,7 @@ pub fn create_job_with_parent(parent_job_id: u64) -> Result<u64, u32> {
             .ok_or(STATUS_INVALID_PARAMETER)?;
 
         let child_limit = parent.child_job_limit.load(Ordering::Acquire);
-        if child_limit > 0
-            && parent.active_child_count.load(Ordering::Acquire) >= child_limit
-        {
+        if child_limit > 0 && parent.active_child_count.load(Ordering::Acquire) >= child_limit {
             return Err(STATUS_QUOTA_EXCEEDED);
         }
 
@@ -532,40 +534,39 @@ pub fn create_job_with_parent(parent_job_id: u64) -> Result<u64, u32> {
         .iter_mut()
         .find(|j| j.job_id == child_id)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-        child.parent_job_id = parent_job_id;
-        child.flags.fetch_or(job_flags::NESTED, Ordering::Release);
+    child.parent_job_id = parent_job_id;
+    child.flags.fetch_or(job_flags::NESTED, Ordering::Release);
 
-        // Inherit process limit.
-        if process_limit > 0 {
-            child.process_limit.store(process_limit, Ordering::Release);
-            child
-                .flags
-                .fetch_or(job_flags::PROCESS_LIMIT_ENABLED, Ordering::Release);
-        }
+    // Inherit process limit.
+    if process_limit > 0 {
+        child.process_limit.store(process_limit, Ordering::Release);
+        child
+            .flags
+            .fetch_or(job_flags::PROCESS_LIMIT_ENABLED, Ordering::Release);
+    }
 
-        // Inherit job memory limit.
-        if memory_limit > 0 {
-            child.job_memory_limit.store(memory_limit, Ordering::Release);
-            child
-                .flags
-                .fetch_or(job_flags::MEMORY_LIMIT_ENABLED, Ordering::Release);
-        }
+    // Inherit job memory limit.
+    if memory_limit > 0 {
+        child
+            .job_memory_limit
+            .store(memory_limit, Ordering::Release);
+        child
+            .flags
+            .fetch_or(job_flags::MEMORY_LIMIT_ENABLED, Ordering::Release);
+    }
 
-        // Inherit CPU time limit.
-        if cpu_limit > 0 {
-            child.cpu_time_limit.store(cpu_limit, Ordering::Release);
-            child
-                .flags
-                .fetch_or(job_flags::CPU_LIMIT_ENABLED, Ordering::Release);
-        }
+    // Inherit CPU time limit.
+    if cpu_limit > 0 {
+        child.cpu_time_limit.store(cpu_limit, Ordering::Release);
+        child
+            .flags
+            .fetch_or(job_flags::CPU_LIMIT_ENABLED, Ordering::Release);
+    }
 
-        // Inherit UI restrictions.
-        child.ui_restrictions.store(ui_limits, Ordering::Release);
+    // Inherit UI restrictions.
+    child.ui_restrictions.store(ui_limits, Ordering::Release);
 
-    if let Some(parent) = table
-        .iter()
-        .find(|j| j.job_id == parent_job_id)
-    {
+    if let Some(parent) = table.iter().find(|j| j.job_id == parent_job_id) {
         parent.active_child_count.fetch_add(1, Ordering::AcqRel);
     }
 

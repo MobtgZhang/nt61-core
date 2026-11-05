@@ -223,12 +223,11 @@ fn test_thread_state_transitions() -> bool {
             thread::KThreadState::Initialized
                 | thread::KThreadState::Ready
                 | thread::KThreadState::Running
-        )
-            && {
-                thread::terminate(ethread as *mut _, 0);
-                process::terminate_process(pid, 0);
-                true
-            }
+        ) && {
+            thread::terminate(ethread as *mut _, 0);
+            process::terminate_process(pid, 0);
+            true
+        }
     }
 }
 

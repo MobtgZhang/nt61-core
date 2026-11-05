@@ -194,20 +194,12 @@ pub fn initialize_wow64_process(
 
         unsafe {
             let thread = &mut *process.main_thread;
-            let teb32 = crate::ps::wow64_thread::initialize_wow64_thread(
-                thread,
-                process,
-                stack_top,
-            );
+            let teb32 =
+                crate::ps::wow64_thread::initialize_wow64_thread(thread, process, stack_top);
             let Some(teb32) = teb32 else {
                 drop(peb32_box);
                 drop(wow64vas_box);
-                cleanup_wow64_process_resources(
-                    process,
-                    heap_base,
-                    stack_top,
-                    None,
-                );
+                cleanup_wow64_process_resources(process, heap_base, stack_top, None);
                 return None;
             };
             let teb32_va = crate::ps::wow64_thread::teb32_user_va(teb32);
@@ -252,10 +244,7 @@ fn cleanup_wow64_process_resources(
 /// The PE loader keeps its image in a temporary kernel buffer. WOW64 code
 /// cannot execute from that buffer, so we allocate contiguous backing pages,
 /// copy the image into them, and map them at the image's preferred base.
-fn map_wow64_image(
-    process: &Eprocess,
-    image: &crate::loader::pe32::LoadedImage32,
-) -> Option<u64> {
+fn map_wow64_image(process: &Eprocess, image: &crate::loader::pe32::LoadedImage32) -> Option<u64> {
     const PAGE_SIZE: u64 = 0x1000;
     let image_size = u64::from(image.size_of_image);
     let page_count = image_size.div_ceil(PAGE_SIZE);

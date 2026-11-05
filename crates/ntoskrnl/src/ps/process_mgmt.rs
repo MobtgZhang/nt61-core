@@ -132,30 +132,21 @@ fn process_user_name(process: &crate::ps::process::Eprocess) -> alloc::string::S
     if token.is_local_system() {
         return alloc::string::String::from("NT AUTHORITY\\SYSTEM");
     }
-    if token
-        .user
-        .equals(&crate::se::sid::sid::well_known(
-            crate::se::sid::WellKnownSid::Administrators,
-        ))
-    {
+    if token.user.equals(&crate::se::sid::sid::well_known(
+        crate::se::sid::WellKnownSid::Administrators,
+    )) {
         return alloc::string::String::from("Administrators");
     }
-    if token
-        .user
-        .equals(&crate::se::sid::sid::well_known(
-            crate::se::sid::WellKnownSid::Guests,
-        ))
-    {
+    if token.user.equals(&crate::se::sid::sid::well_known(
+        crate::se::sid::WellKnownSid::Guests,
+    )) {
         return alloc::string::String::from("Guests");
     }
-    if token
-        .user
-        .equals(&crate::se::sid::sid::with_2subs(
-            [0, 0, 0, 0, 0, 5],
-            21,
-            1001,
-        ))
-    {
+    if token.user.equals(&crate::se::sid::sid::with_2subs(
+        [0, 0, 0, 0, 0, 5],
+        21,
+        1001,
+    )) {
         return alloc::string::String::from("nt61test");
     }
     alloc::string::String::from("User")

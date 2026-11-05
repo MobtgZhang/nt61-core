@@ -256,8 +256,7 @@ impl JobObject {
 
         // NT clears JOB_OBJECT_TERMINATION once all members have been
         // terminated so the job can accept a new process.
-        self.flags
-            .fetch_and(!flags::TERMINATING, Ordering::Release);
+        self.flags.fetch_and(!flags::TERMINATING, Ordering::Release);
         STATUS_SUCCESS
     }
 

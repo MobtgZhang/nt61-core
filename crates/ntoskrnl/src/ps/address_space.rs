@@ -213,8 +213,7 @@ impl ProcessAddressSpace {
         }
 
         if self.vad_tree.insert(unsafe { &mut *vad }).is_err() {
-            let _ =
-                vas::unmap_user_pages(self.pml4_phys, base, aligned_size);
+            let _ = vas::unmap_user_pages(self.pml4_phys, base, aligned_size);
             unsafe { pool::free(vad.cast::<u8>()) };
             return Err(STATUS_UNSUCCESSFUL);
         }

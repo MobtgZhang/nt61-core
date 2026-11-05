@@ -139,17 +139,13 @@ pub fn create_wow64_thread(
 /// The TEB has one kernel-side allocation and one 32-bit user-mode VA.
 /// The kernel allocation is mapped into the process so 32-bit code can
 /// reach its TEB through the WOW64 user segment.
-pub fn allocate_teb32(
-    process: &crate::ps::process::Eprocess,
-) -> Option<(*mut Teb32, ULONG32)> {
+pub fn allocate_teb32(process: &crate::ps::process::Eprocess) -> Option<(*mut Teb32, ULONG32)> {
     const TEB32_SIZE: usize = 0x1100;
     const TEB32_PAGES: usize = (TEB32_SIZE + 0xFFF) / 0x1000;
 
-    let kernel_teb = crate::mm::pool::allocate_aligned(
-        crate::mm::pool::PoolType::NonPaged,
-        TEB32_SIZE,
-        0x1000,
-    ) as *mut Teb32;
+    let kernel_teb =
+        crate::mm::pool::allocate_aligned(crate::mm::pool::PoolType::NonPaged, TEB32_SIZE, 0x1000)
+            as *mut Teb32;
     if kernel_teb.is_null() {
         return None;
     }

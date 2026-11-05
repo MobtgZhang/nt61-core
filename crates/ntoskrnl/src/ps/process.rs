@@ -1516,8 +1516,7 @@ impl UnicodeString {
         let len = s.len().min(255);
         let buffer_size = 256usize.saturating_mul(core::mem::size_of::<u16>());
         let buffer =
-            crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, buffer_size)
-                as *mut u16;
+            crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, buffer_size) as *mut u16;
         if !buffer.is_null() {
             unsafe {
                 core::ptr::write_bytes(buffer, 0u8, 256);
@@ -1869,10 +1868,9 @@ pub fn create_user_process(
 
             // Initialize thread
             let thread = thread_ptr;
-            let tid = crate::ps::thread::NEXT_TID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-            (*thread)
-                .client_id
-                .set(pid, tid);
+            let tid =
+                crate::ps::thread::NEXT_TID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            (*thread).client_id.set(pid, tid);
             (*thread).kthread.client_id.set(pid, tid);
             (*thread).kthread.process = process;
             (*thread).threads_process = process;
@@ -1924,7 +1922,7 @@ pub fn create_user_process(
             crate::mm::pool::free(stack_vad as *mut u8);
             crate::mm::pfn::free_pfn(pml4_phys >> 12);
             crate::mm::pool::free(thread_ptr as *mut u8);
-                crate::mm::pool::free(process as *mut Eprocess as *mut u8);
+            crate::mm::pool::free(process as *mut Eprocess as *mut u8);
             return None;
         }
 
@@ -1962,11 +1960,30 @@ pub fn process_exit(_exit_code: u32) -> ! {
     // all handles, free the EPROCESS and its threads, then switch to
     // the idle thread so other processes can run.
 
+    // CRITICAL: return to the SYSTEM address space first. The exiting
+    // user process PML4 is about to be torn down, and the desktop logon
+    // handoff (refresh_kernel_mappings -> hyperspace window) must run
+    // from the system root exactly like the SMSS direct-launch path;
+    // otherwise the merge faults and the CPU hangs in the kernel.
+    crate::mm::vas::detach_process(0);
+
+
     // Determine which process is exiting. The caller is the last
     // user-mode thread, so the PID was saved in the trap frame; for
     // now we find the process whose main thread state is Terminated.
     let exit_pid = {
         let mut found: u64 = 0;
+        // NT semantics: the exiting process is the caller own process,
+        // reached through the per-CPU current ETHREAD.
+        let cur_thread = crate::arch::common::percpu::get_current_thread();
+        if !cur_thread.is_null() {
+            let cur_proc = unsafe { (*cur_thread).kthread.process };
+            if !cur_proc.is_null() {
+                found = unsafe { (*cur_proc).unique_process_id };
+            }
+        }
+        // Fallback: legacy Terminated-main-thread scan.
+        if found == 0 {
         let list = PROCESS_LIST.lock();
         for i in 0..list.process_count {
             let p = list.processes[i];
@@ -1980,6 +1997,7 @@ pub fn process_exit(_exit_code: u32) -> ! {
                     break;
                 }
             }
+        }
         }
         found
     };
@@ -2032,11 +2050,77 @@ pub fn process_exit(_exit_code: u32) -> ! {
         free_pid(exit_pid);
     }
 
-    crate::hal::serial::write_string_always("cmd.exe: process exit (autoexec finished)\r\n");
+    crate::hal::serial::write_string_always("PS: process exit pid=");
+    crate::hal::serial::write_hex_u64_always(exit_pid as u64);
+    crate::hal::serial::write_string_always("\r\n");
+
+
+    // Desktop-mode logon handoff: when logonui.exe exits after the
+    // user pressed ENTER on the Windows-7 welcome screen, dispatch the
+    // pre-created explorer.exe image into Ring 3. The user shell is
+    // never dispatched through the scheduler (its main thread has no
+    // seeded kernel context), so SMSS parks the pending handoff here
+    // instead - the same direct enter_first_user_thread path that
+    // launch_explorer_shell uses.
+    {
+        let root = LOGON_HANDOFF_ROOT.load(Ordering::Acquire);
+        if root != 0 {
+            // Leave the handoff armed. The idle loop performs the actual
+            // setup_bsp + Ring-3 transfer from a clean scheduler context,
+            // mirroring the working direct launch path in SMSS.
+            crate::hal::serial::write_string_always(
+                "LOGONUI: handoff pending for explorer\r\n",
+            );
+        }
+    }
 
     // Switch to the idle thread so the CPU can service other work
     // instead of parking forever.
     crate::ke::scheduler::idle_loop()
+}
+
+/// Pending desktop logon handoff, armed by SMSS before logonui.exe
+/// is dispatched into Ring 3. Non-zero ROOT means: when the logon
+/// process exits, immediately enter Ring 3 for the ready explorer
+/// image with the saved (root, rip, rsp).
+static LOGON_HANDOFF_ROOT: AtomicU64 = AtomicU64::new(0);
+static LOGON_HANDOFF_RIP: AtomicU64 = AtomicU64::new(0);
+static LOGON_HANDOFF_RSP: AtomicU64 = AtomicU64::new(0);
+/// Explorer main thread (ETHREAD pointer) parked with the handoff so
+/// `process_exit` can run `setup_bsp` before entering Ring 3 - the
+/// same sequence launch_explorer_shell performs on its direct path.
+static LOGON_HANDOFF_THREAD: AtomicU64 = AtomicU64::new(0);
+
+/// Arm the logon-handoff target used by `process_exit`. Called from
+/// SMSS after explorer.exe is created but before LogonUI starts.
+pub fn set_logon_handoff(root_table_phys: u64, user_rip: u64, user_rsp: u64) {
+    LOGON_HANDOFF_ROOT.store(root_table_phys, Ordering::Release);
+    LOGON_HANDOFF_RIP.store(user_rip, Ordering::Release);
+    LOGON_HANDOFF_RSP.store(user_rsp, Ordering::Release);
+}
+
+/// Disarm the pending logon handoff (fallback path when LogonUI
+/// could not be loaded and SMSS dispatches explorer directly).
+pub fn clear_logon_handoff() {
+    LOGON_HANDOFF_ROOT.store(0, Ordering::Release);
+}
+
+/// Park the explorer main thread pointer alongside the handoff triple.
+pub fn set_logon_handoff_thread(thread: u64) {
+    LOGON_HANDOFF_THREAD.store(thread, Ordering::Release);
+}
+
+/// Consume the pending logon handoff from the idle loop: returns the
+/// (root, rip, rsp, main_thread) quadruple exactly once.
+pub fn take_logon_handoff() -> Option<(u64, u64, u64, u64)> {
+    let root = LOGON_HANDOFF_ROOT.swap(0, Ordering::AcqRel);
+    if root == 0 {
+        return None;
+    }
+    let rip = LOGON_HANDOFF_RIP.swap(0, Ordering::AcqRel);
+    let rsp = LOGON_HANDOFF_RSP.swap(0, Ordering::AcqRel);
+    let thread = LOGON_HANDOFF_THREAD.swap(0, Ordering::AcqRel);
+    Some((root, rip, rsp, thread))
 }
 
 /// Get process by PID
@@ -2099,9 +2183,7 @@ fn remove_process_from_list(pid: u64) {
     let mut i = 0;
     while i < list.process_count {
         let process = list.processes[i];
-        if !process.is_null()
-            && unsafe { (*process).unique_process_id } == pid
-        {
+        if !process.is_null() && unsafe { (*process).unique_process_id } == pid {
             // Compact by shifting remaining entries left.
             let mut j = i;
             while j + 1 < list.process_count {
@@ -2291,10 +2373,8 @@ pub fn create_process_full(
 
     if process.object_table.is_null() {
         let ht_size = core::mem::size_of::<ProcessHandleTable>().max(4096);
-        let ht_ptr = crate::mm::pool::allocate(
-            crate::mm::pool::PoolType::NonPaged,
-            ht_size,
-        ) as *mut ProcessHandleTable;
+        let ht_ptr = crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, ht_size)
+            as *mut ProcessHandleTable;
         if !ht_ptr.is_null() {
             unsafe {
                 core::ptr::write_bytes(ht_ptr as *mut u8, 0, ht_size);
@@ -2363,10 +2443,7 @@ pub fn allocate_pid() -> Option<u64> {
     for reserved_pid in [PID_SERVICES, PID_LSASS, PID_WINLOGON] {
         if reserved_pid >= PID_BITMAP_FIRST {
             let offset = (reserved_pid - PID_BITMAP_FIRST) as usize;
-            PID_BITMAP[offset / 64].fetch_or(
-                1u64 << (offset % 64),
-                Ordering::SeqCst,
-            );
+            PID_BITMAP[offset / 64].fetch_or(1u64 << (offset % 64), Ordering::SeqCst);
         }
     }
     // Scan the bitmap for the first zero bit. Atomic CAS loop so

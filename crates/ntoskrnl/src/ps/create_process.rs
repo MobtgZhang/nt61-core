@@ -231,10 +231,8 @@ pub fn nt_create_process(
                     return STATUS_INVALID_PARAMETER;
                 }
                 let image = core::slice::from_raw_parts(base as *const u8, size);
-                let mapping = crate::loader::load_into_user_address_space(
-                    (*process_ptr).pml4_phys,
-                    image,
-                );
+                let mapping =
+                    crate::loader::load_into_user_address_space((*process_ptr).pml4_phys, image);
                 ob::dereference_object(header);
                 let Some(mapping) = mapping else {
                     pool::free(ht_ptr as *mut u8);
