@@ -64,9 +64,7 @@ pub fn init() {
         balance_set_manager_entry as *const () as u64,
         0,
     );
-    let _ = crate::ps::thread::ps_create_system_thread(
-        zero_page_thread_entry as *const () as u64,
-        0,
-    );
+    let _ =
+        crate::ps::thread::ps_create_system_thread(zero_page_thread_entry as *const () as u64, 0);
     // MiModifiedPageWriter is started by `mm::writer::start_modified_page_writer()`.
 }

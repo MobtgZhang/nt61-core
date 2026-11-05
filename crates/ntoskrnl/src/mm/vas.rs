@@ -141,12 +141,30 @@ pub static MM_SYSTEM_VAS: Spinlock<MmSystemAddressSpace> =
 /// this), so the physical address is also a valid virtual address
 /// in the kernel half.
 pub fn system_pml4_ptr() -> *const MMPTE {
-    crate::arch::read_current_page_root() as *const MMPTE
+    system_root_phys() as *const MMPTE
 }
 /// Return a mutable virtual pointer to the system PML4.
 /// See `system_pml4_ptr` for why we read the page root here.
 pub fn system_pml4_mut() -> *mut MMPTE {
-    crate::arch::read_current_page_root() as *mut MMPTE
+    system_root_phys() as *mut MMPTE
+}
+
+/// Physical address of the system (kernel) page root.
+///
+/// After `smss` attaches the first user process the kernel keeps
+/// running with a user PML4 loaded as CR3, so `read_current_page_root()`
+/// no longer identifies the system root. Always prefer the root that
+/// `vas::init` saved in `MM_SYSTEM_VAS`; only fall back to the live
+/// root register during the earliest bootstrap, before that state
+/// exists.
+pub fn system_root_phys() -> u64 {
+    let sys = MM_SYSTEM_VAS.lock();
+    if sys.initialized && sys.pml4_phys != 0 {
+        sys.pml4_phys
+    } else {
+        drop(sys);
+        crate::arch::read_current_page_root()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,8 +371,36 @@ fn ensure_identity_or_log(pa_base: u64, size: u64, what: &str) {
 /// system chain are merged back into the private copy by
 /// `refresh_kernel_mappings`.
 pub fn create_user_address_space() -> Option<u64> {
+    // The whole construction must run with the *system* root loaded.
+    // When the caller is attached to a user process (e.g. smss after
+    // launching winlogon, or the desktop boot sequence after userinit),
+    // CR3 holds a user PML4 whose low-half chain is a private deep
+    // copy. Using it as the "system root" would deep-copy garbage,
+    // install self-map / identity pages into the wrong table and
+    // triple-fault. Switch to the saved system root for the duration
+    // and restore the caller's root afterwards, mirroring what the
+    // early-boot (P9 / smss phase) callers already had.
+    let system_phys = system_root_phys();
+    let prev_root = crate::arch::read_current_page_root();
+    let switched = system_phys != 0 && prev_root != system_phys;
+    if switched {
+        unsafe {
+            crate::arch::load_page_root(system_phys >> 12);
+        }
+        set_current_root(system_phys);
+    }
+    let result = create_user_address_space_inner();
+    if switched {
+        unsafe {
+            crate::arch::load_page_root(prev_root >> 12);
+        }
+        set_current_root(prev_root);
+    }
+    result
+}
+
+fn create_user_address_space_inner() -> Option<u64> {
     let pfn = pfn::allocate_pfn()?;
-    crate::boot_debug_println!("[VAS] create_user_address_space: A: new pfn=0x{:x}", pfn);
     // The root page is handed out by the PFN allocator. On non-x86
     // targets the kernel does not necessarily map every physical
     // frame one-to-one, so install an explicit identity mapping before
@@ -398,7 +444,7 @@ pub fn create_user_address_space() -> Option<u64> {
             };
         }
     }
-    crate::boot_debug_println!("[VAS] create_user_address_space: B: copied system PML4",);
+
     // Install a self-map chain + identity map for this PML4. The
     // system PML4's identity-map entry points at the system PML4's
     // own physical address; the new user PML4 sits at a different
@@ -413,7 +459,7 @@ pub fn create_user_address_space() -> Option<u64> {
         pfn::free_pfn(pfn);
         return None;
     }
-    crate::boot_debug_println!("[VAS] create_user_address_space: D: self-map installed");
+
     if crate::arch::common::self_map::install_hyperspace(pfn).is_err() {
         crate::boot_debug_println!("[VAS] create_user_address_space: ERROR: hyperspace failed");
         pfn::free_pfn(pfn);
@@ -486,7 +532,7 @@ pub fn refresh_kernel_mappings(pml4_phys: u64) {
                 let sys_chain = system_entry0 & PTE_FRAME_MASK;
                 let process_entry0 = core::ptr::read_volatile(process).raw();
                 if process_entry0 & PTE_P == 0 {
-                    if let Some(copied) = copy_identity_chain(sys_chain, 3) {
+                    if let Some(copied) = copy_identity_chain(sys_chain, 3, 0) {
                         let new0 = (system_entry0 & !PTE_FRAME_MASK) | copied;
                         core::ptr::write_volatile(process, MMPTE { u_long: new0 });
                     }
@@ -494,7 +540,7 @@ pub fn refresh_kernel_mappings(pml4_phys: u64) {
                     // refresh retries.
                 } else {
                     let proc_chain = process_entry0 & PTE_FRAME_MASK;
-                    sync_identity_chain(sys_chain, proc_chain, 3);
+                    sync_identity_chain(sys_chain, proc_chain, 3, 0);
                 }
             }
             for idx in 1..(PT_ENTRIES - 1) {
@@ -666,8 +712,36 @@ const PS_BIT: u64 = 1 << 7;
 /// `None`; pages allocated by already-completed sub-levels are then
 /// unreachable and intentionally leaked rather than partially freed
 /// (this runs during early boot where no safe teardown exists).
+/// Validate that `child_phys`'s 2 MiB slice is present as a 2 MiB
+/// leaf in the live system PML4's low chain (PML4[0] -> PDPT -> PD).
+/// Only trusted levels are walked: the PML4[0] entry and the PDPT/PD
+/// pages backing the identity window are in constant use by the
+/// kernel, so reading them is safe; the PT level is never followed.
 #[cfg(target_arch = "x86_64")]
-unsafe fn copy_identity_chain(table_phys: u64, level: u8) -> Option<u64> {
+fn low_chain_slice_mapped(child_phys: u64) -> bool {
+    let cur = crate::arch::read_current_page_root();
+    if cur == 0 {
+        return false;
+    }
+    let pml4 = cur as *const u64;
+    let e0 = unsafe { core::ptr::read_volatile(pml4.add(0)) };
+    if e0 & 1 == 0 {
+        return false;
+    }
+    let pdpt = (e0 & PTE_FRAME_MASK) as *const u64;
+    let pdpt_idx = ((child_phys >> 30) & 0x1FF) as usize;
+    let e1 = unsafe { core::ptr::read_volatile(pdpt.add(pdpt_idx)) };
+    if e1 & 1 == 0 {
+        return false;
+    }
+    let pd = (e1 & PTE_FRAME_MASK) as *const u64;
+    let pd_idx = ((child_phys >> 21) & 0x1FF) as usize;
+    let e2 = unsafe { core::ptr::read_volatile(pd.add(pd_idx)) };
+    e2 & 1 != 0 && e2 & PS_BIT != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn copy_identity_chain(table_phys: u64, level: u8, base: u64) -> Option<u64> {
     let new_table = alloc_zeroed_page()?;
     let src = table_phys as *const u64;
     let dst = new_table as *mut u64;
@@ -676,15 +750,62 @@ unsafe fn copy_identity_chain(table_phys: u64, level: u8) -> Option<u64> {
         if entry & PTE_P == 0 {
             continue;
         }
+        let child_base = base + ((idx as u64) << (12 + 9 * (level as u64 - 1)));
         let is_leaf = level == 1 || (entry & PS_BIT) != 0;
         if is_leaf {
             if entry & PTE_US != 0 {
-                continue;
+                // Firmware/console leaves below 1 MB (VGA text at
+                // 0xB8000, BIOS data, EBDA) were mapped U=1 by the
+                // firmware-era page tables the kernel inherited. The
+                // kernel console writes them from ring 0 under every
+                // process CR3, so they must be carried into each
+                // process chain — with the U bit stripped, because no
+                // legitimate user mapping lives below 1 MB (ring-3
+                // images and stacks start at 0x200000).
+                if child_base >= 0x10_0000 {
+                    continue;
+                }
+                core::ptr::write_volatile(dst.add(idx), entry & !PTE_US);
+            } else {
+                core::ptr::write_volatile(dst.add(idx), entry);
             }
-            core::ptr::write_volatile(dst.add(idx), entry);
         } else {
             let child_phys = entry & PTE_FRAME_MASK;
-            let copied = copy_identity_chain(child_phys, level - 1)?;
+            // Defensive: the low-half chain is built by hand during
+            // early boot, so a stray write can leave a present-looking
+            // entry that points at a free or unmaintained frame.
+            // Recursing into such a frame corrupts the new process
+            // root (or worse, reuses a recycled page as a page table).
+            // Validate the frame against the PFN database and drop
+            // entries that are not active page-table pages.
+            let child_pfn = child_phys >> 12;
+            // Frames outside the PFN database were table pages built by
+            // the firmware / early kernel before the database existed;
+            // they must be copied, not dropped. Only skip frames that
+            // are tracked and demonstrably not in use (Free / zeroed).
+            let child_ok = match crate::mm::pfn::get_entry(child_pfn) {
+                Some(e) => {
+                    let st = unsafe { (*e).state() };
+                    st == crate::mm::pfn::MMPFNSTATE::Active
+                        || st == crate::mm::pfn::MMPFNSTATE::Transition
+                        || st == crate::mm::pfn::MMPFNSTATE::Modified
+                }
+                None => true,
+            };
+            if !child_ok {
+                continue;
+            }
+            // A legitimate low-chain table page is always reachable
+            // through the chain itself: ensure_low_identity_map maps the
+            // 2 MiB slice of every table page it allocates before the
+            // page is zeroed. An entry whose child frame's slice is not
+            // 2 MiB-leaf-mapped cannot be a real chain table - recursing
+            // into it would read an unmapped physical address and
+            // triple-fault. Validate before recursing.
+            if !low_chain_slice_mapped(child_phys) {
+                continue;
+            }
+            let copied = copy_identity_chain(child_phys, level - 1, child_base)?;
             let new_entry = (entry & !PTE_FRAME_MASK) | copied;
             core::ptr::write_volatile(dst.add(idx), new_entry);
         }
@@ -712,7 +833,7 @@ fn copy_system_root_for_process(dst: *mut MMPTE, system: *const MMPTE) -> bool {
         let src0 = core::ptr::read_volatile(system).raw();
         if src0 & PTE_P != 0 {
             let sys_chain = src0 & PTE_FRAME_MASK;
-            match copy_identity_chain(sys_chain, 3) {
+            match copy_identity_chain(sys_chain, 3, 0) {
                 Some(copied) => {
                     let new0 = (src0 & !PTE_FRAME_MASK) | copied;
                     core::ptr::write_volatile(dst, MMPTE { u_long: new0 });
@@ -761,7 +882,7 @@ fn copy_system_root_for_process(dst: *mut MMPTE, system: *const MMPTE) -> bool {
 /// pages allocated by completed sub-levels are leaked, as in
 /// `copy_identity_chain`.
 #[cfg(target_arch = "x86_64")]
-unsafe fn sync_identity_chain(sys_phys: u64, proc_phys: u64, level: u8) -> bool {
+unsafe fn sync_identity_chain(sys_phys: u64, proc_phys: u64, level: u8, base: u64) -> bool {
     let src = sys_phys as *const u64;
     let dst = proc_phys as *mut u64;
     for idx in 0..PT_ENTRIES {
@@ -770,23 +891,72 @@ unsafe fn sync_identity_chain(sys_phys: u64, proc_phys: u64, level: u8) -> bool 
             continue;
         }
         let proc_entry = core::ptr::read_volatile(dst.add(idx));
+        let child_base = base + ((idx as u64) << (12 + 9 * (level as u64 - 1)));
         let is_leaf = level == 1 || (sys_entry & PS_BIT) != 0;
         if is_leaf {
-            if proc_entry & PTE_P == 0 && sys_entry & PTE_US == 0 {
-                core::ptr::write_volatile(dst.add(idx), sys_entry);
+            if proc_entry & PTE_P == 0 {
+                if sys_entry & PTE_US == 0 {
+                    core::ptr::write_volatile(dst.add(idx), sys_entry);
+                } else if child_base < 0x10_0000 {
+                    // Firmware/console leaves below 1 MB (VGA text at
+                    // 0xB8000): merge with the U bit stripped so the
+                    // kernel console stays reachable under every
+                    // process CR3. See copy_identity_chain.
+                    core::ptr::write_volatile(dst.add(idx), sys_entry & !PTE_US);
+                }
             }
         } else if proc_entry & PTE_P == 0 {
             let child = sys_entry & PTE_FRAME_MASK;
-            if let Some(copied) = copy_identity_chain(child, level - 1) {
+            if let Some(copied) = copy_identity_chain(child, level - 1, child_base) {
                 let new_entry = (sys_entry & !PTE_FRAME_MASK) | copied;
                 core::ptr::write_volatile(dst.add(idx), new_entry);
             } else {
                 return false;
             }
+        } else if sys_entry & PS_BIT != 0 {
+            // The system side is still a large leaf while the process
+            // side has already split it into a 4K PT (map_page_in_pml4
+            // does this to install user mappings inside the 2 MiB
+            // slice). Re-materialize the large page's 4K entries into
+            // the absent PT slots so supervisor mappings carried by
+            // the leaf (the low identity map / VGA console) stay
+            // reachable under the process CR3.
+            let large_base = sys_entry & PTE_FRAME_MASK;
+            let mut large_flags = sys_entry & 0xFFF & !PS_BIT;
+            let sys_user = sys_entry & PTE_US != 0;
+            let proc_pt = proc_entry & PTE_FRAME_MASK;
+            for sub_idx in 0..PT_ENTRIES {
+                let slot = core::ptr::read_volatile(
+                    (proc_pt as *const u64).add(sub_idx),
+                );
+                if slot & PTE_P != 0 {
+                    continue;
+                }
+                if sys_user {
+                    // User leaves above 1 MB belong to whoever mapped
+                    // them (same policy as copy_identity_chain); below
+                    // 1 MB they are firmware/console pages and merge
+                    // with the U bit stripped.
+                    let sub_base = child_base + (sub_idx as u64) * 0x1000;
+                    if sub_base >= 0x10_0000 {
+                        continue;
+                    }
+                    // Firmware/console pages merge with the U bit
+                    // stripped (supervisor-only), matching
+                    // copy_identity_chain.
+                    large_flags &= !PTE_US;
+                }
+                let sub_pa = large_base + (sub_idx as u64) * 0x1000;
+                let sub_entry = sub_pa | large_flags | PTE_A | PTE_D;
+                core::ptr::write_volatile(
+                    (proc_pt as *mut u64).add(sub_idx),
+                    sub_entry,
+                );
+            }
         } else {
             let sys_child = sys_entry & PTE_FRAME_MASK;
             let proc_child = proc_entry & PTE_FRAME_MASK;
-            if !sync_identity_chain(sys_child, proc_child, level - 1) {
+            if !sync_identity_chain(sys_child, proc_child, level - 1, child_base) {
                 return false;
             }
         }
@@ -880,6 +1050,49 @@ pub enum MmStatus {
 /// Allocates any missing PDPT/PD/PT pages, all of which are marked
 /// user-accessible so that the Ring 3 code that walks the page
 /// table is allowed to reach the leaf PTE.
+/// Debug helper: walk a per-process PML4 and return the leaf PTE for
+/// `va` (0 when any level is absent). Used to verify NX/US bits after
+/// user-image mapping.
+pub fn debug_read_user_pte(pml4_phys: u64, va: u64) -> u64 {
+    unsafe {
+        let pml4_idx = ((va >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((va >> 30) & 0x1FF) as usize;
+        let pd_idx = ((va >> 21) & 0x1FF) as usize;
+        let pt_idx = ((va >> 12) & 0x1FF) as usize;
+        let pml4e_val = pml4e(pml4_phys, pml4_idx);
+        if pml4e_val & PTE_P == 0 {
+            return 0;
+        }
+        crate::hal::serial::write_string_always("K:pte-pml4e=");
+        crate::hal::serial::write_hex_u64_always(pml4e_val);
+        crate::hal::serial::write_string_always("\r\n");
+        let pdpt_phys = pml4e_val & 0x000F_FFFF_FFFF_F000;
+        let pdpte_val = pte_read(pdpt_phys, pdpt_idx);
+        crate::hal::serial::write_string_always("K:pte-pdpte=");
+        crate::hal::serial::write_hex_u64_always(pdpte_val);
+        crate::hal::serial::write_string_always("\r\n");
+        if pdpte_val & PTE_P == 0 {
+            return 0;
+        }
+        if pdpte_val & (1u64 << 7) != 0 {
+            return pdpte_val;
+        }
+        let pd_phys = pdpte_val & 0x000F_FFFF_FFFF_F000;
+        let pde_val = pte_read(pd_phys, pd_idx);
+        crate::hal::serial::write_string_always("K:pte-pde=");
+        crate::hal::serial::write_hex_u64_always(pde_val);
+        crate::hal::serial::write_string_always("\r\n");
+        if pde_val & PTE_P == 0 {
+            return 0;
+        }
+        if pde_val & (1u64 << 7) != 0 {
+            return pde_val;
+        }
+        let pt_phys = pde_val & 0x000F_FFFF_FFFF_F000;
+        pte_read(pt_phys, pt_idx)
+    }
+}
+
 pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatus {
     if pml4_phys == 0 || va & 0xFFF != 0 || pa & 0xFFF != 0 {
         return MmStatus::InvalidAddress;
@@ -898,6 +1111,15 @@ pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatu
     let pd_idx = ((va >> 21) & 0x1FF) as usize;
     let pt_idx = ((va >> 12) & 0x1FF) as usize;
 
+    // A user mapping is only reachable from Ring 3 when EVERY level of
+    // the path carries PTE_US: the x86 MMU ANDs the user bit across
+    // PML4E -> PDPTE -> PDE -> PTE. A supervisor-only intermediate level
+    // makes the whole region kernel-only even when the leaf PTE grants
+    // user access (observed as #PF e=0x15 instruction fetches at the
+    // explorer entry RIP). Propagate the requested user bit into every
+    // intermediate entry, both freshly allocated and pre-existing.
+    let user_bit = if flags & PTE_US != 0 { PTE_US } else { 0 };
+
     unsafe {
         // PML4 -> PDPT
         let mut pml4e_val = pml4e(pml4_phys, pml4_idx);
@@ -906,7 +1128,11 @@ pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatu
                 Some(p) => p,
                 None => return MmStatus::OutOfMemory,
             };
-            pml4e_val = new_pdpt | INT_PTE_BITS;
+            pml4e_val = new_pdpt | INT_PTE_BITS | user_bit;
+            set_pml4e(pml4_phys, pml4_idx, pml4e_val);
+        }
+        if user_bit != 0 && pml4e_val & PTE_US == 0 {
+            pml4e_val |= user_bit;
             set_pml4e(pml4_phys, pml4_idx, pml4e_val);
         }
         let pdpt_phys = pml4e_val & 0x000F_FFFF_FFFF_F000;
@@ -930,7 +1156,7 @@ pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatu
                 let directory_entry = directory_pa | large_flags | PTE_A | PTE_D | (1u64 << 7);
                 pte_write(new_pd, directory_index, directory_entry);
             }
-            pdpte_val = new_pd | INT_PTE_BITS;
+            pdpte_val = new_pd | INT_PTE_BITS | user_bit;
             pte_write(pdpt_phys, pdpt_idx, pdpte_val);
         }
         if (pdpte_val & PTE_P) == 0 {
@@ -938,7 +1164,11 @@ pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatu
                 Some(p) => p,
                 None => return MmStatus::OutOfMemory,
             };
-            pdpte_val = new_pd | INT_PTE_BITS;
+            pdpte_val = new_pd | INT_PTE_BITS | user_bit;
+            pte_write(pdpt_phys, pdpt_idx, pdpte_val);
+        }
+        if user_bit != 0 && pdpte_val & PTE_US == 0 {
+            pdpte_val |= user_bit;
             pte_write(pdpt_phys, pdpt_idx, pdpte_val);
         }
         let pd_phys = pdpte_val & 0x000F_FFFF_FFFF_F000;
@@ -947,33 +1177,45 @@ pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatu
         let mut pde_val = pte_read(pd_phys, pd_idx);
         // If the existing PDE is a 2MB large page (PS=1), we cannot
         // mix it with 4KB PT entries — the CPU would still treat it
-        // as a leaf mapping. Discard the large-page entry and
-        // replace it with a freshly-allocated PT page. We do NOT
-        // free the 2MB page's backing physical frame here because
-        // that frame belongs to the UEFI/bootloader identity map,
-        // not to our PFN allocator (freeing it would corrupt the
-        // allocator's bookkeeping).
+        // as a leaf mapping. Split the large page into a fully
+        // populated PT instead of discarding it: the low identity
+        // map (firmware-era, covering 0-2 MiB with supervisor 2MB
+        // leaves) and the kernel console VGA mapping at 0xB8000 live
+        // in these leaves, and dropping them faults every later
+        // kernel console write under a process CR3. We do NOT free
+        // the 2MB page's backing physical frame because that frame
+        // belongs to the UEFI/bootloader identity map, not to our
+        // PFN allocator (freeing it would corrupt the allocator's
+        // bookkeeping).
         if pde_val & PTE_P != 0 && pde_val & (1u64 << 7) != 0 {
-            crate::boot_debug_println!(
-                "[VAS] map_page_in_pml4: replacing 2MB large PDE at PD[{}] for va=0x{:x}",
-                pd_idx,
-                va
-            );
-            pde_val = 0;
+            let new_pt = match alloc_zeroed_page() {
+                Some(p) => p,
+                None => return MmStatus::OutOfMemory,
+            };
+            let large_base = pde_val & 0x000F_FFFF_FFFF_F000;
+            let large_flags = pde_val & 0xFFF & !(1u64 << 7);
+            for sub_idx in 0..512usize {
+                let sub_pa = large_base + (sub_idx as u64) * 0x1000;
+                let sub_entry = sub_pa | large_flags | PTE_A | PTE_D;
+                pte_write(new_pt, sub_idx, sub_entry);
+            }
+            pde_val = new_pt | INT_PTE_BITS;
+            if large_flags & PTE_US != 0 {
+                pde_val |= PTE_US;
+            }
+            pte_write(pd_phys, pd_idx, pde_val);
         }
         if (pde_val & PTE_P) == 0 {
             let new_pt = match alloc_zeroed_page() {
                 Some(p) => p,
                 None => return MmStatus::OutOfMemory,
             };
-            pde_val = new_pt | INT_PTE_BITS;
+            pde_val = new_pt | INT_PTE_BITS | user_bit;
             pte_write(pd_phys, pd_idx, pde_val);
-            crate::boot_debug_println!(
-                "[VAS] map_page_in_pml4: PD[{}] <= 0x{:x} (for va=0x{:x})",
-                pd_idx,
-                pde_val,
-                va
-            );
+        }
+        if user_bit != 0 && pde_val & PTE_US == 0 {
+            pde_val |= user_bit;
+            pte_write(pd_phys, pd_idx, pde_val);
         }
         let pt_phys = pde_val & 0x000F_FFFF_FFFF_F000;
 
@@ -987,12 +1229,6 @@ pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatu
             | PTE_A
             | PTE_D
             | (flags & PTE_NX);
-        crate::boot_debug_println!(
-            "[VAS] map_page_in_pml4: PT[{}] <= 0x{:x} (for va=0x{:x})",
-            pt_idx,
-            leaf,
-            va
-        );
         pte_write(pt_phys, pt_idx, leaf);
     }
     MmStatus::Ok
@@ -1871,6 +2107,39 @@ pub fn init() {
     let _ = reserved;
     crate::boot_debug_println!("[VAS] CR3 RESERVED pfn=0x{:x}", pml4_pfn);
     ensure_identity_or_log(pml4_phys & !0x1F_FFFF, 0x20_0000, "system PML4 page");
+
+    // Reserve the boot kernel stack. winload allocates it with UEFI
+    // AllocatePages (1 MiB) outside the PFN database's knowledge, so
+    // without an explicit reservation the free list eventually hands
+    // those frames out again and a page-table zeroing run wipes the
+    // live stack mid-execution, triple-faulting the kernel inside
+    // create_user_address_space. Reserve a window around the current
+    // RSP that covers the whole winload stack.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let rsp: u64;
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem));
+        }
+        const STACK_WINDOW: u64 = 0x10_0000; // 1 MiB, matches winload
+        let lo = (rsp - STACK_WINDOW) & !0xFFF;
+        let hi = (rsp + STACK_WINDOW + 0xFFF) & !0xFFF;
+        let mut reserved_stack = 0u64;
+        let mut pfn_cur = lo >> 12;
+        let pfn_end = hi >> 12;
+        while pfn_cur < pfn_end {
+            if crate::mm::pfn::reserve_pfn(pfn_cur) {
+                reserved_stack += 1;
+            }
+            pfn_cur += 1;
+        }
+        crate::boot_debug_println!(
+            "[VAS] BOOT STACK RESERVED rsp=0x{:x} frames={}",
+            rsp,
+            reserved_stack
+        );
+
+    }
     {
         let (head, count) = crate::mm::pfn::get_free_list_stats();
         crate::hal::serial::write_string_always("[VASCHK] after pml4 identity head=");

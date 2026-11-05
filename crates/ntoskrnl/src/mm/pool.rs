@@ -58,6 +58,19 @@ macro_rules! pool_trace {
 
 pub use crate::ke::sync::Spinlock;
 
+/// Rate-limited SMP bring-up diagnostics: log only the first few
+/// transitions of each pool path so a hung AP shows WHERE it stopped
+/// without flooding the boot log (pool calls are extremely hot).
+fn pool_dbg(what: &str) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    if COUNT.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::hal::serial::write_string_always("[DBG] pool ");
+        crate::hal::serial::write_string_always(what);
+        crate::hal::serial::write_string_always("\r\n");
+    }
+}
+
 /// Pool types matching Windows definitions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -138,8 +151,7 @@ impl PoolHeader {
     pub const BLOCK_VALID: u8 = 0x00;
 
     pub fn has_signature(&self) -> bool {
-        u32::from(self.reserved[0]) | (u32::from(self.reserved[1]) << 16)
-            == POOL_HEADER_SIGNATURE
+        u32::from(self.reserved[0]) | (u32::from(self.reserved[1]) << 16) == POOL_HEADER_SIGNATURE
     }
 
     pub fn set_signature(&mut self) {
@@ -379,6 +391,7 @@ fn alloc_raw(total_size: usize, pool_type: PoolType, tag: u32) -> *mut u8 {
 
 /// Allocate `size` bytes of pool memory of the given type.
 pub fn allocate(pool_type: PoolType, size: usize) -> *mut u8 {
+    pool_dbg("alloc enter");
     // We call alloc_raw directly without an outer with_pool_state
     // wrapper, because alloc_raw internally calls allocate_from_freelist
     // which acquires the POOL_STATE lock itself. Wrapping here would
@@ -776,7 +789,9 @@ const MIN_FREE_BLOCK_SIZE: usize = 32;
 /// Returns Some(ptr) if a suitable block is found, None otherwise
 pub fn allocate_from_freelist(pool_type: PoolType, size: usize) -> Option<*mut u8> {
     ensure_pool_state_initialized();
+    pool_dbg("fl enter");
     with_pool_state_mut(|state| {
+        pool_dbg("fl locked");
         let freelist = if pool_type.is_paged() {
             &mut state.paged_freelist
         } else {

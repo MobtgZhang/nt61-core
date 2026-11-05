@@ -278,7 +278,12 @@ fn resolve_hardware(pte: MMPTE, va: u64, pte_ptr: *mut MMPTE, access: AccessFlag
     FaultStatus::Handled
 }
 
-fn resolve_transition(pte: MMPTE, _va: u64, pte_ptr: *mut MMPTE, access: AccessFlags) -> FaultStatus {
+fn resolve_transition(
+    pte: MMPTE,
+    _va: u64,
+    pte_ptr: *mut MMPTE,
+    access: AccessFlags,
+) -> FaultStatus {
     let pfn_no = pte.transition_pfn();
     // Transition -> hardware: pop the PFN off its current list
     // (standby/modified), promote the PTE.
@@ -409,9 +414,9 @@ fn resolve_demand_zero_inner(
     let pa = pfn_to_phys(pfn_no);
     //     // // // kprintln!("[DEMAND_ZERO_INNER] pte_ptr=0x{:x} pa=0x{:x}", pte_ptr as u64, pa);
     let mut pte_bits: u64 = 1; // P=1
-    // NT 6.1: the hardware R/W bit must honor the VAD's software
-    // protection, not just the fault type. A read-only VAD page
-    // must not become writable simply because a write fault occurred.
+                               // NT 6.1: the hardware R/W bit must honor the VAD's software
+                               // protection, not just the fault type. A read-only VAD page
+                               // must not become writable simply because a write fault occurred.
     let vad_protection = if let Some(v) = vad {
         u64::from(unsafe { (*v).protection.bits() })
     } else {

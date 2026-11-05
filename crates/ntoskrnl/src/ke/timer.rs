@@ -112,8 +112,7 @@ fn timer_array() -> &'static mut [Ktimer; MAX_TIMERS] {
         // SAFETY: same as the fast path.
         return unsafe { &mut *(current as *mut [Ktimer; MAX_TIMERS]) };
     }
-    let bytes = pool::allocate(pool::PoolType::NonPaged, MAX_TIMERS * TIMER_SIZE)
-        as *mut Ktimer;
+    let bytes = pool::allocate(pool::PoolType::NonPaged, MAX_TIMERS * TIMER_SIZE) as *mut Ktimer;
     if bytes.is_null() {
         static mut FALLBACK: [Ktimer; MAX_TIMERS] = [const { Ktimer::new("<fb>") }; MAX_TIMERS];
         // SAFETY: FALLBACK is a static array with the same lifetime as

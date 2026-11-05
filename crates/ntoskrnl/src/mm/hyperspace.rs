@@ -11,9 +11,9 @@
 //! `HYPERSPACE_BASE + ((cpu_id & 0x1FF) * 4096)` and then access the
 //! address.
 
-use core::ptr;
 #[cfg(target_arch = "x86_64")]
 use crate::ke::sync::Spinlock;
+use core::ptr;
 
 #[cfg(target_arch = "x86_64")]
 use crate::mm::constants::MI_HYPERSPACE_INDEX;
@@ -133,8 +133,7 @@ pub fn hyperspace_pointer(va: u64) -> *mut u8 {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn init() {
-}
+pub fn init() {}
 
 #[cfg(not(target_arch = "x86_64"))]
 pub fn init() {}

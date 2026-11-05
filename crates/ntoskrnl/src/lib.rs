@@ -6,8 +6,8 @@
 extern crate alloc;
 extern crate self as ntoskrnl;
 
-pub use nt61_boot_types::boot_types;
 pub use libs::{msvcrt, ntdll};
+pub use nt61_boot_types::boot_types;
 
 #[path = "../../arch/src/arch/mod.rs"]
 pub mod arch;

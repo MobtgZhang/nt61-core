@@ -496,16 +496,14 @@ impl PfnDatabase {
             || self.lists[list_idx].head == 0
             || self.lists[list_idx].count == 0
             || (blink == 0 && self.lists[list_idx].head != pfn)
-            || (blink != 0
-                && {
-                    let prev = self.entry_or_bugcheck(blink);
-                    (*prev).u1.flink != pfn
-                })
-            || (flink != 0
-                && {
-                    let next = self.entry_or_bugcheck(flink);
-                    (*next).u1.blink != pfn
-                })
+            || (blink != 0 && {
+                let prev = self.entry_or_bugcheck(blink);
+                (*prev).u1.flink != pfn
+            })
+            || (flink != 0 && {
+                let next = self.entry_or_bugcheck(flink);
+                (*next).u1.blink != pfn
+            })
         {
             crate::ke::bugcheck::bugcheck_with(
                 crate::ke::bugcheck::BugCheckCode::PfnListCorrupt,
@@ -954,7 +952,12 @@ pub fn init(base_pfn: PfnNumber, pfn_count: PfnNumber) {
                 pfn_count as usize
             }
         };
-        db.init(PFN_STORAGE_PTR, PFN_STORAGE_USED, base_pfn, usable_pfns as u64);
+        db.init(
+            PFN_STORAGE_PTR,
+            PFN_STORAGE_USED,
+            base_pfn,
+            usable_pfns as u64,
+        );
         db.seed_free(base_pfn, usable_pfns as u64);
     }
 

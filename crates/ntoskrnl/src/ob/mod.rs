@@ -2028,7 +2028,7 @@ fn try_delete_object_locked(header: *mut ObjectHeader) -> bool {
             let mut ns = NAMESPACE.lock();
             ns.obj_count = ns.obj_count.saturating_sub(1);
         }
-            let _ = pool::free(header as *mut u8);
+        let _ = pool::free(header as *mut u8);
 
         true
     }

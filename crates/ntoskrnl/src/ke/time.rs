@@ -99,8 +99,7 @@ fn wall_clock_100ns() -> u64 {
         days += month_days[(month - 1) as usize] as u64;
     }
     days += time.day as u64 - 1;
-    let seconds_of_day =
-        time.hour as u64 * 3_600 + time.minute as u64 * 60 + time.second() as u64;
+    let seconds_of_day = time.hour as u64 * 3_600 + time.minute as u64 * 60 + time.second() as u64;
     (days * 86_400 + seconds_of_day) * 10_000_000
 }
 

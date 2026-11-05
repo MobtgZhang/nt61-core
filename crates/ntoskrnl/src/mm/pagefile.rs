@@ -288,12 +288,8 @@ pub fn read_page(page_file_no: u32, offset: u32) -> Option<u64> {
         // 8 × 512 B sectors; start_sector is an LBA, so the byte
         // offset is start_sector * 512 + offset * 4096.
         let byte_offset = disk_start_sector * 512 + (offset as u64) * 4096;
-        let bytes_read = crate::drivers::storage::disk::disk_read(
-            device_id,
-            byte_offset,
-            4096,
-            page_buf,
-        );
+        let bytes_read =
+            crate::drivers::storage::disk::disk_read(device_id, byte_offset, 4096, page_buf);
         if bytes_read < 4096 {
             pfn::free_pfn(dst_pfn);
             return None;

@@ -21,6 +21,12 @@ pub type Irql = u8;
 /// when serial logging is suppressed or unavailable.
 pub static LONG_SPIN_EVENTS: AtomicU64 = AtomicU64::new(0);
 
+/// Source line of the most recent successful Spinlock acquisition.
+/// Diagnostic aid for "who holds the lock" on SMP stalls; the value is
+/// only meaningful when some lock holder never releases (stall), since
+/// in the normal case it just reflects the latest acquire anywhere.
+pub static LAST_ACQUIRE_LINE: AtomicU32 = AtomicU32::new(0);
+
 /// IRQL levels
 //
 // NT 6.1 defines 32 IRQLs (0..31). The documented x86/x64 layout is:
@@ -72,6 +78,32 @@ impl Drop for IrqlRestore {
     }
 }
 
+/// Local interrupt-disable bracket. Held for the whole lifetime of a
+/// spinlock guard: a maskable interrupt arriving on the same CPU while
+/// the lock is held must not be allowed to take the same lock again
+/// (the software-IRQL / CR8 path alone does not block every interrupt
+/// source, e.g. legacy or remapped timer lines).
+struct InterruptGuard {
+    were_enabled: bool,
+}
+
+impl InterruptGuard {
+    fn new() -> Self {
+        let were_enabled = crate::arch::interrupts_enabled();
+        if were_enabled {
+            crate::arch::disable_interrupts();
+        }
+        Self { were_enabled }
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        if self.were_enabled {
+            crate::arch::enable_interrupts();
+        }
+    }
+}
 /// A simple, correct, RAII spinlock. It disables interrupts while held
 /// (so we never deadlock against a clock interrupt that wants the same
 /// lock) and re-enables them on drop. Interrupts are *not* disabled
@@ -118,6 +150,7 @@ impl<T: ?Sized> Spinlock<T> {
     /// When the lock is acquired, interrupts are disabled on this CPU
     /// and will be re-enabled when the guard is dropped.
     pub fn try_lock(&self) -> Option<SpinlockGuard<'_, T>> {
+        let interrupts = InterruptGuard::new();
         let irql_guard = IrqlRestore::raise();
         self.locked
             .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
@@ -125,6 +158,7 @@ impl<T: ?Sized> Spinlock<T> {
             .map(|_| SpinlockGuard {
                 lock: self,
                 _irql_guard: Some(irql_guard),
+                _interrupts: Some(interrupts),
             })
     }
 
@@ -155,7 +189,10 @@ impl<T: ?Sized> Spinlock<T> {
     /// try to take the same lock and deadlock.
     ///
     /// Uses exponential backoff to reduce bus contention on SMP systems.
+    #[track_caller]
     pub fn lock(&self) -> SpinlockGuard<'_, T> {
+        let loc = core::panic::Location::caller();
+        let interrupts = InterruptGuard::new();
         let irql_guard = IrqlRestore::raise();
         let mut spins: u32 = 0;
         loop {
@@ -165,9 +202,11 @@ impl<T: ?Sized> Spinlock<T> {
                 .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                LAST_ACQUIRE_LINE.store(loc.line(), Ordering::Relaxed);
                 return SpinlockGuard {
                     lock: self,
                     _irql_guard: Some(irql_guard),
+                    _interrupts: Some(interrupts),
                 };
             }
 
@@ -189,9 +228,23 @@ impl<T: ?Sized> Spinlock<T> {
                 let is_threshold_crossing = (spins == 10001) || (spins & (spins - 1)) == 0;
                 if is_threshold_crossing {
                     LONG_SPIN_EVENTS.fetch_add(1, Ordering::Relaxed);
-                    crate::hal::serial::write_string(
-                        "[SYNC] spinlock contention: spinning beyond 10000 iterations (possible deadlock)\r\n",
+                    let loc = core::panic::Location::caller();
+                    let _ = loc;
+                    crate::hal::serial::write_string_always(
+                        "[SYNC] spinlock contention @ ",
                     );
+                    crate::hal::serial::write_string_always(core::any::type_name::<T>());
+                    crate::hal::serial::write_string_always(" @ ");
+                    crate::hal::serial::write_string_always(loc.file());
+                    crate::hal::serial::write_string_always(":");
+                    crate::hal::serial::write_string_always(&alloc::format!(
+                        "holder=ke/scheduler-ish line {} (possible deadlock) ",
+                        LAST_ACQUIRE_LINE.load(Ordering::Relaxed)
+                    ));
+                    crate::hal::serial::write_string_always(&alloc::format!(
+                        "{} (possible deadlock)\r\n",
+                        loc.line()
+                    ));
                 }
             }
         }
@@ -216,6 +269,7 @@ impl<T: ?Sized> Spinlock<T> {
 pub struct SpinlockGuard<'a, T: ?Sized + 'a> {
     lock: &'a Spinlock<T>,
     _irql_guard: Option<IrqlRestore>, // Saved IRQL state, re-enabled on drop
+    _interrupts: Option<InterruptGuard>, // Local IF state, restored last
 }
 
 impl<'a, T: ?Sized> core::ops::Deref for SpinlockGuard<'a, T> {
@@ -470,7 +524,8 @@ impl FastMutex {
     }
 
     pub fn owner(&self) -> u64 {
-        self.owner_thread.load(core::sync::atomic::Ordering::Acquire)
+        self.owner_thread
+            .load(core::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -537,7 +592,11 @@ impl EResource {
     }
 
     pub fn acquire_shared(&self) -> bool {
-        if self.owner_thread.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        if self
+            .owner_thread
+            .load(core::sync::atomic::Ordering::Acquire)
+            != 0
+        {
             return false;
         }
         self.shared_count

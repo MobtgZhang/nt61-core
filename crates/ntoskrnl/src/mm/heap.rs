@@ -273,8 +273,13 @@ impl KernelHeap {
             let mut merged = false;
             let mut prev: *mut FreeBlock = ptr::null_mut();
             let mut cur: *mut FreeBlock = *head_ref;
+            let max_blocks = self.size.load(Ordering::Relaxed) / core::mem::size_of::<FreeBlock>() + 1;
+            let mut hops = 0usize;
 
             while !cur.is_null() {
+                if !self.is_in_heap_range(cur as *mut u8, core::mem::size_of::<FreeBlock>()) {
+                    break;
+                }
                 let cur_addr = cur as usize;
                 let cur_size = (*cur).size;
                 let cur_next = (*cur).next;
@@ -296,9 +301,12 @@ impl KernelHeap {
                     }
                     break;
                 }
-
                 prev = cur;
                 cur = cur_next;
+                hops += 1;
+                if hops > max_blocks {
+                    break;
+                }
             }
 
             if !merged {
@@ -306,14 +314,15 @@ impl KernelHeap {
             }
         }
 
-        // Merge with the bump-pointer region when the freed block
-        // sits exactly at the current bump pointer — effectively
-        // returning the memory to the bump allocator.
-        let next = self.next.load(Ordering::SeqCst);
-        if merged_addr + merged_size == next {
-            self.next.store(merged_addr, Ordering::SeqCst);
-            return;
-        }
+        // NOTE: freed memory is *never* returned to the bump
+        // allocator. Rewinding the bump pointer is only sound under
+        // strict LIFO allocation, which this kernel does not provide
+        // (pool keeps its own free list on top of this heap, and
+        // long-lived allocations interleave with frees). A rewind
+        // used to hand out memory that still contained live pool
+        // blocks, which is exactly how a 12.8 MiB image allocation
+        // ended up zeroing a live 12.5 MiB pool buffer. Freed blocks
+        // are recycled exclusively through the free list below.
 
         // Initialize the free block header only after all adjacent blocks
         // have been absorbed; those blocks' storage is part of the merged
@@ -348,15 +357,50 @@ impl KernelHeap {
 
         let mut prev: *mut FreeBlock = ptr::null_mut();
         let mut cur: *mut FreeBlock = *head_ref;
+        // Cycle guard: a corrupted `next` pointer (e.g. from memory
+        // scribbled over a live free block) used to make this walk spin
+        // forever. Bound it and validate every hop.
+        let max_blocks = self.size.load(Ordering::Relaxed) / core::mem::size_of::<FreeBlock>() + 1;
+        let mut hops = 0usize;
         while !cur.is_null() {
+            if !self.is_in_heap_range(cur as *mut u8, core::mem::size_of::<FreeBlock>()) {
+                break;
+            }
             let cur_size = (*cur).size;
-            if cur_size >= needed_size && cur_size < best_size {
+        // A free block must never extend past the bump frontier:
+        // the frontier is monotonically increasing and every block
+        // was carved below it. A block that claims to reach past the
+        // frontier is a corrupt or stale header — skip it instead of
+        // handing out memory that may contain live allocations.
+        let block_end_check = cur as usize + cur_size;
+        let frontier = self.next.load(Ordering::Relaxed);
+        if block_end_check > frontier {
+            // Unlink the corrupt block in place so it can never be
+            // selected, then keep walking from its successor.
+            let corrupt_next = (*cur).next;
+            if prev.is_null() {
+                *head_ref = corrupt_next;
+            } else {
+                (*prev).next = corrupt_next;
+            }
+            cur = corrupt_next;
+            hops += 1;
+            if hops > max_blocks {
+                break;
+            }
+            continue;
+        }
+        if cur_size >= needed_size && cur_size < best_size {
                 best = cur;
                 best_prev = prev;
                 best_size = cur_size;
             }
             prev = cur;
             cur = (*cur).next;
+            hops += 1;
+            if hops > max_blocks {
+                break;
+            }
         }
 
         if best.is_null() {

@@ -330,7 +330,10 @@ fn get_standby_pages(max_count: usize) -> alloc::vec::Vec<u64> {
         }
         if let Some(entry) = db.entry(i) {
             let state = unsafe { (*entry).state() };
-            if matches!(state, crate::mm::pfn::MMPFNSTATE::Active | crate::mm::pfn::MMPFNSTATE::Modified) {
+            if matches!(
+                state,
+                crate::mm::pfn::MMPFNSTATE::Active | crate::mm::pfn::MMPFNSTATE::Modified
+            ) {
                 result.push(i);
                 count += 1;
             }
@@ -555,9 +558,7 @@ fn pageout_single(candidate: &PageoutCandidate) -> bool {
                     let old_pte = *pte_ptr;
                     let protection = (old_pte.u_long >> 48) & 0x1F; // 5-bit software prot
                     let mut new_pte: crate::mm::pte::MMPTE = core::mem::zeroed();
-                    new_pte.set_software_pagefile(
-                        pagefile_no as u32, offset, protection as u32,
-                    );
+                    new_pte.set_software_pagefile(pagefile_no as u32, offset, protection as u32);
                     pte_ptr.write_volatile(new_pte);
                     crate::arch::flush_tlb();
                 }

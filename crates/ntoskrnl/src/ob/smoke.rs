@@ -22,9 +22,8 @@ use core::sync::atomic::Ordering;
 // Imports from the parent ob module.
 use super::{
     create_count, create_object, dereference_object, insert_count, insert_object, lookup_count,
-    lookup_directory, lookup_object, reference_count, reference_object,
-    remove_object_by_name, validate_object_name, ObType, STATUS_OBJECT_NAME_INVALID,
-    STATUS_SUCCESS,
+    lookup_directory, lookup_object, reference_count, reference_object, remove_object_by_name,
+    validate_object_name, ObType, STATUS_OBJECT_NAME_INVALID, STATUS_SUCCESS,
 };
 
 /// Run the object manager smoke test.
