@@ -517,15 +517,15 @@ pub fn create_esp_image(paths: &EspPaths, arch: Arch) -> std::io::Result<PathBuf
     println!("  Creating FAT32 disk image: {:?}", &img_path);
     println!("    Size: {} MB", size_mb);
 
-    let esp_source = paths.efi_dir
+    let esp_source = paths
+        .efi_dir
         .parent()
         .unwrap_or_else(|| paths.efi_dir.as_path())
         .to_path_buf();
     let mut fat_image = Fat32Image::new(size_mb);
     if esp_source.exists() {
-        populate_fat32_image(&mut fat_image, &esp_source).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
-        })?;
+        populate_fat32_image(&mut fat_image, &esp_source)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error.to_string()))?;
     }
     let partition_bytes = fat_image
         .finalize_with_offset((partition_start_lba * sector_size) as usize)
@@ -535,7 +535,12 @@ pub fn create_esp_image(paths: &EspPaths, arch: Arch) -> std::io::Result<PathBuf
     let partition_offset = (partition_start_lba * sector_size) as usize;
     image[partition_offset..partition_offset + partition_bytes.len()]
         .copy_from_slice(&partition_bytes);
-    write_single_gpt(&mut image, total_sectors, partition_start_lba, partition_end_lba);
+    write_single_gpt(
+        &mut image,
+        total_sectors,
+        partition_start_lba,
+        partition_end_lba,
+    );
     std::fs::write(&img_path, &image)?;
 
     println!("    Created FAT32 ESP with a valid single-partition GPT.");

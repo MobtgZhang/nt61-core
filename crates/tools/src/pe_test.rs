@@ -122,8 +122,9 @@ fn main() {
             .expect("load hal.dll");
         db2.register(&hal_loaded, &hal.bytes);
         // Now load ntoskrnl.exe - it should resolve hal.dll imports.
-        let loaded = nt61_loader::loader::load_image_full("ntoskrnl.exe", &image.bytes, &mut db2, 0)
-            .expect("load ntoskrnl.exe");
+        let loaded =
+            nt61_loader::loader::load_image_full("ntoskrnl.exe", &image.bytes, &mut db2, 0)
+                .expect("load ntoskrnl.exe");
         // The OS Loader registers every image it loads, both
         // so the new image's exports can be resolved by
         // subsequent imports, and so callers can introspect the

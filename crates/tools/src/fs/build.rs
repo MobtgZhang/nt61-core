@@ -320,7 +320,11 @@ fn ensure_loongarch_libgcc_stub() -> Result<()> {
         return Ok(());
     }
     let workspace_root = get_workspace_root();
-    let dir = workspace_root.join("crates").join("tools").join("loongarch64").join("lib");
+    let dir = workspace_root
+        .join("crates")
+        .join("tools")
+        .join("loongarch64")
+        .join("lib");
     let archive = dir.join("libgcc.a");
     if archive.exists() {
         return Ok(());
@@ -2865,6 +2869,56 @@ pub fn build_userland_images(arch: &str) -> Result<()> {
         )));
     }
 
+    // Explorer is a Session-1 process loaded and dispatched by the
+    // kernel after SMSS/winlogon/userinit. It is not launched by UEFI
+    // firmware, so build it for the bare-metal kernel ABI and expose
+    // the same `kernel_entry` contract as other kernel-loaded images.
+    let explorer_target = kernel_target_for(arch);
+    log::section("Building explorer");
+    log::info(&format!("Target: {explorer_target}"));
+    let status = Command::new("cargo")
+        .current_dir(&workspace_root)
+        .arg("build")
+        .arg("--release")
+        .arg("--target")
+        .arg(explorer_target)
+        .arg("-p")
+        .arg("nt61-desktop")
+        .arg("--bin")
+        .arg("explorer")
+        .status()
+        .map_err(BuildError::Io)?;
+    if !status.success() {
+        return Err(BuildError::ImageCreateFailed(format!(
+            "explorer build failed with exit code: {status:?}"
+        )));
+    }
+
+    // LogonUI runs before the shell in the Desktop boot mode: SMSS
+    // dispatches it into Session 1 to draw the Windows-7 welcome
+    // screen, and its exit hands control to the ready explorer.exe
+    // thread. Build it with the same bare-metal kernel ABI.
+    let logonui_target = kernel_target_for(arch);
+    log::section("Building logonui");
+    log::info(&format!("Target: {logonui_target}"));
+    let status = Command::new("cargo")
+        .current_dir(&workspace_root)
+        .arg("build")
+        .arg("--release")
+        .arg("--target")
+        .arg(logonui_target)
+        .arg("-p")
+        .arg("nt61-desktop")
+        .arg("--bin")
+        .arg("logonui")
+        .status()
+        .map_err(BuildError::Io)?;
+    if !status.success() {
+        return Err(BuildError::ImageCreateFailed(format!(
+            "logonui build failed with exit code: {status:?}"
+        )));
+    }
+
     log::section("Building nt61-driver");
     log::info(&format!("Target: {target}"));
     let mut driver_command = Command::new("cargo");
@@ -2941,7 +2995,8 @@ fn generate_pe_files_in_process(system32_dir: &Path) -> Result<()> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(BuildError::Io)?;
         }
-        std::fs::write(&dest, &img.bytes).map_err(BuildError::Io)?;
+        let bytes = refresh_pe_checksum(img.bytes.clone());
+        std::fs::write(&dest, &bytes).map_err(BuildError::Io)?;
         if img.bytes.len() >= 2 && &img.bytes[0..2] == b"MZ" {
             log::info(&format!(
                 "Generated PE: {:?} ({} bytes)",
@@ -2962,13 +3017,90 @@ fn generate_pe_files_in_process(system32_dir: &Path) -> Result<()> {
         driver_count,
         total
     ));
+    generate_desktop_resources(system32_dir)?;
     Ok(())
 }
 
-/// A single PE image produced by the in-process generator.
+fn refresh_pe_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.len() < 0x100 || &bytes[0..2] != b"MZ" {
+        return bytes;
+    }
+    let e_lfanew =
+        u32::from_le_bytes([bytes[0x3C], bytes[0x3D], bytes[0x3E], bytes[0x3F]]) as usize;
+    let Some(opt_off) = e_lfanew.checked_add(24) else {
+        return bytes;
+    };
+    let checksum_off = opt_off + 64;
+    if checksum_off + 4 > bytes.len()
+        || bytes.get(e_lfanew..e_lfanew + 4) != Some(&0x00004550u32.to_le_bytes())
+    {
+        return bytes;
+    }
+    bytes[checksum_off..checksum_off + 4].copy_from_slice(&[0; 4]);
+    let mut sum = 0u64;
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        let word = u32::from(bytes[i]) | (u32::from(bytes[i + 1]) << 8);
+        sum = sum.wrapping_add(word as u64);
+        sum = (sum & 0xFFFF) + (sum >> 16);
+        i += 2;
+    }
+    if i < bytes.len() {
+        sum = sum.wrapping_add(u64::from(bytes[i]));
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    let checksum = (sum + bytes.len() as u64) as u32;
+    bytes[checksum_off..checksum_off + 4].copy_from_slice(&checksum.to_le_bytes());
+    bytes
+}
+
+/// Generate Win7 desktop PE resource files into the build output.
+///
+/// The generator lives in `crates/desktop`; the only artifacts emitted
+/// here are under `<System32>/resources/desktop`. This avoids keeping
+/// generated PE/theme files in the source tree.
+fn generate_desktop_resources(system32_dir: &Path) -> Result<()> {
+    use std::process::Command;
+
+    let arch = arch_name(current_pe_arch());
+    let destination = system32_dir.join("resources").join("desktop");
+    let status = Command::new("cargo")
+        .arg("run")
+        .arg("--release")
+        .arg("--features=resource-gen")
+        .arg("-p")
+        .arg("nt61-desktop")
+        .arg("--bin")
+        .arg("resource-gen")
+        .arg("--")
+        .arg("--output")
+        .arg(&destination)
+        .arg("--arch")
+        .arg(arch)
+        .status()
+        .map_err(BuildError::Io)?;
+    if !status.success() {
+        return Err(BuildError::ImageCreateFailed(format!(
+            "desktop resource generation failed with exit code: {status:?}"
+        )));
+    }
+    for name in ["imageres.dll", "shell32.dll", "aero.msstyles"] {
+        let path = destination.join(name);
+        if !path.is_file() {
+            return Err(BuildError::MissingFile(path.display().to_string()));
+        }
+    }
+    log::info(&format!(
+        "Generated desktop resources in {}",
+        destination.display()
+    ));
+    Ok(())
+}
+
 /// A single PE image produced by the in-process generator. The name
 /// is relative to the System32 directory (e.g. `cmd.exe`,
-/// `drivers/acpi.sys`).
+/// `explorer.exe`, `drivers/acpi.sys`).
 pub struct SystemImage {
     pub name: &'static str,
     pub bytes: Vec<u8>,
@@ -3070,6 +3202,69 @@ fn arch_name(arch: TargetArch) -> &'static str {
         TargetArch::RiscV64 => "riscv64",
         TargetArch::LoongArch64 => "loongarch64",
     }
+}
+
+/// Build explorer.exe from the bare-metal ring3 ELF using the pure-Rust
+/// ELF64-to-PE32+ converter. `objcopy -O pei-*` (used by real_pe) emits
+/// a malformed section table for the explorer image (entry RVA falls
+/// between sections), which makes the kernel loader map the entry page
+/// NX and crashes explorer on its first instruction. Our converter emits
+/// one PE section per PT_LOAD with correct characteristics, so the
+/// loader maps .text RX and explorer starts cleanly.
+fn explorer_pe() -> Vec<u8> {
+    let arch = current_pe_arch();
+    let elf_rel = format!(
+        "target/{}/release/explorer",
+        kernel_target_for(arch_name(arch))
+    );
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    if let Ok(elf) = std::fs::read(workspace_root.join(&elf_rel)) {
+        if elf.len() >= 5 && &elf[0..5] == [0x7F, b'E', b'L', b'F', 2] {
+            match super::elf_to_pe::elf_to_pe(&elf, arch_name(arch)) {
+                Some(pe) => {
+                    log::info(&format!(
+                        "explorer.exe: converted {} ({} bytes ELF -> {} bytes PE32+)",
+                        elf_rel,
+                        elf.len(),
+                        pe.len()
+                    ));
+                    return pe;
+                }
+                None => {
+                    log::warn("elf_to_pe failed for explorer, falling back to real_pe");
+                }
+            }
+        }
+    }
+    real_pe("explorer.efi")
+}
+
+/// Build logonui.exe from the bare-metal ring-3 ELF using the same
+/// pure-Rust ELF64-to-PE32+ converter as `explorer_pe` (see the
+/// comment there for why `objcopy -O pei-*` is not used).
+fn logonui_pe() -> Vec<u8> {
+    let arch = current_pe_arch();
+    let elf_rel = format!("target/{}/release/logonui", kernel_target_for(arch_name(arch)));
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    if let Ok(elf) = std::fs::read(workspace_root.join(&elf_rel)) {
+        if elf.len() >= 5 && &elf[0..5] == [0x7F, b'E', b'L', b'F', 2] {
+            match super::elf_to_pe::elf_to_pe(&elf, arch_name(arch)) {
+                Some(pe) => {
+                    log::info(&format!(
+                        "logonui.exe: converted {} ({} bytes ELF -> {} bytes PE32+)",
+                        elf_rel,
+                        elf.len(),
+                        pe.len()
+                    ));
+                    return pe;
+                }
+                None => {
+                    panic!("elf_to_pe failed for logonui");
+                }
+            }
+        }
+    }
+    panic!("logonui ELF not found at {}", elf_rel);
 }
 
 /// Final consistency pass over a freshly wrapped PE image.
@@ -3261,6 +3456,14 @@ pub fn build_system_images() -> Vec<SystemImage> {
         SystemImage {
             name: "cmd.exe",
             bytes: real_pe("nt61-cmd.efi"),
+        },
+        SystemImage {
+            name: "explorer.exe",
+            bytes: explorer_pe(),
+        },
+        SystemImage {
+            name: "logonui.exe",
+            bytes: logonui_pe(),
         },
         SystemImage {
             name: "smss.exe",
