@@ -1,0 +1,141 @@
+pub const SYS_EXIT_PROCESS: u32 = 0x0201;
+pub const SYS_DESKTOP_INFO: u32 = 0x0300;
+pub const SYS_DESKTOP_FILL_RECT: u32 = 0x0301;
+#[allow(dead_code)]
+pub const SYS_DESKTOP_DRAW_TEXT: u32 = 0x0302;
+pub const SYS_DESKTOP_DRAW_RGBA: u32 = 0x0303;
+pub const SYS_DESKTOP_POLL_KEY: u32 = 0x0304;
+pub const SYS_GET_KEY: u32 = 0x0204;
+
+/// # Safety
+///
+/// Callers must provide valid Ring-3 pointers for pointer arguments.
+#[unsafe(naked)]
+unsafe extern "C" fn syscall5_raw(
+    number: u32,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+) -> u64 {
+    core::arch::naked_asm!(
+        "mov x16, x0",
+        "mov x0, x1",
+        "mov x1, x2",
+        "mov x2, x3",
+        "mov x3, x4",
+        "mov x4, x5",
+        "mov x5, xzr",
+        "mov x6, xzr",
+        "mov x7, xzr",
+        "svc #0",
+        "mov x8, x0",
+        "ret",
+    );
+}
+
+#[inline(always)]
+pub fn syscall5(
+    number: u32,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+) -> u64 {
+    unsafe { syscall5_raw(number, arg0, arg1, arg2, arg3, arg4) }
+}
+
+#[inline(always)]
+pub fn desktop_info(info: &mut super::DesktopFramebufferInfo) -> u64 {
+    syscall5(
+        SYS_DESKTOP_INFO,
+        core::ptr::from_mut(info) as usize,
+        0,
+        0,
+        0,
+        0,
+    )
+}
+
+#[inline(always)]
+pub fn fill_rect(x: u32, y: u32, width: u32, height: u32, color: u32) -> u64 {
+    syscall5(
+        SYS_DESKTOP_FILL_RECT,
+        x as usize,
+        y as usize,
+        width as usize,
+        height as usize,
+        color as usize,
+    )
+}
+
+/// # Safety
+///
+/// The text pointer must reference `length` readable bytes in user space.
+#[inline(always)]
+#[allow(dead_code)]
+pub unsafe fn draw_text(
+    text: *const u8,
+    length: usize,
+    x: u32,
+    y: u32,
+    foreground: u32,
+    background: u32,
+) -> u64 {
+    syscall5(
+        SYS_DESKTOP_DRAW_TEXT,
+        text as usize,
+        length,
+        x as usize,
+        y as usize,
+        (((foreground as u64) << 32) | background as u64) as usize,
+    )
+}
+
+/// # Safety
+///
+/// The pixel pointer must reference a complete RGBA bitmap in user space.
+#[inline(always)]
+pub unsafe fn draw_rgba(
+    pixels: *const u8,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    stride: usize,
+) -> u64 {
+    syscall5(
+        SYS_DESKTOP_DRAW_RGBA,
+        pixels as usize,
+        (y as usize) | ((x as usize) << 32),
+        (height as usize) | ((width as usize) << 32),
+        stride,
+        0,
+    )
+}
+
+/// # Safety
+///
+/// `key` must point to writable memory in user space.
+#[inline(always)]
+pub unsafe fn poll_key(key: *mut u8) -> u64 {
+    syscall5(SYS_DESKTOP_POLL_KEY, key as usize, 0, 0, 0, 0)
+}
+
+/// # Safety
+///
+/// `key` must point to writable memory in user space.
+#[inline(always)]
+pub unsafe fn wait_key(key: *mut u8) -> u64 {
+    syscall5(SYS_GET_KEY, key as usize, 0, 0, 0, 0)
+}
+
+#[inline(always)]
+pub fn exit_process(exit_code: u32) -> ! {
+    syscall5(SYS_EXIT_PROCESS, exit_code as usize, 0, 0, 0, 0);
+    loop {
+        core::hint::spin_loop();
+    }
+}

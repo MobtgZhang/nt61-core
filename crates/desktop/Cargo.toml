@@ -1,0 +1,29 @@
+[package]
+name = "nt61-desktop"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+test = true
+
+[features]
+resource-gen = []
+
+[[bin]]
+name = "resource-gen"
+path = "src/bin/resource-gen.rs"
+test = false
+
+[[bin]]
+name = "explorer"
+path = "src/bin/explorer/main.rs"
+test = false
+
+[[bin]]
+name = "logonui"
+path = "src/bin/logonui/main.rs"
+test = false
+
+[dependencies]
