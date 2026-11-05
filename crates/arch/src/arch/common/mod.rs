@@ -8,6 +8,7 @@
 pub mod btl;
 pub mod cmd_host;
 pub mod counter;
+pub mod desktop_host;
 pub mod device_tree;
 pub mod hardware_exception;
 pub mod line_edit;

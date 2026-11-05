@@ -132,20 +132,14 @@ fn update_flags(state: &mut GuestState, op: AluOp, a: u64, b: u64, result: u64) 
             let carry = (a ^ result) & (b ^ result);
             state.set_flag(FLAG_CF, result < a);
             state.set_flag(FLAG_OF, (carry >> 63) != 0);
-            state.set_flag(
-                FLAG_AF,
-                (((a ^ b ^ result) & 0x10) >> 4) != 0,
-            );
+            state.set_flag(FLAG_AF, (((a ^ b ^ result) & 0x10) >> 4) != 0);
         }
         AluOp::Sub | AluOp::Cmp => {
             let diff = a ^ b;
             let borrow = a ^ result;
             state.set_flag(FLAG_CF, a < b);
             state.set_flag(FLAG_OF, (diff & borrow & (1u64 << 63)) != 0);
-            state.set_flag(
-                FLAG_AF,
-                (((a ^ result) & (b ^ a) & 0x10) >> 4) != 0,
-            );
+            state.set_flag(FLAG_AF, (((a ^ result) & (b ^ a) & 0x10) >> 4) != 0);
         }
         _ => {
             state.set_flag(FLAG_CF, false);

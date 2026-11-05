@@ -194,8 +194,7 @@ pub unsafe extern "C" fn dispatch_syscall(frame: *mut TrapFrame) {
 /// needed by the Phase 7 BTL bridge; everything else returns
 /// `STATUS_NOT_IMPLEMENTED`.
 fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
-    const SYS_EXIT_PROCESS_U64: u64 =
-        crate::arch::common::cmd_host::SYS_EXIT_PROCESS as u64;
+    const SYS_EXIT_PROCESS_U64: u64 = crate::arch::common::cmd_host::SYS_EXIT_PROCESS as u64;
     match num {
         SYS_NT_CLOSE => {
             // NT_CLOSE(handle) — Phase 1 returns success for any handle
@@ -229,9 +228,7 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             }
         }
         SYS_RETURN_TO_FIRMWARE => crate::arch::common::cmd_host::return_to_firmware(),
-        SYS_EXIT_PROCESS_U64 => {
-            crate::arch::common::cmd_host::exit_process(a0 as u32)
-        }
+        SYS_EXIT_PROCESS_U64 => crate::arch::common::cmd_host::exit_process(a0 as u32),
         SYS_CMD_EXECUTE => {
             match crate::arch::common::cmd_host::execute_command(a0 as *const u8, a1 as usize) {
                 Ok(exited) => exited as u64,
@@ -239,6 +236,39 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             }
         }
         SYS_PRINT_PROMPT => crate::arch::common::cmd_host::print_prompt(),
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_INFO as u64 => unsafe {
+            crate::arch::common::desktop_host::info(a0 as *mut _)
+        },
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_FILL_RECT as u64 => {
+            crate::arch::common::desktop_host::fill_rect(
+                a0 as u32, a1 as u32, a2 as u32, a3 as u32, a4 as u32,
+            )
+        }
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_DRAW_TEXT as u64 => unsafe {
+            crate::arch::common::desktop_host::draw_text(
+                a0 as *const u8,
+                a1 as usize,
+                a2 as u32,
+                a3 as u32,
+                // User thunk packs {fg | bg << 32} into one argument.
+                ((a4 as u64) >> 32) as u32,
+                (a4 as u64 & 0xFFFF_FFFF) as u32,
+            )
+        },
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_DRAW_RGBA as u64 => unsafe {
+            crate::arch::common::desktop_host::draw_rgba(
+                a0 as *const u8,
+                // User thunk packs {y | x << 32} and {h | w << 32}.
+                ((a1 as u64) >> 32) as u32,
+                (a1 as u64 & 0xFFFF_FFFF) as u32,
+                ((a2 as u64) >> 32) as u32,
+                (a2 as u64 & 0xFFFF_FFFF) as u32,
+                a3 as usize,
+            )
+        },
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_POLL_KEY as u64 => unsafe {
+            crate::arch::common::desktop_host::poll_key(a0 as *mut u8)
+        },
         _ => {
             // Unimplemented in Phase 1.
             let _ = (a0, a1, a2, a3, a4, a5);

@@ -96,6 +96,8 @@ pub fn run_boot_animation() {
     for step in 0..ANIMATION_STEPS {
         let percent = (step + 1) * 100 / ANIMATION_STEPS;
         paint_progress_bar(percent);
+        if step == 0 {
+        }
         boot_delay_ms(100);
     }
 

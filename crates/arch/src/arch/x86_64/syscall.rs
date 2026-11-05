@@ -35,7 +35,7 @@
 //! dispatch returns `STATUS_NOT_IMPLEMENTED` so user-mode callers
 //! see a deterministic NTSTATUS code instead of a #GP fault.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use alloc::boxed::Box;
 
@@ -1606,6 +1606,49 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
             0
         }
 
+        // NT61 desktop-shell framebuffer bridge. These private calls are
+        // deliberately outside the NT native range until win32k's real
+        // USER/GDI object ABI is complete.
+        crate::arch::common::desktop_host::SYS_DESKTOP_INFO => unsafe {
+            crate::arch::common::desktop_host::info(arg0(tf) as *mut _) as i64
+        },
+        crate::arch::common::desktop_host::SYS_DESKTOP_FILL_RECT => {
+            crate::arch::common::desktop_host::fill_rect(
+                arg0(tf) as u32,
+                arg1(tf) as u32,
+                arg2(tf) as u32,
+                arg3(tf) as u32,
+                stack_arg(tf, 0) as u32,
+            ) as i64
+        }
+        crate::arch::common::desktop_host::SYS_DESKTOP_DRAW_TEXT => unsafe {
+            crate::arch::common::desktop_host::draw_text(
+                arg0(tf) as *const u8,
+                arg1(tf) as usize,
+                arg2(tf) as u32,
+                arg3(tf) as u32,
+                // The user thunk packs {fg: u32, bg: u32} into a single
+                // stack argument (fg in the high half).
+                ((stack_arg(tf, 0) as u64) >> 32) as u32,
+                (stack_arg(tf, 0) as u64 & 0xFFFF_FFFF) as u32,
+            ) as i64
+        },
+        crate::arch::common::desktop_host::SYS_DESKTOP_DRAW_RGBA => unsafe {
+            crate::arch::common::desktop_host::draw_rgba(
+                arg0(tf) as *const u8,
+                // The user thunk packs coordinates into 64-bit halves:
+                // arg1 = {y | x << 32}, arg2 = {h | w << 32}.
+                ((arg1(tf) as u64) >> 32) as u32,
+                (arg1(tf) as u64 & 0xFFFF_FFFF) as u32,
+                ((arg2(tf) as u64) >> 32) as u32,
+                (arg2(tf) as u64 & 0xFFFF_FFFF) as u32,
+                arg3(tf) as usize,
+            ) as i64
+        },
+        crate::arch::common::desktop_host::SYS_DESKTOP_POLL_KEY => unsafe {
+            crate::arch::common::desktop_host::poll_key(arg0(tf) as *mut u8) as i64
+        },
+
         nums::SYS_FILE_OPEN => {
             let path = match crate::mm::user_copy::read_user_utf16(arg0(tf), arg1(tf)) {
                 Ok(path) => path,
@@ -1734,7 +1777,6 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
         // any failure.
         nums::SYS_SPAWN_SUBSYSTEM_PROCESS => {
             let user_path_ptr = arg0(tf) as *const u8;
-            crate::boot_println!("[SYS-SPAWN] user_path_ptr=0x{:x}", user_path_ptr as u64);
             let pid =
                 crate::servers::smss::spawn_user_subsystem(user_path_ptr).unwrap_or(0xFFFFFFFFu64);
             pid as i64
@@ -1792,18 +1834,6 @@ fn validate_output(pointer: u64, length: usize) -> bool {
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 pub unsafe extern "win64" fn syscall_dispatch(syscall_num: u64, tf: *mut TrapFrame) -> u64 {
-    static FIRST_DIAGNOSTIC: AtomicBool = AtomicBool::new(false);
-    if !FIRST_DIAGNOSTIC.swap(true, Ordering::SeqCst) {
-        unsafe {
-            crate::hal::serial::write_string_always("[SYSCALL-FIRST] num=");
-            crate::hal::serial::write_hex_u64_always(syscall_num);
-            crate::hal::serial::write_string_always(" rip=");
-            crate::hal::serial::write_hex_u64_always((*tf).rip);
-            crate::hal::serial::write_string_always(" rsp=");
-            crate::hal::serial::write_hex_u64_always((*tf).rsp);
-            crate::hal::serial::write_string_always("\r\n");
-        }
-    }
     // CRITICAL: snapshot RAX/RCX/RDX/etc. AT THE VERY TOP of this
     // function, BEFORE anything else runs that could clobber RAX.
     //
@@ -1923,7 +1953,7 @@ pub fn init_syscall_msrs() {
     //    Final value:
     //      STAR = (0x20 << 48) | (0x30 << 32)
     //           = 0x0020_0030_0000_0000.
-    let star: u64 = (0x0018_u64 << 48) | (KERNEL_CS as u64);
+    let star: u64 = (0x0018_u64 << 48) | ((KERNEL_CS as u64) << 32);
     wrmsr(IA32_STAR, star);
 
     // 3. IA32_LSTAR: 64-bit RIP for SYSCALL. The CPU jumps here
@@ -1949,6 +1979,11 @@ pub fn init_syscall_msrs() {
     set_user_gs_base(0);
     init_storage(); // Initialize the per-CPU pages storage
     let cpu_base = init(0); // Init BSP's per-CPU area
+
+    // Pin BOTH GS MSRs to the per-CPU area so `swapgs` in the entry
+    // stubs is an unconditional no-op (see percpu_impl::allocate).
+    set_user_gs_base(cpu_base);
+    set_kernel_gs_base(cpu_base);
 
     // 5b. Publish the absolute virtual address of SYSCALL_ENTRY_SNAP
     //     into the per-CPU area at gs:[0x58]. The syscall_entry asm
@@ -7060,7 +7095,6 @@ pub mod win7_sp1_syscalls {
         }
     }
 }
-
 
 // =====================================================================
 // Merged from syscall_numbers.rs — NT native syscall number constants (u32).

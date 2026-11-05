@@ -335,9 +335,6 @@ pub fn init() {
     // The kprintln! macro may have issues when LOG_EARLY_READY is false and the
     // formatted output path involves code/data that isn't yet properly mapped.
     #[cfg(target_arch = "x86_64")]
-    {
-        early_uart_puts(b"[HW] gdt_init_begin\r\n");
-    }
 
     // User SS at slot 4 (selector 0x23): DPL=3, data, exec/read/write.
     // User CS at slot 5 (selector 0x2b): DPL=3, code, exec/read.
@@ -476,20 +473,6 @@ pub fn init() {
             let addr = gdtr_base + slot_offsets[i as usize];
             core::ptr::write_volatile(addr as *mut u64, data[i as usize]);
         }
-        // Dump the augmented slots so we can see the bytes (early UART output).
-        #[cfg(target_arch = "x86_64")]
-        {
-            early_uart_puts(b"[HW] gdt_dump\r\n");
-            for i in 0..10u64 {
-                let addr = (gdtr_base + i * 8) as *const u64;
-                let lo: u64 = core::ptr::read_unaligned(addr);
-                early_uart_puts(b"slot ");
-                early_uart_put_hex64(i);
-                early_uart_puts(b" = ");
-                early_uart_put_hex64(lo);
-                early_uart_puts(b"\r\n");
-            }
-        }
         #[cfg(not(target_arch = "x86_64"))]
         {
             let _ = (gdtr_base, slot_offsets, data);
@@ -507,34 +490,11 @@ pub fn init() {
             buf = in(reg) gdt_ptr16.as_mut_ptr(),
             options(nostack),
         );
-        #[cfg(target_arch = "x86_64")]
-        {
-            early_uart_puts(b"[HW] gdt_lgdt_done\r\n");
-        }
-        // Dump the current CS selector so we can see what the kernel
-        // is actually running with. Far-jumping to 0x38 only makes
-        // sense if that is the actual CS — if it's not, the far-jump
-        // would re-enter the wrong segment.
-        #[cfg(target_arch = "x86_64")]
-        let cs_val: u16;
-        #[cfg(target_arch = "x86_64")]
-        core::arch::asm!(
-            "mov {cs:x}, cs",
-            cs = out(reg) cs_val,
-            options(preserves_flags),
-        );
-        #[cfg(target_arch = "x86_64")]
-        {
-            early_uart_puts(b"[HW] cs_before_farjump=0x");
-            early_uart_put_hex64(cs_val as u64);
-            early_uart_puts(b"\r\n");
-        }
         // Far-jump to slot 6 (selector 0x30) so the CPU reloads the CS
         // descriptor cache from the new GDT entry (which now has
         // proper 64-bit flags G=1 D=0 L=1). Without this reload, the
         // CPU keeps using the old slot 7 (D=1 L=1 = invalid 64-bit
         // encoding) and pushq only pushes 4 bytes, breaking iretq.
-        #[cfg(target_arch = "x86_64")]
         // 0x38 is KERNEL_CS; the far jump is to the *next*
         // instruction so we don't lose control flow.
         // We use a memory operand to avoid AX-routing surprises.
@@ -544,77 +504,12 @@ pub fn init() {
             "push rax",
             "retfq",
             "2:",
+            // The asm clobbers RAX (lea target); declare it so LLVM
+            // never keeps a live value (e.g. the lgdt pointer) in RAX
+            // across this block.
+            out("rax") _,
             options(nostack),
         );
-        // Sanity check: dump CS right after the far-jump so we
-        // can confirm the descriptor cache reload happened.
-        #[cfg(target_arch = "x86_64")]
-        let cs_after: u16;
-        #[cfg(target_arch = "x86_64")]
-        core::arch::asm!(
-            "mov {cs:x}, cs",
-            cs = out(reg) cs_after,
-            options(nostack, preserves_flags),
-        );
-        // Dump CS.L and CS.D by reading the GDT slot 7.
-        #[cfg(target_arch = "x86_64")]
-        let slot7_lo: u64;
-        #[cfg(target_arch = "x86_64")]
-        core::arch::asm!(
-            "mov {lo}, qword ptr [{gdtr} + 0x38]",
-            lo = out(reg) slot7_lo,
-            gdtr = in(reg) gdtr_base,
-            options(nostack),
-        );
-        #[cfg(target_arch = "x86_64")]
-        {
-            let cs_dbg = cs_after;
-            early_uart_puts(b"[HW] gdt_far_jump_done cs=0x");
-            early_uart_put_hex64(cs_dbg as u64);
-            early_uart_puts(b" slot7_lo=0x");
-            early_uart_put_hex64(slot7_lo);
-            early_uart_puts(b"\r\n");
-            // DEBUG: Compare the GDT slot 7 in memory with what's in the
-            // CPU's CS descriptor cache.
-            // First, read slot 7 directly from GDT.
-            let slot7_qword: u64;
-            core::arch::asm!(
-                "mov {v}, qword ptr [{gdtr} + 0x38]",
-                v = out(reg) slot7_qword,
-                gdtr = in(reg) gdtr_base,
-                options(nostack),
-            );
-            early_uart_puts(b"[HW] slot7 mem=0x");
-            early_uart_put_hex64(slot7_qword);
-            early_uart_puts(b"\r\n");
-            // Now compare with what LAR reports.
-            let cs_ar_eax: u32;
-            core::arch::asm!(
-                "mov eax, cs",
-                "lar eax, ax",
-                out("eax") cs_ar_eax,
-                options(nostack, preserves_flags),
-            );
-            early_uart_puts(b"[HW] CS AR eax=0x");
-            early_uart_put_hex64(cs_ar_eax as u64);
-            early_uart_puts(b"\r\n");
-            // read the cache via the GDT slot 7 in memory so we can
-            // see if the cache matches.
-            let slot7_qword_2: u64;
-            core::arch::asm!(
-                "mov {v}, qword ptr [{gdtr} + 0x38]",
-                v = out(reg) slot7_qword_2,
-                gdtr = in(reg) gdtr_base,
-                options(nostack),
-            );
-            let byte5 = ((slot7_qword_2 >> 40) & 0xFF) as u8;
-            let byte6 = ((slot7_qword_2 >> 48) & 0xFF) as u8;
-            early_uart_puts(b"[HW] slot7 byte5=0x");
-            early_uart_put_hex64(byte5 as u64);
-            early_uart_puts(b" byte6=0x");
-            early_uart_put_hex64(byte6 as u64);
-            early_uart_puts(b"\r\n");
-        }
         // GS/SS reloads are skipped here because they were causing
         // the kernel to silently hang in QEMU. The far-jump above
         // is enough to fix the iretq issue (kernel CS descriptor
@@ -628,18 +523,80 @@ pub fn init() {
             sel = in(reg) (TSS_SEL as u64),
             options(nostack, preserves_flags),
         );
-        #[cfg(target_arch = "x86_64")]
-        {
-            early_uart_puts(b"[HW] gdt_ltr_done\r\n");
-        }
     }
 
-    // Sanity check: verify that the user PML4 has a copy of the
-    // kernel half so kernel code stays reachable after CR3 switch.
-    #[cfg(target_arch = "x86_64")]
-    {
-        early_uart_puts(b"[HW] gdt_init_done\r\n");
+    relocate_bsp_gdt_into_kernel_image();
+}
+
+/// Static storage for the relocated BSP GDT: 10 slots × 8 bytes
+/// (slots 0..9, including the 16-byte TSS descriptor at slot 8).
+#[cfg(target_arch = "x86_64")]
+static mut GDT_RELOC: [u8; 0x50] = [0; 0x50];
+
+/// Copy the live BSP GDT into the kernel image and switch GDTR to
+/// it. Must run while the firmware GDT is still reachable through
+/// the current (system) page tables, i.e. during boot Phase 0.
+#[cfg(target_arch = "x86_64")]
+fn relocate_bsp_gdt_into_kernel_image() {
+    let mut buf = [0u8; 16];
+    // SAFETY: sgdt writes exactly 10 bytes into buf.
+    unsafe {
+        core::arch::asm!(
+            "sgdt [{buf}]",
+            buf = in(reg) buf.as_mut_ptr(),
+            options(nostack),
+        );
     }
+    let limit = u16::from_le_bytes([buf[0], buf[1]]);
+    let base = u64::from_le_bytes([
+        buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
+    ]);
+    if base == 0 || (limit as usize) + 1 > 0x50 {
+        early_uart_puts(b"[HW] gdt_reloc_skip (unexpected limit)\r\n");
+        return;
+    }
+    let count = limit as usize + 1;
+    // SAFETY: src points at the live GDT (present in the current
+    // address space); dst is our exclusive .bss buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            base as *const u8,
+            core::ptr::addr_of_mut!(GDT_RELOC) as *mut u8,
+            count,
+        );
+    }
+    #[repr(C, packed)]
+    struct RelocGdtPtr {
+        limit: u16,
+        base: u64,
+    }
+    let ptr = RelocGdtPtr {
+        limit,
+        base: core::ptr::addr_of_mut!(GDT_RELOC) as u64,
+    };
+    unsafe {
+        core::arch::asm!(
+            "lgdt [{ptr}]",
+            // Far-return through the kernel CS so the descriptor
+            // cache reloads from the relocated table.
+            "push {cs_imm}",
+            "lea rax, [rip + 2f]",
+            "push rax",
+            "retfq",
+            "2:",
+            ptr = in(reg) &ptr,
+            cs_imm = const KERNEL_CS as u32,
+            out("rax") _,
+            options(nostack),
+        );
+        // NOTE: TR must NOT be reloaded here. The BSP TSS descriptor
+        // was already loaded with ltr earlier in gdt::init(), which
+        // marked it busy in the table. Reloading TR from a busy TSS
+        // descriptor raises #GP(TSS_SEL). The TR descriptor cache
+        // (base/limit/attributes) persists across lgdt, and the TSS
+        // itself did not move, so the cache contents remain valid.
+    }
+    early_uart_puts(b"[HW] gdt_relocated\r\n");
 }
 
 // ---------------------------------------------------------------------------

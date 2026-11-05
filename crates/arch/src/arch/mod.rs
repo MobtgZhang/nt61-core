@@ -1414,27 +1414,15 @@ pub fn seed_thread_stack(stack_top: u64, entry: u64, arg: u64) -> u64 {
         unsafe {
             #[cfg(target_arch = "aarch64")]
             {
-                aarch64::context_switch::seed_thread_frame(
-                    stack_top as *mut u64,
-                    entry,
-                    arg,
-                )
+                aarch64::context_switch::seed_thread_frame(stack_top as *mut u64, entry, arg)
             }
             #[cfg(target_arch = "riscv64")]
             {
-                riscv64::context_switch::seed_thread_frame(
-                    stack_top as *mut u64,
-                    entry,
-                    arg,
-                )
+                riscv64::context_switch::seed_thread_frame(stack_top as *mut u64, entry, arg)
             }
             #[cfg(target_arch = "loongarch64")]
             {
-                loongarch64::context_switch::seed_thread_frame(
-                    stack_top as *mut u64,
-                    entry,
-                    arg,
-                )
+                loongarch64::context_switch::seed_thread_frame(stack_top as *mut u64, entry, arg)
             }
         }
     }

@@ -206,7 +206,7 @@ global_asm!(
     // before any handler can touch per-CPU data.  At common-entry RSP
     // points at the vector slot pushed by int_stub_N; the saved RDI is
     // immediately above it, followed by the CPU frame.
-    "  cmp word ptr [rsp + 0x10], 0x2b",
+    "  cmp word ptr [rsp + 0x08], 0x2b",
     "  jne 6f",
     "  swapgs",
     "6:",

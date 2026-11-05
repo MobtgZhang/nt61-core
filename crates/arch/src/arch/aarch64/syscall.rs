@@ -27,6 +27,7 @@ const STATUS_INVALID_PARAMETER: u64 = 0xC000_000D;
 const STATUS_NO_DATA: u64 = 0xC000_0011;
 
 use crate::arch::common::cmd_host as host;
+use crate::arch::common::desktop_host as desktop;
 
 /// Dispatch a system call whose arguments and result are passed
 /// via the `TrapFrame`. Reads the syscall number from `tf.x16`,
@@ -123,6 +124,37 @@ pub unsafe extern "C" fn syscall_dispatch_with_tf(syscall_num: u64, tf: *mut Tra
             }
         }
         host::SYS_PRINT_PROMPT => host::print_prompt(),
+        desktop::SYS_DESKTOP_INFO => unsafe { desktop::info(tf_ref.x0 as *mut _) },
+        desktop::SYS_DESKTOP_FILL_RECT => desktop::fill_rect(
+            tf_ref.x0 as u32,
+            tf_ref.x1 as u32,
+            tf_ref.x2 as u32,
+            tf_ref.x3 as u32,
+            tf_ref.x4 as u32,
+        ),
+        desktop::SYS_DESKTOP_DRAW_TEXT => unsafe {
+            desktop::draw_text(
+                tf_ref.x0 as *const u8,
+                tf_ref.x1 as usize,
+                tf_ref.x2 as u32,
+                tf_ref.x3 as u32,
+                // User thunk packs {fg | bg << 32} into one argument.
+                ((tf_ref.x4 as u64) >> 32) as u32,
+                (tf_ref.x4 as u64 & 0xFFFF_FFFF) as u32,
+            )
+        },
+        desktop::SYS_DESKTOP_DRAW_RGBA => unsafe {
+            desktop::draw_rgba(
+                tf_ref.x0 as *const u8,
+                // User thunk packs {y | x << 32} and {h | w << 32}.
+                ((tf_ref.x1 as u64) >> 32) as u32,
+                (tf_ref.x1 as u64 & 0xFFFF_FFFF) as u32,
+                ((tf_ref.x2 as u64) >> 32) as u32,
+                (tf_ref.x2 as u64 & 0xFFFF_FFFF) as u32,
+                tf_ref.x3 as usize,
+            )
+        },
+        desktop::SYS_DESKTOP_POLL_KEY => unsafe { desktop::poll_key(tf_ref.x0 as *mut u8) },
         _ => STATUS_INVALID_SYSTEM_SERVICE,
     }
 }

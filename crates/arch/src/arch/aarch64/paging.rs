@@ -422,8 +422,7 @@ pub fn page_is_mapped_in_root(root_pfn: u64, va: u64) -> bool {
             return false;
         }
         let l1e = core::ptr::read_volatile(
-            ((l0e & 0x0000_FFFF_FFFF_F000) as *const u64)
-                .add(((va >> 30) & 0x1FF) as usize),
+            ((l0e & 0x0000_FFFF_FFFF_F000) as *const u64).add(((va >> 30) & 0x1FF) as usize),
         );
         if (l1e & 0x3) == 0x1 {
             return true;
@@ -432,8 +431,7 @@ pub fn page_is_mapped_in_root(root_pfn: u64, va: u64) -> bool {
             return false;
         }
         let l2e = core::ptr::read_volatile(
-            ((l1e & 0x0000_FFFF_FFFF_F000) as *const u64)
-                .add(((va >> 21) & 0x1FF) as usize),
+            ((l1e & 0x0000_FFFF_FFFF_F000) as *const u64).add(((va >> 21) & 0x1FF) as usize),
         );
         if (l2e & 0x3) == 0x1 {
             return true;
@@ -442,8 +440,7 @@ pub fn page_is_mapped_in_root(root_pfn: u64, va: u64) -> bool {
             return false;
         }
         let l3e = core::ptr::read_volatile(
-            ((l2e & 0x0000_FFFF_FFFF_F000) as *const u64)
-                .add(((va >> 12) & 0x1FF) as usize),
+            ((l2e & 0x0000_FFFF_FFFF_F000) as *const u64).add(((va >> 12) & 0x1FF) as usize),
         );
         is_valid_page(l3e)
     }

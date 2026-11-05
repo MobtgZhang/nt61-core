@@ -5,7 +5,7 @@
 //! vector number.
 
 use crate::mm::access_fault::{self, AccessFlags};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Re-entrancy guard for the `#PF` dispatcher.
 ///
@@ -17,7 +17,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// kernel-mode one raises a bugcheck.
 static PF_IN_HANDLER: AtomicBool = AtomicBool::new(false);
 
-static TIMER_ISR_DIAG: AtomicU32 = AtomicU32::new(0);
 
 /// Registers saved by `int_common_dispatch`. The frame layout
 /// matches the on-stack layout pushed by the stub:
@@ -588,59 +587,31 @@ pub unsafe extern "win64" fn dispatch_trap_frame(vector: u64, tf: *mut TrapFrame
 
             // === PIT / HPET / keyboard / APIC timer vectors ===
             32 => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let diagnostic = TIMER_ISR_DIAG.fetch_add(1, Ordering::SeqCst) == 0;
-                    if diagnostic {
-                        crate::hal::serial::write_string_always("[IRQ32] enter\r\n");
-                    }
-                    if diagnostic {
-                        crate::hal::serial::write_string_always("[IRQ32] before eoi\r\n");
-                    }
-                    if crate::hal::x86_64::apic::timer_active() {
-                        crate::hal::x86_64::apic::eoi();
-                    } else {
-                        crate::hal::x86_64::pic::irq_dispatch(0);
-                    }
-                    if diagnostic {
-                        crate::hal::serial::write_string_always("[IRQ32] after eoi\r\n");
-                    }
-                    // ke_sched P0-5: run the kernel-timer expiry pass —
-                    // ke::timer::tick() was never wired into the clock
-                    // ISR, so armed KTIMERs never fired.
-                    crate::ke::timer::tick();
-                    if diagnostic {
-                        crate::hal::serial::write_string_always("[IRQ32] after timer\r\n");
-                    }
-                    crate::ke::scheduler::tick();
-                    if diagnostic {
-                        crate::hal::serial::write_string_always("[IRQ32] after scheduler\r\n");
-                    }
-                    // ke_sched P0-5: the PSSS workers and the dispatcher
-                    // wait list (wait-timeout expiry) also ran on no
-                    // clock path at all — `psss_tick` had no callers,
-                    // so `KeWaitForSingleObject` timeouts never
-                    // expired. Run it alongside the other tick passes.
-                    crate::ke::psss::psss_tick();
-                    if diagnostic {
-                        crate::hal::serial::write_string_always("[IRQ32] after psss\r\n");
-                    }
-                    // ISR exit: the clock ISR itself runs at CLOCK_LEVEL and
-                    // cannot swap context. Lower to DISPATCH_LEVEL, retire any
-                    // deferred work, and only then honour the reschedule the
-                    // ISR recorded.
-                    // We entered this handler at CLOCK_LEVEL (raised in
-                    // the dispatcher prologue), so drop instead of raise.
-                    crate::ke::irql::lower_irql(crate::ke::irql::Irql::DispatchLevel);
-                    crate::ke::dpc::ki_retire_dpc_list();
-                    if diagnostic {
-                        crate::hal::serial::write_string_always("[IRQ32] after dpc\r\n");
-                    }
-                    crate::ke::scheduler::dispatch_pending_reschedule();
-                    if diagnostic {
-                        crate::hal::serial::write_string_always("[IRQ32] after reschedule\r\n");
-                    }
+                if crate::hal::x86_64::apic::timer_active() {
+                    crate::hal::x86_64::apic::eoi();
+                } else {
+                    crate::hal::x86_64::pic::irq_dispatch(0);
                 }
+                // ke_sched P0-5: run the kernel-timer expiry pass —
+                // ke::timer::tick() was never wired into the clock
+                // ISR, so armed KTIMERs never fired.
+                crate::ke::timer::tick();
+                crate::ke::scheduler::tick();
+                // ke_sched P0-5: the PSSS workers and the dispatcher
+                // wait list (wait-timeout expiry) also ran on no
+                // clock path at all — `psss_tick` had no callers,
+                // so `KeWaitForSingleObject` timeouts never
+                // expired. Run it alongside the other tick passes.
+                crate::ke::psss::psss_tick();
+                // ISR exit: the clock ISR itself runs at CLOCK_LEVEL and
+                // cannot swap context. Lower to DISPATCH_LEVEL, retire any
+                // deferred work, and only then honour the reschedule the
+                // ISR recorded.
+                // We entered this handler at CLOCK_LEVEL (raised in
+                // the dispatcher prologue), so drop instead of raise.
+                crate::ke::irql::lower_irql(crate::ke::irql::Irql::DispatchLevel);
+                crate::ke::dpc::ki_retire_dpc_list();
+                crate::ke::scheduler::dispatch_pending_reschedule();
             }
             #[cfg(target_arch = "x86_64")]
             33 => crate::hal::x86_64::keyboard::irq_handler(),
