@@ -4,6 +4,7 @@ pub const SYS_DESKTOP_FILL_RECT: u32 = 0x0301;
 pub const SYS_DESKTOP_DRAW_TEXT: u32 = 0x0302;
 pub const SYS_DESKTOP_DRAW_RGBA: u32 = 0x0303;
 pub const SYS_DESKTOP_POLL_KEY: u32 = 0x0304;
+pub const SYS_DESKTOP_POLL_MOUSE: u32 = 0x0305;
 pub const SYS_GET_KEY: u32 = 0x0204;
 
 /// # Safety
@@ -119,6 +120,21 @@ pub unsafe fn draw_rgba(
 #[inline(always)]
 pub unsafe fn poll_key(key: *mut u8) -> u64 {
     syscall5(SYS_DESKTOP_POLL_KEY, key as usize, 0, 0, 0, 0)
+}
+
+/// # Safety
+///
+/// `state` must point to writable memory of at least 12 bytes.
+#[inline(always)]
+pub unsafe fn poll_mouse(state: *mut super::DesktopMouseState) -> u64 {
+    syscall5(
+        SYS_DESKTOP_POLL_MOUSE,
+        core::ptr::from_mut(&mut *state) as usize,
+        0,
+        0,
+        0,
+        0,
+    )
 }
 
 /// # Safety

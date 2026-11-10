@@ -4,6 +4,7 @@ pub const SYS_DESKTOP_FILL_RECT: u32 = 0x0301;
 pub const SYS_DESKTOP_DRAW_TEXT: u32 = 0x0302;
 pub const SYS_DESKTOP_DRAW_RGBA: u32 = 0x0303;
 pub const SYS_DESKTOP_POLL_KEY: u32 = 0x0304;
+pub const SYS_DESKTOP_POLL_MOUSE: u32 = 0x0305;
 pub const SYS_GET_KEY: u32 = 0x0204;
 pub const SYS_PUTCHAR: u32 = 0x0202;
 
@@ -26,8 +27,8 @@ unsafe extern "sysv64" fn syscall5_raw(
     // stack. The kernel reads stack argument 0 at RSP+8, so push the
     // placeholder first and the extra argument second.
     core::arch::naked_asm!(
-        "push r9", // arg4 saved first; ends up at RSP+8 after the dummy push
-        "push rax", // dummy placeholder at RSP; RAX still holds garbage here
+        "push r9",    // arg4 saved first; ends up at RSP+8 after the dummy push
+        "push rax",   // dummy placeholder at RSP; RAX still holds garbage here
         "mov r9, r8", // arg3: SysV r8 → kernel r9
         "mov r8, rcx",
         "mov r10, rsi", // arg0: SysV rsi → kernel r10
@@ -124,6 +125,21 @@ pub unsafe fn draw_rgba(
 #[inline(always)]
 pub unsafe fn poll_key(key: *mut u8) -> u64 {
     syscall5(SYS_DESKTOP_POLL_KEY, key as usize, 0, 0, 0, 0)
+}
+
+/// # Safety
+///
+/// `state` must point to writable memory of at least 12 bytes.
+#[inline(always)]
+pub unsafe fn poll_mouse(state: *mut super::DesktopMouseState) -> u64 {
+    syscall5(
+        SYS_DESKTOP_POLL_MOUSE,
+        core::ptr::from_mut(&mut *state) as usize,
+        0,
+        0,
+        0,
+        0,
+    )
 }
 
 /// # Safety
