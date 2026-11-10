@@ -1,16 +1,7 @@
-#![allow(dead_code)]
-// Shared Open Sans glyph renderer for the Ring-3 desktop binaries.
-//
-// The glyph atlas is produced at build time by
-// crates/desktop/tools/gen_assets.py from the Open Sans family in
-// resources/fonts/open-sans. Glyphs are blitted with per-pixel alpha
-// through the kernel's SYS_DESKTOP_DRAW_RGBA (source-over blending).
-
-#[path = "font_atlas_data.rs"]
-pub mod atlas;
-
-use crate::png;
 use alloc::vec::Vec;
+
+use nt61_desktop::graphics::font::FontLib;
+use nt61_desktop::graphics::Surface;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Ink {
@@ -19,79 +10,75 @@ pub enum Ink {
 }
 
 pub struct FontPack {
-    atlas_white: png::Image,
-    atlas_black: png::Image,
+    font: FontLib,
+    size: u32,
 }
 
+#[allow(dead_code)]
 impl FontPack {
-    pub fn decode() -> Option<Self> {
-        let atlas_white = png::decode_png(atlas::ATLAS_WHITE).ok()?;
-        let atlas_black = png::decode_png(atlas::ATLAS_BLACK).ok()?;
-        Some(Self {
-            atlas_white,
-            atlas_black,
-        })
+    pub fn new(size: u32) -> Option<Self> {
+        let font = FontLib::ui().ok()?;
+        Some(Self { font, size })
     }
 
-    pub fn ui(&self) -> &[atlas::Glyph] {
-        &atlas::GLYPHS_UI
+    pub fn measure(&self, text: &str) -> u32 {
+        self.font
+            .measure(text, self.size)
+            .map(|layout| layout.width)
+            .unwrap_or(0)
     }
 
-    pub fn brand(&self) -> &[atlas::Glyph] {
-        &atlas::GLYPHS_BRAND
-    }
-
-    pub fn measure(&self, glyphs: &[atlas::Glyph], text: &str) -> u32 {
-        let mut total = 0u32;
-        for byte in text.bytes() {
-            if (byte as u32) < atlas::FIRST_CHAR || (byte as u32) >= atlas::LAST_CHAR {
-                continue;
-            }
-            total += glyphs[(byte as usize) - atlas::FIRST_CHAR as usize].advance as u32;
-        }
-        total
-    }
-
-    pub fn draw(&self, glyphs: &[atlas::Glyph], text: &str, x: u32, y: u32, ink: Ink) {
-        let source = match ink {
-            Ink::White => &self.atlas_white,
-            Ink::Black => &self.atlas_black,
+    pub fn draw(&self, text: &str, x: u32, y: u32, ink: Ink) {
+        let layout = match self.font.measure(text, self.size) {
+            Some(layout) => layout,
+            None => return,
         };
-        let stride = source.stride();
-        let mut pen_x = x;
-        for byte in text.bytes() {
-            if (byte as u32) < atlas::FIRST_CHAR || (byte as u32) >= atlas::LAST_CHAR {
-                continue;
-            }
-            let glyph = &glyphs[(byte as usize) - atlas::FIRST_CHAR as usize];
-            if glyph.w != 0 && glyph.h != 0 {
-                let mut scratch: Vec<u8> = Vec::new();
-                for row in 0..glyph.h as usize {
-                    let start =
-                        glyph.atlas_y as usize * stride + glyph.atlas_x as usize * 4 + row * stride;
-                    let end = start + glyph.w as usize * 4;
-                    scratch.extend_from_slice(&source.pixels[start..end]);
-                }
-                let draw_y = y as i64 + glyph.ink_top as i64;
-                if draw_y >= 0 {
-                    unsafe {
-                        crate::arch::draw_rgba(
-                            scratch.as_ptr(),
-                            pen_x,
-                            draw_y as u32,
-                            glyph.w as u32,
-                            glyph.h as u32,
-                            glyph.w as usize * 4,
-                        );
-                    }
-                }
-            }
-            pen_x += glyph.advance as u32;
+        let mut surface = Surface::new(layout.width.max(1), self.size);
+        let color = match ink {
+            Ink::White => 0xFFFF_FFFF,
+            Ink::Black => 0xFF00_0000,
+        };
+        if self
+            .font
+            .draw_text(&mut surface, text, 0, 0, self.size, color)
+            .is_err()
+        {
+            return;
+        }
+        let mut pixels = Vec::with_capacity(surface.pixels().len() * 4);
+        for pixel in surface.pixels() {
+            pixels.push((pixel >> 16) as u8);
+            pixels.push((pixel >> 8) as u8);
+            pixels.push(*pixel as u8);
+            pixels.push((pixel >> 24) as u8);
+        }
+        unsafe {
+            crate::arch::draw_rgba(
+                pixels.as_ptr(),
+                x,
+                y,
+                surface.width(),
+                surface.height(),
+                surface.width() as usize * 4,
+            );
         }
     }
 
-    pub fn draw_labelled(&self, glyphs: &[atlas::Glyph], text: &str, x: u32, y: u32) {
-        self.draw(glyphs, text, x + 1, y + 1, Ink::Black);
-        self.draw(glyphs, text, x, y, Ink::White);
+    pub fn draw_labelled(&self, text: &str, x: u32, y: u32) {
+        self.draw(text, x + 1, y + 1, Ink::Black);
+        self.draw(text, x, y, Ink::White);
+    }
+
+    pub fn draw_onto(&self, surface: &mut Surface, text: &str, x: i32, y: i32, ink: Ink) {
+        let color = match ink {
+            Ink::White => 0xFFFF_FFFF,
+            Ink::Black => 0xFF00_0000,
+        };
+        let _ = self.font.draw_text(surface, text, x, y, self.size, color);
+    }
+
+    pub fn draw_labelled_onto(&self, surface: &mut Surface, text: &str, x: i32, y: i32) {
+        self.draw_onto(surface, text, x + 1, y + 1, Ink::Black);
+        self.draw_onto(surface, text, x, y, Ink::White);
     }
 }
