@@ -1,0 +1,8 @@
+[package]
+name = "nt61-abi"
+version = "0.1.0"
+edition = "2021"
+description = "Windows 7 SP1 x64 Win32 ABI types, constants and structures shared by the kernel and Ring 3"
+publish = false
+
+[dependencies]
