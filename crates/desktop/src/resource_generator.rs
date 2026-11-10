@@ -392,6 +392,9 @@ mod tests {
             assert!(image.starts_with(b"MZ"));
             let pe_offset = u32::from_le_bytes(image[0x3C..0x40].try_into().unwrap()) as usize;
             assert_eq!(&image[pe_offset..pe_offset + 4], b"PE\x00\x00");
+            let machine =
+                u16::from_le_bytes(image[pe_offset + 4..pe_offset + 6].try_into().unwrap());
+            assert_eq!(machine, machine_for_arch(arch));
             let optional_header = pe_offset + 4 + 20;
             let resource_size = u32::from_le_bytes(
                 image[optional_header + 0x78..optional_header + 0x7c]
