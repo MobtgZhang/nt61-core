@@ -1562,6 +1562,19 @@ pub struct SystemThreadResult {
 
 /// create a kernel-mode system thread (PsCreateSystemThread)
 pub fn ps_create_system_thread(start_address: u64, start_context: u64) -> SystemThreadResult {
+    ps_create_system_thread_affinity(start_address, start_context, 0)
+}
+
+/// Create a kernel-mode system thread with an affinity mask applied
+/// before it enters a ready queue.
+///
+/// This is required for boot-time dispatch on secondary CPUs: once a
+/// thread is queued, changing `home_cpu` does not move the queue entry.
+pub fn ps_create_system_thread_affinity(
+    start_address: u64,
+    start_context: u64,
+    affinity_mask: u64,
+) -> SystemThreadResult {
     let system_process = match crate::ps::process::get_by_pid(crate::ps::process::PID_SYSTEM) {
         Some(p) => p as *mut crate::ps::process::Eprocess,
         None => {
@@ -1664,6 +1677,9 @@ pub fn ps_create_system_thread(start_address: u64, start_context: u64) -> System
             ));
 
         (*ethread).kthread.state = KThreadState::Ready;
+        if affinity_mask != 0 {
+            crate::ke::scheduler::set_thread_affinity(ethread, affinity_mask);
+        }
         crate::ke::scheduler::add_ready(ethread as *mut _, (*ethread).kthread.base_priority as u8);
 
         THREAD_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
@@ -1733,8 +1749,13 @@ pub fn ps_exit_system_thread(exit_code: u32) -> ! {
         ps_terminate_system_thread(ethread, exit_code);
     }
     // Enter the scheduler so another thread (or the idle thread) runs
-    // instead of parking this CPU forever.
-    crate::ke::scheduler::idle_loop()
+    // instead of parking this CPU forever. A terminating thread can be
+    // switching away from a caller that is blocked on its completion,
+    // so attempt an immediate dispatch before falling back to idle.
+    if !crate::ke::scheduler::schedule() {
+        crate::ke::scheduler::idle_loop()
+    }
+    unreachable!("scheduler switched away from a terminating thread")
 }
 
 // =============================================================================

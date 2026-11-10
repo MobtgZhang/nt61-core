@@ -6,8 +6,9 @@
 //! - Function calls
 //! - CPU stop/halt
 //
-//!   IPI vectors are allocated in the high range (0xF0-0xFF) to avoid
-//!   conflicts with hardware IRQs.
+//!   Reschedule uses the IDT-dispatched IPI vector range (0xE0-0xEF);
+//!   other vectors should not use reserved 0xF0-0xFF entries unless
+//!   the dispatch table is extended.
 
 use crate::hal::x86_64::apic::{apic_write, lapic_reg};
 use crate::ke::sync::Spinlock;
@@ -19,7 +20,7 @@ use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum IpiVector {
-    Reschedule = 0xF0,   // Request reschedule on target CPU
+    Reschedule = 0xE0,   // Request reschedule on target CPU
     TlbFlush = 0xF1,     // Flush TLB on target CPU
     FunctionCall = 0xF2, // Execute a function on target CPU
     Stop = 0xF3,         // Stop/halt target CPU
@@ -32,7 +33,7 @@ impl IpiVector {
 
     pub fn from_u8(val: u8) -> Option<Self> {
         match val {
-            0xF0 => Some(IpiVector::Reschedule),
+            0xE0 => Some(IpiVector::Reschedule),
             0xF1 => Some(IpiVector::TlbFlush),
             0xF2 => Some(IpiVector::FunctionCall),
             0xF3 => Some(IpiVector::Stop),
@@ -111,9 +112,16 @@ pub fn send_ipi_raw(target_apic_id: u32, vector: u32, delivery_mode: IpiDelivery
     // Bit 14: Level (1=assert, 0=de-assert)
     // Bit 15: Trigger Mode (0=edge, 1=level)
     // Bits 18-19: Destination Shorthand
-    let icr_low = vector | ((delivery_mode as u32) << 8) | (1 << 14); // Assert level
+    let icr_low = vector | ((delivery_mode as u32) << 8);
 
     apic_write(lapic_reg::ICR_LOW, icr_low);
+    crate::hal::serial::write_string_always("[IPI] raw sent target=0x");
+    crate::hal::serial::write_hex_u64_always(target_apic_id as u64);
+    crate::hal::serial::write_string_always(" vector=0x");
+    crate::hal::serial::write_hex_u64_always(vector as u64);
+    crate::hal::serial::write_string_always(" icr=0x");
+    crate::hal::serial::write_hex_u64_always(icr_low as u64);
+    crate::hal::serial::write_string_always("\r\n");
 }
 
 /// Broadcast an IPI to all CPUs except self
@@ -126,12 +134,15 @@ pub fn broadcast_ipi(vector: IpiVector) {
 pub fn broadcast_ipi_raw(vector: u32, delivery_mode: IpiDeliveryMode) {
     // Same TCG constraint as send_ipi_raw: never poll ICR bit 12.
     // Use destination shorthand: all excluding self (bits 18-19 = 11)
-    let icr_low = vector
-        | ((delivery_mode as u32) << 8)
-        | (1 << 14)  // Assert level
-        | ((IpiDestination::AllExcludingSelf as u32) << 18);
+    let icr_low =
+        vector | ((delivery_mode as u32) << 8) | ((IpiDestination::AllExcludingSelf as u32) << 18);
 
     apic_write(lapic_reg::ICR_LOW, icr_low);
+    crate::hal::serial::write_string_always("[IPI] broadcast sent vector=0x");
+    crate::hal::serial::write_hex_u64_always(vector as u64);
+    crate::hal::serial::write_string_always(" icr=0x");
+    crate::hal::serial::write_hex_u64_always(icr_low as u64);
+    crate::hal::serial::write_string_always("\r\n");
 }
 
 /// Send a reschedule IPI to a specific CPU

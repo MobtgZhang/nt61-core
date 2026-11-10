@@ -17,7 +17,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// kernel-mode one raises a bugcheck.
 static PF_IN_HANDLER: AtomicBool = AtomicBool::new(false);
 
-
 /// Registers saved by `int_common_dispatch`. The frame layout
 /// matches the on-stack layout pushed by the stub:
 ///
@@ -592,6 +591,7 @@ pub unsafe extern "win64" fn dispatch_trap_frame(vector: u64, tf: *mut TrapFrame
                 } else {
                     crate::hal::x86_64::pic::irq_dispatch(0);
                 }
+                crate::hal::x86_64::pit::increment_ticks();
                 // ke_sched P0-5: run the kernel-timer expiry pass —
                 // ke::timer::tick() was never wired into the clock
                 // ISR, so armed KTIMERs never fired.

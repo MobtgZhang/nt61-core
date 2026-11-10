@@ -84,8 +84,6 @@ const BLOB_STAGE3: [u8; 0x24] = [
     0x03, 0x00, 0x00, 0xFF, 0x25, 0x1F, 0x03, 0x00, 0x00, 0xF4, 0xEB, 0xFE,
 ];
 
-
-
 /// Copy the three blob stages into the trampoline page at their
 /// fixed offsets: stage 1 -> 0x000, stage 2 -> 0x100, stage 3 -> 0x200.
 /// The far jumps use full linear addresses (0x70100 / 0x70200), so
@@ -282,7 +280,11 @@ pub unsafe fn smp_boot_aps(pml4_pfn: u64) {
         // Diagnostics: verify the blob landed and log the patched-in
         // entry pointer so a bad patch is visible in the serial log.
         smp_print_hex(b"[smp] entry=0x", ap_entry as u64, b" cr3=0x");
-        smp_print_hex(b"", ((pml4_pfn & 0x000F_FFFF_FFFF) * 0x1000) as u64, b" stack=0x");
+        smp_print_hex(
+            b"",
+            ((pml4_pfn & 0x000F_FFFF_FFFF) * 0x1000) as u64,
+            b" stack=0x",
+        );
         smp_print_hex(b"", ap_stack_top, b"\r\n");
     }
     // Bring up each AP.
@@ -332,8 +334,8 @@ pub unsafe fn smp_boot_aps(pml4_pfn: u64) {
             }
         }
         if !arrived {
-        smp_print_hex(b"[smp] AP handshake timeout idx=", i as u64, b" val=");
-        smp_print_hex(b"", core::ptr::read_volatile(handshake) as u64, b"\r\n");
+            smp_print_hex(b"[smp] AP handshake timeout idx=", i as u64, b" val=");
+            smp_print_hex(b"", core::ptr::read_volatile(handshake) as u64, b"\r\n");
             // Retry ONLY when the handshake is still zero (the AP never
             // left the trampoline). A non-zero value means the AP is
             // already running ap_entry_long: re-sending the SIPI would
@@ -437,6 +439,7 @@ fn send_ipi(apic_id: u8, icr_low: u32) {
 #[no_mangle]
 pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     let ap_idx = ap_index as usize;
+    smp_print_hex(b"[smp] AP enter idx=", ap_index, b"\r\n");
     if ap_idx >= tss::MAX_APS {
         smp_print_hex(b"[smp] ap_index out of range: ", ap_index, b"\r\n");
         loop {
@@ -448,6 +451,7 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     // SMEP/SMAP have to be re-established on every AP rather than relying
     // on the BSP having set them.
     cpu_flags::enable_user_boundary_protection();
+    smp_print_hex(b"[smp] AP CR4 ok idx=", ap_index, b"\r\n");
 
     // Allocate a per-AP kernel stack. 64 KiB is more than enough
     // for bring-up; the real per-thread kernel stacks are
@@ -462,6 +466,8 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
         }
     }
     let rsp0 = stack_base + AP_STACK_SIZE as u64 - 16;
+    smp_print_hex(b"[smp] AP stack ok idx=", ap_index, b" base=0x");
+    smp_print_hex(b"", stack_base, b"\r\n");
 
     // Initialise the per-AP TSS and GDT.
     // SAFETY: AP_GDTS is module-scoped. Each AP accesses only its own index.
@@ -483,17 +489,42 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
         gdt::build_per_cpu_gdt(&mut AP_GDTS[ap_idx], tss_ptr as u64, tss_limit);
         gdt::ap_install(&AP_GDTS[ap_idx]);
     }
+    smp_print_hex(b"[smp] AP GDT ok idx=", ap_index, b"\r\n");
 
     // 2. Initialise the local APIC. The BSP may have set the
     //    spurious-interrupt vector; each AP must re-enable it.
+    crate::arch::x86_64::idt::install();
+    smp_print_hex(
+        b"[smp] AP IDT expected base=0x",
+        crate::arch::x86_64::idt::static_base(),
+        b"\r\n",
+    );
+    smp_print_hex(
+        b"[smp] AP IDT actual base=0x",
+        crate::arch::x86_64::idt::nt61_idt_current_base(),
+        b"\r\n",
+    );
+    smp_print_hex(
+        b"[smp] AP IDT bytes low=0x",
+        crate::arch::x86_64::idt::nt61_idt_current_bytes_low(),
+        b"\r\n",
+    );
+    smp_print_hex(
+        b"[smp] AP IDT bytes high=0x",
+        crate::arch::x86_64::idt::nt61_idt_current_bytes_high(),
+        b"\r\n",
+    );
     #[cfg(target_arch = "x86_64")]
     crate::hal::x86_64::apic::init_smp();
+    smp_print_hex(b"[smp] AP APIC ok idx=", ap_index, b"\r\n");
 
     // 3. Allocate a per-CPU area for this AP. This ensures each CPU
     //    has its own independent PerCpuArea, preventing APs from
     //    overwriting BSP's per-CPU data.
     #[cfg(target_arch = "x86_64")]
     let per_cpu_page = crate::arch::x86_64::syscall::allocate_per_cpu_area(ap_index as u32);
+    smp_print_hex(b"[smp] AP percpu alloc idx=", ap_index, b" page=0x");
+    smp_print_hex(b"", per_cpu_page, b"\r\n");
     if per_cpu_page == 0 {
         smp_print_hex(b"[smp] AP per-CPU area OOM idx=", ap_index, b"\r\n");
         loop {

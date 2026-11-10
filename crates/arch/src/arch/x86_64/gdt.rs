@@ -335,7 +335,6 @@ pub fn init() {
     // The kprintln! macro may have issues when LOG_EARLY_READY is false and the
     // formatted output path involves code/data that isn't yet properly mapped.
     #[cfg(target_arch = "x86_64")]
-
     // User SS at slot 4 (selector 0x23): DPL=3, data, exec/read/write.
     // User CS at slot 5 (selector 0x2b): DPL=3, code, exec/read.
     // TSS at slot 8 (selector 0x40): 16-byte available 64-bit TSS.

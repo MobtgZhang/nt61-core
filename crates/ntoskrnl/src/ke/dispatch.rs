@@ -61,13 +61,14 @@ fn panic_stop_set() -> bool {
 }
 
 pub fn handle_ipi_reschedule() {
-    // The bootstrap's scheduler doesn't have a separate IPI
-    // trigger path; the timer tick already calls
-    // `ke::scheduler::schedule` on the BSP. The IPI handler
-    // still does the right thing (run the dispatcher) so that
-    // when the scheduler is upgraded to an IPI-triggered
-    // model the boot path is already in place.
-    let _ = crate::ke::scheduler::schedule();
+    crate::hal::serial::write_string_always("[IPI] reschedule enter\r\n");
+    // Do not context-switch inside the interrupt frame. Record the
+    // request and let the interrupted idle loop / IRQ-exit path run
+    // the dispatcher at a safe scheduling point.
+    crate::ke::scheduler::request_reschedule(crate::ke::scheduler::get_current_cpu_id() as usize);
+    if let Some(percpu) = crate::arch::x86_64::percpu::PerCpuData::try_current() {
+        percpu.set_need_reschedule();
+    }
 }
 
 pub fn handle_ipi_intr_enter() {
