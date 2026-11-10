@@ -330,18 +330,34 @@ fn fat32_system_fallback(path: &str) -> Option<Vec<u8>> {
 fn open_system_file_data(path: &str) -> Option<Vec<u8>> {
     let is_system = path.len() >= 8 && &path[1..8] == "Windows";
     if is_system {
-        if let Some(data) = crate::ntfs_boot::read_ntfs_system_file(path) {
-            return Some(data);
+        let fs_kind = unsafe { core::ptr::addr_of!(SYSTEM_FS_KIND).read_volatile() };
+        if fs_kind == SYSTEM_FS_UNKNOWN || fs_kind == SYSTEM_FS_NTFS {
+            if let Some(data) = crate::ntfs_boot::read_ntfs_system_file(path) {
+                unsafe {
+                    core::ptr::addr_of_mut!(SYSTEM_FS_KIND).write_volatile(SYSTEM_FS_NTFS);
+                }
+                return Some(data);
+            }
         }
-        // EXT4 System partition: UEFI SimpleFileSystem only speaks
-        // FAT, so EXT4 volumes are resolved by the in-tree reader.
-        if let Some(data) = crate::ext4_boot::read_ext4_system_file(path) {
-            return Some(data);
+        if fs_kind == SYSTEM_FS_UNKNOWN || fs_kind == SYSTEM_FS_EXT4 {
+            // EXT4 System partition: UEFI SimpleFileSystem only speaks
+            // FAT, so EXT4 volumes are resolved by the in-tree reader.
+            if let Some(data) = crate::ext4_boot::read_ext4_system_file(path) {
+                unsafe {
+                    core::ptr::addr_of_mut!(SYSTEM_FS_KIND).write_volatile(SYSTEM_FS_EXT4);
+                }
+                return Some(data);
+            }
         }
-        // ReFS System partition: resolve via the self-describing
-        // directory index produced by the in-tree builder.
-        if let Some(data) = crate::refs_boot::read_refs_system_file(path) {
-            return Some(data);
+        if fs_kind == SYSTEM_FS_UNKNOWN || fs_kind == SYSTEM_FS_REFS {
+            // ReFS System partition: resolve via the self-describing
+            // directory index produced by the in-tree builder.
+            if let Some(data) = crate::refs_boot::read_refs_system_file(path) {
+                unsafe {
+                    core::ptr::addr_of_mut!(SYSTEM_FS_KIND).write_volatile(SYSTEM_FS_REFS);
+                }
+                return Some(data);
+            }
         }
         #[cfg(feature = "log_level_debug")]
         crate::ext4_boot::log_ext4_layout();
@@ -1053,6 +1069,11 @@ static mut SFS_HANDLE_READY: bool = false;
 /// We cache both handles so winload.efi can read files from either partition.
 static mut CACHED_SYSTEM_SFS_PTR: usize = 0;
 static mut SYSTEM_SFS_HANDLE_READY: bool = false;
+const SYSTEM_FS_UNKNOWN: u8 = 0;
+const SYSTEM_FS_NTFS: u8 = 1;
+const SYSTEM_FS_EXT4: u8 = 2;
+const SYSTEM_FS_REFS: u8 = 3;
+static mut SYSTEM_FS_KIND: u8 = SYSTEM_FS_UNKNOWN;
 
 /// Locate the ESP's SimpleFileSystem handle and cache it. Call once
 /// from `efi_main` (before any other boot-services activity that
@@ -4333,8 +4354,7 @@ fn os_loader_run() -> ! {
     // winload image is not guaranteed to survive ExitBootServices, and
     // losing this copy makes the kernel validate against defaults and
     // lose the framebuffer, filesystem mirrors, and boot mode.
-    let runtime_boot_info_pages =
-        core::mem::size_of::<BootInfo>().div_ceil(_PAGE_SIZE as usize);
+    let runtime_boot_info_pages = core::mem::size_of::<BootInfo>().div_ceil(_PAGE_SIZE as usize);
     let runtime_boot_info_base = allocate_pages(
         AllocateType::AnyPages,
         MemoryType::RUNTIME_SERVICES_DATA,
@@ -4508,11 +4528,7 @@ fn os_loader_run() -> ! {
     // Patch the callback field at end-of-.text with the host trampoline
     // address. The disk stub's `lea rax, [rip + disp]` points here.
     unsafe {
-        arch::current::launch_kernel(
-            stack_top,
-            bi_ptr,
-            ki_va,
-        );
+        arch::current::launch_kernel(stack_top, bi_ptr, ki_va);
     }
 }
 
