@@ -9,11 +9,13 @@ path = "src/lib.rs"
 test = false
 
 [dependencies]
+nt61-abi = { path = "../abi" }
 nt61-boot-types = { path = "../boot-types" }
 des = { version = "0.8", optional = true, default-features = false }
 rand_core = { version = "0.6", optional = true, default-features = false, features = ["alloc"] }
 rsa = { version = "0.9", optional = true, features = ["pem", "sha2"] }
 spin = "0.9"
+libm = "0.2"
 bitflags = "2.3"
 hashbrown = "0.14"
 nt61-fonts = { path = "../fonts" }

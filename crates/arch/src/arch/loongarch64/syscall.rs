@@ -269,6 +269,9 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         n if n == crate::arch::common::desktop_host::SYS_DESKTOP_POLL_KEY as u64 => unsafe {
             crate::arch::common::desktop_host::poll_key(a0 as *mut u8)
         },
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_POLL_MOUSE as u64 => unsafe {
+            crate::arch::common::desktop_host::poll_mouse(a0 as *mut _)
+        },
         _ => {
             // Unimplemented in Phase 1.
             let _ = (a0, a1, a2, a3, a4, a5);

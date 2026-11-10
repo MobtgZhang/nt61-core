@@ -13,5 +13,6 @@ test = false
 binary_panic = []
 
 [dependencies]
+nt61-abi = { path = "../abi" }
 nt61-boot-types = { path = "../boot-types" }
 ntoskrnl = { path = "../ntoskrnl" }

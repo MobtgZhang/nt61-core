@@ -36,6 +36,7 @@ pub const SYS_DESKTOP_FILL_RECT: u32 = 0x0301;
 pub const SYS_DESKTOP_DRAW_TEXT: u32 = 0x0302;
 pub const SYS_DESKTOP_DRAW_RGBA: u32 = 0x0303;
 pub const SYS_DESKTOP_POLL_KEY: u32 = 0x0304;
+pub const SYS_DESKTOP_POLL_MOUSE: u32 = 0x0305;
 
 pub const STATUS_SUCCESS: u64 = 0;
 pub const STATUS_INVALID_PARAMETER: u64 = 0xC000_000D;
@@ -49,6 +50,14 @@ pub struct DesktopFramebufferInfo {
     pub height: u32,
     pub pitch: u32,
     pub bpp: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DesktopMouseState {
+    pub x: i32,
+    pub y: i32,
+    pub buttons: u32,
 }
 
 impl DesktopFramebufferInfo {
@@ -221,13 +230,34 @@ pub unsafe fn poll_key(key: *mut u8) -> u64 {
         return STATUS_NO_DATA;
     };
     let bytes = [byte];
-    // TEMPORARY diagnostic: confirm the desktop input path receives
-    // keystrokes (remove once the logon handoff is verified).
-    crate::hal::serial::write_string_always("[DESKHOST] key=0x");
-    crate::hal::serial::write_hex_u64_always(byte as u64);
-    crate::hal::serial::write_string_always("\r\n");
     match crate::ntoskrnl::mm::user_copy::copy_to_user(key as u64, &bytes) {
         Ok(()) => 1,
+        Err(_) => STATUS_INVALID_PARAMETER,
+    }
+}
+
+/// Copy the current pointer state to the caller. `buttons` uses bit 0 for
+/// left, bit 1 for right, and bit 2 for middle.
+///
+/// # Safety
+///
+/// `state` must point to writable user memory of at least 12 bytes.
+pub unsafe fn poll_mouse(state_pointer: *mut DesktopMouseState) -> u64 {
+    if state_pointer.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    crate::drivers::input::virtio_input::poll();
+    let (x, y, buttons) = crate::drivers::input::virtio_input::get_mouse_state();
+    let state = DesktopMouseState {
+        x: i32::from(x),
+        y: i32::from(y),
+        buttons: u32::from(buttons),
+    };
+    let bytes = core::mem::size_of::<DesktopMouseState>();
+    let raw = core::ptr::from_ref(&state) as *const u8;
+    let slice = core::slice::from_raw_parts(raw, bytes);
+    match crate::ntoskrnl::mm::user_copy::copy_to_user(state_pointer as u64, slice) {
+        Ok(()) => bytes as u64,
         Err(_) => STATUS_INVALID_PARAMETER,
     }
 }

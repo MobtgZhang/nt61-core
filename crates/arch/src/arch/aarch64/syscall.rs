@@ -155,6 +155,7 @@ pub unsafe extern "C" fn syscall_dispatch_with_tf(syscall_num: u64, tf: *mut Tra
             )
         },
         desktop::SYS_DESKTOP_POLL_KEY => unsafe { desktop::poll_key(tf_ref.x0 as *mut u8) },
+        desktop::SYS_DESKTOP_POLL_MOUSE => unsafe { desktop::poll_mouse(tf_ref.x0 as *mut _) },
         _ => STATUS_INVALID_SYSTEM_SERVICE,
     }
 }
