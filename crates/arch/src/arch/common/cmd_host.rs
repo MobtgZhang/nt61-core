@@ -25,6 +25,12 @@ pub fn putchar(byte: u8) -> u64 {
     // serial gate. Route it through the HAL's dual console and force
     // the serial sink open; the framebuffer sink is handled by the
     // same helper on each architecture.
+    if crate::drivers::bootvid::gui_console_active() {
+        crate::hal::common::serial_disable::with_serial_unmasked(|| {
+            crate::hal::serial::write_char(byte);
+        });
+        return STATUS_SUCCESS;
+    }
     crate::hal::serial::with_serial_unmasked(|| {
         crate::hal::text_console::put_serial_and_console(byte);
     });

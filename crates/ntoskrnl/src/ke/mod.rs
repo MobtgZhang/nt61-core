@@ -13,6 +13,7 @@
 //! Phase 9.
 
 pub mod apc;
+pub mod boot_anim;
 pub mod bugcheck;
 pub mod dispatch;
 pub mod dpc;

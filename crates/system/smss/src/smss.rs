@@ -585,6 +585,8 @@ pub unsafe fn init_peb(process: *mut crate::ps::process::Eprocess) -> *mut crate
     // Allocate a page for the PEB.
     let result = crate::mm::vas::alloc_zeroed_page_for_vas();
     if result.is_none() {
+        boot_println!("[SMSS] init_peb failed: PEB page allocation");
+        crate::hal::serial::write_string_always("[SMSS] init_peb failed: PEB page allocation\r\n");
         return core::ptr::null_mut();
     }
     let peb_phys = result.unwrap();
@@ -601,7 +603,24 @@ pub unsafe fn init_peb(process: *mut crate::ps::process::Eprocess) -> *mut crate
     const PEB_SIZE: u64 = 0x1000;
 
     let pml4_phys = unsafe { (*process).page_table_pml4 };
+    crate::hal::serial::write_string_always("[SMSS] init_peb pml4-check\r\n");
+    crate::hal::serial::write_string_always(" process=");
+    crate::hal::serial::write_hex_u64_always(process as u64);
+    crate::hal::serial::write_string_always(" page_table=");
+    crate::hal::serial::write_hex_u64_always(unsafe { (*process).page_table_pml4 });
+    crate::hal::serial::write_string_always(" alias=");
+    crate::hal::serial::write_hex_u64_always(unsafe { (*process).pml4_phys });
+    crate::hal::serial::write_string_always("\r\n");
     if pml4_phys == 0 {
+        boot_println!("[SMSS] init_peb failed: PML4");
+        crate::hal::serial::write_string_always("[SMSS] init_peb failed: PML4\r\n");
+        if let Some((heap_base, heap_size)) = crate::mm::heap::KERNEL_HEAP.configured_region() {
+            crate::hal::serial::write_string_always("[SMSS] heap=");
+            crate::hal::serial::write_hex_u64_always(heap_base as u64);
+            crate::hal::serial::write_string_always("-");
+            crate::hal::serial::write_hex_u64_always(heap_base as u64 + heap_size as u64);
+            crate::hal::serial::write_string_always("\r\n");
+        }
         return core::ptr::null_mut();
     }
 
@@ -612,6 +631,8 @@ pub unsafe fn init_peb(process: *mut crate::ps::process::Eprocess) -> *mut crate
         crate::mm::vas::PTE_RW | crate::mm::vas::PTE_US,
     );
     if map_result != crate::mm::vas::MmStatus::Ok {
+        boot_println!("[SMSS] init_peb failed: PEB mapping");
+        crate::hal::serial::write_string_always("[SMSS] init_peb failed: PEB mapping\r\n");
         return core::ptr::null_mut();
     }
 
@@ -619,16 +640,21 @@ pub unsafe fn init_peb(process: *mut crate::ps::process::Eprocess) -> *mut crate
     // user VAs; those helpers perform short process-root attaches.
     let heap_base = crate::userspace::kernel32::heap::init_user_heap(pml4_phys);
     if heap_base == 0 {
+        boot_println!("[SMSS] init_peb failed: user heap");
+        crate::hal::serial::write_string_always("[SMSS] init_peb failed: user heap\r\n");
         return core::ptr::null_mut();
     }
 
     let session_id = unsafe { (*process).session_id };
+    crate::hal::serial::write_string_always("[SMSS] init_process_parameters begin\r\n");
     let params = init_process_parameters(process, session_id);
     boot_println!(
         "[SMSS] init_peb process parameters returned 0x{:x}",
         params as u64
     );
+    crate::hal::serial::write_string_always("[SMSS] init_process_parameters return\r\n");
     if params.is_null() {
+        crate::hal::serial::write_string_always("[SMSS] init_peb failed: parameters\r\n");
         return core::ptr::null_mut();
     }
 
@@ -705,12 +731,18 @@ fn init_process_parameters(
 
     let pml4_phys = unsafe { (*process).pml4_phys };
     if pml4_phys == 0 {
+        boot_println!("[SMSS] init_process_parameters failed: PML4");
+        crate::hal::serial::write_string_always("[SMSS] init_process_parameters failed: PML4\r\n");
         return core::ptr::null_mut();
     }
 
     // Allocate a page for process parameters.
     let result = crate::mm::vas::alloc_zeroed_page_for_vas();
     if result.is_none() {
+        boot_println!("[SMSS] init_process_parameters failed: allocation");
+        crate::hal::serial::write_string_always(
+            "[SMSS] init_process_parameters failed: allocation\r\n",
+        );
         return core::ptr::null_mut();
     }
     let params_phys = result.unwrap();
@@ -728,8 +760,14 @@ fn init_process_parameters(
             PARAMS_BASE,
             params_phys
         );
+        crate::hal::serial::write_string_always(
+            "[SMSS] init_process_parameters failed: mapping\r\n",
+        );
         return core::ptr::null_mut();
     }
+
+    boot_println!("[SMSS] init_process_parameters mapped");
+    crate::hal::serial::write_string_always("[SMSS] init_process_parameters mapped\r\n");
 
     crate::mm::vas::refresh_kernel_mappings(pml4_phys);
     let previous_root = crate::mm::vas::attach_process(pml4_phys);
@@ -830,6 +868,8 @@ fn init_process_parameters(
         (*params).environment_version = 1;
 
         crate::mm::vas::detach_process(previous_root);
+        boot_println!("[SMSS] init_process_parameters done");
+        crate::hal::serial::write_string_always("[SMSS] init_process_parameters done\r\n");
         params
     }
 }
@@ -1323,6 +1363,10 @@ pub fn load_and_create_process(
     base_pid: u64,
 ) -> Result<SystemExeLoadResult, ExeLoadError> {
     unsafe {
+        crate::hal::serial::write_string_always("[SMSS] load_and_create_process enter\r\n");
+        crate::hal::serial::write_string_always("[SMSS] load ");
+        crate::hal::serial::write_string_always(process_name);
+        crate::hal::serial::write_string_always("\r\n");
         boot_println!(
             "[SMSS] load_and_create_process: path={} name={} session={} pid=0x{:x}",
             disk_path,
@@ -1332,26 +1376,37 @@ pub fn load_and_create_process(
         );
 
         // Step 1: read the PE file from the mounted disk
+        crate::hal::serial::write_string_always("[SMSS] read PE begin\r\n");
         let pe_data = match read_pe_from_disk(disk_path) {
-            Some(data) => {
-                data
-            }
+            Some(data) => data,
             None => {
                 return Err(ExeLoadError::FileNotFound);
             }
         };
-
+        crate::hal::serial::write_string_always("[SMSS] read PE done\r\n");
+        crate::hal::serial::write_string_always("[SMSS] PE len=");
+        crate::hal::serial::write_hex_u64_always(pe_data.len() as u64);
+        crate::hal::serial::write_string_always("\r\n[SMSS] PE head=");
+        for byte in pe_data.iter().take(16) {
+            crate::hal::serial::write_hex_u64_always(*byte as u64);
+        }
+        crate::hal::serial::write_string_always("\r\n");
+        crate::hal::serial::write_string_always("[SMSS] PE ptr=");
+        crate::hal::serial::write_hex_u64_always(pe_data.as_ptr() as u64);
+        crate::hal::serial::write_string_always("\r\n");
 
         // Step 2: Parse PE headers to get entry point and image base
+        crate::hal::serial::write_string_always("[SMSS] parse PE begin\r\n");
         let (entry_point, _preferred_base) = match parse_pe_headers(&pe_data) {
             Some(result) => result,
             None => {
                 return Err(ExeLoadError::InvalidPe);
             }
         };
-
+        crate::hal::serial::write_string_always("[SMSS] parse PE done\r\n");
 
         // Step 3: create the process using the PE data
+        crate::hal::serial::write_string_always("[SMSS] create process begin\r\n");
         let pid = base_pid;
         let process =
             match crate::ps::process::create_user_process(&pe_data, pid, Some(entry_point)) {
@@ -1361,6 +1416,20 @@ pub fn load_and_create_process(
                     return Err(ExeLoadError::ProcessCreationFailed);
                 }
             };
+        crate::hal::serial::write_string_always("[SMSS] create process done\r\n");
+        crate::hal::serial::write_string_always("[SMSS] after create\r\n");
+        crate::hal::serial::write_string_always("[SMSS] PE head after create=");
+        for byte in pe_data.iter().take(8) {
+            crate::hal::serial::write_hex_u64_always(*byte as u64);
+        }
+        crate::hal::serial::write_string_always("\r\n");
+        crate::hal::serial::write_string_always(" process=");
+        crate::hal::serial::write_hex_u64_always(process as u64);
+        crate::hal::serial::write_string_always(" page_table=");
+        crate::hal::serial::write_hex_u64_always((*process).page_table_pml4);
+        crate::hal::serial::write_string_always(" alias=");
+        crate::hal::serial::write_hex_u64_always((*process).pml4_phys);
+        crate::hal::serial::write_string_always("\r\n");
 
         boot_println!(
             "[SMSS] Created process {} with PID 0x{:x}",
@@ -1410,7 +1479,17 @@ pub fn load_and_create_process(
             (*process).user_image_base = mapping.image_base;
             (*process).user_image_size = mapping.image_size;
         }
+        crate::hal::serial::write_string_always("[SMSS] init_peb begin\r\n");
+        crate::hal::serial::write_string_always("[SMSS] before PE load\r\n");
+        crate::hal::serial::write_string_always(" process=");
+        crate::hal::serial::write_hex_u64_always(process as u64);
+        crate::hal::serial::write_string_always(" page_table=");
+        crate::hal::serial::write_hex_u64_always({ (*process).page_table_pml4 });
+        crate::hal::serial::write_string_always(" alias=");
+        crate::hal::serial::write_hex_u64_always({ (*process).pml4_phys });
+        crate::hal::serial::write_string_always("\r\n");
         let peb = init_peb(process);
+        crate::hal::serial::write_string_always("[SMSS] init_peb end\r\n");
         if peb.is_null() {
             boot_println!("[SMSS] Failed to initialize PEB for {}", process_name);
             return Err(ExeLoadError::LoadFailed);
@@ -1421,6 +1500,7 @@ pub fn load_and_create_process(
             entry_point: mapping.entry_point,
             image_base: mapping.image_base,
         };
+        crate::hal::serial::write_string_always("[SMSS] load_and_create_process done\r\n");
         boot_println!("[SMSS] Returning Ok result");
         Ok(_r)
     }
@@ -2218,15 +2298,21 @@ pub fn start_boot_sequence() {
 
     // Phase 1: Initialize SMSS
     boot_println!("[BOOT] Phase 1: Initializing Session Manager...");
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 1 begin\r\n");
     phase1_initialize();
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 1 done\r\n");
 
     // Phase 2: create sessions
     boot_println!("[BOOT] Phase 2: Creating Sessions...");
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 2 begin\r\n");
     phase2_create_sessions();
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 2 done\r\n");
 
     // Phase 3: Start subsystems (CSRSS)
     boot_println!("[BOOT] Phase 3: Starting Subsystems...");
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 3 begin\r\n");
     phase3_start_subsystems();
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 3 done\r\n");
 
     // =========================================================================
     // Phase 012: csrss / wininit / services / lsass subsystem spin-up
@@ -2242,11 +2328,15 @@ pub fn start_boot_sequence() {
 
     // Phase 4: Start WinInit
     boot_println!("[BOOT] Phase 4: Starting WinInit...");
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 4 begin\r\n");
     phase4_start_wininit();
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 4 done\r\n");
 
     // Phase 5: Launch WinLogon + UserInit (Session 1 logon chain).
     boot_println!("[BOOT] Phase 5: Starting Session 1 Logon...");
+    crate::hal::serial::write_string_always("[SMSS] desktop phase5 begin\r\n");
     phase5_start_logon();
+    crate::hal::serial::write_string_always("[SMSS] desktop phase5 done\r\n");
 
     // =========================================================================
     // Phase 013: cmd.exe (Ring-3 syscall loop)
@@ -2291,11 +2381,16 @@ pub fn start_desktop_boot_sequence() -> ! {
     phase4_start_wininit();
 
     boot_println!("[BOOT] Phase 5: Starting Session 1 Logon...");
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 5 begin\r\n");
     phase5_start_logon();
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 5 done\r\n");
 
     crate::rtl::windows_log::write_phase_header(13);
     boot_println!("    EXPLORER: explorer.exe Ring-3 entry");
     *BOOT_COMPLETE.lock() = true;
+    crate::arch::boot::mark_boot_animation_complete();
+    crate::arch::boot::wait_boot_animation_finished();
+    crate::hal::serial::write_string_always("[SMSS] desktop launching logon\r\n");
     launch_logonui_then_explorer();
 }
 
@@ -2593,8 +2688,12 @@ pub fn launch_logonui_then_explorer() -> ! {
         // Step 1: create explorer.exe now, but do NOT dispatch it. Its
         // (pml4, rip, rsp) is parked in the kernel logon-handoff slot
         // and `process_exit` will enter Ring 3 for it once LogonUI exits.
-        let explorer_result =
-            load_and_create_process("C:\\Windows\\System32\\explorer.exe", "explorer.exe", SESSION_1, PID_EXPLORER);
+        let explorer_result = load_and_create_process(
+            "C:\\Windows\\System32\\explorer.exe",
+            "explorer.exe",
+            SESSION_1,
+            PID_EXPLORER,
+        );
         match explorer_result {
             Ok(result) => {
                 if let Some(process) = crate::ps::process::get_by_pid(PID_EXPLORER) {
@@ -2608,7 +2707,9 @@ pub fn launch_logonui_then_explorer() -> ! {
                     }
                     boot_println!(
                         "[BOOT]   explorer.exe pending (root=0x{:x} RIP=0x{:x} RSP=0x{:x})",
-                        root, rip, rsp
+                        root,
+                        rip,
+                        rsp
                     );
                     let _ = result;
                 } else {
@@ -2632,11 +2733,18 @@ pub fn launch_logonui_then_explorer() -> ! {
         }
 
         boot_println!("[BOOT]   Loading logonui.exe from disk...");
-        let logonui_result =
-            load_and_create_process("C:\\Windows\\System32\\logonui.exe", "logonui.exe", SESSION_1, PID_LOGONUI);
+        let logonui_result = load_and_create_process(
+            "C:\\Windows\\System32\\logonui.exe",
+            "logonui.exe",
+            SESSION_1,
+            PID_LOGONUI,
+        );
         match logonui_result {
             Ok(result) => {
-                boot_println!("[BOOT]   logonui.exe loaded successfully (PID 0x{:x})", result.pid);
+                boot_println!(
+                    "[BOOT]   logonui.exe loaded successfully (PID 0x{:x})",
+                    result.pid
+                );
                 if let Some(process) = crate::ps::process::get_by_pid(PID_LOGONUI) {
                     let process_pointer = process as *mut crate::ps::process::Eprocess;
                     let main_thread = { (*process_pointer).main_thread };
@@ -2648,6 +2756,7 @@ pub fn launch_logonui_then_explorer() -> ! {
                             "[BOOT]   Dispatching logonui.exe into Ring 3 (root=0x{:x} RIP=0x{:x} RSP=0x{:x})",
                             root_table_phys, user_rip, user_rsp
                         );
+                        crate::arch::boot::mark_boot_animation_complete();
                         crate::hal::text_console::clear();
                         crate::drivers::bootvid::vid_clear_black();
                         crate::drivers::bootvid::vid_set_cursor_position(0, 0);
@@ -2672,7 +2781,10 @@ pub fn launch_logonui_then_explorer() -> ! {
                 }
             }
             Err(error) => {
-                boot_println!("[BOOT]   WARNING: Failed to launch logonui.exe: {:?}", error);
+                boot_println!(
+                    "[BOOT]   WARNING: Failed to launch logonui.exe: {:?}",
+                    error
+                );
                 boot_println!("[BOOT]   Falling back to direct explorer dispatch");
                 crate::ps::process::clear_logon_handoff();
                 launch_explorer_shell();
@@ -2725,6 +2837,7 @@ pub fn launch_explorer_shell() -> ! {
                             user_rip,
                             user_rsp
                         );
+                        crate::arch::boot::mark_boot_animation_complete();
                         crate::hal::serial::write_string_always("[EXPLORER] clear console\r\n");
                         crate::hal::text_console::clear();
                         crate::drivers::bootvid::vid_clear_black();

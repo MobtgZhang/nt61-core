@@ -330,6 +330,17 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     phase_header!(1, "Kernel Executive");
     ke::init();
 
+    // Windows 7 plays the "Starting Windows" sequence while the rest of
+    // the kernel is still coming up. The first frame is visible as soon
+    // as HAL/PIT are live and SMP startup has finished. The dedicated
+    // thread is attached once the process/thread manager is ready.
+    if matches!(
+        boot_mode,
+        crate::boot_types::BootMode::Desktop | crate::boot_types::BootMode::Cmd
+    ) {
+        crate::arch::boot::run_boot_animation();
+    }
+
     // ============================================================================
     // PHASE 3: Object Manager (ob)
     // ============================================================================
@@ -392,12 +403,10 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     drivers::init();
     crate::rtl::klog::phase_trace_marker(702);
 
-
     // Bring the TCP/IP protocol stack up immediately after its NIC
     // miniports are registered; otherwise `ethif` has no MAC/interface
     // bindings and DHCP cannot transmit.
     crate::netstack::init();
-
 
     // ============================================================================
     // PHASE 9: Process / Thread Subsystem (ps)
@@ -411,7 +420,6 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // background refiller and every demand-zero fault pays a full
     // synchronous 4 KiB clear.
     crate::mm::zeropage::start_zero_page_thread();
-
 
     // ============================================================================
     // PHASE 9: Reserved — disk ntoskrnl.exe manages subsystem PEs
@@ -435,6 +443,14 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // ============================================================================
     phase_header!(10, "System Processes");
     create_system_processes();
+
+    if matches!(
+        boot_mode,
+        crate::boot_types::BootMode::Desktop | crate::boot_types::BootMode::Cmd
+    ) {
+        crate::ke::boot_anim::start_animation_thread();
+    }
+
     crate::servers::init();
     crate::libs::init();
 
@@ -460,6 +476,10 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     }
 
     let boot_mode = BootMode::from_u32(boot_info.boot_mode);
+    crate::hal::serial::write_string_always("[KERNEL] boot mode start-session-manager\r\n");
+    crate::hal::serial::write_string_always(" mode=");
+    crate::hal::serial::write_hex_u64_always(boot_mode as u64);
+    crate::hal::serial::write_string_always("\r\n");
     start_session_manager(boot_mode);
 
     // ============================================================================
@@ -520,6 +540,10 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // ============================================================================
     crate::rtl::klog::phase_trace_marker(15);
     let mode = BootMode::from_u32(boot_info.boot_mode);
+    crate::hal::serial::write_string_always("[KERNEL] phase15 mode\r\n");
+    crate::hal::serial::write_string_always(" mode=");
+    crate::hal::serial::write_hex_u64_always(mode as u64);
+    crate::hal::serial::write_string_always("\r\n");
     boot_print!("Boot mode: ");
     match mode {
         BootMode::Desktop => boot_print!("Desktop\r\n"),
@@ -543,17 +567,31 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     match mode {
         BootMode::Desktop => {
             crate::rtl::klog::phase_trace_marker(151);
+            crate::arch::mark_interrupts_ready();
+            crate::arch::enable_interrupts();
+            crate::hal::serial::write_string_always("[KERNEL] desktop animation begin\r\n");
             crate::arch::boot::run_boot_animation();
+            crate::arch::boot::wait_boot_animation_finished();
+            crate::hal::serial::write_string_always("[KERNEL] desktop animation done\r\n");
             crate::rtl::klog::phase_trace_marker(152);
+            // From this point the GUI owns the framebuffer. Ring-3
+            // diagnostics still go to serial, but they must never draw
+            // text over LogonUI or Explorer.
+            crate::drivers::bootvid::set_gui_console_active(true);
             crate::hal::keyboard_input::init();
             crate::rtl::klog::phase_trace_marker(153);
             crate::hal::text_console::init();
+            crate::hal::serial::write_string_always("[KERNEL] desktop dispatch\r\n");
             crate::rtl::klog::phase_trace_marker(154);
             servers::smss::start_desktop_boot_sequence();
         }
         BootMode::Cmd => {
             crate::rtl::klog::phase_trace_marker(151);
+            crate::arch::mark_interrupts_ready();
+            crate::arch::enable_interrupts();
             crate::arch::boot::run_boot_animation();
+            crate::arch::boot::wait_boot_animation_finished();
+            crate::arch::boot::mark_boot_animation_complete();
             crate::rtl::klog::phase_trace_marker(152);
             crate::hal::keyboard_input::init();
             crate::rtl::klog::phase_trace_marker(153);

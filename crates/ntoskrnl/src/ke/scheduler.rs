@@ -1283,6 +1283,11 @@ pub unsafe fn add_ready(thread: *mut Ethread, priority: u8) {
         // Add to per-CPU PRCB ready queue
         let prcb = prcb_ptr(target_cpu);
         if !prcb.is_null() {
+            crate::hal::serial::write_string_always("[SCHED] ready queue cpu=");
+            crate::hal::serial::write_hex_u64_always(target_cpu as u64);
+            crate::hal::serial::write_string_always(" priority=");
+            crate::hal::serial::write_hex_u64_always(priority as u64);
+            crate::hal::serial::write_string_always("\r\n");
             let entry_ptr = unsafe {
                 core::ptr::addr_of_mut!((*thread).kthread.global_thread_list_entry)
                     as *mut ListEntry
@@ -1375,7 +1380,7 @@ pub unsafe fn remove_ready(thread: *mut Ethread) -> bool {
             let mut entry_ptr = queue.head;
 
             while !entry_ptr.is_null() {
-                    unsafe {
+                unsafe {
                     // Compare entry pointers - queue stores pointers to global_thread_list_entry
                     let thread_list_ptr =
                         core::ptr::addr_of!((*thread).kthread.global_thread_list_entry)
@@ -1720,11 +1725,24 @@ pub fn tick() {
 /// idle loop, so syscall entry and the clock path both call this as a
 /// deferred-work opportunity.
 pub fn poll_services() {
+    if crate::arch::boot::is_boot_animation_running() {
+        crate::arch::boot::poll_boot_animation();
+    }
     crate::drivers::net::poll_all();
 }
 
 /// Per-CPU reschedule requests raised by the clock ISR.
 static PENDING_RESCHEDULE: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// TCG can fail to deliver the early boot IPI while an AP is parked in
+/// HLT. The boot animation enables this bounded polling window and clears
+/// it after the sequence has handed off or completed.
+static EARLY_AP_POLLING: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable the early boot-animation polling fallback.
+pub fn set_early_ap_polling(enabled: bool) {
+    EARLY_AP_POLLING.store(enabled, Ordering::Release);
+}
 
 /// Record that the dispatcher must run on `cpu` once IRQL drops to
 /// DISPATCH_LEVEL.
@@ -1782,6 +1800,14 @@ fn ms_to_ticks(ms: u32) -> u64 {
 /// Uses the unified `arch::wait_for_interrupt()` so the per-arch
 /// `sti;hlt` / `wfi` / `idle 0` sequence stays inside `arch::*`.
 pub fn idle_loop() -> ! {
+    {
+        let cpu = get_current_cpu();
+        crate::hal::serial::write_string_always("[SCHED] AP idle enter cpu=");
+        crate::hal::serial::write_hex_u64_always(cpu as u64);
+        crate::hal::serial::write_string_always(" pending=");
+        crate::hal::serial::write_hex_u64_always(has_pending_reschedule(cpu) as u64);
+        crate::hal::serial::write_string_always("\r\n");
+    }
     loop {
         // ke_sched P0-1: the idle loop used to just halt forever, so a
         // thread made ready (or a reschedule request recorded) by an
@@ -1798,6 +1824,31 @@ pub fn idle_loop() -> ! {
         }
         if let Some((root, rip, rsp, thread)) = handoff {
             crate::hal::serial::write_string_always("SCHED: dispatching explorer from handoff\r\n");
+            let root = if thread != 0 {
+                let thread = thread as *mut Ethread;
+                let process = unsafe { (*thread).threads_process };
+                let pid = unsafe { (*process).unique_process_id };
+                let pml4 = unsafe { (*process).pml4_phys };
+                crate::hal::serial::write_string_always("K:handoff thread-pid=");
+                crate::hal::serial::write_hex_u64_always(pid);
+                crate::hal::serial::write_string_always(" thread-root=");
+                crate::hal::serial::write_hex_u64_always(pml4);
+                crate::hal::serial::write_string_always(" parked-root=");
+                crate::hal::serial::write_hex_u64_always(root);
+                crate::hal::serial::write_string_always("\r\n");
+                pml4
+            } else {
+                root
+            };
+            crate::hal::serial::write_string_always("K:handoff root=");
+            crate::hal::serial::write_hex_u64_always(root);
+            crate::hal::serial::write_string_always(" rip=");
+            crate::hal::serial::write_hex_u64_always(rip);
+            crate::hal::serial::write_string_always(" rsp=");
+            crate::hal::serial::write_hex_u64_always(rsp);
+            crate::hal::serial::write_string_always(" thread=");
+            crate::hal::serial::write_hex_u64_always(thread);
+            crate::hal::serial::write_string_always("\r\n");
             if thread != 0 {
                 unsafe {
                     setup_bsp(thread as *mut Ethread);
@@ -1808,10 +1859,19 @@ pub fn idle_loop() -> ! {
             }
         } else if has_pending_reschedule(cpu) {
             dispatch_pending_reschedule();
+        } else if cpu > 0
+            && EARLY_AP_POLLING.load(Ordering::Acquire)
+            && crate::arch::boot::is_boot_animation_running()
+        {
+            crate::arch::boot::poll_boot_animation();
         } else if has_work() {
             schedule();
         } else {
-            crate::arch::wait_for_interrupt();
+            if crate::arch::boot::is_boot_animation_running() {
+                core::hint::spin_loop();
+            } else {
+                crate::arch::wait_for_interrupt();
+            }
         }
     }
 }
@@ -2008,19 +2068,27 @@ pub fn init_smp_this_cpu(cpu_id: u32) {
     // (KeStartAllProcessors semantics); only allocate a fallback when
     // it is missing (e.g. CPU count discovered late).
     let pre_created = unsafe {
-    if (*raw).idle_thread.is_null() {
-        None
-    } else {
-        // SAFETY: the idle thread was published by init_smp and is
-        // exclusively owned by this PRCB.
-        Some(&mut *(*raw).idle_thread)
-    }
+        if (*raw).idle_thread.is_null() {
+            None
+        } else {
+            // SAFETY: the idle thread was published by init_smp and is
+            // exclusively owned by this PRCB.
+            Some(&mut *(*raw).idle_thread)
+        }
     };
     let idle = if pre_created.is_none() {
         crate::hal::serial::write_string_always("[DBG] ap idle create enter\r\n");
-        let idle = create_thread_idle(idx as u32);
-        crate::hal::serial::write_string_always("[DBG] ap idle create done\r\n");
-        idle
+        if crate::ps::process::get_by_pid(crate::ps::process::PID_SYSTEM).is_some() {
+            let idle = create_thread_idle(idx as u32);
+            crate::hal::serial::write_string_always("[DBG] ap idle create done\r\n");
+            idle
+        } else {
+            // SMP is initialized before the System process. The BSP
+            // later creates all idle threads in create_idle_thread(),
+            // so an AP must not bugcheck while that process is absent.
+            crate::hal::serial::write_string_always("[DBG] ap idle deferred\r\n");
+            None
+        }
     } else {
         crate::hal::serial::write_string_always("[DBG] ap idle reused\r\n");
         pre_created

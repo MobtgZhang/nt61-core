@@ -34,6 +34,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
+pub mod win7;
+
 /// Boot display mode (Windows 7 behavior)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BootDisplayMode {
@@ -65,8 +67,48 @@ static FB_WIDTH: AtomicU32 = AtomicU32::new(0);
 static FB_HEIGHT: AtomicU32 = AtomicU32::new(0);
 static FB_PITCH: AtomicU32 = AtomicU32::new(0);
 
+/// Optional off-screen render target used by the boot animation.
+/// When set, pixel blending goes to this buffer instead of the
+/// visible framebuffer; the animation then copies the finished frame
+/// back once per refresh to avoid clearing-induced flicker.
+static RENDER_BASE: AtomicU64 = AtomicU64::new(0);
+static RENDER_PITCH: AtomicU32 = AtomicU32::new(0);
+
+fn render_base() -> u64 {
+    let base = RENDER_BASE.load(Ordering::Acquire);
+    if base != 0 {
+        base
+    } else {
+        FB_BASE.load(Ordering::Acquire)
+    }
+}
+
+fn render_pitch() -> u32 {
+    let pitch = RENDER_PITCH.load(Ordering::Acquire);
+    if pitch != 0 {
+        pitch
+    } else {
+        FB_PITCH.load(Ordering::Acquire)
+    }
+}
+
+pub fn set_render_target(base: u64, pitch: u32) {
+    RENDER_BASE.store(base, Ordering::Release);
+    RENDER_PITCH.store(pitch, Ordering::Release);
+}
+
+pub fn clear_render_target() {
+    RENDER_BASE.store(0, Ordering::Release);
+    RENDER_PITCH.store(0, Ordering::Release);
+}
+
 /// Boot display mode - controls what is shown on screen
 static BOOT_DISPLAY_MODE: AtomicI32 = AtomicI32::new(0);
+
+/// Set only after the kernel selects Ring-3 desktop mode. While this
+/// flag is active, Ring-3 debug output must remain on the serial port
+/// and must not paint over LogonUI/Explorer graphics.
+static GUI_CONSOLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Cursor and SPINNER state.
 static INITIALISED: AtomicBool = AtomicBool::new(false);
@@ -900,6 +942,14 @@ pub fn fb_height() -> u32 {
     FB_HEIGHT.load(Ordering::Acquire)
 }
 
+pub fn fb_pitch() -> u32 {
+    FB_PITCH.load(Ordering::Acquire)
+}
+
+pub fn is_lfb_active() -> bool {
+    MODE_LFB.load(Ordering::Acquire)
+}
+
 /// Pick the text attribute used by the next characters. Standard
 /// 16-colour VGA palette (see `colour_for_attr`).
 pub fn set_attr(attr: u8) {
@@ -970,6 +1020,528 @@ pub fn paint_phase_banner(title: &str) {
     ATTR.store(prev_attr, Ordering::Release);
     CURSOR_X.store(0, Ordering::Release);
     CURSOR_Y.store(y0 + FONT_LINE_HEIGHT * 2, Ordering::Release);
+}
+
+/// Paint the Windows 7 normal-boot screen: black background, glowing
+/// four-pane logo, "Starting Windows" text and a centered progress bar.
+pub fn paint_boot_screen(percent: u32) {
+    win7::paint_boot_screen(percent);
+}
+
+pub fn paint_boot_screen_time(t_ms: u32) {
+    win7::paint_boot_screen_time(t_ms);
+}
+
+pub fn poll_animation_strip(cpu: u32) -> bool {
+    win7::poll_animation_strip(cpu)
+}
+
+pub fn present_desktop_frame() -> bool {
+    win7::present_desktop_frame()
+}
+
+/// Draw four colored orbs moving toward the flag center with soft trails.
+fn boot_draw_converging_orbs(screen_width: u32, screen_height: u32, logo_size: u32, progress: u32) {
+    let progress = progress.clamp(0, 100);
+    let center_x = screen_width / 2;
+    let center_y = screen_height / 3;
+    let spread_x = screen_width * 2 / 5;
+    let spread_y = screen_height * 2 / 5;
+    let travel = (progress * 73804 / 100) as i32;
+    const ORBS: [(i32, i32, u32, u32, u32); 4] = [
+        (-1, -1, 0x1C, 0x5A, 0xF7),
+        (1, -1, 0x08, 0xAF, 0x38),
+        (-1, 1, 0xF7, 0xA1, 0x00),
+        (1, 1, 0x00, 0xB4, 0xFF),
+    ];
+    for (direction_x, direction_y, blue, green, red) in ORBS {
+        let end_x = spread_x as i32 * direction_x;
+        let end_y = spread_y as i32 * direction_y;
+        let position_x = center_x as i32 + end_x * (100 - progress as i32) / 100;
+        let position_y = center_y as i32 + end_y * (100 - progress as i32) / 100;
+        let core_size = logo_size / 4 + logo_size / 8;
+        let _ = travel;
+        boot_orb(
+            position_x.max(0) as u32,
+            position_y.max(0) as u32,
+            core_size,
+            blue,
+            green,
+            red,
+            0xE8,
+        );
+        let trail_length = 4 + progress / 12;
+        for trail in 1..=trail_length {
+            let trail_x = position_x + (end_x * trail as i32 / 16);
+            let trail_y = position_y + (end_y * trail as i32 / 16);
+            let alpha = 0xD8u32.saturating_sub(trail * 0x30);
+            if alpha == 0 || trail_x < 0 || trail_y < 0 {
+                continue;
+            }
+            boot_orb(
+                trail_x as u32,
+                trail_y as u32,
+                core_size * 3 / 4,
+                blue,
+                green,
+                red,
+                alpha,
+            );
+        }
+    }
+}
+
+/// Blend the Windows flag in as the four colored lights settle.
+fn boot_flag_forming(x: u32, y: u32, size: u32, progress: u32) {
+    let progress = progress.clamp(0, 255);
+    if progress == 0 {
+        return;
+    }
+    let screen_size = size as i32;
+    let half = screen_size / 2;
+    let wave = (size / 10).max(2) as i32;
+    let gap = 2_i32;
+    for row in 0..size {
+        let fy = row as i32;
+        for column in 0..size {
+            let fx = column as i32;
+            let edge_y = wave * boot_sine_u16((fx * 64 / screen_size.max(1)) as u32) / 73804;
+            let edge_x = wave * boot_sine_u16((fy * 64 / screen_size.max(1)) as u32) / 73804;
+            let vertical_division = half + edge_y;
+            let horizontal_division = half + edge_x;
+            if fx < edge_y
+                || fx >= screen_size - edge_y
+                || fy < edge_x
+                || fy >= screen_size - edge_x
+                || (fx - vertical_division).abs() <= gap
+                || (fy - horizontal_division).abs() <= gap
+            {
+                continue;
+            }
+            let color = if fx < vertical_division && fy < horizontal_division {
+                (0x1C, 0x5A, 0xF7)
+            } else if fx >= vertical_division && fy < horizontal_division {
+                (0x08, 0xAF, 0x38)
+            } else if fx < vertical_division && fy >= horizontal_division {
+                (0xF7, 0xA1, 0x00)
+            } else {
+                (0x00, 0xB4, 0xFF)
+            };
+            boot_blend_pixel(x + column, y + row, color.0, color.1, color.2, progress);
+        }
+    }
+}
+
+/// Draw one soft radial light with a bright core.
+fn boot_orb(center_x: u32, center_y: u32, size: u32, blue: u32, green: u32, red: u32, alpha: u32) {
+    let origin_x = center_x.saturating_sub(size / 2);
+    let origin_y = center_y.saturating_sub(size / 2);
+    let radius = size.max(1) / 2;
+    let radius_sq = (radius * radius).max(1) as u32;
+    for row in 0..size {
+        let dy = row as i32 - radius as i32;
+        for column in 0..size {
+            let dx = column as i32 - radius as i32;
+            let distance_sq = (dx * dx + dy * dy) as u32;
+            if distance_sq > radius_sq {
+                continue;
+            }
+            let falloff = 255 - distance_sq * 190 / radius_sq;
+            let pixel_alpha = (alpha * falloff / 255).clamp(0, 255);
+            if pixel_alpha == 0 {
+                continue;
+            }
+            boot_blend_pixel(
+                origin_x + column,
+                origin_y + row,
+                blue,
+                green,
+                red,
+                pixel_alpha,
+            );
+        }
+    }
+}
+
+/// Bright central flash when the four lights meet.
+fn boot_flash(center_x: u32, center_y: u32, size: u32, alpha: u32) {
+    let flash_size = size * 4;
+    boot_orb(
+        center_x,
+        center_y,
+        flash_size,
+        0xFF,
+        0xFF,
+        0xFF,
+        alpha.max(32),
+    );
+    boot_orb(center_x, center_y, flash_size / 3, 0xFF, 0xFF, 0xFF, alpha);
+}
+
+/// Paint the four Windows flag panes with curved, waving edges. The
+/// curve model is intentionally deterministic and integer-friendly;
+/// it reproduces the Win7 flag's 2x2 quadrants without shipping a
+/// bitmap asset.
+fn boot_flag(x: u32, y: u32, size: u32) {
+    let screen_size = size as i32;
+    let half = screen_size / 2;
+    let wave = (size / 10).max(2) as i32;
+    let gap = 2_i32;
+    for row in 0..size {
+        let fy = row as i32;
+        for column in 0..size {
+            let fx = column as i32;
+            let edge_y = wave * boot_sine_u16((fx * 64 / screen_size.max(1)) as u32) / 73804;
+            let edge_x = wave * boot_sine_u16((fy * 64 / screen_size.max(1)) as u32) / 73804;
+            let vertical_division = half + edge_y;
+            let horizontal_division = half + edge_x;
+            if fx < edge_y
+                || fx >= screen_size - edge_y
+                || fy < edge_x
+                || fy >= screen_size - edge_x
+            {
+                continue;
+            }
+            if (fx - vertical_division).abs() <= gap || (fy - horizontal_division).abs() <= gap {
+                continue;
+            }
+            let color = if fx < vertical_division && fy < horizontal_division {
+                (0x1C, 0x5A, 0xF7)
+            } else if fx >= vertical_division && fy < horizontal_division {
+                (0x08, 0xAF, 0x38)
+            } else if fx < vertical_division && fy >= horizontal_division {
+                (0xF7, 0xA1, 0x00)
+            } else {
+                (0x00, 0xB4, 0xFF)
+            };
+            boot_fill_lfb(x + column, y + row, 1, 1, color.0, color.1, color.2);
+        }
+    }
+}
+
+fn boot_sine_u16(angle: u32) -> i32 {
+    const SINE: [u32; 66] = [
+        0, 1608, 3216, 4823, 6428, 8031, 9632, 11230, 12825, 14416, 16002, 17583, 19157, 20725,
+        22285, 23837, 25380, 26912, 28433, 29943, 31439, 32923, 34393, 35849, 37289, 38713, 40120,
+        41510, 42883, 44236, 45570, 46885, 48178, 49450, 50700, 51927, 53131, 54311, 55466, 56596,
+        57699, 58774, 59821, 60838, 61825, 62780, 63702, 64591, 65445, 66264, 67046, 67790, 68496,
+        69163, 69790, 70377, 70923, 71427, 71889, 72308, 72684, 73016, 73304, 73548, 73748, 73804,
+    ];
+    SINE[angle.min(64) as usize] as i32
+}
+
+/// Draw a soft, animated glow behind the flag.
+fn boot_flag_glow(center_x: u32, center_y: u32, size: u32, alpha: u32) {
+    let glow_size = size * 9 / 4;
+    let origin_x = center_x.saturating_sub(glow_size / 2);
+    let origin_y = center_y.saturating_sub(glow_size / 2);
+    let radius = glow_size as i32 / 2;
+    let radius_sq = (radius * radius).max(1) as u32;
+    let pulse_step = (alpha * 24 / 255) as i32;
+    let base_alpha = 22 + pulse_step;
+    for row in 0..glow_size {
+        let dy = row as i32 - radius;
+        for column in 0..glow_size {
+            let dx = column as i32 - radius;
+            let distance_sq = (dx * dx + dy * dy) as u32;
+            if distance_sq > radius_sq {
+                continue;
+            }
+            let falloff = 255 - distance_sq * 210 / radius_sq;
+            let pixel_alpha = ((base_alpha as u32) * falloff / 255).max(0).min(255) as u32;
+            if pixel_alpha == 0 {
+                continue;
+            }
+            boot_blend_pixel(
+                origin_x + column,
+                origin_y + row,
+                0xD4,
+                0xB4,
+                0x68,
+                pixel_alpha,
+            );
+        }
+    }
+}
+
+/// Integer pulse in `[0, 255]`; the logo's glow breathes during boot.
+fn boot_pulse(percent: u32) -> u32 {
+    let cycle = (percent * 24 / 100 + 12) % 48;
+    const SINE: [u32; 49] = [
+        0, 33, 65, 96, 126, 155, 182, 207, 230, 249, 264, 275, 282, 286, 286, 282, 275, 264, 249,
+        230, 207, 182, 155, 126, 96, 65, 33, 0, 33, 65, 96, 126, 155, 182, 207, 230, 249, 264, 275,
+        282, 286, 286, 282, 275, 264, 249, 230, 207, 182,
+    ];
+    SINE[cycle as usize]
+}
+
+/// Draw the centered boot label with a sans-serif face, cached as a
+/// coverage bitmap to avoid repeated font allocations per frame.
+fn boot_draw_label(text: &str, screen_width: u32, y: u32) {
+    const LABEL_HEIGHT: u32 = 18;
+    static LABEL: spin::Once<Option<BootLabel>> = spin::Once::new();
+    let label = LABEL.get().and_then(|label| label.as_ref()).or_else(|| {
+        let label = BootLabel::new(text, LABEL_HEIGHT);
+        LABEL.call_once(|| label).as_ref()
+    });
+    let Some(label) = label else { return };
+    let x = screen_width.saturating_sub(label.width) / 2;
+    for row in 0..label.height {
+        for column in 0..label.width {
+            let Some(alpha) = label
+                .coverage
+                .get(row as usize * label.width as usize + column as usize)
+                .copied()
+            else {
+                continue;
+            };
+            if alpha == 0 {
+                continue;
+            }
+            boot_blend_pixel(x + column, y + row, 0xFF, 0xFF, 0xFF, u32::from(alpha));
+        }
+    }
+}
+
+fn boot_draw_label_at(
+    cache: &'static spin::Once<Option<BootLabel>>,
+    text: &str,
+    screen_width: u32,
+    y: u32,
+    alpha: u32,
+    blue: u32,
+    green: u32,
+    red: u32,
+    pixel_height: u32,
+) {
+    let label = cache.get().and_then(|label| label.as_ref()).or_else(|| {
+        let label = BootLabel::new(text, pixel_height);
+        cache.call_once(|| label).as_ref()
+    });
+    let Some(label) = label else { return };
+    let x = screen_width.saturating_sub(label.width) / 2;
+    for row in 0..label.height {
+        for column in 0..label.width {
+            let Some(coverage) = label
+                .coverage
+                .get(row as usize * label.width as usize + column as usize)
+                .copied()
+            else {
+                continue;
+            };
+            if coverage == 0 {
+                continue;
+            }
+            let blended = (u32::from(coverage) * alpha) / 255;
+            if blended > 0 {
+                boot_blend_pixel(x + column, y + row, blue, green, red, blended);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BootLabel {
+    width: u32,
+    height: u32,
+    coverage: alloc::vec::Vec<u8>,
+}
+
+impl BootLabel {
+    fn new(text: &str, pixel_height: u32) -> Option<Self> {
+        let face = nt61_fonts::FontFace::from_bytes(nt61_fonts::UI_FONT).ok()?;
+        let mut width = 0_u32;
+        let mut top = i32::MAX;
+        let mut bottom = i32::MIN;
+        let mut glyphs = alloc::vec::Vec::new();
+        for character in text.chars() {
+            let glyph = face.rasterize(character, pixel_height)?;
+            let top_y = -(glyph.metrics.height as i32 + glyph.metrics.ymin);
+            let bottom_y = top_y + glyph.metrics.height as i32;
+            top = top.min(top_y);
+            bottom = bottom.max(bottom_y);
+            width += (glyph.metrics.advance_width + 0.5) as u32;
+            glyphs.push(glyph);
+        }
+        if glyphs.is_empty() || top > bottom {
+            return None;
+        }
+        let height = (bottom - top) as u32;
+        let mut coverage = alloc::vec![0_u8; width as usize * height as usize];
+        let mut pen_x = 0_i32;
+        for glyph in glyphs {
+            let x0 = pen_x + glyph.metrics.xmin;
+            let top_y = -(glyph.metrics.height as i32 + glyph.metrics.ymin) - top;
+            for row in 0..glyph.metrics.height {
+                for column in 0..glyph.metrics.width {
+                    let Some(source) = glyph.coverage_at(column, row) else {
+                        continue;
+                    };
+                    if source == 0 {
+                        continue;
+                    }
+                    let x = x0 + column as i32;
+                    let y = top_y + row as i32;
+                    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+                        continue;
+                    }
+                    let index = y as usize * width as usize + x as usize;
+                    coverage[index] = source.max(coverage[index]);
+                }
+            }
+            pen_x += (glyph.metrics.advance_width + 0.5) as i32;
+        }
+        Some(Self {
+            width,
+            height,
+            coverage,
+        })
+    }
+}
+
+fn boot_fill_rounded_lfb(
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    radius: u32,
+    blue: u32,
+    green: u32,
+    red: u32,
+) {
+    let radius = radius.min(width / 2).min(height / 2);
+    for row in 0..height {
+        for column in 0..width {
+            if !boot_rounded_inside(column, row, width, height, radius) {
+                continue;
+            }
+            boot_fill_lfb(x + column, y + row, 1, 1, blue, green, red);
+        }
+    }
+}
+
+fn boot_fill_rounded_blend(
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    radius: u32,
+    blue: u32,
+    green: u32,
+    red: u32,
+    alpha: u32,
+) {
+    let radius = radius.min(width / 2).min(height / 2);
+    for row in 0..height {
+        for column in 0..width {
+            if !boot_rounded_inside(column, row, width, height, radius) {
+                continue;
+            }
+            boot_blend_pixel(x + column, y + row, blue, green, red, alpha);
+        }
+    }
+}
+
+fn boot_rounded_inside(column: u32, row: u32, width: u32, height: u32, radius: u32) -> bool {
+    if radius == 0 {
+        return true;
+    }
+    let right = width.saturating_sub(radius);
+    let bottom = height.saturating_sub(radius);
+    let dx = if column < radius {
+        radius as i32 - column as i32
+    } else if column >= right {
+        (column - right + 1) as i32
+    } else {
+        0
+    };
+    let dy = if row < radius {
+        radius as i32 - row as i32
+    } else if row >= bottom {
+        (row - bottom + 1) as i32
+    } else {
+        0
+    };
+    (dx * dx + dy * dy) <= (radius * radius) as i32
+}
+
+fn boot_blend_pixel(x: u32, y: u32, blue: u32, green: u32, red: u32, alpha: u32) {
+    let base = render_base();
+    let pitch = render_pitch();
+    let fb_width = FB_WIDTH.load(Ordering::Acquire);
+    let fb_height = FB_HEIGHT.load(Ordering::Acquire);
+    if base == 0 || pitch == 0 || x >= fb_width || y >= fb_height {
+        return;
+    }
+    let offset = ((y * pitch) + (x * 4)) as usize;
+    let pixel = unsafe { (base as *mut u8).add(offset) };
+    unsafe {
+        for (channel_index, source) in [blue, green, red].iter().enumerate() {
+            let destination = core::ptr::read_volatile(pixel.add(channel_index)) as u32;
+            let mixed = (source * alpha + destination * (255 - alpha) + 128) / 255;
+            core::ptr::write_volatile(pixel.add(channel_index), mixed as u8);
+        }
+    }
+}
+
+fn boot_fill_lfb(x: u32, y: u32, width: u32, height: u32, blue: u32, green: u32, red: u32) {
+    let base = FB_BASE.load(Ordering::Acquire);
+    let pitch = FB_PITCH.load(Ordering::Acquire);
+    let fb_width = FB_WIDTH.load(Ordering::Acquire);
+    let fb_height = FB_HEIGHT.load(Ordering::Acquire);
+    if base == 0 || pitch == 0 || x >= fb_width || y >= fb_height {
+        return;
+    }
+    let width = width.min(fb_width - x);
+    let height = height.min(fb_height - y);
+    unsafe {
+        for row in 0..height {
+            for column in 0..width {
+                let offset = ((y + row) * pitch + (x + column) * 4) as usize;
+                let pixel = (base as *mut u8).add(offset);
+                core::ptr::write_volatile(pixel, blue as u8);
+                core::ptr::write_volatile(pixel.add(1), green as u8);
+                core::ptr::write_volatile(pixel.add(2), red as u8);
+                core::ptr::write_volatile(pixel.add(3), 0xFF);
+            }
+        }
+    }
+}
+
+fn boot_fill_blend(
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    blue: u32,
+    green: u32,
+    red: u32,
+    alpha: u32,
+) {
+    let base = FB_BASE.load(Ordering::Acquire);
+    let pitch = FB_PITCH.load(Ordering::Acquire);
+    let fb_width = FB_WIDTH.load(Ordering::Acquire);
+    let fb_height = FB_HEIGHT.load(Ordering::Acquire);
+    if base == 0 || pitch == 0 {
+        return;
+    }
+    let x0 = x.min(fb_width.saturating_sub(1));
+    let y0 = y.min(fb_height.saturating_sub(1));
+    let width = width.min(fb_width - x0);
+    let height = height.min(fb_height - y0);
+    unsafe {
+        for row in 0..height {
+            for column in 0..width {
+                let offset = ((y0 + row) * pitch + (x0 + column) * 4) as usize;
+                let pixel = (base as *mut u8).add(offset);
+                for (channel_index, source) in [blue, green, red].iter().enumerate() {
+                    let destination = core::ptr::read_volatile(pixel.add(channel_index)) as u32;
+                    let mixed = (source * alpha + destination * (255 - alpha) + 128) / 255;
+                    core::ptr::write_volatile(pixel.add(channel_index), mixed as u8);
+                }
+            }
+        }
+    }
 }
 
 /// Paint a bottom progress-bar segment representing `percent`% of
@@ -1086,6 +1658,17 @@ pub fn set_boot_mode(mode: BootDisplayMode) {
 /// Get current boot display mode
 pub fn get_boot_mode() -> BootDisplayMode {
     BootDisplayMode::from_atomic()
+}
+
+/// Mark the framebuffer as owned by the Ring-3 desktop session.
+pub fn set_gui_console_active(active: bool) {
+    GUI_CONSOLE_ACTIVE.store(active, Ordering::Release);
+}
+
+/// Returns `true` when LogonUI/Explorer owns the framebuffer. Ring-3
+/// debug strings should only use serial output in this state.
+pub fn gui_console_active() -> bool {
+    GUI_CONSOLE_ACTIVE.load(Ordering::Acquire)
 }
 
 /// Check if we should display scrolling text (SOS mode only)
