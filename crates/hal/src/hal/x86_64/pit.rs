@@ -100,6 +100,35 @@ pub fn tsc_frequency_hz() -> u64 {
     frequency
 }
 
+/// Calibrate the invariant TSC against the free-running PIT channel 0.
+///
+/// This avoids CPUID frequency leaves, which do not necessarily describe
+/// the guest TSC rate under KVM/QEMU. The PIT runs at a fixed 1.193182 MHz,
+/// so a single ~17 ms sample is sufficient for animation pacing.
+pub fn calibrate_tsc_from_pit(sample_counts: u16) -> bool {
+    let start_count = pit_counter();
+    let start_tsc = unsafe { core::arch::x86_64::_rdtsc() };
+
+    loop {
+        let elapsed_counts = start_count.wrapping_sub(pit_counter());
+        if elapsed_counts >= sample_counts {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    let elapsed_tsc = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(start_tsc);
+    let frequency = elapsed_tsc
+        .saturating_mul(u64::from(PIT_FREQUENCY))
+        .saturating_div(u64::from(sample_counts));
+    if (100_000_000..=10_000_000_000).contains(&frequency) {
+        TSC_HZ.store(frequency, Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
+
 /// Increment the PIT tick count (called from PIT interrupt handler)
 pub fn increment_ticks() {
     PIT_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -108,13 +137,17 @@ pub fn increment_ticks() {
 /// Get system time in milliseconds since PIT initialization
 pub fn get_system_time_ms() -> u64 {
     let frequency = tsc_frequency_hz();
-    unsafe { core::arch::x86_64::_rdtsc() }.saturating_mul(1000) / frequency
+    unsafe { core::arch::x86_64::_rdtsc() }
+        .saturating_mul(1000)
+        .saturating_div(frequency.max(1))
 }
 
 /// Get system time in microseconds since PIT initialization
 pub fn get_system_time_us() -> u64 {
     let frequency = tsc_frequency_hz();
-    unsafe { core::arch::x86_64::_rdtsc() }.saturating_mul(1_000_000) / frequency
+    unsafe { core::arch::x86_64::_rdtsc() }
+        .saturating_mul(1_000_000)
+        .saturating_div(frequency.max(1))
 }
 
 #[inline]

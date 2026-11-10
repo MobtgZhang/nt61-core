@@ -117,8 +117,20 @@ pub fn init_hardware() {
         // Try to init PIT/HPET/keyboard, but don't fail if they need MM
         crate::arch::boot::early_write_str(b"[ARCH] pit_begin\r\n");
         let _ = crate::hal::pit::init(100);
+        let tsc_calibrated = crate::hal::x86_64::pit::calibrate_tsc_from_pit(20_000);
+        if !tsc_calibrated {
+            crate::hal::serial::write_string_always("[ARCH] tsc calibration failed\r\n");
+        }
+        crate::hal::serial::write_string_always("[ARCH] tsc_hz=0x");
+        crate::hal::serial::write_hex_u64_always(crate::hal::x86_64::pit::tsc_frequency_hz());
+        crate::hal::serial::write_string_always(" calibrated=");
+        crate::hal::serial::write_hex_u64_always(tsc_calibrated as u64);
+        crate::hal::serial::write_string_always("\r\n");
         let apic_timer_ready = crate::hal::x86_64::apic::init()
             && crate::hal::x86_64::apic::init_timer_calibrated(100);
+        crate::hal::serial::write_string_always("[ARCH] apic_timer_ready=");
+        crate::hal::serial::write_hex_u64_always(apic_timer_ready as u64);
+        crate::hal::serial::write_string_always("\r\n");
         if !apic_timer_ready {
             crate::hal::pic::unmask_irq(0);
         }
@@ -630,6 +642,14 @@ pub fn init_per_cpu(cpu_id: u32) {
 /// boundary rather than letting kernel subsystems query hardware
 /// directly.
 pub fn request_reschedule_ipi(target_cpu: u32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match x86_64::percpu::get_cpu_data(target_cpu) {
+            Some(per_cpu) => x86_64::ipi::send_reschedule_ipi(per_cpu.apic_id),
+            None => x86_64::ipi::broadcast_reschedule_ipi(),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     let _ = target_cpu;
 }
 
@@ -929,6 +949,7 @@ pub fn enable_interrupts() {
     unsafe {
         asm!("csrsi sstatus, 0x2");
     }
+    INTERRUPTS_ENABLED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 /// Disable maskable interrupts on the current CPU.
@@ -953,6 +974,7 @@ pub fn disable_interrupts() {
     unsafe {
         asm!("csrci sstatus, 0x2");
     }
+    INTERRUPTS_ENABLED.store(false, core::sync::atomic::Ordering::Release);
 }
 
 /// CRITICAL-004: Enable maskable interrupts once.
@@ -1005,6 +1027,13 @@ pub fn interrupts_ready() -> bool {
 /// masked-IRQ Safe Mode path has no wake source at all).
 pub fn interrupts_enabled() -> bool {
     INTERRUPTS_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn hardware_interrupts_enabled() -> bool {
+    let rflags: u64;
+    unsafe { core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nostack)) };
+    rflags & 0x200 != 0
 }
 
 /// CRITICAL-004: Enable interrupts, but only once.
