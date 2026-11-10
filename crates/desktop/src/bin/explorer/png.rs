@@ -327,7 +327,7 @@ pub fn decode_png(data: &[u8]) -> Result<Image, DecodeError> {
                 depth = payload[8];
                 colortype = payload[9];
                 let ok = match (depth, colortype) {
-                    (8, 6) => true,
+                    (8, 2 | 6) => true,
                     (2 | 4 | 8, 3) => true,
                     _ => false,
                 };
@@ -351,6 +351,7 @@ pub fn decode_png(data: &[u8]) -> Result<Image, DecodeError> {
     let width = width as usize;
     let height = height as usize;
     let (row_bytes, bpp) = match colortype {
+        2 => (width * 3, 3usize),
         6 => (width * 4, 4usize),
         3 => ((width * depth as usize + 7) / 8, 1usize),
         _ => return Err(DecodeError::Unsupported),
@@ -388,6 +389,11 @@ pub fn decode_png(data: &[u8]) -> Result<Image, DecodeError> {
         }
         let out = &mut pixels[row * width * 4..(row + 1) * width * 4];
         match colortype {
+            2 => {
+                for (x, chunk) in current.chunks_exact(3).enumerate() {
+                    out[x * 4..x * 4 + 4].copy_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]);
+                }
+            }
             6 => out.copy_from_slice(&current),
             _ => {
                 for x in 0..width {

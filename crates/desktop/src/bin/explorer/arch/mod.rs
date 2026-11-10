@@ -31,3 +31,11 @@ pub struct DesktopFramebufferInfo {
     pub pitch: u32,
     pub bpp: u32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DesktopMouseState {
+    pub x: i32,
+    pub y: i32,
+    pub buttons: u32,
+}
