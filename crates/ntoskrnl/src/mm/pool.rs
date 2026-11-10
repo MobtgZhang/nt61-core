@@ -307,6 +307,8 @@ fn alloc_raw(total_size: usize, pool_type: PoolType, tag: u32) -> *mut u8 {
             (*header).pool_tag = tag;
             (*header).set_signature();
         }
+        crate::mm::heap::KERNEL_HEAP
+            .reserve_high_water((ptr as usize).saturating_add(total_alloc_size));
         // The freelist path also needs to update the authoritative
         // PoolDescriptor stats (was previously leaking allocations
         // - only the bump path incremented total_bytes / total_allocs).

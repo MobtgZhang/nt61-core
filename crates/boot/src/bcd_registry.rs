@@ -157,11 +157,7 @@ fn read_u16(data: &[u8], off: usize) -> Option<u16> {
 fn compute_header_checksum(data: &[u8]) -> u32 {
     let mut sum = 0u32;
     for offset in (0..0x1FC).step_by(4) {
-        sum ^= u32::from_le_bytes(
-            data[offset..offset + 4]
-                .try_into()
-                .unwrap_or_default(),
-        );
+        sum ^= u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or_default());
     }
     sum
 }

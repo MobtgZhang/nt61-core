@@ -49,7 +49,10 @@ pub fn smoke_test() -> bool {
     //   The real create path is exercised directly by Phase 9 /
     //   smss.exe, so the synthetic smoke create is skipped, matching
     //   the documented skip pattern of IO/DRIVERS/LIBS above.
-    stats.test_skipped("User Process Creation", "synthetic create+terminate triple-faults after real session processes exist (TLE-9)");
+    stats.test_skipped(
+        "User Process Creation",
+        "synthetic create+terminate triple-faults after real session processes exist (TLE-9)",
+    );
     stats.test("Thread Counter", step5_thread_counter);
     stats.test("Process Table", step6_process_table);
     stats.test("ExFastRef", step7_ex_fast_ref);

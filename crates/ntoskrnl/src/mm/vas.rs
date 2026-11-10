@@ -669,6 +669,20 @@ pub fn detach_process(prev: u64) {
 fn alloc_zeroed_page() -> Option<u64> {
     let pfn = crate::mm::pfn::allocate_pfn()?;
     let pa = crate::mm::pte::pfn_to_phys(pfn);
+    if let Some((heap_base, heap_size)) = crate::mm::heap::KERNEL_HEAP.configured_region() {
+        let heap_start = heap_base as u64;
+        let heap_end = heap_start + heap_size as u64;
+        if pa >= heap_start && pa < heap_end {
+            crate::hal::serial::write_string_always("[MM] ERROR PFN heap overlap\r\n");
+            crate::hal::serial::write_string_always(" pa=");
+            crate::hal::serial::write_hex_u64_always(pa);
+            crate::hal::serial::write_string_always(" heap=");
+            crate::hal::serial::write_hex_u64_always(heap_start);
+            crate::hal::serial::write_string_always("-");
+            crate::hal::serial::write_hex_u64_always(heap_end);
+            crate::hal::serial::write_string_always("\r\n");
+        }
+    }
     if !crate::arch::identity_map_region(pa & !0x1F_FFFF, 0x20_0000) {
         return None;
     }
@@ -926,9 +940,7 @@ unsafe fn sync_identity_chain(sys_phys: u64, proc_phys: u64, level: u8, base: u6
             let sys_user = sys_entry & PTE_US != 0;
             let proc_pt = proc_entry & PTE_FRAME_MASK;
             for sub_idx in 0..PT_ENTRIES {
-                let slot = core::ptr::read_volatile(
-                    (proc_pt as *const u64).add(sub_idx),
-                );
+                let slot = core::ptr::read_volatile((proc_pt as *const u64).add(sub_idx));
                 if slot & PTE_P != 0 {
                     continue;
                 }
@@ -948,10 +960,7 @@ unsafe fn sync_identity_chain(sys_phys: u64, proc_phys: u64, level: u8, base: u6
                 }
                 let sub_pa = large_base + (sub_idx as u64) * 0x1000;
                 let sub_entry = sub_pa | large_flags | PTE_A | PTE_D;
-                core::ptr::write_volatile(
-                    (proc_pt as *mut u64).add(sub_idx),
-                    sub_entry,
-                );
+                core::ptr::write_volatile((proc_pt as *mut u64).add(sub_idx), sub_entry);
             }
         } else {
             let sys_child = sys_entry & PTE_FRAME_MASK;
@@ -2138,7 +2147,6 @@ pub fn init() {
             rsp,
             reserved_stack
         );
-
     }
     {
         let (head, count) = crate::mm::pfn::get_free_list_stats();

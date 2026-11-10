@@ -172,6 +172,16 @@ pub fn bugcheck(code: BugCheckCode) -> ! {
 pub fn bugcheck_with(code: BugCheckCode, p1: u64, p2: u64, p3: u64, p4: u64) -> ! {
     record(code, p1, p2, p3, p4);
 
+    crate::hal::serial::write_string_always(&alloc::format!(
+        "[FATAL] bugcheck 0x{:08X} ({}) p1=0x{:x} p2=0x{:x} p3=0x{:x} p4=0x{:x}\r\n",
+        code.as_u32(),
+        code.name(),
+        p1,
+        p2,
+        p3,
+        p4
+    ));
+
     // Host unit tests cannot reach the display (the VGA text buffer at
     // 0xB8000 is not mapped in user space) and cannot execute `hlt`, so a
     // bugcheck would fault the libtest binary. Surface it as a panic under

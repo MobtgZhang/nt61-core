@@ -1959,6 +1959,9 @@ pub fn process_exit(_exit_code: u32) -> ! {
     // NT 6.1 runs PspExitProcess: tear down the address space, close
     // all handles, free the EPROCESS and its threads, then switch to
     // the idle thread so other processes can run.
+    crate::hal::serial::write_string_always("K:exit-code=");
+    crate::hal::serial::write_hex_u64_always(_exit_code as u64);
+    crate::hal::serial::write_string_always("\r\n");
 
     // CRITICAL: return to the SYSTEM address space first. The exiting
     // user process PML4 is about to be torn down, and the desktop logon
@@ -1966,7 +1969,6 @@ pub fn process_exit(_exit_code: u32) -> ! {
     // from the system root exactly like the SMSS direct-launch path;
     // otherwise the merge faults and the CPU hangs in the kernel.
     crate::mm::vas::detach_process(0);
-
 
     // Determine which process is exiting. The caller is the last
     // user-mode thread, so the PID was saved in the trap frame; for
@@ -1984,20 +1986,20 @@ pub fn process_exit(_exit_code: u32) -> ! {
         }
         // Fallback: legacy Terminated-main-thread scan.
         if found == 0 {
-        let list = PROCESS_LIST.lock();
-        for i in 0..list.process_count {
-            let p = list.processes[i];
-            if !p.is_null() {
-                let proc = unsafe { &mut *p };
-                if !proc.main_thread.is_null()
-                    && unsafe { (*proc.main_thread).kthread.state }
-                        == crate::ps::thread::KThreadState::Terminated
-                {
-                    found = proc.unique_process_id;
-                    break;
+            let list = PROCESS_LIST.lock();
+            for i in 0..list.process_count {
+                let p = list.processes[i];
+                if !p.is_null() {
+                    let proc = unsafe { &mut *p };
+                    if !proc.main_thread.is_null()
+                        && unsafe { (*proc.main_thread).kthread.state }
+                            == crate::ps::thread::KThreadState::Terminated
+                    {
+                        found = proc.unique_process_id;
+                        break;
+                    }
                 }
             }
-        }
         }
         found
     };
@@ -2054,7 +2056,6 @@ pub fn process_exit(_exit_code: u32) -> ! {
     crate::hal::serial::write_hex_u64_always(exit_pid as u64);
     crate::hal::serial::write_string_always("\r\n");
 
-
     // Desktop-mode logon handoff: when logonui.exe exits after the
     // user pressed ENTER on the Windows-7 welcome screen, dispatch the
     // pre-created explorer.exe image into Ring 3. The user shell is
@@ -2068,9 +2069,7 @@ pub fn process_exit(_exit_code: u32) -> ! {
             // Leave the handoff armed. The idle loop performs the actual
             // setup_bsp + Ring-3 transfer from a clean scheduler context,
             // mirroring the working direct launch path in SMSS.
-            crate::hal::serial::write_string_always(
-                "LOGONUI: handoff pending for explorer\r\n",
-            );
+            crate::hal::serial::write_string_always("LOGONUI: handoff pending for explorer\r\n");
         }
     }
 

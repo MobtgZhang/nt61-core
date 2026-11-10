@@ -131,6 +131,7 @@ pub struct KernelHeap {
     pub base: AtomicUsize,
     pub size: AtomicUsize,
     pub next: AtomicUsize,
+    high_water: AtomicUsize,
     initialized: AtomicBool,
     control: UnsafeCell<HeapControl>,
     allocated: AtomicUsize,
@@ -195,6 +196,7 @@ impl KernelHeap {
             base: AtomicUsize::new(0),
             size: AtomicUsize::new(0),
             next: AtomicUsize::new(0),
+            high_water: AtomicUsize::new(0),
             initialized: AtomicBool::new(false),
             control: UnsafeCell::new(HeapControl::new()),
             allocated: AtomicUsize::new(0),
@@ -209,6 +211,7 @@ impl KernelHeap {
         self.base.store(base as usize, Ordering::SeqCst);
         self.size.store(size, Ordering::SeqCst);
         self.next.store(base as usize, Ordering::SeqCst);
+        self.high_water.store(base as usize, Ordering::SeqCst);
         self.initialized.store(true, Ordering::SeqCst);
 
         // SAFETY: We just stored the base; nothing else has had time to
@@ -220,6 +223,24 @@ impl KernelHeap {
             c.reserve_size = size;
             c.commit_size = size;
             c.next_free = base;
+        }
+    }
+
+    /// Record an externally-managed allocation so the bump frontier cannot
+    /// cross into it. Pool free-list hits bypass `GlobalAlloc::alloc` and
+    /// therefore must extend the heap high water mark themselves.
+    pub fn reserve_high_water(&self, allocation_end: usize) {
+        let mut current = self.high_water.load(Ordering::Relaxed);
+        while allocation_end > current {
+            match self.high_water.compare_exchange(
+                current,
+                allocation_end,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
     }
 
@@ -241,6 +262,24 @@ impl KernelHeap {
             return None;
         }
         Some((base, size))
+    }
+
+    pub unsafe fn debug_free_list(&self) {
+        let lock_ref = &*self.heap_lock.get();
+        let _guard = lock_ref.lock();
+        let mut cur = *self.free_list_head.get();
+        let mut index = 0;
+        while !cur.is_null() && index < 32 {
+            let address = cur as usize;
+            let size = (*cur).size;
+            crate::hal::serial::write_string_always("K:heap-free=");
+            crate::hal::serial::write_hex_u64_always(address as u64);
+            crate::hal::serial::write_string_always("+");
+            crate::hal::serial::write_hex_u64_always(size as u64);
+            crate::hal::serial::write_string_always("\r\n");
+            cur = (*cur).next;
+            index += 1;
+        }
     }
 
     /// Check if a pointer and size fall within the heap range.
@@ -273,7 +312,8 @@ impl KernelHeap {
             let mut merged = false;
             let mut prev: *mut FreeBlock = ptr::null_mut();
             let mut cur: *mut FreeBlock = *head_ref;
-            let max_blocks = self.size.load(Ordering::Relaxed) / core::mem::size_of::<FreeBlock>() + 1;
+            let max_blocks =
+                self.size.load(Ordering::Relaxed) / core::mem::size_of::<FreeBlock>() + 1;
             let mut hops = 0usize;
 
             while !cur.is_null() {
@@ -367,30 +407,30 @@ impl KernelHeap {
                 break;
             }
             let cur_size = (*cur).size;
-        // A free block must never extend past the bump frontier:
-        // the frontier is monotonically increasing and every block
-        // was carved below it. A block that claims to reach past the
-        // frontier is a corrupt or stale header — skip it instead of
-        // handing out memory that may contain live allocations.
-        let block_end_check = cur as usize + cur_size;
-        let frontier = self.next.load(Ordering::Relaxed);
-        if block_end_check > frontier {
-            // Unlink the corrupt block in place so it can never be
-            // selected, then keep walking from its successor.
-            let corrupt_next = (*cur).next;
-            if prev.is_null() {
-                *head_ref = corrupt_next;
-            } else {
-                (*prev).next = corrupt_next;
+            // A free block must never extend past the bump frontier:
+            // the frontier is monotonically increasing and every block
+            // was carved below it. A block that claims to reach past the
+            // frontier is a corrupt or stale header — skip it instead of
+            // handing out memory that may contain live allocations.
+            let block_end_check = cur as usize + cur_size;
+            let frontier = self.next.load(Ordering::Relaxed);
+            if block_end_check > frontier {
+                // Unlink the corrupt block in place so it can never be
+                // selected, then keep walking from its successor.
+                let corrupt_next = (*cur).next;
+                if prev.is_null() {
+                    *head_ref = corrupt_next;
+                } else {
+                    (*prev).next = corrupt_next;
+                }
+                cur = corrupt_next;
+                hops += 1;
+                if hops > max_blocks {
+                    break;
+                }
+                continue;
             }
-            cur = corrupt_next;
-            hops += 1;
-            if hops > max_blocks {
-                break;
-            }
-            continue;
-        }
-        if cur_size >= needed_size && cur_size < best_size {
+            if cur_size >= needed_size && cur_size < best_size {
                 best = cur;
                 best_prev = prev;
                 best_size = cur_size;
@@ -406,7 +446,6 @@ impl KernelHeap {
         if best.is_null() {
             return None;
         }
-
         // Unlink `best` from the list.
         let best_next = (*best).next;
         if best_prev.is_null() {
@@ -504,6 +543,21 @@ unsafe impl GlobalAlloc for KernelHeap {
         //    the intrusive list in `dealloc()`, so this is where
         //    previously-returned memory is recycled.
         if let Some(ptr) = self.alloc_from_free_list(layout) {
+            let block_end = (ptr as usize)
+                .checked_add(Self::align_up(layout.size(), 8))
+                .unwrap_or(usize::MAX);
+            let mut high_water = self.high_water.load(Ordering::Relaxed);
+            while block_end > high_water {
+                match self.high_water.compare_exchange(
+                    high_water,
+                    block_end,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => high_water = current,
+                }
+            }
             let stats = &mut *self.stats.get();
             stats.total_allocations += 1;
             stats.free_list_hits += 1;
@@ -521,7 +575,10 @@ unsafe impl GlobalAlloc for KernelHeap {
         let mut iters = 0;
         loop {
             let cur = self.next.load(Ordering::Relaxed);
-            let aligned = Self::align_up(cur + AllocationHeader::SIZE, layout.align().max(8));
+            let high_water = self.high_water.load(Ordering::Relaxed);
+            let bump_start = cur.max(high_water);
+            let aligned =
+                Self::align_up(bump_start + AllocationHeader::SIZE, layout.align().max(8));
             let allocation_size = Self::align_up(layout.size(), 8);
             let new_next = Self::align_up(aligned + allocation_size, 8);
             if new_next > base + size {
@@ -533,6 +590,18 @@ unsafe impl GlobalAlloc for KernelHeap {
                 .compare_exchange(cur, new_next, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
+                let mut high_water = self.high_water.load(Ordering::Relaxed);
+                while new_next > high_water {
+                    match self.high_water.compare_exchange(
+                        high_water,
+                        new_next,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(current) => high_water = current,
+                    }
+                }
                 self.allocated.fetch_add(layout.size(), Ordering::Relaxed);
                 stats.total_allocations += 1;
                 stats.current_allocated += layout.size();

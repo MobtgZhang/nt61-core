@@ -449,6 +449,17 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+/// `IMAGE_ORDINAL_FLAG64` — in a PE32+ import table, an entry with
+/// this bit set is an **ordinal import**; a clear bit means the entry
+/// is a hint/name RVA.
+///
+/// This is the exact inverse of the PE32 convention, where the flag
+/// lives in bit 31 of a 32-bit entry and means "import by ordinal".
+/// The 64-bit flag was moved to bit 63 so that the 32-bit
+/// `IMAGE_ORDINAL_FLAG` and the 64-bit `IMAGE_ORDINAL_FLAG64` could
+/// coexist in the same slot with different meanings.
+pub const IMAGE_ORDINAL_FLAG64: u64 = 1u64 << 63;
+
 /// A loaded PE image, in memory, after relocations and import
 /// resolution have been applied. The `bytes` field is a private
 /// owned copy in kernel virtual memory.
@@ -756,6 +767,9 @@ pub fn load_image_full(
     if size_of_image as usize > MAX_IMAGE_SIZE {
         return None;
     }
+    unsafe {
+        ntoskrnl::mm::heap::KERNEL_HEAP.debug_free_list();
+    }
     let mut img = alloc::vec![0; size_of_image as usize];
     // `loaded.bytes` is addressed by RVA.  The headers live at RVA 0 and
     // are not part of any section, so they must be copied explicitly.
@@ -773,13 +787,43 @@ pub fn load_image_full(
     // zeroed header and fails. Fall back to the end of the section
     // table, capped at one page.
     let header_copy_len = if size_of_headers == 0 {
-        let sect_end = opt_off + file_hdr.size_of_optional_header as usize
+        let sect_end = opt_off
+            + file_hdr.size_of_optional_header as usize
             + file_hdr.number_of_sections as usize * 40;
         sect_end.min(0x1000).min(bytes.len()).min(img.len())
     } else {
         size_of_headers.min(bytes.len()).min(img.len())
     };
+    ntoskrnl::hal::serial::write_string_always("K:mapf-copy-len=");
+    ntoskrnl::hal::serial::write_hex_u64_always(header_copy_len as u64);
+    ntoskrnl::hal::serial::write_string_always("\r\n");
     img[..header_copy_len].copy_from_slice(&bytes[..header_copy_len]);
+    let source_head = if bytes.len() >= 8 {
+        let mut value = [0u8; 8];
+        value.copy_from_slice(&bytes[0..8]);
+        u64::from_le_bytes(value)
+    } else {
+        0
+    };
+    let image_head = if img.len() >= 8 {
+        let mut value = [0u8; 8];
+        value.copy_from_slice(&img[0..8]);
+        u64::from_le_bytes(value)
+    } else {
+        0
+    };
+    ntoskrnl::hal::serial::write_string_always("K:mapf-copy-src=");
+    ntoskrnl::hal::serial::write_hex_u64_always(source_head);
+    ntoskrnl::hal::serial::write_string_always("\r\n");
+    ntoskrnl::hal::serial::write_string_always("K:mapf-src-ptr=");
+    ntoskrnl::hal::serial::write_hex_u64_always(bytes.as_ptr() as u64);
+    ntoskrnl::hal::serial::write_string_always("\r\n");
+    ntoskrnl::hal::serial::write_string_always("K:mapf-img-ptr=");
+    ntoskrnl::hal::serial::write_hex_u64_always(img.as_ptr() as u64);
+    ntoskrnl::hal::serial::write_string_always("\r\n");
+    ntoskrnl::hal::serial::write_string_always("K:mapf-copy-dst=");
+    ntoskrnl::hal::serial::write_hex_u64_always(image_head);
+    ntoskrnl::hal::serial::write_string_always("\r\n");
     // Copy sections. Section table starts right after the optional
     // header.
     let sect_off = opt_off + file_hdr.size_of_optional_header as usize;
@@ -1134,7 +1178,13 @@ fn resolve_imports(
                 break;
             }
             let iat_off_in_image = iat_rva + 8 * ((ilt_off - ilt_off_file) as u32 / 8);
-            if entry & 0x8000_0000_0000_0000 != 0 {
+            // `IMAGE_ORDINAL_FLAG64` **set** means "import by
+            // ordinal"; a clear bit means the entry is a hint/name
+            // RVA. This is the exact inverse of the PE32 convention
+            // (where bit 31 of a 32-bit entry means "by ordinal"),
+            // because the 64-bit flag was moved to bit 63 so both
+            // conventions could coexist in the same slot.
+            if entry & IMAGE_ORDINAL_FLAG64 == 0 {
                 // Import by name: the low bits are a hint/name RVA.
                 let hint_rva = (entry & 0x7FFF_FFFF) as u32;
                 let resolved = rva_to_file(hint_rva)
@@ -2308,6 +2358,26 @@ fn map_prebuilt_image_into_user_address_space(
     ntoskrnl::hal::serial::write_hex_u64_always(image_base);
     ntoskrnl::hal::serial::write_string_always(" soi=");
     ntoskrnl::hal::serial::write_hex_u64_always(size_of_image as u64);
+    ntoskrnl::hal::serial::write_string_always("\r\n");
+    let head0 = if prebuilt.len() >= 8 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&prebuilt[0..8]);
+        u64::from_le_bytes(bytes)
+    } else {
+        0
+    };
+    ntoskrnl::hal::serial::write_string_always("K:mapf-head0=");
+    ntoskrnl::hal::serial::write_hex_u64_always(head0);
+    ntoskrnl::hal::serial::write_string_always("\r\n");
+    let head88 = if prebuilt.len() >= 0x90 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&prebuilt[0x88..0x90]);
+        u64::from_le_bytes(bytes)
+    } else {
+        0
+    };
+    ntoskrnl::hal::serial::write_string_always("K:mapf-head88=");
+    ntoskrnl::hal::serial::write_hex_u64_always(head88);
     ntoskrnl::hal::serial::write_string_always("\r\n");
     let (file_hdr, _opt_size, magic, opt_off) = match parse_headers(prebuilt) {
         Some(h) => h,

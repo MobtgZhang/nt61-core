@@ -230,9 +230,7 @@ impl<T: ?Sized> Spinlock<T> {
                     LONG_SPIN_EVENTS.fetch_add(1, Ordering::Relaxed);
                     let loc = core::panic::Location::caller();
                     let _ = loc;
-                    crate::hal::serial::write_string_always(
-                        "[SYNC] spinlock contention @ ",
-                    );
+                    crate::hal::serial::write_string_always("[SYNC] spinlock contention @ ");
                     crate::hal::serial::write_string_always(core::any::type_name::<T>());
                     crate::hal::serial::write_string_always(" @ ");
                     crate::hal::serial::write_string_always(loc.file());
