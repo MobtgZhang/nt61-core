@@ -10,11 +10,21 @@ extern crate alloc;
 
 pub mod arch;
 pub mod boot;
+pub mod compositor;
+pub mod controls;
+pub mod file;
 pub mod fs;
+pub mod graphics;
+pub mod login;
+pub mod platform;
 #[cfg(any(test, feature = "resource-gen"))]
 pub mod resource_generator;
 pub mod resources;
 pub mod shell;
 pub mod theme;
+pub mod user_allocator;
+pub mod widgets;
+pub mod win32;
+pub mod window;
 
 pub const NT_VERSION: (u16, u16, u16) = (6, 1, 7601);
