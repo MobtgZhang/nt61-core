@@ -19,10 +19,22 @@ pub struct MachineIds {
 
 pub fn machine_ids_for(arch: &str) -> MachineIds {
     match arch {
-        "x86_64" => MachineIds { pe_machine: 0x8664, elf_machine: 62 },
-        "aarch64" => MachineIds { pe_machine: 0xAA64, elf_machine: 183 },
-        "riscv64" => MachineIds { pe_machine: 0x5064, elf_machine: 243 },
-        _ => MachineIds { pe_machine: 0x6264, elf_machine: 258 },
+        "x86_64" => MachineIds {
+            pe_machine: 0x8664,
+            elf_machine: 62,
+        },
+        "aarch64" => MachineIds {
+            pe_machine: 0xAA64,
+            elf_machine: 183,
+        },
+        "riscv64" => MachineIds {
+            pe_machine: 0x5064,
+            elf_machine: 243,
+        },
+        _ => MachineIds {
+            pe_machine: 0x6264,
+            elf_machine: 258,
+        },
     }
 }
 
@@ -100,8 +112,7 @@ pub fn elf_to_pe(elf: &[u8], arch: &str) -> Option<Vec<u8>> {
             continue;
         }
         raw_offsets.push(file_size);
-        file_size = file_size.next_multiple_of(FILE_ALIGN)
-            + filesz.next_multiple_of(FILE_ALIGN);
+        file_size = file_size.next_multiple_of(FILE_ALIGN) + filesz.next_multiple_of(FILE_ALIGN);
     }
 
     let mut pe = vec![0u8; file_size as usize];
@@ -113,8 +124,7 @@ pub fn elf_to_pe(elf: &[u8], arch: &str) -> Option<Vec<u8>> {
     pe[0x83] = 0;
     let coff = 0x84usize;
     pe[coff..coff + 2].copy_from_slice(&ids.pe_machine.to_le_bytes());
-    pe[coff + 2..coff + 4]
-        .copy_from_slice(&(segments.len() as u16).to_le_bytes());
+    pe[coff + 2..coff + 4].copy_from_slice(&(segments.len() as u16).to_le_bytes());
     pe[coff + 16..coff + 18].copy_from_slice(&0xF0u16.to_le_bytes());
     pe[coff + 18..coff + 20].copy_from_slice(&0x0022u16.to_le_bytes());
 
@@ -126,14 +136,10 @@ pub fn elf_to_pe(elf: &[u8], arch: &str) -> Option<Vec<u8>> {
         .map(|s| s.1 as u32)
         .sum();
     pe[opt + 4..opt + 8].copy_from_slice(&size_of_code.to_le_bytes());
-    pe[opt + 0x10..opt + 0x14]
-        .copy_from_slice(&(entry_rva as u32).to_le_bytes());
-    pe[opt + 0x18..opt + 0x20]
-        .copy_from_slice(&image_base.to_le_bytes());
-    pe[opt + 0x20..opt + 0x24]
-        .copy_from_slice(&0x1000u32.to_le_bytes());
-    pe[opt + 0x24..opt + 0x28]
-        .copy_from_slice(&(FILE_ALIGN as u32).to_le_bytes());
+    pe[opt + 0x10..opt + 0x14].copy_from_slice(&(entry_rva as u32).to_le_bytes());
+    pe[opt + 0x18..opt + 0x20].copy_from_slice(&image_base.to_le_bytes());
+    pe[opt + 0x20..opt + 0x24].copy_from_slice(&0x1000u32.to_le_bytes());
+    pe[opt + 0x24..opt + 0x28].copy_from_slice(&(FILE_ALIGN as u32).to_le_bytes());
     // NT 6.1 version fields (OS 6.1 / Subsystem 6.1).
     pe[opt + 0x28] = 6;
     pe[opt + 0x2A] = 1;
@@ -144,10 +150,8 @@ pub fn elf_to_pe(elf: &[u8], arch: &str) -> Option<Vec<u8>> {
     pe[opt + 0x2E] = 1;
     pe[opt + 0x30] = 6;
     pe[opt + 0x32] = 1;
-    pe[opt + 0x38..opt + 0x3C]
-        .copy_from_slice(&(size_of_image as u32).to_le_bytes());
-    pe[opt + 0x3C..opt + 0x40]
-        .copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
+    pe[opt + 0x38..opt + 0x3C].copy_from_slice(&(size_of_image as u32).to_le_bytes());
+    pe[opt + 0x3C..opt + 0x40].copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
     pe[opt + 0x44..opt + 0x46].copy_from_slice(&0x000Au16.to_le_bytes());
     pe[opt + 0x48..opt + 0x50].copy_from_slice(&0x100000u64.to_le_bytes());
     pe[opt + 0x50..opt + 0x58].copy_from_slice(&0x1000u64.to_le_bytes());
@@ -159,9 +163,7 @@ pub fn elf_to_pe(elf: &[u8], arch: &str) -> Option<Vec<u8>> {
     const CODE: u32 = 0x6000_0020; // CNT_CODE | EXECUTE | READ
     const DATA_RW: u32 = 0xC000_0040; // CNT_DATA | READ | WRITE
     const DATA_RO: u32 = 0x4000_0040; // CNT_DATA | READ
-    for (index, (vaddr, filesz, memsz, flags, file_off)) in
-        segments.iter().enumerate()
-    {
+    for (index, (vaddr, filesz, memsz, flags, file_off)) in segments.iter().enumerate() {
         let header = sect_table as usize + index * 40;
         if header + 40 > HEADER_SIZE as usize {
             return None;
@@ -173,17 +175,11 @@ pub fn elf_to_pe(elf: &[u8], arch: &str) -> Option<Vec<u8>> {
         } else {
             b".rdata"
         };
-        pe[header..header + name.len()]
-            .copy_from_slice(name);
-        pe[header + 8..header + 12]
-            .copy_from_slice(&(*memsz as u32).to_le_bytes());
-        pe[header + 12..header + 16].copy_from_slice(
-            &((*vaddr - image_base) as u32).to_le_bytes(),
-        );
-        pe[header + 16..header + 20]
-            .copy_from_slice(&(*filesz as u32).to_le_bytes());
-        pe[header + 20..header + 24]
-            .copy_from_slice(&(raw_offsets[index] as u32).to_le_bytes());
+        pe[header..header + name.len()].copy_from_slice(name);
+        pe[header + 8..header + 12].copy_from_slice(&(*memsz as u32).to_le_bytes());
+        pe[header + 12..header + 16].copy_from_slice(&((*vaddr - image_base) as u32).to_le_bytes());
+        pe[header + 16..header + 20].copy_from_slice(&(*filesz as u32).to_le_bytes());
+        pe[header + 20..header + 24].copy_from_slice(&(raw_offsets[index] as u32).to_le_bytes());
         let chars = if flags & 0x1 != 0 {
             CODE
         } else if flags & 0x2 != 0 {
@@ -191,8 +187,7 @@ pub fn elf_to_pe(elf: &[u8], arch: &str) -> Option<Vec<u8>> {
         } else {
             DATA_RO
         };
-        pe[header + 36..header + 40]
-            .copy_from_slice(&chars.to_le_bytes());
+        pe[header + 36..header + 40].copy_from_slice(&chars.to_le_bytes());
         if *filesz > 0 {
             let src = usize::try_from(*file_off).ok()?;
             let src_end = src.checked_add(*filesz as usize)?;
@@ -200,8 +195,7 @@ pub fn elf_to_pe(elf: &[u8], arch: &str) -> Option<Vec<u8>> {
                 return None;
             }
             let dst = raw_offsets[index] as usize;
-            pe[dst..dst + *filesz as usize]
-                .copy_from_slice(&elf[src..src_end]);
+            pe[dst..dst + *filesz as usize].copy_from_slice(&elf[src..src_end]);
         }
     }
     Some(pe)

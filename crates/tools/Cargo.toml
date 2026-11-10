@@ -53,12 +53,13 @@ nt61-loader = { path = "../loader" }
 # hive_gen is always available
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
 uuid = { version = "1.12", default-features = false }
 tempfile = { version = "3.8", optional = true }
 
 [dev-dependencies]
 tempfile = "3.8"
+# The metrics schema test parses `docs/desktop/win7-metrics.toml`.
+toml = "0.8"
 
 [features]
 default = []

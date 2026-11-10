@@ -3017,7 +3017,40 @@ fn generate_pe_files_in_process(system32_dir: &Path) -> Result<()> {
         driver_count,
         total
     ));
+    generate_win32_dlls(system32_dir)?;
     generate_desktop_resources(system32_dir)?;
+    Ok(())
+}
+
+/// Write the Win32 Ring 3 DLLs into `C:\Windows\System32`.
+///
+/// These are the *real* PE32+ DLLs described in `fs::win32_dlls`:
+/// GUI subsystem, import table, export table and base relocations.
+/// The old `build_ntdll_pe` / `build_kernel32_pe` stubs were
+/// single-section images with an EFI-application subsystem and no
+/// import table, so nothing could link against them.
+///
+/// `ntdll.dll` and `kernel32.dll` are written from the same
+/// specification, replacing the old stubs.
+fn generate_win32_dlls(system32_dir: &Path) -> Result<()> {
+    use super::win32_dlls;
+
+    let mut total = 0usize;
+    for spec in win32_dlls::ALL_DLLS {
+        let bytes = win32_dlls::build_dll_image(spec);
+        let dest = system32_dir.join(spec.file_name);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(BuildError::Io)?;
+        }
+        let bytes = refresh_pe_checksum(bytes);
+        std::fs::write(&dest, &bytes).map_err(BuildError::Io)?;
+        total += bytes.len();
+    }
+    log::info(&format!(
+        "Generated {} Win32 DLLs ({} bytes)",
+        win32_dlls::ALL_DLLS.len(),
+        total
+    ));
     Ok(())
 }
 
@@ -3244,7 +3277,10 @@ fn explorer_pe() -> Vec<u8> {
 /// comment there for why `objcopy -O pei-*` is not used).
 fn logonui_pe() -> Vec<u8> {
     let arch = current_pe_arch();
-    let elf_rel = format!("target/{}/release/logonui", kernel_target_for(arch_name(arch)));
+    let elf_rel = format!(
+        "target/{}/release/logonui",
+        kernel_target_for(arch_name(arch))
+    );
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     if let Ok(elf) = std::fs::read(workspace_root.join(&elf_rel)) {
         if elf.len() >= 5 && &elf[0..5] == [0x7F, b'E', b'L', b'F', 2] {
@@ -3439,14 +3475,14 @@ pub fn build_system_images() -> Vec<SystemImage> {
             name: "BOOTVID.DLL",
             bytes: build_bootvid_pe(),
         },
-        SystemImage {
-            name: "ntdll.dll",
-            bytes: build_ntdll_pe(),
-        },
-        SystemImage {
-            name: "kernel32.dll",
-            bytes: build_kernel32_pe(),
-        },
+        // `ntdll.dll` and `kernel32.dll` are written by
+        // `generate_win32_dlls` from the shared specification in
+        // `fs::win32_dlls`. Listing them here as well would produce
+        // two different images with the same name — one of them
+        // without an import table and with the EFI-application
+        // subsystem — and which one landed on the disk would depend
+        // on the write order.
+        //
         // cmd.exe — the Safe-Mode CMD user-mode host. The kernel
         // reads this PE directly from `<system32>/cmd.exe` at
         // boot (see `try_launch_cmd_exe_arch` in `arch/boot.rs`),
@@ -3809,48 +3845,11 @@ fn build_bootvid_pe() -> Vec<u8> {
     )
 }
 
-fn build_ntdll_pe() -> Vec<u8> {
-    let exports = [
-        ("NtCreateFile", SECTION_ALIGNMENT),
-        ("NtReadFile", SECTION_ALIGNMENT + 0x10),
-        ("NtWriteFile", SECTION_ALIGNMENT + 0x20),
-        ("NtClose", SECTION_ALIGNMENT + 0x30),
-        ("NtAllocateVirtualMemory", SECTION_ALIGNMENT + 0x40),
-        ("NtFreeVirtualMemory", SECTION_ALIGNMENT + 0x50),
-        ("NtQuerySystemInformation", SECTION_ALIGNMENT + 0x60),
-        ("RtlAllocateHeap", SECTION_ALIGNMENT + 0x70),
-        ("RtlFreeHeap", SECTION_ALIGNMENT + 0x80),
-        ("LdrLoadDll", SECTION_ALIGNMENT + 0x90),
-        ("RtlUserThreadStart", SECTION_ALIGNMENT + 0xA0),
-    ];
-    build_pe_image(
-        0x0000_1000_0000_0000,
-        SECTION_ALIGNMENT,
-        IMAGE_SUBSYSTEM_WINDOWS_CUI,
-        true,
-        &exports,
-    )
-}
-
-fn build_kernel32_pe() -> Vec<u8> {
-    let exports = [
-        ("CreateFileW", SECTION_ALIGNMENT),
-        ("ReadFile", SECTION_ALIGNMENT + 0x10),
-        ("WriteFile", SECTION_ALIGNMENT + 0x20),
-        ("CloseHandle", SECTION_ALIGNMENT + 0x30),
-        ("VirtualAlloc", SECTION_ALIGNMENT + 0x40),
-        ("VirtualFree", SECTION_ALIGNMENT + 0x50),
-        ("LoadLibraryW", SECTION_ALIGNMENT + 0x60),
-        ("GetProcAddress", SECTION_ALIGNMENT + 0x70),
-    ];
-    build_pe_image(
-        0x0000_1000_1000_0000,
-        SECTION_ALIGNMENT,
-        IMAGE_SUBSYSTEM_WINDOWS_CUI,
-        true,
-        &exports,
-    )
-}
+// `ntdll.dll` and `kernel32.dll` used to be built here as
+// single-section images with an EFI-application subsystem and no
+// import table. They are now produced by `fs::win32_dlls` from the
+// shared Win32 DLL specification, so that the DLLs on the disk and
+// the DLLs the tests verify are the same bytes.
 
 fn build_smss_pe() -> Vec<u8> {
     let exports = [

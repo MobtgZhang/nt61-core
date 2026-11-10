@@ -10,22 +10,26 @@
 
 pub mod backend;
 pub mod build;
-#[path = "elf_to_pe.rs"]
-pub mod elf_to_pe;
 pub mod copy;
 pub mod dir;
+#[path = "elf_to_pe.rs"]
+pub mod elf_to_pe;
 pub mod esp;
 pub mod ext4;
 pub mod fat32;
 pub mod image;
 pub mod iso9660;
+pub mod lld_link;
 pub mod ntfs;
 pub mod partition;
+pub mod pe;
+pub mod pe_read;
 pub mod qcow2;
 pub mod refs;
 pub mod remove;
 pub mod stubs;
 pub mod system;
+pub mod win32_dlls;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
