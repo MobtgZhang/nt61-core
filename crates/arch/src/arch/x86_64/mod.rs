@@ -40,7 +40,6 @@ pub mod user_syscall;
 pub use context::{CpuContext, ThreadContext};
 pub use paging::{PageTableEntry, PhysAddr, VirtAddr, PAGE_SHIFT, PAGE_SIZE};
 
-pub mod boot_anim;
 pub mod dynamic_paging;
 pub mod exception;
 pub mod idt_header;
