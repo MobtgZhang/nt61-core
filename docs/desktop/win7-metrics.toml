@@ -1,0 +1,240 @@
+# NT61 Win7 SP1 Aero — Visual Metrics Specification
+#
+# This file is the SINGLE SOURCE OF TRUTH for every pixel-level decision
+# in the NT61 desktop. Rendering code (theme engine, uxtheme, comctl32,
+# explorer shell, DWM compositor, LogonUI) must read these numbers
+# instead of hard-coding literals.
+#
+# All numbers are Win7 SP1 (6.1.7601) values at 96 DPI unless the key
+# name says otherwise. Colours are RGB triplets (0..=255).
+#
+# Colour sources: `GetSysColor` / `GetSysColorBrush` index values are
+# part of the public Win32 API and are documented by Microsoft. Image
+# assets are procedurally generated — no Microsoft artwork is shipped.
+
+[meta]
+spec_version = "1.0.0"
+target_os = "Windows 7 SP1"
+target_build = 7601
+dpi = 96
+
+[screen]
+# The reference resolution is 1024x768; the desktop must scale the
+# taskbar and Start orb by the *actual* display height when the
+# resolution changes, but the metrics below are the 96 DPI baseline.
+reference_width = 1024
+reference_height = 768
+
+# ---------------------------------------------------------------------
+# System metrics that GetSystemMetrics(SM_*) must report.
+# These are the Win7 values, not the 1024x768 hard-code that the
+# pre-A baseline used.
+# ---------------------------------------------------------------------
+sm_cxscreen = 1024
+sm_cyscreen = 768
+sm_cxframe = 8          # SM_CXFRAME (includes resize border)
+sm_cyframe = 8
+sm_cxcaption = 22       # SM_CYCAPTION
+sm_cycaption = 22
+sm_cxmenu = 0
+sm_cymenu = 19
+sm_cxborder = 1
+sm_cyborder = 1
+sm_cxscrollbar = 17
+sm_cyscrollbar = 17
+sm_cxicon = 32
+sm_cyicon = 32
+sm_cxiconv = 16
+sm_cyiconv = 16
+sm_cxiconh = 24
+sm_cyiconh = 24
+sm_cxmenudropdown = 16
+sm_cxmenubar = 0
+sm_cxsize = 26          # SM_CXSIZE (caption button width)
+sm_cysize = 26
+sm_cxmin = 26           # SM_CXMIN (minimize button width)
+sm_cymin = 26
+sm_cxmax = 26
+sm_cymax = 26
+sm_cxsizegrrip = 26
+sm_cysizegrrip = 26
+sm_cxdoubleclk = 4
+sm_cydoubleclk = 4
+sm_cxhline = 0
+sm_cxvscroll = 17
+sm_cxicon_spacing = 12
+sm_cxborderwidth = 1
+sm_cxsizeframework = 4  # SM_CXSIZEFRAME
+
+# ---------------------------------------------------------------------
+# Taskbar (Win7 "Superbar")
+# ---------------------------------------------------------------------
+taskbar_height = 40
+taskbar_button_width = 160
+taskbar_button_height = 40
+taskbar_button_padding = 4
+taskbar_top_inset = 0
+# Win7 draws the taskbar button text with a 1px white drop shadow
+# below the glyph when the taskbar is glass.
+taskbar_text_shadow = 1
+
+# Start Orb
+orb_size = 36
+orb_margin = 6
+orb_gloss_height_ratio = 0.55
+orb_glow_radius = 4
+orb_glow_alpha = 0.35
+
+# Notification area / system tray
+tray_width = 118
+tray_icon_size = 16
+tray_icon_spacing = 2
+tray_padding = 4
+
+# Clock
+clock_width = 68
+clock_height = 40
+clock_font_size = 12
+
+# Show Desktop peek strip
+show_desktop_width = 10
+
+# ---------------------------------------------------------------------
+# Window frame
+# ---------------------------------------------------------------------
+[window]
+caption_height = 22
+caption_button_width = 29
+caption_button_height = 21
+caption_button_gap = 0
+caption_text_x = 8
+caption_text_size = 12
+# Distance from the right edge of the window to the close button.
+caption_button_right_margin = 4
+
+border_width = 8
+resize_grip = 14
+corner_radius = 8
+shadow_extent = 12
+shadow_opacity = 0.45
+
+# ---------------------------------------------------------------------
+# Aero glass
+# ---------------------------------------------------------------------
+[aero]
+glass_tint = [0x1E, 0x40, 0x7A]
+glass_tint_alpha = 0.55
+glass_highlight = 0.28
+glass_blur_radius = 12
+glass_saturation = 1.30
+glass_frame_tint = [0x4A, 0x7A, 0xB8]
+glass_frame_tint_alpha = 0.30
+glass_frame_highlight = 0.35
+glass_outer_glow_alpha = 0.20
+
+active_caption_text = [0xFF, 0xFF, 0xFF]
+inactive_caption_text = [0xE8, 0xE8, 0xE8]
+active_caption_glow = 0.55
+inactive_caption_glow = 0.12
+title_text_size = 12
+title_text_x = 8
+
+# Window body (Win7 Basic / non-Aero fallback)
+window_body_color = [0xF0, 0xF0, 0xF0]
+window_body_text = [0x00, 0x00, 0x00]
+window_border_color = [0x70, 0x70, 0x70]
+window_inactive_body = [0xF5, 0xF5, 0xF5]
+
+# ---------------------------------------------------------------------
+# Start menu (Win7 two-column layout)
+# ---------------------------------------------------------------------
+[start_menu]
+width = 440
+height = 640
+left_pane_width = 260
+right_pane_width = 180
+header_height = 58
+footer_height = 46
+search_height = 24
+item_height = 32
+recent_items = 17
+separator_height = 1
+radius = 8
+backdrop_blur = 14
+backdrop_tint = [0x20, 0x30, 0x50]
+backdrop_tint_alpha = 0.55
+text = [0xFF, 0xFF, 0xFF]
+text_shadow = [0x00, 0x00, 0x00]
+selected = [0x3A, 0x6E, 0xA5]
+selected_alpha = 0.70
+
+# ---------------------------------------------------------------------
+# Logon UI
+# ---------------------------------------------------------------------
+[logon]
+panel_width = 320
+panel_height = 300
+avatar_size = 96
+password_field = [28, 208, 210, 30]
+password_field_y = 208
+username_y = 168
+brand_baseline = 96
+user_text_size = 18
+error_text_size = 12
+background_tint = [0x05, 0x10, 0x28]
+background_tint_alpha = 0.45
+panel_blur = 10
+panel_tint = [0x18, 0x30, 0x60]
+panel_tint_alpha = 0.60
+ease_access = [24, 96]
+shutdown = [24, 96]
+
+# ---------------------------------------------------------------------
+# Desktop icons
+# ---------------------------------------------------------------------
+[desktop]
+icon_size = 48
+icon_spacing_x = 80
+icon_spacing_y = 80
+icon_label_width = 72
+icon_label_height = 30
+icon_label_size = 12
+selection_fill = [0x33, 0x66, 0x99]
+selection_alpha = 0.45
+selection_border = [0xC0, 0xD8, 0xF0]
+label_shadow_alpha = 0.75
+
+# ---------------------------------------------------------------------
+# Fonts
+# ---------------------------------------------------------------------
+[font]
+# The names below are the Win7 *metric reference* names only. The
+# actual faces shipped with NT61 are listed in docs/desktop/
+# theme-license.md and are open-licensed substitutes.
+ui_family = "Segoe UI"
+ui_size = 9               # pt @96 DPI -> 12 px
+caption_size = 9
+small_size = 8            # pt -> 11 px
+title_size = 9
+menu_size = 9
+icon_label_size = 9
+logon_name_size = 14      # pt -> 18 px
+
+[font.fallback]
+# Fallback chain used by the glyph resolver: index 0 is primary.
+families = ["NT61 Sans", "Liberation Sans", "DejaVu Sans", "Noto Sans CJK SC"]
+cjk_family = "Noto Sans CJK SC"
+
+[animation]
+# Win7 animation durations (ms).
+menu_fade_in = 140
+menu_fade_out = 100
+window_minimize = 200
+window_restore = 200
+window_open = 200
+window_close = 160
+start_orb_hover = 100
+start_orb_press = 60
+flip_3d_step = 90
+peek_fade = 120
+snap_preview = 120
