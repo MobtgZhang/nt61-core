@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/init",
   "crates/arch",
+  "crates/abi",
   "crates/boot-types",
   "crates/sync",
   "crates/ntoskrnl",

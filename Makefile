@@ -78,6 +78,16 @@ EDK2_LOONGARCH64_VARS = $(IMAGES_DIR)/edk2_loongarch64_vars.fd
 
 # QEMU
 QEMU_X86 := qemu-system-x86_64
+# Safe mode uses the stable GTK framebuffer path. Pass QEMU_GPU_MODE=gl only
+# when the host EGL/GLX stack is known to work with virgl/QEMU.
+QEMU_GPU_MODE ?= safe
+ifeq ($(QEMU_GPU_MODE),gl)
+QEMU_GPU_DEVICE := -device virtio-gpu-gl-pci,xres=1024,yres=768,blob=on
+QEMU_DISPLAY := -display gtk,gl=on,zoom-to-fit=off
+else
+QEMU_GPU_DEVICE := -device virtio-gpu-pci,xres=1024,yres=768
+QEMU_DISPLAY := -display gtk,zoom-to-fit=off
+endif
 QEMU_AARCH64 := qemu-system-aarch64
 QEMU_RISCV64 := qemu-system-riscv64
 QEMU_LOONGARCH64 := qemu-system-loongarch64
@@ -450,14 +460,16 @@ define _run_x86_64
 	@$(SCRIPT_DIR)/scripts/ensure-qemu-bridge.sh
 	@rm -f /tmp/nt61-qmp-$(ARCH).sock
 	@echo "Starting QEMU (x86_64/$(FORMAT))..."
-	$(QEMU_X86) -machine q35 -m 8G -smp 4 \
+	@echo "QEMU_GPU_MODE=$(QEMU_GPU_MODE)"
+	env GDK_BACKEND=x11 GDK_SCALE=1 GDK_DPI_SCALE=1 $(QEMU_X86) -machine q35 -m 8G -smp 4 \
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		$(DISK_FLAGS) \
 		-boot $(if $(filter iso,$(FORMAT)),d,c) $(QEMU_NET_BRIDGE) \
 		-device virtio-keyboard-pci \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) -display gtk
+		$(QEMU_GPU_DEVICE) \
+		-serial file:$(SERIAL_LOG) $(QEMU_DISPLAY)
 endef
 
 define _run_aarch64
@@ -531,7 +543,7 @@ run-serial:
 	$(MAKE) run-$(ARCH)-$(FORMAT)-serial
 
 run-gtk:
-	$(MAKE) run-$(ARCH)-$(FORMAT)-serial
+	$(MAKE) run-$(ARCH)-$(FORMAT)
 
 # ============================================================
 # Per-arch quick-run targets (NTFS default)
@@ -825,6 +837,7 @@ run-x86_64-ntfs-serial: build-x86_64-ntfs
 		-drive format=raw,file=$(DISK_IMG) \
 		-boot c -net none \
 		-device virtio-keyboard-pci \
+		-device virtio-gpu-pci,xres=1024,yres=768,blob=on \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) -display gtk || true
 
@@ -841,6 +854,7 @@ run-x86_64-fat32-serial: build-x86_64-fat32
 		-drive format=raw,file=$(DISK_IMG) \
 		-boot c -net none \
 		-device virtio-keyboard-pci \
+		-device virtio-gpu-pci,xres=1024,yres=768,blob=on \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) -display gtk || true
 
@@ -857,6 +871,7 @@ run-x86_64-ext4-serial: build-x86_64-ext4
 		-drive format=raw,file=$(DISK_IMG) \
 		-boot c -net none \
 		-device virtio-keyboard-pci \
+		-device virtio-gpu-pci,xres=1024,yres=768,blob=on \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) -display gtk || true
 
@@ -1164,7 +1179,7 @@ test-host:
 
 test-desktop:
 	@echo "Running desktop shell and resource tests..."
-	cargo test -p nt61-desktop -- --nocapture
+	cargo test -p nt61-desktop --features resource-gen -- --nocapture
 
 test-pe:
 	@echo "Running PE validation tests..."
