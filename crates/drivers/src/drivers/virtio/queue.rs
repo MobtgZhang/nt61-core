@@ -7,10 +7,8 @@
 //! supported target, so virtual-to-physical translation is performed
 //! through mm::virt_to_phys.
 
-use alloc::vec::Vec;
-use core::alloc::Layout;
-
 use crate::mm::virt_to_phys;
+use alloc::vec::Vec;
 
 // Descriptor flag bits (virtio_ring.h VRING_DESC_F_*).
 pub const VRING_DESC_F_NEXT: u16 = 1;
@@ -90,37 +88,34 @@ impl QueueLayout {
         let used_len = 4 + num as usize * core::mem::size_of::<UsedElement>() + 2;
         let align = 16;
         let avail_off = (desc_len + align - 1) & !(align - 1);
-        let used_off = (avail_off + avail_len + align - 1) & !(align - 1);
+        let used_off = (avail_off + avail_len + 0x0FFF) & !0x0FFF;
         let mem_len = used_off + used_len;
 
-        let _layout = match Layout::from_size_align(mem_len, QUEUE_ALIGNMENT) {
-            Ok(layout) => layout,
-            Err(_) => return None,
-        };
         crate::hal::serial::write_string_always("[QUEUE] layout ok\r\n");
-        let stack_probe = 0u8;
-        let stack_addr = (&stack_probe as *const u8) as u64;
-        crate::hal::serial::write_string_always("[QUEUE] sp=0x");
-        crate::hal::serial::write_hex_u64_always(stack_addr);
-        crate::hal::serial::write_string_always(" size=0x");
-        crate::hal::serial::write_hex_u64_always(mem_len as u64);
-        crate::hal::serial::write_string_always("\r\n");
-        let page_count = mem_len.div_ceil(4096) as u64;
+        let page_count = mem_len.div_ceil(0x1000) as u64;
         let mem_phys = crate::mm::allocate_pages(page_count)?;
         let map_base = mem_phys & !0x1F_FFFF;
-        if !crate::arch::identity_map_region(map_base, 0x20_0000) {
+        let map_len = ((mem_len as u64) + (mem_phys - map_base)).div_ceil(0x20_0000) * 0x20_0000;
+        if !crate::arch::identity_map_region(map_base, map_len) {
             crate::mm::free_pages(mem_phys, page_count);
             return None;
         }
         let mem = mem_phys as *mut u8;
-        if mem.is_null() {
-            return None;
-        }
         unsafe {
             core::ptr::write_bytes(mem, 0, mem_len);
             let desc = mem as *mut Descriptor;
             let avail_base = mem.add(avail_off);
             let used_base = mem.add(used_off);
+
+            crate::hal::serial::write_string_always("[QUEUE] mem va=0x");
+            crate::hal::serial::write_hex_u64_always(mem as u64);
+            crate::hal::serial::write_string_always(" desc va=0x");
+            crate::hal::serial::write_hex_u64_always(desc as u64);
+            if let Some(phys) = virt_to_phys(desc as u64) {
+                crate::hal::serial::write_string_always(" desc pa=0x");
+                crate::hal::serial::write_hex_u64_always(phys);
+            }
+            crate::hal::serial::write_string_always("\r\n");
 
             // Free list: every descriptor chained through next.
             for i in 0..num as usize {
@@ -165,6 +160,22 @@ impl QueueLayout {
 
     pub fn used_physical(&self) -> Option<u64> {
         virt_to_phys(self.used_base as u64)
+    }
+
+    pub fn debug_descriptor(&self, head: u16) -> (u64, u32, u16, u16) {
+        unsafe {
+            let d = self.desc.add(head as usize);
+            (
+                (*d).addr,
+                (*d).len,
+                (*d).flags,
+                if (*d).flags & VRING_DESC_F_NEXT != 0 {
+                    (*d).next
+                } else {
+                    0
+                },
+            )
+        }
     }
 
     /// Append one descriptor chain built from buffers and return the
@@ -264,8 +275,7 @@ impl QueueLayout {
 impl Drop for QueueLayout {
     fn drop(&mut self) {
         if !self.mem.is_null() {
-            let page_count = self.mem_len.div_ceil(4096) as u64;
-            crate::mm::free_pages(self.mem as u64, page_count);
+            crate::mm::free_pages(self.mem as u64, self.mem_len.div_ceil(0x1000) as u64);
             self.mem = core::ptr::null_mut();
         }
     }

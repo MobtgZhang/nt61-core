@@ -5,7 +5,9 @@
 
 use crate::hal::common::pci;
 use crate::mm::pool::{self, PoolType};
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU16, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicI16, AtomicPtr, AtomicU16, AtomicU8, AtomicUsize, Ordering,
+};
 
 const VENDOR_VIRTIO: u16 = 0x1AF4;
 const DEVICE_INPUT_MODERN: u16 = 0x1040 + 18;
@@ -66,7 +68,11 @@ const CAP_ISR_CFG: u8 = 3;
 
 const DESC_F_WRITE: u16 = 2;
 const EVENT_TYPE_KEY: u16 = 1;
+const EVENT_TYPE_REL: u16 = 2;
 const KEY_VALUE_RELEASE: i32 = 0;
+const BTN_LEFT: u16 = 0x130;
+const BTN_RIGHT: u16 = 0x131;
+const BTN_MIDDLE: u16 = 0x132;
 
 const QUEUE_SIZE: u16 = 64;
 const EVENT_SIZE: usize = 8;
@@ -221,7 +227,28 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
     let event_type = u16::from_le_bytes([event[0], event[1]]);
     let code = u16::from_le_bytes([event[2], event[3]]);
     let value = i32::from_le_bytes([event[4], event[5], event[6], event[7]]);
+    if event_type == EVENT_TYPE_REL {
+        let delta = i16::try_from(value).unwrap_or(0);
+        if code == 0 {
+            let x = MOUSE_X.load(Ordering::Relaxed);
+            MOUSE_X.store(x.saturating_add(delta).max(0), Ordering::Relaxed);
+        } else if code == 1 {
+            let y = MOUSE_Y.load(Ordering::Relaxed);
+            MOUSE_Y.store(y.saturating_add(delta).max(0), Ordering::Relaxed);
+        }
+        return;
+    }
     if event_type != EVENT_TYPE_KEY {
+        return;
+    }
+    if (BTN_LEFT..=BTN_MIDDLE).contains(&code) {
+        let bit = 1u8 << (code - BTN_LEFT);
+        let buttons = MOUSE_BUTTONS.load(Ordering::Relaxed);
+        if value == KEY_VALUE_RELEASE {
+            MOUSE_BUTTONS.store(buttons & !bit, Ordering::Relaxed);
+        } else if value != 0 {
+            MOUSE_BUTTONS.store(buttons | bit, Ordering::Relaxed);
+        }
         return;
     }
     // Shift releases must clear the modifier state; every other
@@ -241,6 +268,27 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
             enqueue_byte(*byte);
         }
     }
+}
+
+pub fn set_mouse_screen_bounds(width: u32, height: u32) {
+    MOUSE_SCREEN_WIDTH.store(
+        i16::try_from(width.saturating_sub(1)).unwrap_or(i16::MAX),
+        Ordering::Relaxed,
+    );
+    MOUSE_SCREEN_HEIGHT.store(
+        i16::try_from(height.saturating_sub(1)).unwrap_or(i16::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+pub fn get_mouse_state() -> (i16, i16, u8) {
+    let x = MOUSE_X
+        .load(Ordering::Relaxed)
+        .min(MOUSE_SCREEN_WIDTH.load(Ordering::Relaxed));
+    let y = MOUSE_Y
+        .load(Ordering::Relaxed)
+        .min(MOUSE_SCREEN_HEIGHT.load(Ordering::Relaxed));
+    (x, y, MOUSE_BUTTONS.load(Ordering::Relaxed))
 }
 
 fn translate_key(code: u16) -> &'static [u8] {
@@ -609,6 +657,11 @@ static FIRST_EVENT_SEEN: AtomicUsize = AtomicUsize::new(0);
 static RING_HEAD: AtomicUsize = AtomicUsize::new(0);
 static RING_TAIL: AtomicUsize = AtomicUsize::new(0);
 static RING: [AtomicU8; RING_SIZE] = [const { AtomicU8::new(0) }; RING_SIZE];
+static MOUSE_X: AtomicI16 = AtomicI16::new(0);
+static MOUSE_Y: AtomicI16 = AtomicI16::new(0);
+static MOUSE_BUTTONS: AtomicU8 = AtomicU8::new(0);
+static MOUSE_SCREEN_WIDTH: AtomicI16 = AtomicI16::new(i16::MAX);
+static MOUSE_SCREEN_HEIGHT: AtomicI16 = AtomicI16::new(i16::MAX);
 
 /// One decoded virtio-pci capability region (BAR-relative).
 struct CapRegion {
@@ -941,9 +994,7 @@ fn initialise_queue(mmio: *mut u8) -> Option<Queue> {
 
     let mut queue = {
         match allocate_queue(QUEUE_SIZE) {
-            Some(q) => {
-                q
-            }
+            Some(q) => q,
             None => {
                 return None;
             }
@@ -1035,9 +1086,7 @@ fn allocate_queue(size: u16) -> Option<Queue> {
         (*queue.used).index = AtomicU16::new(0);
         queue.descriptor_physical = {
             match translate(allocation as u64) {
-                Some(p) => {
-                    p
-                }
+                Some(p) => p,
                 None => {
                     return None;
                 }

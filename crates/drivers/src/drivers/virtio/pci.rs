@@ -551,7 +551,6 @@ impl PciTransport {
     /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
     pub unsafe fn reset(&mut self) {
         write_u8(self.common_base + COMMON_STATUS, 0);
-        // Wait for the status to clear (virtio spec 2.1.2).
         while read_u8(self.common_base + COMMON_STATUS) != 0 {}
     }
 
