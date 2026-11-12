@@ -66,9 +66,6 @@ pub fn handle_ipi_reschedule() {
     // request and let the interrupted idle loop / IRQ-exit path run
     // the dispatcher at a safe scheduling point.
     crate::ke::scheduler::request_reschedule(crate::ke::scheduler::get_current_cpu_id() as usize);
-    if let Some(percpu) = crate::arch::x86_64::percpu::PerCpuData::try_current() {
-        percpu.set_need_reschedule();
-    }
 }
 
 pub fn handle_ipi_intr_enter() {
