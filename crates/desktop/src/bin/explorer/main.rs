@@ -5,32 +5,39 @@
 mod arch;
 #[path = "../../font_view.rs"]
 mod font_view;
+mod ico;
 mod png;
 mod resources_data;
 
-const AVATAR_PNG: &[u8] = include_bytes!("../../../assets/avatar.png");
-const CLOSE_BUTTON: &[u8] = include_bytes!("../../../assets/7css/gui/icon/close.png");
-const MAXIMIZE_BUTTON: &[u8] = include_bytes!("../../../assets/7css/gui/icon/maximize.png");
-const MINIMIZE_BUTTON: &[u8] = include_bytes!("../../../assets/7css/gui/icon/minimize.png");
-const RESTORE_BUTTON: &[u8] = include_bytes!("../../../assets/7css/gui/icon/restore.png");
-const CURSOR_PNG: &[u8] = include_bytes!("../../../assets/cursor.png");
-const START_ORB_PNG: &[u8] = include_bytes!("../../../assets/theme/orb.png");
-const TASKBAR_PNG: &[u8] = include_bytes!("../../../assets/theme/taskbar.png");
-const DESKTOP_WALLPAPER_PNG: &[u8] = include_bytes!("../../../assets/desktop-wallpaper.png");
+const CURSOR_CUR: &[u8] = include_bytes!("../../../assets/windows7/cursors/aero_arrow_l.cur");
+const WALLPAPER_PNG: &[u8] =
+    include_bytes!("../../../assets/windows7/wallpapers/Desktop/Windows/img0-1024.png");
+const START_BUTTON_NORMAL_PNG: &[u8] =
+    include_bytes!("../../../assets/windows7/start_button_normal.png");
+const START_BUTTON_HOVER_PNG: &[u8] =
+    include_bytes!("../../../assets/windows7/start_button_hover.png");
+const START_BUTTON_PRESSED_PNG: &[u8] =
+    include_bytes!("../../../assets/windows7/start_button_pressed.png");
 
 use core::panic::PanicInfo;
+use nt61_desktop::bmp;
 use nt61_desktop::compositor::aero;
 use nt61_desktop::controls::PointerAction;
 use nt61_desktop::graphics::blit::blit_rgba;
-use nt61_desktop::shell::ShellModel;
+use nt61_desktop::shell::{
+    notification_area_left, taskbar_program_x, ShellModel, CONTROL_DESKTOP_BASE, CONTROL_START,
+    CONTROL_TASKBAR_BASE, PROGRAM_BUTTON_WIDTH, START_BUTTON_WIDTH, START_MENU_HEIGHT,
+    START_MENU_WIDTH, TASKBAR_HEIGHT,
+};
 use nt61_desktop::theme::Theme;
+use nt61_desktop::user_account_pictures::USER;
 
 extern crate alloc;
 
 use nt61_desktop::user_allocator::StaticHeapAllocator;
 
 #[global_allocator]
-static EXPLORER_ALLOCATOR: StaticHeapAllocator<{ 48 * 1024 * 1024 }> = StaticHeapAllocator::new();
+static EXPLORER_ALLOCATOR: StaticHeapAllocator<{ 64 * 1024 * 1024 }> = StaticHeapAllocator::new();
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -53,11 +60,9 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_entry() -> ! {
-    arch::debug_str("[EXPLORER] kernel_entry\r\n");
     desktop_main()
 }
 
-const TASKBAR_HEIGHT: u32 = 40;
 const ICON_CELL: u32 = 96;
 const DESKTOP_MARGIN: u32 = 12;
 const WALLPAPER_TOP: u32 = 0x2f5f8f;
@@ -68,14 +73,11 @@ struct Shell {
     network: png::Image,
     recycle_bin: png::Image,
     control_panel: png::Image,
-    close: png::Image,
-    maximize: png::Image,
-    minimize: png::Image,
-    restore: png::Image,
     avatar: png::Image,
     cursor: png::Image,
-    start_orb: png::Image,
-    taskbar_asset: png::Image,
+    start_button_normal: png::Image,
+    start_button_hover: png::Image,
+    start_button_pressed: png::Image,
     wallpaper_asset: png::Image,
     fonts: font_view::FontPack,
     model: ShellModel,
@@ -84,12 +86,8 @@ struct Shell {
 }
 
 fn desktop_main() -> ! {
-    #[cfg(target_arch = "x86_64")]
-    arch::debug_str("[EXPLORER] enter\r\n");
     let mut framebuffer = arch::DesktopFramebufferInfo::default();
     arch::desktop_info(&mut framebuffer);
-    #[cfg(target_arch = "x86_64")]
-    arch::debug_str("[EXPLORER] fb ok\r\n");
     if framebuffer.width == 0 || framebuffer.height == 0 {
         loop {
             let mut key = 0u8;
@@ -102,8 +100,6 @@ fn desktop_main() -> ! {
     let mut shell = match Shell::load() {
         Some(shell) => shell,
         None => {
-            #[cfg(target_arch = "x86_64")]
-            arch::debug_str("[EXPLORER] resources decode failed, fallback\r\n");
             // Resource decode failure: keep the old flat fallback so the
             // desktop is still visible and the user can still log on.
             draw_fallback_desktop(&framebuffer);
@@ -133,18 +129,23 @@ fn desktop_main() -> ! {
     let mut previous_buttons = 0u32;
     let mut cursor_x = (framebuffer.width / 2) as i32;
     let mut cursor_y = (framebuffer.height / 2) as i32;
-    shell.draw_desktop(&framebuffer, &mut frame, cursor_x, cursor_y);
+    let mut frame_rgba = alloc::vec![0u8; frame.pixels().len() * 4];
+    shell.draw_desktop(
+        &framebuffer,
+        &mut frame,
+        cursor_x,
+        cursor_y,
+        &mut frame_rgba,
+    );
     shell
         .model
         .refresh_controls(framebuffer.width, framebuffer.height);
-    #[cfg(target_arch = "x86_64")]
-    arch::debug_str("[EXPLORER] desktop drawn\r\n");
     loop {
         let mut redraw = false;
         let mut key = 0u8;
         let key_pending = unsafe { arch::poll_key(&mut key) == 1 };
-        let mouse_pending = unsafe { arch::poll_mouse(&mut mouse) == 1 };
-        if mouse_pending {
+        let mut mouse_pending = false;
+        while unsafe { arch::poll_mouse(&mut mouse) != 0 } {
             cursor_x = mouse.x.clamp(0, framebuffer.width.saturating_sub(1) as i32);
             cursor_y = mouse
                 .y
@@ -195,13 +196,17 @@ fn desktop_main() -> ! {
                 }
             }
             previous_buttons = mouse.buttons;
+            mouse_pending = true;
+        }
+        if mouse_pending {
             redraw = true;
         }
         if key_pending {
             let changed = if shell.model.start_menu.open {
-                match shell.model.controls.route_key(key) {
-                    Some(event) => shell.model.handle_control_event(event),
-                    None => false,
+                if let Some(event) = shell.model.controls.route_key(key) {
+                    shell.model.handle_control_event(event)
+                } else {
+                    shell.model.handle_start_menu_key(key)
                 }
             } else {
                 shell.model.handle_window_key(key)
@@ -214,12 +219,31 @@ fn desktop_main() -> ! {
             redraw = true;
         }
         if redraw {
-            shell.draw_desktop(&framebuffer, &mut frame, cursor_x, cursor_y);
+            shell.draw_desktop(
+                &framebuffer,
+                &mut frame,
+                cursor_x,
+                cursor_y,
+                &mut frame_rgba,
+            );
         }
         if !key_pending && !mouse_pending {
             core::hint::spin_loop();
         }
     }
+}
+
+fn decoded_wallpaper() -> Option<png::Image> {
+    png::decode_png(WALLPAPER_PNG).ok()
+}
+
+fn scaled_icon(bytes: &[u8]) -> Option<png::Image> {
+    let decoded = ico::decode_ico(bytes).ok()?;
+    Some(png::Image {
+        width: 56,
+        height: 56,
+        pixels: scale_rgba(&decoded, 56, 56),
+    })
 }
 
 impl Shell {
@@ -255,19 +279,23 @@ impl Shell {
             300,
         );
         Some(Self {
-            computer: png::decode_png(resources_data::COMPUTER).ok()?,
-            network: png::decode_png(resources_data::NETWORK).ok()?,
-            recycle_bin: png::decode_png(resources_data::RECYCLE_BIN).ok()?,
-            control_panel: png::decode_png(resources_data::CONTROL_PANEL).ok()?,
-            close: png::decode_png(CLOSE_BUTTON).ok()?,
-            maximize: png::decode_png(MAXIMIZE_BUTTON).ok()?,
-            minimize: png::decode_png(MINIMIZE_BUTTON).ok()?,
-            restore: png::decode_png(RESTORE_BUTTON).ok()?,
-            avatar: png::decode_png(AVATAR_PNG).ok()?,
-            cursor: png::decode_png(CURSOR_PNG).ok()?,
-            start_orb: png::decode_png(START_ORB_PNG).ok()?,
-            taskbar_asset: png::decode_png(TASKBAR_PNG).ok()?,
-            wallpaper_asset: png::decode_png(DESKTOP_WALLPAPER_PNG).ok()?,
+            computer: scaled_icon(resources_data::COMPUTER)?,
+            network: scaled_icon(resources_data::NETWORK)?,
+            recycle_bin: scaled_icon(resources_data::RECYCLE_BIN)?,
+            control_panel: scaled_icon(resources_data::CONTROL_PANEL)?,
+            avatar: {
+                let decoded_avatar = bmp::decode_bmp(USER.bytes).ok()?;
+                png::Image {
+                    width: decoded_avatar.width,
+                    height: decoded_avatar.height,
+                    pixels: decoded_avatar.pixels,
+                }
+            },
+            cursor: ico::decode_ico_preferred(CURSOR_CUR, 32).ok()?,
+            start_button_normal: png::decode_png(START_BUTTON_NORMAL_PNG).ok()?,
+            start_button_hover: png::decode_png(START_BUTTON_HOVER_PNG).ok()?,
+            start_button_pressed: png::decode_png(START_BUTTON_PRESSED_PNG).ok()?,
+            wallpaper_asset: decoded_wallpaper()?,
             fonts: font_view::FontPack::new(16)?,
             model,
             wallpaper: nt61_desktop::graphics::Surface::new(1, 1),
@@ -299,6 +327,7 @@ impl Shell {
         frame: &mut nt61_desktop::graphics::Surface,
         cursor_x: i32,
         cursor_y: i32,
+        output_pixels: &mut [u8],
     ) {
         frame.copy_from(&self.wallpaper);
         self.draw_icons(frame, framebuffer);
@@ -318,7 +347,7 @@ impl Shell {
                 self.cursor.height,
             ),
         );
-        present_surface(frame);
+        present_surface_with(frame, output_pixels);
     }
 
     fn draw_icons(
@@ -341,29 +370,36 @@ impl Shell {
             let column = (index as u32) / rows;
             let row = (index as u32) % rows;
             let x = DESKTOP_MARGIN + column * ICON_CELL;
-            let y = DESKTOP_MARGIN + row * ICON_CELL;
-            let scaled = scale_rgba(icon, 56, 56);
+            let y = DESKTOP_MARGIN + row * ICON_CELL + 4;
+            let control_id = CONTROL_DESKTOP_BASE + index as u32;
             blit_rgba(
                 frame,
-                &scaled,
+                &icon.pixels,
                 56 * 4,
-                nt61_desktop::graphics::Rect::new(x as i32, y as i32, 56, 56),
+                nt61_desktop::graphics::Rect::new(
+                    (x + (ICON_CELL - 56) / 2) as i32,
+                    y as i32,
+                    56,
+                    56,
+                ),
             );
             let width = self.fonts.measure(label);
-            let label_x = x + (56u32.saturating_sub(width)) / 2;
-            aero::blend_rounded_rect(
-                frame,
-                nt61_desktop::graphics::Rect::new(
-                    x.saturating_sub(8) as i32,
-                    y.saturating_sub(4) as i32,
-                    72,
-                    84,
-                ),
-                3,
-                0x30FF_FFFF,
-            );
+            let label_x = x + (ICON_CELL.saturating_sub(width)) / 2;
+            if self.model.controls.hot() == control_id {
+                aero::blend_rounded_rect(
+                    frame,
+                    nt61_desktop::graphics::Rect::new(
+                        x.saturating_sub(6) as i32,
+                        y.saturating_sub(8) as i32,
+                        ICON_CELL,
+                        ICON_CELL,
+                    ),
+                    3,
+                    0x30FF_FFFF,
+                );
+            }
             self.fonts
-                .draw_labelled_onto(frame, label, label_x as i32, y as i32 + 52);
+                .draw_labelled_onto(frame, label, label_x as i32, y as i32 + 64);
         }
     }
 
@@ -494,36 +530,6 @@ impl Shell {
                 ),
                 aero::WindowControlButtonKind::Close,
                 false,
-            );
-            let mut blit_icon = |icon: &png::Image, x: u32| {
-                blit_rgba(
-                    frame,
-                    &icon.pixels,
-                    icon.stride(),
-                    nt61_desktop::graphics::Rect::new(
-                        x as i32,
-                        group_bounds.y + (20 - icon.height) as i32 / 2,
-                        icon.width,
-                        icon.height,
-                    ),
-                );
-            };
-            blit_icon(
-                &self.minimize,
-                group_bounds.x as u32 + (29 - self.minimize.width) / 2,
-            );
-            let middle_icon = if window.maximized {
-                &self.restore
-            } else {
-                &self.maximize
-            };
-            blit_icon(
-                middle_icon,
-                group_bounds.x as u32 + 29 + (29 - middle_icon.width) / 2,
-            );
-            blit_icon(
-                &self.close,
-                group_bounds.x as u32 + 58 + (44 - self.close.width) / 2,
             );
         }
     }
@@ -722,46 +728,60 @@ impl Shell {
         framebuffer: &arch::DesktopFramebufferInfo,
     ) {
         let top = framebuffer.height.saturating_sub(TASKBAR_HEIGHT);
-        let taskbar = scale_rgba(&self.taskbar_asset, framebuffer.width, TASKBAR_HEIGHT);
-        blit_rgba(
+        let taskbar =
+            nt61_desktop::graphics::Rect::new(0, top as i32, framebuffer.width, TASKBAR_HEIGHT);
+        aero::taskbar_chrome(frame, taskbar, &self.glass);
+        aero::blend_rect(
             frame,
-            &taskbar,
-            (framebuffer.width * 4) as usize,
-            nt61_desktop::graphics::Rect::new(0, top as i32, framebuffer.width, TASKBAR_HEIGHT),
+            nt61_desktop::graphics::Rect::new(0, top as i32, framebuffer.width, 1),
+            0x90FF_FFFF,
         );
         self.draw_start_button(frame, top);
-        let notification_width = 118;
         for (index, window) in self.model.taskbar.windows.iter().enumerate() {
-            let x = 44 + index as u32 * 92;
-            if x + 86 > framebuffer.width.saturating_sub(notification_width + 12) {
+            let button_id = CONTROL_TASKBAR_BASE + index as u32;
+            let x = taskbar_program_x(index as u32);
+            if x + PROGRAM_BUTTON_WIDTH > notification_area_left(framebuffer.width) {
                 break;
             }
-            aero::superbar_button(
-                frame,
-                nt61_desktop::graphics::Rect::new(
-                    x as i32,
-                    top as i32 + 4,
-                    86,
-                    TASKBAR_HEIGHT.saturating_sub(9),
-                ),
-                Some(window.id) == self.model.selected_window && !window.minimized,
+            let button = nt61_desktop::graphics::Rect::new(
+                x as i32,
+                top as i32 + 4,
+                PROGRAM_BUTTON_WIDTH,
+                TASKBAR_HEIGHT.saturating_sub(9),
             );
+            let selected = Some(window.id) == self.model.selected_window && !window.minimized;
+            aero::superbar_button(frame, button, selected);
+            if !selected && self.model.controls.hot() == button_id {
+                aero::blend_rounded_rect(frame, button, 3, 0x70FF_FFFF);
+            }
+            if self.model.controls.pressed() == button_id {
+                aero::blend_rounded_rect(frame, button, 3, 0x8000_0000);
+            }
             self.fonts
-                .draw_labelled_onto(frame, &window.title, x as i32 + 4, top as i32 + 14);
+                .draw_labelled_onto(frame, &window.title, x as i32 + 8, top as i32 + 15);
         }
         self.draw_notification_area(frame, framebuffer);
     }
 
     fn draw_start_button(&self, frame: &mut nt61_desktop::graphics::Surface, top: u32) {
+        let active = self.model.controls.pressed() == CONTROL_START;
+        let hovered = self.model.controls.hot() == CONTROL_START;
+        let image = if active {
+            &self.start_button_pressed
+        } else if hovered {
+            &self.start_button_hover
+        } else {
+            &self.start_button_normal
+        };
         blit_rgba(
             frame,
-            &self.start_orb.pixels,
-            self.start_orb.stride(),
+            &image.pixels,
+            image.stride(),
             nt61_desktop::graphics::Rect::new(
-                4,
-                top as i32 + 2,
-                self.start_orb.width,
-                self.start_orb.height,
+                0,
+                top.saturating_sub(START_BUTTON_WIDTH.saturating_sub(TASKBAR_HEIGHT) / 2) as i32,
+                START_BUTTON_WIDTH,
+                START_BUTTON_WIDTH,
             ),
         );
     }
@@ -773,66 +793,76 @@ impl Shell {
     ) {
         let top = framebuffer.height.saturating_sub(TASKBAR_HEIGHT);
         let right = framebuffer.width;
-        aero::blend_rounded_rect(
+        let left = notification_area_left(right);
+        aero::blend_rect(
             frame,
-            nt61_desktop::graphics::Rect::new(
-                right.saturating_sub(10) as i32,
-                top as i32 + 6,
-                5,
-                TASKBAR_HEIGHT.saturating_sub(12),
-            ),
-            1,
+            nt61_desktop::graphics::Rect::new(left as i32, top as i32 + 5, 1, TASKBAR_HEIGHT - 10),
             0x50FF_FFFF,
         );
-        let icon_center = right.saturating_sub(46);
+
+        let volume_x = (left + 16) as i32;
+        for row in 0..3 {
+            let width = 8 - row * 2;
+            let y = top + 14 + row * 5;
+            frame.fill_rect(volume_x, y as i32, width, 3, 0xFFF0_F6FF);
+        }
+
+        let network_x = (left + 40) as i32;
         aero::blend_rounded_rect(
             frame,
-            nt61_desktop::graphics::Rect::new(icon_center as i32 - 5, top as i32 + 14, 10, 8),
+            nt61_desktop::graphics::Rect::new(network_x, top as i32 + 14, 16, 12),
             2,
-            0xF0FF_FFFF,
+            0xE8F0_F6FF,
         );
+        frame.fill_rect(network_x + 4, top as i32 + 17, 8, 3, 0xFF18_4A7C);
+
+        let action_x = (left + 64) as i32;
         aero::blend_rounded_rect(
             frame,
-            nt61_desktop::graphics::Rect::new(icon_center as i32 - 2, top as i32 + 20, 4, 3),
-            1,
-            0xF0FF_FFFF,
+            nt61_desktop::graphics::Rect::new(action_x, top as i32 + 13, 14, 14),
+            2,
+            0xE8F0_F6FF,
         );
-        aero::blend_rounded_rect(
-            frame,
-            nt61_desktop::graphics::Rect::new(
-                right.saturating_sub(74) as i32,
-                top as i32 + 14,
-                10,
-                8,
-            ),
-            3,
-            0xE8FF_FFFF,
-        );
+        frame.fill_rect(action_x + 6, top as i32 + 15, 2, 6, 0xFF18_4A7C);
+        frame.fill_rect(action_x + 6, top as i32 + 23, 2, 2, 0xFF18_4A7C);
+
         aero::blend_rect(
             frame,
             nt61_desktop::graphics::Rect::new(
-                right.saturating_sub(71) as i32,
-                top as i32 + 16,
-                4,
-                4,
-            ),
-            0xE80B4C9B,
-        );
-        aero::blend_rect(
-            frame,
-            nt61_desktop::graphics::Rect::new(
-                right.saturating_sub(98) as i32,
-                top as i32 + 8,
+                right.saturating_sub(88) as i32,
+                top as i32 + 5,
                 1,
-                TASKBAR_HEIGHT.saturating_sub(16),
+                TASKBAR_HEIGHT.saturating_sub(10),
             ),
             0x90FF_FFFF,
         );
         self.fonts.draw_labelled_onto(
             frame,
             "12:00 PM",
-            right.saturating_sub(92) as i32,
+            right.saturating_sub(82) as i32,
             top as i32 + 14,
+        );
+
+        let show_desktop_x = right.saturating_sub(16);
+        aero::blend_rect(
+            frame,
+            nt61_desktop::graphics::Rect::new(
+                show_desktop_x as i32,
+                top as i32 + 5,
+                1,
+                TASKBAR_HEIGHT.saturating_sub(10),
+            ),
+            0x50FF_FFFF,
+        );
+        aero::blend_rect(
+            frame,
+            nt61_desktop::graphics::Rect::new(
+                (show_desktop_x + 5) as i32,
+                top as i32 + 11,
+                5,
+                TASKBAR_HEIGHT.saturating_sub(22),
+            ),
+            0x70FF_FFFF,
         );
     }
 
@@ -841,13 +871,13 @@ impl Shell {
         frame: &mut nt61_desktop::graphics::Surface,
         framebuffer: &arch::DesktopFramebufferInfo,
     ) {
-        let width = 374;
-        let height = 374;
+        let width = START_MENU_WIDTH;
+        let height = START_MENU_HEIGHT;
         let x = 2;
         let y = framebuffer.height.saturating_sub(TASKBAR_HEIGHT + height);
         let bounds = nt61_desktop::graphics::Rect::new(x as i32, y as i32, width, height);
         aero::shadow(frame, bounds, 4);
-        aero::blend_rounded_rect(frame, bounds, 4, 0xE820_3850);
+        aero::blend_rounded_rect(frame, bounds, 4, 0xEE15_1F2C);
         aero::blend_rounded_rect(
             frame,
             nt61_desktop::graphics::Rect::new(
@@ -857,48 +887,49 @@ impl Shell {
                 height.saturating_sub(2),
             ),
             3,
-            0x28FF_FFFF,
+            0x50FF_FFFF,
         );
 
-        let pane = width * 55 / 100;
+        let pane = width * 62 / 100;
         frame.fill_rect(
             x as i32 + 5,
             y as i32 + 5,
             pane.saturating_sub(10),
             height.saturating_sub(10),
-            0xFFF6_FAFF,
+            0xFFF7_FAFF,
         );
         frame.fill_rect(
             (x + pane + 1) as i32,
             y as i32 + 5,
             width.saturating_sub(pane + 6),
             height.saturating_sub(10),
-            0xFF20_3850,
+            0xFF15_2538,
         );
 
-        let programs = [
-            "Notepad",
-            "Command Prompt",
-            "Windows Explorer",
-            "Calculator",
-        ];
+        let programs = self.model.start_menu.all_programs();
         for (index, program) in programs.iter().enumerate() {
-            let item_y = y + 12 + index as u32 * 38;
-            aero::blend_rounded_rect(
-                frame,
-                nt61_desktop::graphics::Rect::new(
-                    (x + 8) as i32,
-                    item_y as i32,
-                    pane.saturating_sub(20),
-                    32,
-                ),
-                2,
-                0x22CC_E2EF,
+            let item_id = nt61_desktop::shell::CONTROL_MENU_BASE + index as u32;
+            let item_y = y + 24 + index as u32 * 38;
+            let item = nt61_desktop::graphics::Rect::new(
+                (x + 14) as i32,
+                item_y as i32,
+                pane.saturating_sub(28),
+                32,
             );
+            let highlighted =
+                self.model.start_menu.highlighted == index || self.model.controls.hot() == item_id;
+            if highlighted {
+                aero::blend_rounded_rect(frame, item, 3, 0xD86B_B2E6);
+                aero::blend_rect(
+                    frame,
+                    nt61_desktop::graphics::Rect::new(item.x, item.y, item.width, 1),
+                    0x80FF_FFFF,
+                );
+            }
             self.fonts.draw_onto(
                 frame,
-                program,
-                (x + 16) as i32,
+                program.title(),
+                item.x + 12,
                 item_y as i32 + 9,
                 font_view::Ink::Black,
             );
@@ -907,7 +938,7 @@ impl Shell {
             (x + 8) as i32,
             (y + height.saturating_sub(48)) as i32,
             pane.saturating_sub(20),
-            28,
+            26,
             0xFFFF_FFFF,
         );
         aero::blend_rect(
@@ -916,15 +947,19 @@ impl Shell {
                 (x + 8) as i32,
                 (y + height.saturating_sub(48)) as i32,
                 pane.saturating_sub(20),
-                28,
+                26,
             ),
             0xFF66_6666,
         );
         self.fonts.draw_onto(
             frame,
-            "Search programs and files",
+            if self.model.start_menu.query.is_empty() {
+                "Search programs and files"
+            } else {
+                &self.model.start_menu.query
+            },
             (x + 14) as i32,
-            (y + height.saturating_sub(40)) as i32,
+            (y + height.saturating_sub(42)) as i32,
             font_view::Ink::Black,
         );
 
@@ -937,7 +972,7 @@ impl Shell {
             "Devices",
         ];
         for (index, link) in links.iter().enumerate() {
-            let item_y = y + 12 + index as u32 * 44;
+            let item_y = y + 88 + index as u32 * 40;
             aero::menu_item(
                 frame,
                 nt61_desktop::graphics::Rect::new(
@@ -953,8 +988,8 @@ impl Shell {
         }
 
         let avatar_size = 44;
-        let avatar_x = x + pane + 10;
-        let avatar_y = y + height.saturating_sub(54);
+        let avatar_x = x + pane + (width - pane - avatar_size) / 2;
+        let avatar_y = y + 20;
         aero::blend_rounded_rect(
             frame,
             nt61_desktop::graphics::Rect::new(
@@ -991,17 +1026,76 @@ fn scale_rgba(source: &png::Image, target_width: u32, target_height: u32) -> all
     if source.width == 0 || source.height == 0 {
         return output;
     }
-    for row in 0..target_height as usize {
-        let source_row = row * source.height as usize / target_height as usize;
-        for column in 0..target_width as usize {
-            let source_column = column * source.width as usize / target_width as usize;
-            let source_offset = (source_row * source.width as usize + source_column) * 4;
-            let target_offset = (row * target_width as usize + column) * 4;
-            output[target_offset..target_offset + 4]
-                .copy_from_slice(&source.pixels[source_offset..source_offset + 4]);
+    scale_rgba_bilinear(source, target_width, target_height, &mut output);
+    output
+}
+
+fn scale_rgba_bilinear(
+    source: &png::Image,
+    target_width: u32,
+    target_height: u32,
+    output: &mut [u8],
+) {
+    let source_width = source.width as usize;
+    let source_height = source.height as usize;
+    let target_width = target_width as usize;
+    let target_height = target_height as usize;
+    if target_width == 0 || target_height == 0 {
+        return;
+    }
+    let x_ratio: u64 = if target_width > 1 {
+        (((source_width - 1) as u64) << 16) / (target_width - 1) as u64
+    } else {
+        0
+    };
+    let y_ratio: u64 = if target_height > 1 {
+        (((source_height - 1) as u64) << 16) / (target_height - 1) as u64
+    } else {
+        0
+    };
+    for target_row in 0..target_height {
+        let source_y = (target_row as u64 * y_ratio) >> 16;
+        let y_frac = (((target_row as u64 * y_ratio) & 0xFFFF) >> 8) as u32;
+        let y0 = source_y as usize;
+        let y1 = (y0 + 1).min(source_height - 1);
+        for target_column in 0..target_width {
+            let source_x = (target_column as u64 * x_ratio) >> 16;
+            let x_frac = (((target_column as u64 * x_ratio) & 0xFFFF) >> 8) as u32;
+            let x0 = source_x as usize;
+            let x1 = (x0 + 1).min(source_width - 1);
+
+            let top_left = (y0 * source_width + x0) * 4;
+            let top_right = (y0 * source_width + x1) * 4;
+            let bottom_left = (y1 * source_width + x0) * 4;
+            let bottom_right = (y1 * source_width + x1) * 4;
+
+            let target_offset = (target_row * target_width + target_column) * 4;
+            for channel in 0..4 {
+                let top = lerp(
+                    source.pixels[top_left + channel],
+                    source.pixels[top_right + channel],
+                    x_frac,
+                );
+                let bottom = lerp(
+                    source.pixels[bottom_left + channel],
+                    source.pixels[bottom_right + channel],
+                    x_frac,
+                );
+                let result = lerp_u32(top, bottom, y_frac);
+                output[target_offset + channel] = ((result >> 8) & 0xFF).min(255) as u8;
+            }
         }
     }
-    output
+}
+
+fn lerp(a: u8, b: u8, t: u32) -> u32 {
+    let af = a as u32;
+    let bf = b as u32;
+    ((af << 8) * (255 - t) / 255) + ((bf << 8) * t / 255)
+}
+
+fn lerp_u32(a: u32, b: u32, t: u32) -> u32 {
+    (a * (255 - t) / 255) + (b * t / 255)
 }
 
 fn cover_image(source: &png::Image, target: &mut nt61_desktop::graphics::Surface) -> bool {
@@ -1025,18 +1119,49 @@ fn cover_image(source: &png::Image, target: &mut nt61_desktop::graphics::Surface
     };
     let offset_x = (source.width as u64).saturating_sub(visible_width) / 2;
     let offset_y = (source.height as u64).saturating_sub(visible_height) / 2;
+    let x_ratio: u64 = if target_width > 1 {
+        (((visible_width - 1) as u64) << 16) / (target_width - 1) as u64
+    } else {
+        0
+    };
+    let y_ratio: u64 = if target_height > 1 {
+        (((visible_height - 1) as u64) << 16) / (target_height - 1) as u64
+    } else {
+        0
+    };
     for row in 0..target_height as usize {
-        let source_y = offset_y + (row as u64 * visible_height) / target_height as u64;
+        let source_y = offset_y + (row as u64 * y_ratio >> 16);
+        let y_frac = (((row as u64 * y_ratio) & 0xFFFF) >> 8) as u32;
+        let y0 = source_y as usize;
+        let y1 = (y0 + 1).min(source.height as usize - 1);
         for column in 0..target_width as usize {
-            let source_x = offset_x + (column as u64 * visible_width) / target_width as u64;
-            let source_offset = (source_y as usize * source.width as usize + source_x as usize) * 4;
-            let Some(chunk) = source.pixels.get(source_offset..source_offset + 4) else {
-                return false;
-            };
+            let source_x = offset_x + (column as u64 * x_ratio >> 16);
+            let x_frac = (((column as u64 * x_ratio) & 0xFFFF) >> 8) as u32;
+            let x0 = source_x as usize;
+            let x1 = (x0 + 1).min(source.width as usize - 1);
+            let top_left = (y0 * source.width as usize + x0) * 4;
+            let top_right = (y0 * source.width as usize + x1) * 4;
+            let bottom_left = (y1 * source.width as usize + x0) * 4;
+            let bottom_right = (y1 * source.width as usize + x1) * 4;
+            let mut pixel = [0u8; 4];
+            for channel in 0..4 {
+                let top = lerp(
+                    source.pixels[top_left + channel],
+                    source.pixels[top_right + channel],
+                    x_frac,
+                );
+                let bottom = lerp(
+                    source.pixels[bottom_left + channel],
+                    source.pixels[bottom_right + channel],
+                    x_frac,
+                );
+                let result = lerp_u32(top, bottom, y_frac);
+                pixel[channel] = ((result >> 8) & 0xFF).min(255) as u8;
+            }
             target.set_pixel(
                 column as u32,
                 row as u32,
-                u32::from_le_bytes([chunk[2], chunk[1], chunk[0], chunk[3]]),
+                u32::from_le_bytes([pixel[2], pixel[1], pixel[0], pixel[3]]),
             );
         }
     }
@@ -1058,8 +1183,10 @@ fn draw_wallpaper_into(surface: &mut nt61_desktop::graphics::Surface, width: u32
     );
 }
 
-fn present_surface(surface: &nt61_desktop::graphics::Surface) {
-    let mut pixels = alloc::vec![0u8; surface.pixels().len() * 4];
+fn present_surface_with(surface: &nt61_desktop::graphics::Surface, pixels: &mut [u8]) {
+    if pixels.len() < surface.pixels().len() * 4 {
+        return;
+    }
     for (target, color) in pixels.chunks_exact_mut(4).zip(surface.pixels()) {
         target.copy_from_slice(&[
             ((color >> 16) & 0xFF) as u8,
@@ -1097,5 +1224,6 @@ fn draw_fallback_desktop(framebuffer: &arch::DesktopFramebufferInfo) {
         ),
         &glass,
     );
-    present_surface(&surface);
+    let mut pixels = alloc::vec![0u8; surface.pixels().len() * 4];
+    present_surface_with(&surface, &mut pixels);
 }

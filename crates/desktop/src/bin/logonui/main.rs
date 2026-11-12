@@ -3,6 +3,8 @@
 #![deny(warnings)]
 
 mod arch;
+#[path = "../explorer/ico.rs"]
+mod ico;
 
 #[path = "../../font_view.rs"]
 mod font_view;
@@ -11,69 +13,22 @@ mod png;
 
 use core::panic::PanicInfo;
 use core::str;
+use nt61_desktop::bmp;
 use nt61_desktop::compositor::aero;
 use nt61_desktop::controls::{ControlEvent, ControlKind, ControlTree, PointerAction};
 use nt61_desktop::graphics::blit::blit_rgba;
 use nt61_desktop::graphics::Surface;
 use nt61_desktop::login::AuthenticationProvider;
+use nt61_desktop::user_account_pictures::USER;
 use png::Image;
 
 extern crate alloc;
 
-const AVATAR_PNG: &[u8] = include_bytes!("../../../assets/logon/avatar.png");
-const CURSOR_PNG: &[u8] = include_bytes!("../../../assets/cursor.png");
-const FLAG_PNG: &[u8] = include_bytes!("../../../assets/logon/flag.png");
-const EASE_PNG: &[u8] = include_bytes!("../../../assets/logon/ease.png");
-const POWER_PNG: &[u8] = include_bytes!("../../../assets/logon/power.png");
-
-struct WallpaperAsset {
-    width: u32,
-    height: u32,
-    png: &'static [u8],
-}
-
-const WALLPAPERS: [WallpaperAsset; 8] = [
-    WallpaperAsset {
-        width: 1920,
-        height: 1200,
-        png: include_bytes!("../../../assets/logon/wallpaper-1.png"),
-    },
-    WallpaperAsset {
-        width: 1280,
-        height: 768,
-        png: include_bytes!("../../../assets/logon/wallpaper-2.png"),
-    },
-    WallpaperAsset {
-        width: 1360,
-        height: 768,
-        png: include_bytes!("../../../assets/logon/wallpaper-3.png"),
-    },
-    WallpaperAsset {
-        width: 1280,
-        height: 1024,
-        png: include_bytes!("../../../assets/logon/wallpaper-4.png"),
-    },
-    WallpaperAsset {
-        width: 1280,
-        height: 960,
-        png: include_bytes!("../../../assets/logon/wallpaper-5.png"),
-    },
-    WallpaperAsset {
-        width: 1024,
-        height: 768,
-        png: include_bytes!("../../../assets/logon/wallpaper-6.png"),
-    },
-    WallpaperAsset {
-        width: 1600,
-        height: 1200,
-        png: include_bytes!("../../../assets/logon/wallpaper-7.png"),
-    },
-    WallpaperAsset {
-        width: 1440,
-        height: 900,
-        png: include_bytes!("../../../assets/logon/wallpaper-8.png"),
-    },
-];
+const CURSOR_CUR: &[u8] = include_bytes!("../../../assets/windows7/cursors/aero_arrow_l.cur");
+const FLAG_ICO: &[u8] = include_bytes!("../../../assets/windows7/icons/shell32/ICON34_1.ico");
+const EASE_ICO: &[u8] = include_bytes!("../../../assets/windows7/icons/shell32/ICON29_1.ico");
+const POWER_ICO: &[u8] = include_bytes!("../../../assets/windows7/icons/shell32/ICON28_1.ico");
+const WALLPAPER_PNG: &[u8] = include_bytes!("../../../assets/windows7/wallpapers/login-1024.png");
 
 const MAX_PASSWORD: usize = 32;
 const USER_NAME: &str = "User";
@@ -93,9 +48,7 @@ fn panic(info: &PanicInfo) -> ! {
     struct SerialWriter;
     impl core::fmt::Write for SerialWriter {
         fn write_str(&mut self, text: &str) -> core::fmt::Result {
-            #[cfg(target_arch = "x86_64")]
             arch::debug_str(text);
-            let _ = text;
             Ok(())
         }
     }
@@ -155,6 +108,10 @@ struct Credentials {
     length: usize,
 }
 
+fn decoded_wallpaper() -> Option<Image> {
+    png::decode_png(WALLPAPER_PNG).ok()
+}
+
 impl Credentials {
     fn new() -> Self {
         Self {
@@ -197,22 +154,37 @@ fn logonui_main() -> ! {
     let mut authentication = AuthenticationProvider::new();
     let layout = Layout::new(framebuffer.width, framebuffer.height);
     let mut controls = build_login_controls(framebuffer.width, framebuffer.height, &layout);
+    let mut frame = Surface::new(framebuffer.width, framebuffer.height);
+    let mut frame_rgba = alloc::vec![0u8; frame.pixels().len() * 4];
     if let Some(screen) = assets.as_ref() {
-        let mut frame = Surface::new(framebuffer.width, framebuffer.height);
         screen.draw(&framebuffer, &mut frame, &credentials, false, &controls);
-        present_surface(&frame);
+        draw_login_cursor(
+            screen,
+            &mut frame,
+            (framebuffer.width / 2) as i32,
+            (framebuffer.height / 2) as i32,
+        );
+        present_surface_with(&frame, &mut frame_rgba);
     } else {
+        arch::debug_str("[LOGONUI] assets failed\r\n");
         draw_fallback_screen(&framebuffer);
     }
+    arch::debug_str("[LOGONUI] assets loaded\r\n");
 
+    let mut previous_buttons = 0u32;
+    let mut cursor_x = (framebuffer.width / 2) as i32;
+    let mut cursor_y = (framebuffer.height / 2) as i32;
     loop {
         let mut key = 0u8;
         let mut mouse = arch::DesktopMouseState::default();
-        let previous_buttons = 0u32;
         let mut failed = false;
         let mut redraw = false;
-        let mouse_pending = unsafe { arch::poll_mouse(&mut mouse) == 1 };
+        let mouse_pending = unsafe { arch::poll_mouse(&mut mouse) != 0 };
         if mouse_pending {
+            cursor_x = mouse.x.clamp(0, framebuffer.width.saturating_sub(1) as i32);
+            cursor_y = mouse
+                .y
+                .clamp(0, framebuffer.height.saturating_sub(1) as i32);
             let action = if mouse.buttons & 1 == 0 && previous_buttons & 1 != 0 {
                 Some(PointerAction::Up)
             } else if mouse.buttons & 1 != 0 && previous_buttons & 1 == 0 {
@@ -234,9 +206,10 @@ fn logonui_main() -> ! {
                         credentials.clear();
                         failed = true;
                     }
-                    redraw = true;
                 }
             }
+            redraw = true;
+            previous_buttons = mouse.buttons;
         }
         unsafe {
             if arch::poll_key(&mut key) == 0 {
@@ -272,14 +245,28 @@ fn logonui_main() -> ! {
 
         if redraw || key_redraw {
             if let Some(screen) = assets.as_ref() {
-                let mut frame = Surface::new(framebuffer.width, framebuffer.height);
                 screen.draw(&framebuffer, &mut frame, &credentials, failed, &controls);
-                present_surface(&frame);
+                draw_login_cursor(screen, &mut frame, cursor_x, cursor_y);
+                present_surface_with(&frame, &mut frame_rgba);
             } else {
                 draw_fallback_screen(&framebuffer);
             }
         }
     }
+}
+
+fn draw_login_cursor(screen: &LogonAssets, frame: &mut Surface, cursor_x: i32, cursor_y: i32) {
+    blit_rgba(
+        frame,
+        &screen.cursor.pixels,
+        screen.cursor.stride(),
+        nt61_desktop::graphics::Rect::new(
+            cursor_x,
+            cursor_y,
+            screen.cursor.width,
+            screen.cursor.height,
+        ),
+    );
 }
 
 fn build_login_controls(width: u32, _height: u32, layout: &Layout) -> ControlTree {
@@ -332,15 +319,40 @@ fn build_login_controls(width: u32, _height: u32, layout: &Layout) -> ControlTre
 }
 
 impl LogonAssets {
-    fn load(width: u32, height: u32) -> Option<Self> {
+    fn load(_width: u32, _height: u32) -> Option<Self> {
+        let fonts = font_view::FontPack::new(16);
+        let fonts = fonts?;
+        arch::debug_str("[LOGONUI] asset fonts ok\r\n");
+        let decoded_avatar = bmp::decode_bmp(USER.bytes).ok()?;
+        let avatar = png::Image {
+            width: decoded_avatar.width,
+            height: decoded_avatar.height,
+            pixels: decoded_avatar.pixels,
+        };
+        arch::debug_str("[LOGONUI] asset avatar ok\r\n");
+        let cursor = ico::decode_ico_preferred(CURSOR_CUR, 32).ok();
+        let cursor = cursor?;
+        arch::debug_str("[LOGONUI] asset cursor ok\r\n");
+        let flag = ico::decode_ico(FLAG_ICO).ok();
+        let flag = flag?;
+        arch::debug_str("[LOGONUI] asset flag ok\r\n");
+        let ease = ico::decode_ico(EASE_ICO).ok();
+        let ease = ease?;
+        arch::debug_str("[LOGONUI] asset ease ok\r\n");
+        let power = ico::decode_ico(POWER_ICO).ok();
+        let power = power?;
+        arch::debug_str("[LOGONUI] asset power ok\r\n");
+        let wallpaper = decoded_wallpaper();
+        let wallpaper = wallpaper?;
+        arch::debug_str("[LOGONUI] asset wallpaper ok\r\n");
         Some(Self {
-            fonts: font_view::FontPack::new(16)?,
-            avatar: png::decode_png(AVATAR_PNG).ok()?,
-            cursor: png::decode_png(CURSOR_PNG).ok()?,
-            flag: png::decode_png(FLAG_PNG).ok()?,
-            ease: png::decode_png(EASE_PNG).ok()?,
-            power: png::decode_png(POWER_PNG).ok()?,
-            wallpaper: png::decode_png(select_wallpaper_png(width, height)).ok()?,
+            fonts,
+            avatar,
+            cursor,
+            flag,
+            ease,
+            power,
+            wallpaper,
         })
     }
 
@@ -672,23 +684,6 @@ fn cover_image(source: &Image, target_width: u32, target_height: u32) -> alloc::
     )
 }
 
-fn select_wallpaper_png(width: u32, height: u32) -> &'static [u8] {
-    let mut selected = &WALLPAPERS[0];
-    let mut selected_score = u64::MAX;
-    for wallpaper in &WALLPAPERS {
-        let aspect_score = (wallpaper.width as u64 * height as u64)
-            .abs_diff(wallpaper.height as u64 * width as u64);
-        let area_score = (wallpaper.width as u64 * wallpaper.height as u64)
-            .abs_diff(width as u64 * height as u64);
-        let score = aspect_score * 1000 + area_score;
-        if score < selected_score {
-            selected_score = score;
-            selected = wallpaper;
-        }
-    }
-    selected.png
-}
-
 fn sample_bilinear(
     source: &Image,
     sample_x: u64,
@@ -768,7 +763,8 @@ fn lerp(left: u8, right: u8, scale: u16) -> u8 {
 fn draw_fallback_screen(framebuffer: &arch::DesktopFramebufferInfo) {
     let mut surface = Surface::new(framebuffer.width, framebuffer.height);
     surface.vertical_gradient(0x396996, 0x08243f);
-    present_surface(&surface);
+    let mut rgba = alloc::vec![0u8; surface.pixels().len() * 4];
+    present_surface_with(&surface, &mut rgba);
 }
 
 fn fill_gradient(
@@ -788,11 +784,22 @@ fn fill_gradient(
     }
 }
 
-fn present_surface(surface: &Surface) {
+fn present_surface_with(surface: &Surface, rgba: &mut [u8]) {
     let pixels = surface.pixels();
+    if rgba.len() < pixels.len() * 4 {
+        return;
+    }
+    for (target, color) in rgba.chunks_exact_mut(4).zip(pixels) {
+        target.copy_from_slice(&[
+            ((color >> 16) & 0xFF) as u8,
+            ((color >> 8) & 0xFF) as u8,
+            (color & 0xFF) as u8,
+            ((color >> 24) & 0xFF) as u8,
+        ]);
+    }
     unsafe {
         arch::draw_rgba(
-            pixels.as_ptr() as *const u8,
+            rgba.as_ptr() as *const u8,
             0,
             0,
             surface.width(),
