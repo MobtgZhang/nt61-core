@@ -683,7 +683,8 @@ fn alloc_zeroed_page() -> Option<u64> {
             crate::hal::serial::write_string_always("\r\n");
         }
     }
-    if !crate::arch::identity_map_region(pa & !0x1F_FFFF, 0x20_0000) {
+    let mapped = crate::arch::identity_map_region(pa, PAGE_SIZE as u64);
+    if !mapped {
         return None;
     }
     unsafe {
@@ -1072,14 +1073,8 @@ pub fn debug_read_user_pte(pml4_phys: u64, va: u64) -> u64 {
         if pml4e_val & PTE_P == 0 {
             return 0;
         }
-        crate::hal::serial::write_string_always("K:pte-pml4e=");
-        crate::hal::serial::write_hex_u64_always(pml4e_val);
-        crate::hal::serial::write_string_always("\r\n");
         let pdpt_phys = pml4e_val & 0x000F_FFFF_FFFF_F000;
         let pdpte_val = pte_read(pdpt_phys, pdpt_idx);
-        crate::hal::serial::write_string_always("K:pte-pdpte=");
-        crate::hal::serial::write_hex_u64_always(pdpte_val);
-        crate::hal::serial::write_string_always("\r\n");
         if pdpte_val & PTE_P == 0 {
             return 0;
         }
@@ -1088,9 +1083,6 @@ pub fn debug_read_user_pte(pml4_phys: u64, va: u64) -> u64 {
         }
         let pd_phys = pdpte_val & 0x000F_FFFF_FFFF_F000;
         let pde_val = pte_read(pd_phys, pd_idx);
-        crate::hal::serial::write_string_always("K:pte-pde=");
-        crate::hal::serial::write_hex_u64_always(pde_val);
-        crate::hal::serial::write_string_always("\r\n");
         if pde_val & PTE_P == 0 {
             return 0;
         }

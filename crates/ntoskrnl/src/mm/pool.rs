@@ -293,36 +293,6 @@ fn alloc_raw(total_size: usize, pool_type: PoolType, tag: u32) -> *mut u8 {
         }
     };
 
-    // First, try to allocate from the free list (fast path for freed memory)
-    if let Some(ptr) = allocate_from_freelist(pool_type, total_alloc_size) {
-        pool_trace!(
-            LogLevel::Debug,
-            "alloc_raw: freelist hit ptr=0x{:x} size={}",
-            ptr as u64,
-            total_alloc_size
-        );
-        unsafe {
-            let header = ptr.sub(PoolHeader::HEADER_SIZE) as *mut PoolHeader;
-            (*header).previous_size = 0;
-            (*header).pool_tag = tag;
-            (*header).set_signature();
-        }
-        crate::mm::heap::KERNEL_HEAP
-            .reserve_high_water((ptr as usize).saturating_add(total_alloc_size));
-        // The freelist path also needs to update the authoritative
-        // PoolDescriptor stats (was previously leaking allocations
-        // - only the bump path incremented total_bytes / total_allocs).
-        let descriptor = if pool_type.is_paged() {
-            &PAGED_POOL
-        } else {
-            &NON_PAGED_POOL
-        };
-        let mut d = descriptor.lock();
-        d.total_bytes += total_size as u64;
-        d.total_allocs.fetch_add(1, Ordering::Relaxed);
-        return ptr;
-    }
-
     // SAFETY: We call our own KernelHeap directly. The bump
     // allocator is single-threaded for the pool's purposes (the
     // pool is protected by a spinlock at the descriptor level,
@@ -556,8 +526,12 @@ pub unsafe fn free(ptr: *mut u8) -> *mut u8 {
             _ => PoolType::NonPaged,
         };
 
-        // Add to free list for future allocations (with coalescing)
-        free_to_freelist(header_ptr, total, pool_type);
+        // Pool memory is owned by the kernel heap. Returning it to a
+        // second pool freelist would alias the heap's own free blocks
+        // and can make a later heap allocation zero a live PE image.
+        let layout = Layout::from_size_align(total, 32)
+            .expect("pool allocation layout must remain valid on free");
+        crate::mm::heap::KERNEL_HEAP.dealloc(header_ptr, layout);
 
         let descriptor = if pool_type.is_paged() {
             &PAGED_POOL

@@ -272,11 +272,6 @@ impl KernelHeap {
         while !cur.is_null() && index < 32 {
             let address = cur as usize;
             let size = (*cur).size;
-            crate::hal::serial::write_string_always("K:heap-free=");
-            crate::hal::serial::write_hex_u64_always(address as u64);
-            crate::hal::serial::write_string_always("+");
-            crate::hal::serial::write_hex_u64_always(size as u64);
-            crate::hal::serial::write_string_always("\r\n");
             cur = (*cur).next;
             index += 1;
         }
@@ -673,61 +668,16 @@ unsafe impl GlobalAlloc for KernelHeap {
 /// configured, the rest of the subsystem (pool, working set,
 /// ...) can proceed as before.
 pub fn init() {
-    use crate::mm::frame;
+    // Use a kernel-image-owned BSS heap.  On AArch64/RISC-V/LoongArch64,
+    // UEFI reserved holes fragment high-order buddy blocks even when the
+    // firmware reports a large RAM range, and the PFN database itself is
+    // also allocated from the same buddy.  A BSS heap removes this early
+    // bootstrap dependency and keeps pool/object initialization reliable.
+    #[link_section = ".bss"]
+    static mut KERNEL_HEAP_STORAGE: [u8; 32 * 1024 * 1024] = [0; 32 * 1024 * 1024];
 
-    // Try 64 MiB first; fall back to 32 MiB then 16 MiB if the
-    // buddy allocator can't satisfy the larger request. The system
-    // image loader (`system_image::build_all`) builds ~30 PE files
-    // in memory (each a few KiB plus alignment), the loader's import
-    // database needs a few hundred KiB more.  With a 64 MiB buddy
-    // region, a 64 MiB heap gives comfortable headroom for the two
-    // ~23 MiB system images (ntoskrnl.exe + hal.dll) that
-    // `load_system_files()` must read from disk into the kernel heap.
-    const HEAP_PAGES_LARGE: u64 = (256 * 1024 * 1024) / 4096;
-    const HEAP_PAGES_MEDIUM: u64 = (32 * 1024 * 1024) / 4096;
-    const HEAP_PAGES_SMALL: u64 = (16 * 1024 * 1024) / 4096;
-
-    let (phys, pages) = match frame::allocate_pages(HEAP_PAGES_LARGE) {
-        Some(p) => {
-            crate::hal::serial::write_string_always("[heap] allocated 64MB at phys=");
-            crate::hal::serial::write_hex_u64(p);
-            crate::hal::serial::write_string("\r\n");
-            (p, HEAP_PAGES_LARGE)
-        }
-        None => {
-            crate::hal::serial::write_string_always("[heap] 64MB FAILED, trying 32MB\r\n");
-            match frame::allocate_pages(HEAP_PAGES_MEDIUM) {
-                Some(p) => {
-                    crate::hal::serial::write_string_always("[heap] allocated 32MB at phys=");
-                    crate::hal::serial::write_hex_u64(p);
-                    crate::hal::serial::write_string("\r\n");
-                    (p, HEAP_PAGES_MEDIUM)
-                }
-                None => {
-                    crate::hal::serial::write_string_always("[heap] 32MB FAILED, trying 16MB\r\n");
-                    match frame::allocate_pages(HEAP_PAGES_SMALL) {
-                        Some(p) => {
-                            crate::hal::serial::write_string_always(
-                                "[heap] allocated 16MB at phys=",
-                            );
-                            crate::hal::serial::write_hex_u64(p);
-                            crate::hal::serial::write_string("\r\n");
-                            (p, HEAP_PAGES_SMALL)
-                        }
-                        None => {
-                            crate::hal::serial::write_string(
-                                "[heap] FATAL: 16MB allocation failed\r\n",
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    };
-
-    let base = phys as *mut u8;
-    let size = (pages * 4096) as usize;
+    let base = core::ptr::addr_of_mut!(KERNEL_HEAP_STORAGE) as *mut u8;
+    let size = 32 * 1024 * 1024;
     crate::hal::serial::write_string_always("[heap] about to configure base=");
     crate::hal::serial::write_hex_u64(base as u64);
     crate::hal::serial::write_string(" size=");

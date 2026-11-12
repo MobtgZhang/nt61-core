@@ -763,14 +763,39 @@ pub fn load_image_full(
     }
     // size_of_image comes from the file, so an image can claim a huge size and
     // exhaust the kernel pool here. Cap it at a sane maximum.
-    const MAX_IMAGE_SIZE: usize = 64 * 1024 * 1024;
+    const MAX_IMAGE_SIZE: usize = 128 * 1024 * 1024;
     if size_of_image as usize > MAX_IMAGE_SIZE {
         return None;
     }
     unsafe {
         ntoskrnl::mm::heap::KERNEL_HEAP.debug_free_list();
     }
-    let mut img = alloc::vec![0; size_of_image as usize];
+    let sect_table_off = opt_off + file_hdr.size_of_optional_header as usize;
+    let header_extent = u32::from_le_bytes([
+        bytes[opt_off + 0x3C],
+        bytes[opt_off + 0x3D],
+        bytes[opt_off + 0x3E],
+        bytes[opt_off + 0x3F],
+    ]) as usize;
+    let mut initialized_extent = header_extent.min(size_of_image as usize);
+    for i in 0..file_hdr.number_of_sections as usize {
+        let sh_off = sect_table_off + i * 40;
+        if sh_off + 40 > bytes.len() {
+            return None;
+        }
+        let section: SectionHeader = unsafe {
+            core::ptr::read_unaligned(bytes.as_ptr().add(sh_off) as *const SectionHeader)
+        };
+        if section.size_of_raw_data == 0 {
+            continue;
+        }
+        let section_end = section.virtual_address as usize
+            + section
+                .size_of_raw_data
+                .min(size_of_image.saturating_sub(section.virtual_address)) as usize;
+        initialized_extent = initialized_extent.max(section_end);
+    }
+    let mut img = alloc::vec![0; initialized_extent];
     // `loaded.bytes` is addressed by RVA.  The headers live at RVA 0 and
     // are not part of any section, so they must be copied explicitly.
     // Without this, every later parse of the mapped image sees a zeroed
@@ -794,9 +819,6 @@ pub fn load_image_full(
     } else {
         size_of_headers.min(bytes.len()).min(img.len())
     };
-    ntoskrnl::hal::serial::write_string_always("K:mapf-copy-len=");
-    ntoskrnl::hal::serial::write_hex_u64_always(header_copy_len as u64);
-    ntoskrnl::hal::serial::write_string_always("\r\n");
     img[..header_copy_len].copy_from_slice(&bytes[..header_copy_len]);
     let source_head = if bytes.len() >= 8 {
         let mut value = [0u8; 8];
@@ -812,18 +834,6 @@ pub fn load_image_full(
     } else {
         0
     };
-    ntoskrnl::hal::serial::write_string_always("K:mapf-copy-src=");
-    ntoskrnl::hal::serial::write_hex_u64_always(source_head);
-    ntoskrnl::hal::serial::write_string_always("\r\n");
-    ntoskrnl::hal::serial::write_string_always("K:mapf-src-ptr=");
-    ntoskrnl::hal::serial::write_hex_u64_always(bytes.as_ptr() as u64);
-    ntoskrnl::hal::serial::write_string_always("\r\n");
-    ntoskrnl::hal::serial::write_string_always("K:mapf-img-ptr=");
-    ntoskrnl::hal::serial::write_hex_u64_always(img.as_ptr() as u64);
-    ntoskrnl::hal::serial::write_string_always("\r\n");
-    ntoskrnl::hal::serial::write_string_always("K:mapf-copy-dst=");
-    ntoskrnl::hal::serial::write_hex_u64_always(image_head);
-    ntoskrnl::hal::serial::write_string_always("\r\n");
     // Copy sections. Section table starts right after the optional
     // header.
     let sect_off = opt_off + file_hdr.size_of_optional_header as usize;
@@ -2352,33 +2362,6 @@ fn map_prebuilt_image_into_user_address_space(
         ntoskrnl::hal::serial::write_string_always("K:mapf-noncanon\r\n");
         return None;
     }
-    ntoskrnl::hal::serial::write_string_always("K:mapf-enter len=");
-    ntoskrnl::hal::serial::write_hex_u64_always(prebuilt.len() as u64);
-    ntoskrnl::hal::serial::write_string_always(" base=");
-    ntoskrnl::hal::serial::write_hex_u64_always(image_base);
-    ntoskrnl::hal::serial::write_string_always(" soi=");
-    ntoskrnl::hal::serial::write_hex_u64_always(size_of_image as u64);
-    ntoskrnl::hal::serial::write_string_always("\r\n");
-    let head0 = if prebuilt.len() >= 8 {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&prebuilt[0..8]);
-        u64::from_le_bytes(bytes)
-    } else {
-        0
-    };
-    ntoskrnl::hal::serial::write_string_always("K:mapf-head0=");
-    ntoskrnl::hal::serial::write_hex_u64_always(head0);
-    ntoskrnl::hal::serial::write_string_always("\r\n");
-    let head88 = if prebuilt.len() >= 0x90 {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&prebuilt[0x88..0x90]);
-        u64::from_le_bytes(bytes)
-    } else {
-        0
-    };
-    ntoskrnl::hal::serial::write_string_always("K:mapf-head88=");
-    ntoskrnl::hal::serial::write_hex_u64_always(head88);
-    ntoskrnl::hal::serial::write_string_always("\r\n");
     let (file_hdr, _opt_size, magic, opt_off) = match parse_headers(prebuilt) {
         Some(h) => h,
         None => {
@@ -2386,7 +2369,6 @@ fn map_prebuilt_image_into_user_address_space(
             return None;
         }
     };
-    ntoskrnl::hal::serial::write_string_always("K:mapf-parsed\r\n");
     let aep: u32 = if magic == 0x10B {
         match read_opt32(prebuilt, opt_off) {
             Some(v) => v.2,
@@ -2448,16 +2430,6 @@ fn map_prebuilt_image_into_user_address_space(
         });
     }
 
-    for s in &section_info {
-        ntoskrnl::hal::serial::write_string_always("K:sect va=");
-        ntoskrnl::hal::serial::write_hex_u64_always(s.va_start);
-        ntoskrnl::hal::serial::write_string_always("-");
-        ntoskrnl::hal::serial::write_hex_u64_always(s.va_end);
-        ntoskrnl::hal::serial::write_string_always(" chars=");
-        ntoskrnl::hal::serial::write_hex_u64_always(s.chars as u64);
-        ntoskrnl::hal::serial::write_string_always("\r\n");
-    }
-
     // Initial mapping: RW+NX so bytes can be written and no stale
     // I-cache translation can exist for this VA.
     for (page_index, &p) in phys_pages.iter().enumerate() {
@@ -2510,11 +2482,6 @@ fn map_prebuilt_image_into_user_address_space(
                 break;
             }
         }
-        if page_va == ((image_base + aep as u64) & !0xFFFu64) {
-            ntoskrnl::hal::serial::write_string_always("K:entry-page flags=");
-            ntoskrnl::hal::serial::write_hex_u64_always(final_flags);
-            ntoskrnl::hal::serial::write_string_always("\r\n");
-        }
         let r = ntoskrnl::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, final_flags);
         if r != ntoskrnl::mm::vas::MmStatus::Ok {
             ntoskrnl::hal::serial::write_string_always("K:mapf-final-map\r\n");
@@ -2525,13 +2492,6 @@ fn map_prebuilt_image_into_user_address_space(
             return None;
         }
         ntoskrnl::mm::vas::invalidate_tlb(page_va);
-    }
-    {
-        let entry_page_va = (image_base + aep as u64) & !0xFFFu64;
-        let pte = ntoskrnl::mm::vas::debug_read_user_pte(pml4_phys, entry_page_va);
-        ntoskrnl::hal::serial::write_string_always("K:entry-pte=");
-        ntoskrnl::hal::serial::write_hex_u64_always(pte);
-        ntoskrnl::hal::serial::write_string_always("\r\n");
     }
     ntoskrnl::arch::flush_tlb();
     ntoskrnl::arch::restore_system_address_space(saved_cr3);
@@ -2551,11 +2511,13 @@ fn map_prebuilt_image_into_user_address_space(
 pub fn map_loaded_image_into_kernel_space(loaded: &LoadedImage) -> bool {
     let system_pml4 = ntoskrnl::mm::vas::MM_SYSTEM_VAS.lock().pml4_phys;
     if system_pml4 == 0 || loaded.image_base == 0 || loaded.bytes.is_empty() {
+        ntoskrnl::hal::serial::write_string_always("K:mapimg-invalid\r\n");
         return false;
     }
     let image_base = loaded.image_base;
     let size_of_image = loaded.image_size as usize;
     if size_of_image == 0 {
+        ntoskrnl::hal::serial::write_string_always("K:mapimg-empty\r\n");
         return false;
     }
     if ntoskrnl::mm::vas::is_user_range_mapped(system_pml4, image_base, 0x1000) {
@@ -2567,16 +2529,24 @@ pub fn map_loaded_image_into_kernel_space(loaded: &LoadedImage) -> bool {
     };
 
     let page_count = size_of_image.div_ceil(0x1000);
-    let mut phys_pages: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(page_count);
+    let mut phys_pages_storage = [0u64; 256];
+    let mut phys_page_count = 0usize;
     for _ in 0..page_count {
         let Some(p) = ntoskrnl::mm::vas::alloc_zeroed_page_for_vas() else {
-            for &pa in &phys_pages {
+            ntoskrnl::hal::serial::write_string_always("K:mapimg-page-alloc-failed\r\n");
+            for &pa in &phys_pages_storage[..phys_page_count] {
                 ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return false;
         };
-        phys_pages.push(p);
+        if phys_page_count >= phys_pages_storage.len() {
+            ntoskrnl::hal::serial::write_string_always("K:mapimg-page-alloc-failed\r\n");
+            return false;
+        }
+        phys_pages_storage[phys_page_count] = p;
+        phys_page_count += 1;
     }
+    let phys_pages = &phys_pages_storage[..phys_page_count];
 
     #[derive(Copy, Clone)]
     struct SectInfo {
@@ -2621,7 +2591,7 @@ pub fn map_loaded_image_into_kernel_space(loaded: &LoadedImage) -> bool {
         if ntoskrnl::mm::vas::map_page_in_pml4(system_pml4, page_va, p, initial_flags)
             != ntoskrnl::mm::vas::MmStatus::Ok
         {
-            for &pa in &phys_pages {
+            for &pa in phys_pages {
                 ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return false;
@@ -2654,13 +2624,14 @@ pub fn map_loaded_image_into_kernel_space(loaded: &LoadedImage) -> bool {
         let r = ntoskrnl::mm::vas::map_page_in_pml4(system_pml4, page_va, p, final_flags);
         if r != ntoskrnl::mm::vas::MmStatus::Ok {
             ntoskrnl::arch::restore_system_address_space(saved_cr3);
-            for &pa in &phys_pages {
+            for &pa in phys_pages {
                 ntoskrnl::mm::pfn::free_pfn(pa >> 12);
             }
             return false;
         }
         ntoskrnl::mm::vas::invalidate_tlb(page_va);
     }
+    ntoskrnl::hal::serial::write_string_always("K:mapimg-done\r\n");
     ntoskrnl::arch::flush_tlb();
     ntoskrnl::arch::restore_system_address_space(saved_cr3);
     true

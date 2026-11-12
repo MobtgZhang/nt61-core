@@ -63,12 +63,7 @@ fn current_process_pml4() -> u64 {
 pub struct UserHeapAllocator;
 
 pub fn init_user_heap(pml4: u64) -> u64 {
-    crate::hal::serial::write_string_always("[USER-HEAP] init enter\r\n");
-    crate::hal::serial::write_string_always("[USER-HEAP] pml4\r\n");
-    crate::hal::serial::write_hex_u64_always(pml4);
-    crate::hal::serial::write_string_always("\r\n");
     if pml4 == 0 {
-        crate::hal::serial::write_string_always("[USER-HEAP] init failed: pml4\r\n");
         return 0;
     }
 
@@ -78,18 +73,11 @@ pub fn init_user_heap(pml4: u64) -> u64 {
         return base;
     }
     if table.len() >= HEAP_TABLE_MAX {
-        crate::hal::serial::write_string_always("[USER-HEAP] init failed: table full\r\n");
         return 0;
     }
 
     let status = vas::map_user_pages(pml4, HEAP_BASE, HEAP_PAGE_BUDGET, pte::PTE_RW | pte::PTE_US);
-    crate::hal::serial::write_string_always("[USER-HEAP] map status\r\n");
-    crate::hal::serial::write_hex_u64_always(status as u64);
-    crate::hal::serial::write_string_always("\r\n");
     if status != vas::MmStatus::Ok {
-        crate::hal::serial::write_string_always("[USER-HEAP] init failed: map status ");
-        crate::hal::serial::write_hex_u64_always(status as u64);
-        crate::hal::serial::write_string_always("\r\n");
         return 0;
     }
 
@@ -97,15 +85,12 @@ pub fn init_user_heap(pml4: u64) -> u64 {
     // all user pages exist, so the heap can be initialized through user VAs.
     vas::refresh_kernel_mappings(pml4);
     let previous_root = vas::attach_process(pml4);
-    crate::hal::serial::write_string_always("[USER-HEAP] attached\r\n");
 
     let base = HEAP_BASE;
     let first_block = (base + HEADER_SIZE as u64) as *mut BlockHeader;
     let first_size = HEAP_PAGE_BUDGET as usize - HEADER_SIZE;
     unsafe {
-        for offset in 0..HEAP_PAGE_BUDGET as usize {
-            core::ptr::write_volatile((base + offset as u64) as *mut u8, 0u8);
-        }
+        core::ptr::write_bytes(base as *mut u8, 0, HEAP_PAGE_BUDGET as usize);
         ptr::write(
             first_block,
             BlockHeader {
@@ -116,9 +101,7 @@ pub fn init_user_heap(pml4: u64) -> u64 {
             },
         );
     }
-    crate::hal::serial::write_string_always("[USER-HEAP] zeroed\r\n");
     vas::detach_process(previous_root);
-    crate::hal::serial::write_string_always("[USER-HEAP] detached\r\n");
 
     // Insert the heap only after returning to the system root. `Vec::push`
     // can allocate, and kernel allocations may touch PFN metadata by
@@ -131,7 +114,6 @@ pub fn init_user_heap(pml4: u64) -> u64 {
             free_head: first_block,
         },
     });
-    crate::hal::serial::write_string_always("[USER-HEAP] registered\r\n");
     base
 }
 
