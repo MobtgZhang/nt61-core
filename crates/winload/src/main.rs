@@ -328,6 +328,10 @@ fn fat32_system_fallback(path: &str) -> Option<Vec<u8>> {
 }
 
 fn open_system_file_data(path: &str) -> Option<Vec<u8>> {
+    if let Some(data) = cached_system_file(path) {
+        return Some(data);
+    }
+
     let is_system = path.len() >= 8 && &path[1..8] == "Windows";
     if is_system {
         let fs_kind = unsafe { core::ptr::addr_of!(SYSTEM_FS_KIND).read_volatile() };
@@ -336,6 +340,7 @@ fn open_system_file_data(path: &str) -> Option<Vec<u8>> {
                 unsafe {
                     core::ptr::addr_of_mut!(SYSTEM_FS_KIND).write_volatile(SYSTEM_FS_NTFS);
                 }
+                cache_system_file(path, &data);
                 return Some(data);
             }
         }
@@ -346,6 +351,7 @@ fn open_system_file_data(path: &str) -> Option<Vec<u8>> {
                 unsafe {
                     core::ptr::addr_of_mut!(SYSTEM_FS_KIND).write_volatile(SYSTEM_FS_EXT4);
                 }
+                cache_system_file(path, &data);
                 return Some(data);
             }
         }
@@ -356,6 +362,7 @@ fn open_system_file_data(path: &str) -> Option<Vec<u8>> {
                 unsafe {
                     core::ptr::addr_of_mut!(SYSTEM_FS_KIND).write_volatile(SYSTEM_FS_REFS);
                 }
+                cache_system_file(path, &data);
                 return Some(data);
             }
         }
@@ -850,6 +857,60 @@ fn capture_device_tree_hardware() -> DeviceTreeHardware {
     hardware
 }
 
+fn capture_device_tree_base() -> Option<u64> {
+    let handle = uefi::boot::get_handle_for_protocol::<FdtClientProtocol>().ok()?;
+    let client = unsafe {
+        uefi::boot::open_protocol::<FdtClientProtocol>(
+            uefi::boot::OpenProtocolParams {
+                handle,
+                agent: uefi::boot::image_handle(),
+                controller: None,
+            },
+            uefi::boot::OpenProtocolAttributes::GetProtocol,
+        )
+        .ok()?
+    };
+    for compatible in [
+        b"memory\0".as_slice(),
+        b"memory@40000000\0".as_slice(),
+        b"\0".as_slice(),
+        b"arm,dummy-virt\0".as_slice(),
+    ] {
+        if let Some(range) = query_fdt_client_reg(&client, compatible) {
+            if range.size != 0 {
+                return Some(range.base);
+            }
+        }
+    }
+    // EDK2's FdtClientDxe knows the DTB address but does not publish it
+    // through a configuration table on this firmware. The protocol object is
+    // embedded in a private context that contains the DTB pointer; dump a
+    // small window around it for the kernel bootstrap.
+    let client_addr = &client as *const _ as u64;
+    let mut found = None;
+    for offset in (-8192i64..=8192i64).step_by(8) {
+        let probe = (client_addr as i64).wrapping_add(offset) as *const u64;
+        let candidate = unsafe { probe.read_volatile() };
+        if !(0x40000000..0x48000000).contains(&candidate) {
+            continue;
+        }
+        let bytes = candidate as *const u8;
+        if unsafe { bytes.read_volatile() } == 0xd0
+            && unsafe { bytes.add(1).read_volatile() } == 0x0d
+            && unsafe { bytes.add(2).read_volatile() } == 0xfe
+            && unsafe { bytes.add(3).read_volatile() } == 0xed
+        {
+            found = Some(candidate);
+            break;
+        }
+    }
+    uefi::println!(
+        "[WINLOAD] FDT protocol scan found=0x{:x}",
+        found.unwrap_or(0)
+    );
+    found
+}
+
 /// Locate the UEFI DTB table, copy it into runtime-surviving memory, and
 /// record its exact address/size for `BootInfo`. The firmware-owned DTB is
 /// not guaranteed to remain valid after `ExitBootServices`, so winload owns
@@ -873,8 +934,72 @@ fn capture_device_tree() {
         .iter()
         .find(|entry| entry.vendor_guid == EFI_DTB_TABLE_GUID)
     else {
+        let system_table = unsafe { &*(system_table.as_ptr() as *const EfiSystemTable) };
+        let entries = unsafe {
+            core::slice::from_raw_parts(
+                system_table.configuration_table,
+                system_table.number_of_table_entries,
+            )
+        };
+        for (index, entry) in entries.iter().enumerate() {
+            let guid = entry.vendor_guid.0;
+            uefi::println!(
+                "[WINLOAD] config-table[{}] guid={:02x?} table=0x{:x}",
+                index,
+                guid,
+                entry.vendor_table as u64
+            );
+        }
         if hardware.uart.is_none() {
             debug_println!("[LOADER] DTB capture unavailable: no FDT client or DTB table");
+        }
+        let source = capture_device_tree_base();
+        if let Some(source) = source {
+            let source = source as *const u8;
+            let magic = u32::from_be_bytes(unsafe {
+                [
+                    source.read_volatile(),
+                    source.add(1).read_volatile(),
+                    source.add(2).read_volatile(),
+                    source.add(3).read_volatile(),
+                ]
+            });
+            if magic == 0xd00d_feed {
+                let total_size = u32::from_be_bytes(unsafe {
+                    [
+                        source.add(4).read_volatile(),
+                        source.add(5).read_volatile(),
+                        source.add(6).read_volatile(),
+                        source.add(7).read_volatile(),
+                    ]
+                });
+                if total_size > 0 && total_size <= 8 * 1024 * 1024 {
+                    let page_count = (total_size as usize + 0xfff) / 0x1000;
+                    let Ok(mut destination) = uefi::boot::allocate_pages(
+                        uefi::boot::AllocateType::AnyPages,
+                        uefi::boot::MemoryType::RUNTIME_SERVICES_DATA,
+                        page_count,
+                    ) else {
+                        debug_println!("[LOADER] [WARN] DTB capture allocation failed");
+                        return;
+                    };
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            source,
+                            destination.as_mut(),
+                            total_size as usize,
+                        );
+                    }
+                    let persistent = unsafe { &mut *core::ptr::addr_of_mut!(PERSISTENT) };
+                    persistent.device_tree_base = destination.as_ptr() as u64;
+                    persistent.device_tree_size = total_size;
+                    uefi::println!(
+                        "[WINLOAD] DTB captured from protocol: base=0x{:x} size={}",
+                        persistent.device_tree_base,
+                        persistent.device_tree_size
+                    );
+                }
+            }
         }
         return;
     };
@@ -1074,6 +1199,52 @@ const SYSTEM_FS_NTFS: u8 = 1;
 const SYSTEM_FS_EXT4: u8 = 2;
 const SYSTEM_FS_REFS: u8 = 3;
 static mut SYSTEM_FS_KIND: u8 = SYSTEM_FS_UNKNOWN;
+
+/// Startup-time cache for immutable system files.
+///
+/// Driver loading reads each `.sys` file once and its `.sha256` and
+/// `.sig` sidecars once. Previously every one of those reads re-parsed
+/// the NTFS boot sector and MFT record, which made boot with 13
+/// drivers extremely slow. System files are immutable while the loader
+/// runs, so caching them by path is safe. Entries are limited to
+/// prevent malformed input from exhausting memory.
+const SYSTEM_FILE_CACHE_LIMIT: usize = 64;
+const SYSTEM_FILE_CACHE_SIZE_LIMIT: usize = 64 * 1024 * 1024;
+static mut SYSTEM_FILE_CACHE: Option<Vec<(alloc::string::String, Vec<u8>)>> = None;
+
+fn cache_system_file(path: &str, data: &[u8]) {
+    if data.len() > SYSTEM_FILE_CACHE_SIZE_LIMIT {
+        return;
+    }
+    // SAFETY: called from the single-threaded UEFI loader before
+    // ExitBootServices; this static is private to this module.
+    unsafe {
+        if (*core::ptr::addr_of_mut!(SYSTEM_FILE_CACHE)).is_none() {
+            *core::ptr::addr_of_mut!(SYSTEM_FILE_CACHE) = Some(Vec::new());
+        }
+        let cache = (*core::ptr::addr_of_mut!(SYSTEM_FILE_CACHE))
+            .as_mut()
+            .expect("system file cache");
+        if cache.iter().any(|(cached_path, _)| cached_path == path) {
+            return;
+        }
+        if cache.len() >= SYSTEM_FILE_CACHE_LIMIT {
+            return;
+        }
+        cache.push((alloc::string::String::from(path), Vec::from(data)));
+    }
+}
+
+fn cached_system_file(path: &str) -> Option<Vec<u8>> {
+    // SAFETY: read-only access from the single-threaded UEFI loader.
+    unsafe {
+        let cache = &*core::ptr::addr_of!(SYSTEM_FILE_CACHE);
+        cache
+            .as_ref()
+            .and_then(|cache| cache.iter().find(|(cached_path, _)| cached_path == path))
+            .map(|(_, data)| data.clone())
+    }
+}
 
 /// Locate the ESP's SimpleFileSystem handle and cache it. Call once
 /// from `efi_main` (before any other boot-services activity that
@@ -2554,7 +2725,7 @@ static mut MEM_MAP_BUF: MemMapBuf = MemMapBuf([0u8; 32 * 1024]);
 fn raw_get_memory_map_with_key(
     out: &mut [MemoryMapEntry],
     descriptor_buf: &mut [u8],
-) -> (usize, usize) {
+) -> (usize, usize, usize) {
     // SAFETY: the system table is set once in `efi_main` and is
     // valid for the entire boot. Boot services are still active
     // here, so the boot-services table pointer is valid.
@@ -2563,7 +2734,7 @@ fn raw_get_memory_map_with_key(
     let bt_ptr = st.boot_services;
     if bt_ptr.is_null() {
         debug_println!("  [LOAD] GetMemoryMap: boot_services is null");
-        return (0, 0);
+        return (0, 0, 0);
     }
     let bt = unsafe { &*bt_ptr };
     let mut map_size: usize = descriptor_buf.len();
@@ -2582,11 +2753,11 @@ fn raw_get_memory_map_with_key(
     };
     if !status.is_success() {
         debug_println!("  [LOAD] GetMemoryMap raw failed");
-        return (0, 0);
+        return (0, 0, 0);
     }
     if desc_size == 0 {
         debug_println!("  [LOAD] GetMemoryMap returned desc_size=0");
-        return (0, 0);
+        return (0, 0, 0);
     }
     let count = map_size / desc_size;
     let cap = (out.len()).min(count);
@@ -2595,17 +2766,17 @@ fn raw_get_memory_map_with_key(
         for i in 0..cap {
             let off = i * desc_size;
             let phys = core::ptr::read_unaligned(desc_ptr.add(off + 8) as *const u64);
-            let pages: u64 = core::ptr::read_unaligned(desc_ptr.add(off + 24) as *const u64);
             let ty: u32 = core::ptr::read_unaligned(desc_ptr.add(off + 0) as *const u32);
+            let page_count: u64 = core::ptr::read_unaligned(desc_ptr.add(off + 24) as *const u64);
             out[i] = MemoryMapEntry {
                 base: phys,
-                length: pages * 4096,
+                length: page_count.saturating_mul(4096),
                 memory_type: ty,
                 reserved: 0,
             };
         }
     }
-    (cap, map_key)
+    (cap, map_key, desc_size)
 }
 
 fn collect_memory_map() {
@@ -2619,11 +2790,12 @@ fn collect_memory_map() {
         // returns (entry_count, map_key) — we save the map_key in
         // `PERSISTENT.map_key` so the eventual `ExitBootServices`
         // call can pass it back to the firmware.
-        let (n, key) = raw_get_memory_map_with_key(
+        let (n, key, descriptor_size) = raw_get_memory_map_with_key(
             &mut pd.memory_map,
             &mut (*core::ptr::addr_of_mut!(MEM_MAP_BUF)).0,
         );
         pd.map_key = key;
+        pd.descriptor_size = descriptor_size as u32;
         if n == 0 {
             // Fall back to a conservative static map so the kernel still
             // boots on firmware that fails `GetMemoryMap` during boot.
@@ -3617,6 +3789,12 @@ fn read_fb_mailbox_from_config_table() -> Option<FramebufferInfo> {
 
 fn build_boot_info(kernel_pa: u64, kernel_size: u64) -> BootInfo {
     let pd = unsafe { &*core::ptr::addr_of!(PERSISTENT) };
+    uefi::println!(
+        "[WINLOAD] BootInfo DTB base=0x{:x} size={} hardware={}",
+        pd.device_tree_base,
+        pd.device_tree_size,
+        pd.device_tree_hardware.uart.is_some()
+    );
 
     // Count loaded boot drivers
     let boot_driver_count = pd.boot_drivers.iter().filter(|r| r.loaded).count() as u32;
@@ -3630,7 +3808,10 @@ fn build_boot_info(kernel_pa: u64, kernel_size: u64) -> BootInfo {
         memory_map: &pd.memory_map as *const MemoryMapEntry as u64,
         memory_map_entries: pd.memory_map_count as u64,
         memory_map_size_bytes: pd.memory_map_size_bytes as u64,
-        memory_descriptor_size: pd.descriptor_size,
+        // `BootInfo` points at the compact 32-byte `MemoryMapEntry`
+        // array, not the raw UEFI 40-byte descriptors. The kernel
+        // must use the stride of the array it actually receives.
+        memory_descriptor_size: core::mem::size_of::<MemoryMapEntry>() as u32,
         _reserved: 0,
         cmdline: 0,
         acpi_rsdp: pd.acpi_rsdp,
@@ -4403,7 +4584,7 @@ fn os_loader_run() -> ! {
     // same function pointer can fault.  The reliable fix is to obtain a
     // fresh map/key just before the single ExitBootServices call.
     uefi::println!("[WINLOAD] L10 refreshing memory map");
-    let (fresh_entries, fresh_key) = unsafe {
+    let (fresh_entries, fresh_key, fresh_descriptor_size) = unsafe {
         let pd = &mut *core::ptr::addr_of_mut!(PERSISTENT);
         raw_get_memory_map_with_key(
             &mut pd.memory_map,
@@ -4414,6 +4595,7 @@ fn os_loader_run() -> ! {
         let pd = unsafe { &mut *core::ptr::addr_of_mut!(PERSISTENT) };
         pd.memory_map_count = fresh_entries;
         pd.map_key = fresh_key;
+        pd.descriptor_size = fresh_descriptor_size as u32;
     }
     let mut map_key = fresh_key;
     uefi::println!(
@@ -4467,13 +4649,14 @@ fn os_loader_run() -> ! {
             // may be used while retrying, so refresh through the raw
             // table and do not run any higher-level allocator work.
             let pd = &mut *core::ptr::addr_of_mut!(PERSISTENT);
-            let (retry_entries, retry_key) = raw_get_memory_map_with_key(
+            let (retry_entries, retry_key, retry_descriptor_size) = raw_get_memory_map_with_key(
                 &mut pd.memory_map,
                 &mut (*core::ptr::addr_of_mut!(MEM_MAP_BUF)).0,
             );
             if retry_entries > 0 {
                 pd.memory_map_count = retry_entries;
                 pd.map_key = retry_key;
+                pd.descriptor_size = retry_descriptor_size as u32;
             }
             map_key = retry_key;
             status = (bt_ref.exit_boot_services)(handle_ptr, map_key);
