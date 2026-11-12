@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod arch;
+pub mod bmp;
 pub mod boot;
 pub mod compositor;
 pub mod controls;
@@ -22,9 +23,14 @@ pub mod resource_generator;
 pub mod resources;
 pub mod shell;
 pub mod theme;
+pub mod user_account_pictures;
 pub mod user_allocator;
 pub mod widgets;
 pub mod win32;
 pub mod window;
 
 pub const NT_VERSION: (u16, u16, u16) = (6, 1, 7601);
+
+#[cfg(test)]
+#[path = "ico_test.rs"]
+mod ico_tests;

@@ -5,6 +5,12 @@ use crate::theme::Theme;
 use crate::widgets::textbox::TextBox;
 
 pub const TASKBAR_HEIGHT: u32 = 40;
+pub const START_BUTTON_WIDTH: u32 = 54;
+pub const PROGRAM_BUTTON_WIDTH: u32 = 88;
+pub const PROGRAM_BUTTON_GAP: u32 = 4;
+pub const NOTIFICATION_AREA_WIDTH: u32 = 132;
+pub const START_MENU_WIDTH: u32 = 420;
+pub const START_MENU_HEIGHT: u32 = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowKind {
@@ -23,6 +29,14 @@ pub struct DesktopItem {
     pub icon: ImageResource,
     pub x: i32,
     pub y: i32,
+}
+
+pub fn taskbar_program_x(index: u32) -> u32 {
+    START_BUTTON_WIDTH + 4 + index * (PROGRAM_BUTTON_WIDTH + PROGRAM_BUTTON_GAP)
+}
+
+pub fn notification_area_left(width: u32) -> u32 {
+    width.saturating_sub(NOTIFICATION_AREA_WIDTH)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -481,11 +495,11 @@ impl ShellModel {
         controls.add(
             CONTROL_START,
             ControlKind::Button,
-            Rect::new(2, top as i32, 38, TASKBAR_HEIGHT),
+            Rect::new(0, top as i32, START_BUTTON_WIDTH, TASKBAR_HEIGHT),
         );
         for (index, window) in self.taskbar.windows.iter().enumerate() {
-            let x = 48 + index as u32 * 92;
-            if x + 86 > width.saturating_sub(130) {
+            let x = taskbar_program_x(index as u32);
+            if x + PROGRAM_BUTTON_WIDTH > notification_area_left(width) {
                 break;
             }
             controls.add(
@@ -498,7 +512,7 @@ impl ShellModel {
                 Rect::new(
                     x as i32,
                     top as i32 + 4,
-                    86,
+                    PROGRAM_BUTTON_WIDTH,
                     TASKBAR_HEIGHT.saturating_sub(9),
                 ),
             );
@@ -511,13 +525,14 @@ impl ShellModel {
             );
         }
         if self.start_menu.open {
-            let menu_y = height.saturating_sub(TASKBAR_HEIGHT + 374);
+            let menu_y = height.saturating_sub(TASKBAR_HEIGHT + START_MENU_HEIGHT);
+            let pane_width = START_MENU_WIDTH * 62 / 100;
             for index in 0..4 {
-                let y = menu_y + 12 + index as u32 * 38;
+                let y = menu_y + 24 + index as u32 * 38;
                 controls.add(
                     CONTROL_MENU_BASE + index as u32,
                     ControlKind::Button,
-                    Rect::new(8, y as i32, 180, 32),
+                    Rect::new(14, y as i32, pane_width.saturating_sub(28), 32),
                 );
             }
         }
@@ -830,6 +845,38 @@ impl ShellModel {
             }
             _ => false,
         }
+    }
+
+    pub fn handle_start_menu_key(&mut self, key: u8) -> bool {
+        if !self.start_menu.open {
+            return false;
+        }
+        let changed = match key {
+            0x26 => {
+                self.start_menu.move_highlight(-1);
+                true
+            }
+            0x28 => {
+                self.start_menu.move_highlight(1);
+                true
+            }
+            8 => {
+                self.start_menu.query.pop();
+                self.start_menu.highlighted = 0;
+                true
+            }
+            0x20..=0x7e => {
+                let mut query = alloc::string::String::from(&self.start_menu.query);
+                query.push(key as char);
+                self.start_menu.set_query(&query);
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.start_menu.selected = None;
+        }
+        changed
     }
 
     pub fn cycle_windows(&mut self) -> Option<u32> {
