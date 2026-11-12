@@ -3091,13 +3091,25 @@ fn refresh_pe_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
 /// Generate Win7 desktop PE resource files into the build output.
 ///
 /// The generator lives in `crates/desktop`; the only artifacts emitted
-/// here are under `<System32>/resources/desktop`. This avoids keeping
-/// generated PE/theme files in the source tree.
+/// here are directly under `<System32>` with their Windows names.
 fn generate_desktop_resources(system32_dir: &Path) -> Result<()> {
     use std::process::Command;
 
+    let legacy_directory = system32_dir.join("resources/desktop");
+    if legacy_directory.is_dir() {
+        std::fs::remove_dir_all(&legacy_directory).map_err(BuildError::Io)?;
+    }
+    let resources_parent = system32_dir.join("resources");
+    if resources_parent.is_dir()
+        && std::fs::read_dir(&resources_parent)
+            .map(|entries| entries.filter_map(std::result::Result::ok).next().is_none())
+            .unwrap_or(false)
+    {
+        std::fs::remove_dir(&resources_parent).map_err(BuildError::Io)?;
+    }
+
     let arch = arch_name(current_pe_arch());
-    let destination = system32_dir.join("resources").join("desktop");
+    let destination = system32_dir.to_path_buf();
     let status = Command::new("cargo")
         .arg("run")
         .arg("--release")
@@ -3118,14 +3130,14 @@ fn generate_desktop_resources(system32_dir: &Path) -> Result<()> {
             "desktop resource generation failed with exit code: {status:?}"
         )));
     }
-    for name in ["imageres.dll", "shell32.dll", "aero.msstyles"] {
+    for name in ["imageres.dll", "shell32.dll"] {
         let path = destination.join(name);
         if !path.is_file() {
             return Err(BuildError::MissingFile(path.display().to_string()));
         }
     }
     log::info(&format!(
-        "Generated desktop resources in {}",
+        "Generated Windows 7 resources in {}",
         destination.display()
     ));
     Ok(())
