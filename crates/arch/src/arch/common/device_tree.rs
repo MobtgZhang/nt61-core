@@ -217,6 +217,14 @@ fn parse_reg_ranges(
     ranges
 }
 
+pub fn parse_reg_ranges_public(
+    value: &[u8],
+    address_cells: u32,
+    size_cells: u32,
+) -> [DeviceRange; MAX_REG_RANGES] {
+    parse_reg_ranges(value, address_cells, size_cells)
+}
+
 fn read_big_endian(bytes: Option<&[u8]>) -> u64 {
     let Some(bytes) = bytes else { return 0 };
     let mut value = 0u64;

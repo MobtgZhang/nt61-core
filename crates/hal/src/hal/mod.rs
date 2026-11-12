@@ -147,6 +147,7 @@ pub fn init() {
     #[cfg(target_arch = "aarch64")]
     {
         crate::hal::serial::write_string("hal_mod_init:about_to_call_aarch64\r\n");
+        crate::arch::boot::early_write_str(b"[TRACE] hal-mod-enter\r\n");
         aarch64::init();
     }
 

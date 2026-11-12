@@ -91,6 +91,7 @@ endif
 QEMU_AARCH64 := qemu-system-aarch64
 QEMU_RISCV64 := qemu-system-riscv64
 QEMU_LOONGARCH64 := qemu-system-loongarch64
+QEMU_GENERIC_DISPLAY ?= -display gtk
 
 BRIDGE ?= br0
 QEMU_NET_BRIDGE := -netdev bridge,id=n0,br=$(BRIDGE) -device virtio-net-pci,netdev=n0
@@ -467,9 +468,10 @@ define _run_x86_64
 		$(DISK_FLAGS) \
 		-boot $(if $(filter iso,$(FORMAT)),d,c) $(QEMU_NET_BRIDGE) \
 		-device virtio-keyboard-pci \
+		-device virtio-mouse-pci \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		$(QEMU_GPU_DEVICE) \
-		-serial file:$(SERIAL_LOG) $(QEMU_DISPLAY)
+		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY)
 endef
 
 define _run_aarch64
@@ -483,7 +485,7 @@ define _run_aarch64
 		-device ramfb -device qemu-xhci -device virtio-keyboard-pci \
 		-boot order=c $(QEMU_NET_BRIDGE) \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) -display gtk
+		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY)
 endef
 
 define _run_riscv64
@@ -509,7 +511,7 @@ define _run_riscv64
 		-device qemu-xhci -device virtio-keyboard-pci \
 		$(QEMU_NET_BRIDGE) \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) -display gtk
+		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY)
 endef
 
 define _run_loongarch64
@@ -522,7 +524,7 @@ define _run_loongarch64
 		$(DISK_FLAGS) -device ramfb -device qemu-xhci -device virtio-keyboard-pci \
 		-boot order=c $(QEMU_NET_BRIDGE) \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) -display gtk
+		-serial file:$(SERIAL_LOG) $(QEMU_DISPLAY)
 endef
 
 # ============================================================
@@ -837,9 +839,10 @@ run-x86_64-ntfs-serial: build-x86_64-ntfs
 		-drive format=raw,file=$(DISK_IMG) \
 		-boot c -net none \
 		-device virtio-keyboard-pci \
-		-device virtio-gpu-pci,xres=1024,yres=768,blob=on \
+		-device virtio-mouse-pci \
+		-device virtio-gpu-pci,xres=1024,yres=768 \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) -display gtk || true
+		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
 
 run-x86_64-fat32-serial: ARCH=x86_64
 run-x86_64-fat32-serial: FORMAT=fat32
@@ -854,9 +857,10 @@ run-x86_64-fat32-serial: build-x86_64-fat32
 		-drive format=raw,file=$(DISK_IMG) \
 		-boot c -net none \
 		-device virtio-keyboard-pci \
-		-device virtio-gpu-pci,xres=1024,yres=768,blob=on \
+		-device virtio-mouse-pci \
+		-device virtio-gpu-pci,xres=1024,yres=768 \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) -display gtk || true
+		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
 
 run-x86_64-ext4-serial: ARCH=x86_64
 run-x86_64-ext4-serial: FORMAT=ext4
@@ -871,9 +875,10 @@ run-x86_64-ext4-serial: build-x86_64-ext4
 		-drive format=raw,file=$(DISK_IMG) \
 		-boot c -net none \
 		-device virtio-keyboard-pci \
-		-device virtio-gpu-pci,xres=1024,yres=768,blob=on \
+		-device virtio-mouse-pci \
+		-device virtio-gpu-pci,xres=1024,yres=768 \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) -display gtk || true
+		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
 
 # Network end-to-end verification: boots the x86_64 kernel with QEMU
 # user networking (slirp). The kernel runs `netstack::e2e_test::
@@ -948,7 +953,7 @@ define _run_aarch64_serial
 		-device ramfb -device qemu-xhci -device virtio-keyboard-pci \
 		-boot order=c -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) -display gtk || true
+		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
 endef
 
 define _run_riscv64_serial
@@ -961,7 +966,7 @@ define _run_riscv64_serial
 		-device ramfb -device qemu-xhci -device virtio-keyboard-pci \
 		-boot order=c -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) -display gtk || true
+		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
 endef
 
 define _run_loongarch64_serial
@@ -973,7 +978,7 @@ define _run_loongarch64_serial
 		-device ramfb -device qemu-xhci -device virtio-keyboard-pci \
 		-boot order=c -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) -display gtk || true
+		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
 endef
 
 # aarch64

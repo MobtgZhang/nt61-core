@@ -276,8 +276,11 @@ pub fn detect_soc() -> SocType {
     // Architecture >= v8: look up the implementer.
     let detected = match (implementer, part) {
         // ARM Ltd. (0x41): Cortex-A parts.
-        (0x41, 0xD07) => SocType::RockchipRK3588, // Cortex-A55 placeholder
-        (0x41, 0xD08) => SocType::RockchipRK356x, // Cortex-A76 placeholder
+        // Cortex-A57 is the CPU model used by the QEMU `virt` machine's
+        // default GICv2 configuration. It is not evidence of Rockchip
+        // silicon; Rockchip parts must come from the Rockchip MIDR.
+        (0x41, 0xD07) => SocType::QEMUVirt,
+        (0x41, 0xD08) => SocType::QEMUVirt,
         // Huawei implementer ID (0x68 / 0x6B varies by part).
         (0x68, _) => SocType::KunPeng920,
         // Phytium (FT-2000/4, D2000, D3000 — implementer 0x70).

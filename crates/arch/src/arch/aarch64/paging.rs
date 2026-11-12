@@ -32,8 +32,8 @@
 
 use core::arch::asm;
 use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::mm::pfn;
 use crate::mm::pte::pfn_to_phys;
 
 pub const PAGE_SIZE: u64 = 4096;
@@ -103,6 +103,60 @@ fn sync_new_page_table() {
     }
 }
 
+/// Static, pre-mapped page-table frames. The kernel image already has
+/// translations for these bytes, so installing a new L1/L2/L3 must
+/// never allocate another page-table frame to map its own storage.
+const SPARE_PAGE_TABLE_COUNT: usize = 512;
+const SPARE_PAGE_TABLE_ENTRIES: usize = 512;
+#[repr(C, align(4096))]
+struct SparePageTables([u64; SPARE_PAGE_TABLE_COUNT * SPARE_PAGE_TABLE_ENTRIES]);
+
+static mut SPARE_PAGE_TABLES: SparePageTables =
+    SparePageTables([0; SPARE_PAGE_TABLE_COUNT * SPARE_PAGE_TABLE_ENTRIES]);
+static SPARE_PAGE_TABLE_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+#[repr(C, align(4096))]
+struct CrossRootScratchPage([u64; 512]);
+
+static mut CROSS_ROOT_SCRATCH: CrossRootScratchPage = CrossRootScratchPage([0; 512]);
+
+/// Report the physical extent occupied by the preallocated page tables.
+/// The PFN database reserves this extent immediately after it is seeded so
+/// `alloc_zeroed_page` can never zero a live page-table frame.
+pub fn static_page_table_range() -> Option<(u64, u64)> {
+    let start_va = ptr::addr_of!(SPARE_PAGE_TABLES) as u64;
+    let end_va = start_va + (SPARE_PAGE_TABLE_COUNT * SPARE_PAGE_TABLE_ENTRIES * 8) as u64;
+    let start_pa = translate_virt(start_va)? & !0xFFF;
+    let last_pa = translate_virt(end_va - 1)? & !0xFFF;
+    Some((start_pa, last_pa + PAGE_SIZE - start_pa))
+}
+
+pub fn cross_root_scratch_range() -> Option<(u64, u64)> {
+    let start_va = ptr::addr_of!(CROSS_ROOT_SCRATCH) as u64;
+    Some((start_va, 4096))
+}
+
+fn alloc_page_table_frame() -> Option<(u64, u64)> {
+    let index = SPARE_PAGE_TABLE_INDEX.fetch_add(1, Ordering::Relaxed);
+    if index >= SPARE_PAGE_TABLE_COUNT {
+        return None;
+    }
+    let va = unsafe {
+        ptr::addr_of!(SPARE_PAGE_TABLES)
+            .cast::<SparePageTables>()
+            .cast::<u64>()
+            .add(index * SPARE_PAGE_TABLE_ENTRIES) as u64
+    };
+    let Some(pa) = translate_virt(va) else {
+        return None;
+    };
+    let pa = pa & !0xFFF;
+    unsafe {
+        ptr::write_bytes(va as *mut u8, 0, 4096);
+    }
+    Some((va, pa))
+}
+
 /// Address (PA) of the active root translation table. The page root
 /// itself is left identity-mapped by the boot stub (the root page is
 /// allocated from physical memory whose PA == VA mapping is preserved
@@ -169,56 +223,78 @@ fn split_block_attrs(desc: u64) -> u64 {
     attrs
 }
 
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Walk the kernel page tables and return a writable pointer to
-/// the leaf PTE that maps `va`. Allocates any missing
-/// intermediates along the way. The caller writes the leaf PTE
-/// (this function intentionally does NOT touch the leaf, only the
-/// chain leading up to it). On allocation failure returns a null
-/// pointer.
-unsafe fn leaf_pte_ptr_for(va: u64) -> *mut u64 {
-    let l0_phys = current_l0_phys();
+/// Convert portable PTE flags into AArch64 stage-1 leaf flags.
+#[inline]
+fn arch_flags_for(flags: u64) -> u64 {
+    let user_access =
+        flags & (crate::mm::pte::PTE_US | crate::arch::common::paging::PageFlags::USER.bits()) != 0;
+    if user_access {
+        if flags & crate::mm::pte::PTE_RW != 0 {
+            super::paging_enhanced::flags::USER_DATA
+        } else {
+            super::paging_enhanced::flags::USER_CODE
+        }
+    } else {
+        super::paging_enhanced::flags::KERNEL_DATA
+    }
+}
+
+/// Walk an arbitrary page-table root and return a writable pointer to
+/// the leaf PTE that maps `va`. Allocates any missing intermediates.
+/// Unlike `leaf_pte_ptr_for`, this never changes the hardware root, so
+/// it is safe to call while executing from a different address space.
+unsafe fn leaf_pte_ptr_for_root(root_phys: u64, va: u64, sync: bool) -> *mut u64 {
+    let l0_phys = root_phys & 0x0000_FFFF_FFFF_F000;
     let l0_idx = ((va >> 39) & 0x1FF) as usize;
     let l1_idx = ((va >> 30) & 0x1FF) as usize;
     let l2_idx = ((va >> 21) & 0x1FF) as usize;
     let l3_idx = ((va >> 12) & 0x1FF) as usize;
 
-    let l0 = l0_phys as *mut u64;
-    let l0e = core::ptr::read_volatile(l0.add(l0_idx));
+    let current_root = current_l0_phys();
+    let scratch = ptr::addr_of!(CROSS_ROOT_SCRATCH) as u64;
+    let use_alias = !sync && l0_phys != current_root;
+    let root_visible = !use_alias || map_page_raw(scratch, l0_phys, 0x40C);
+    if !root_visible {
+        return core::ptr::null_mut();
+    }
+    let l0_ptr = if use_alias {
+        scratch as *mut u64
+    } else {
+        l0_phys as *mut u64
+    };
+
+    let l0e = core::ptr::read_volatile(l0_ptr.add(l0_idx));
     let l1_phys = if (l0e & 0x3) == 0x3 {
         l0e & 0x0000_FFFF_FFFF_F000
     } else {
-        let pfn = match pfn::allocate_pfn() {
-            Some(p) => p,
-            None => return core::ptr::null_mut(),
-        };
-        let new_phys = pfn_to_phys(pfn);
-        if !identity_map_region(new_phys & !0x1F_FFFF, 0x20_0000) {
+        let Some((new_va, new_phys)) = alloc_page_table_frame() else {
+            crate::hal::serial::write_string_always("K:a64-walk-l0-alloc-failed\r\n");
             return core::ptr::null_mut();
-        }
-        ptr::write_bytes(new_phys as *mut u8, 0, 4096);
+        };
         let new_desc = table_desc_at(new_phys);
-        core::ptr::write_volatile(l0.add(l0_idx), new_desc);
-        sync_new_page_table();
+        core::ptr::write_volatile(l0_ptr.add(l0_idx), new_desc);
+        if sync {
+            sync_new_page_table();
+        }
         new_phys
     };
 
-    let l1 = l1_phys as *mut u64;
+    let l1 = if use_alias {
+        if !map_page_raw(scratch, l1_phys, 0x40C) {
+            return core::ptr::null_mut();
+        }
+        scratch as *mut u64
+    } else {
+        l1_phys as *mut u64
+    };
     let l1e = core::ptr::read_volatile(l1.add(l1_idx));
     let l2_phys = if (l1e & 0x3) == 0x3 {
         l1e & 0x0000_FFFF_FFFF_F000
     } else {
-        let pfn = match pfn::allocate_pfn() {
-            Some(p) => p,
-            None => return core::ptr::null_mut(),
-        };
-        let new_phys = pfn_to_phys(pfn);
-        if !identity_map_region(new_phys & !0x1F_FFFF, 0x20_0000) {
+        let Some((new_va, new_phys)) = alloc_page_table_frame() else {
+            crate::hal::serial::write_string_always("K:a64-walk-l1-alloc-failed\r\n");
             return core::ptr::null_mut();
-        }
-        ptr::write_bytes(new_phys as *mut u8, 0, 4096);
+        };
         if (l1e & 0x3) == 0x1 {
             // 1 GiB block descriptor: splitting it into a fresh L2
             // table must preserve the block's coverage, otherwise
@@ -227,7 +303,7 @@ unsafe fn leaf_pte_ptr_for(va: u64) -> *mut u64 {
             // descriptors cloned from the 1 GiB block.
             let block_pa = l1e & 0x0000_FFFF_C000_0000;
             let attrs = split_block_attrs(l1e);
-            let l2_new = new_phys as *mut u64;
+            let l2_new = new_va as *mut u64;
             for i in 0..512usize {
                 let sub_pa = block_pa + (i as u64) * 0x20_0000;
                 core::ptr::write_volatile(
@@ -238,24 +314,28 @@ unsafe fn leaf_pte_ptr_for(va: u64) -> *mut u64 {
         }
         let new_desc = table_desc_at(new_phys);
         core::ptr::write_volatile(l1.add(l1_idx), new_desc);
-        sync_new_page_table();
+        if sync {
+            sync_new_page_table();
+        }
         new_phys
     };
 
-    let l2 = l2_phys as *mut u64;
+    let l2 = if use_alias {
+        if !map_page_raw(scratch, l2_phys, 0x40C) {
+            return core::ptr::null_mut();
+        }
+        scratch as *mut u64
+    } else {
+        l2_phys as *mut u64
+    };
     let l2e = core::ptr::read_volatile(l2.add(l2_idx));
     let l3_phys = if (l2e & 0x3) == 0x3 {
         l2e & 0x0000_FFFF_FFFF_F000
     } else {
-        let pfn = match pfn::allocate_pfn() {
-            Some(p) => p,
-            None => return core::ptr::null_mut(),
-        };
-        let new_phys = pfn_to_phys(pfn);
-        if !identity_map_region(new_phys & !0x1F_FFFF, 0x20_0000) {
+        let Some((new_va, new_phys)) = alloc_page_table_frame() else {
+            crate::hal::serial::write_string_always("K:a64-walk-l2-alloc-failed\r\n");
             return core::ptr::null_mut();
-        }
-        ptr::write_bytes(new_phys as *mut u8, 0, 4096);
+        };
         if (l2e & 0x3) == 0x1 {
             // 2 MiB block descriptor: splitting it into a fresh L3
             // table must preserve the block's coverage, otherwise
@@ -270,7 +350,7 @@ unsafe fn leaf_pte_ptr_for(va: u64) -> *mut u64 {
             // so device regions stay device.
             let block_pa = l2e & 0x0000_FFFF_FFE0_0000;
             let attrs = split_block_attrs(l2e);
-            let l3_new = new_phys as *mut u64;
+            let l3_new = new_va as *mut u64;
             for i in 0..512usize {
                 let sub_pa = block_pa + (i as u64) * 0x1000;
                 core::ptr::write_volatile(
@@ -281,12 +361,38 @@ unsafe fn leaf_pte_ptr_for(va: u64) -> *mut u64 {
         }
         let new_desc = table_desc_at(new_phys);
         core::ptr::write_volatile(l2.add(l2_idx), new_desc);
-        sync_new_page_table();
+        if sync {
+            sync_new_page_table();
+        }
         new_phys
     };
 
-    let l3 = l3_phys as *mut u64;
+    let l3 = if use_alias {
+        if !map_page_raw(scratch, l3_phys, 0x40C) {
+            return core::ptr::null_mut();
+        }
+        scratch as *mut u64
+    } else {
+        l3_phys as *mut u64
+    };
     l3.add(l3_idx)
+}
+
+/// Map a page-table page used by a foreign root into the active root.
+/// Physical pointers are only valid here when the page is also an
+/// identity-mapped virtual address.
+
+/// # Safety
+///
+/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// Walk the currently active page tables and return a writable pointer to
+/// the leaf PTE that maps `va`. Allocates any missing
+/// intermediates along the way. The caller writes the leaf PTE
+/// (this function intentionally does NOT touch the leaf, only the
+/// chain leading up to it). On allocation failure returns a null
+/// pointer.
+unsafe fn leaf_pte_ptr_for(va: u64) -> *mut u64 {
+    leaf_pte_ptr_for_root(current_l0_phys(), va, true)
 }
 
 pub fn map_page(va: u64, pa: u64, flags: u64) -> bool {
@@ -298,17 +404,7 @@ pub fn map_page(va: u64, pa: u64, flags: u64) -> bool {
     // protection bits to an AArch64 stage-1 descriptor: AP[1:0]=11
     // gives privileged and user read/write access, while AF must be
     // set before the first access.
-    let user_access =
-        flags & (crate::mm::pte::PTE_US | crate::arch::common::paging::PageFlags::USER.bits()) != 0;
-    let arch_flags = if user_access {
-        if flags & crate::mm::pte::PTE_RW != 0 {
-            super::paging_enhanced::flags::USER_DATA
-        } else {
-            super::paging_enhanced::flags::USER_CODE
-        }
-    } else {
-        super::paging_enhanced::flags::KERNEL_DATA
-    };
+    let arch_flags = arch_flags_for(flags);
     // write the leaf as an AArch64 page descriptor (bits[1:0] = 0b11).
     let desc = make_page_desc(pa, arch_flags);
     unsafe {
@@ -325,6 +421,32 @@ pub fn map_page(va: u64, pa: u64, flags: u64) -> bool {
         let verify = core::ptr::read_volatile(l3_pte);
         debug_assert_eq!(verify, desc);
     }
+    true
+}
+
+/// Map a page in an arbitrary AArch64 root without switching the
+/// hardware translation regime. This is required because the active
+/// kernel may execute from a mapping that is not present in the target
+/// root; briefly selecting that root would immediately fault.
+pub unsafe fn map_page_in_root(root_pfn: u64, va: u64, pa: u64, flags: u64) -> bool {
+    let root_phys = if root_pfn & 0x0000_FFFF_FFFF_F000 == root_pfn {
+        root_pfn
+    } else {
+        root_pfn << 12
+    };
+    let current_root = current_l0_phys();
+    if root_phys == current_root {
+        return map_page(va, pa, flags);
+    }
+
+    let l3_pte = leaf_pte_ptr_for_root(root_phys, va, false);
+    if l3_pte.is_null() {
+        crate::hal::serial::write_string_always("K:a64-maproot-null\r\n");
+        return false;
+    }
+    let desc = make_page_desc(pa, arch_flags_for(flags));
+    core::ptr::write_volatile(l3_pte, desc);
+    asm!("dsb ishst", options(nostack));
     true
 }
 

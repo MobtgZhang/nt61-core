@@ -78,17 +78,22 @@ pub fn init(dist_base: u64, cpu_base: u64) {
     let _ = dist_base;
     let _ = cpu_base;
     crate::hal::serial::write_string("hal_apic:init_enter\r\n");
+    crate::arch::boot::early_write_str(b"[TRACE] gic-enter\r\n");
 
     crate::hal::serial::write_string("hal_apic:before_interrupt_controller\r\n");
+    crate::arch::boot::early_write_str(b"[TRACE] gic-before-controller\r\n");
     let ic = crate::arch::aarch64::soc::interrupt_controller();
     crate::hal::serial::write_string("hal_apic:after_interrupt_controller\r\n");
+    crate::arch::boot::early_write_str(b"[TRACE] gic-after-controller\r\n");
 
     match ic {
         soc::InterruptController::GICv3 => {
+            crate::arch::boot::early_write_str(b"[TRACE] gic-v3\r\n");
             crate::hal::serial::write_string("hal_apic:match_gicv3\r\n");
             init_gicv3()
         }
         soc::InterruptController::GICv2 => {
+            crate::arch::boot::early_write_str(b"[TRACE] gic-v2\r\n");
             crate::hal::serial::write_string("hal_apic:match_gicv2\r\n");
             init_gicv2()
         }
@@ -98,15 +103,18 @@ pub fn init(dist_base: u64, cpu_base: u64) {
         }
         soc::InterruptController::None => {
             crate::hal::serial::write_string("hal_apic:match_none\r\n");
+            crate::arch::boot::early_write_str(b"[TRACE] gic-none\r\n");
         }
     }
     crate::hal::serial::write_string("hal_apic:done\r\n");
+    crate::arch::boot::early_write_str(b"[TRACE] gic-controller-done\r\n");
 
     // Unmask the PL011 receive interrupt in the peripheral. The GIC
     // line was enabled in 'init_gicv2' and 'dispatch_irq' drains the
     // UART FIFO into the unified keyboard ring, so the armed line can
     // no longer storm.
     crate::hal::common::keyboard_unified::enable_serial_rx_irq();
+    crate::arch::boot::early_write_str(b"[TRACE] gic-done\r\n");
 }
 
 fn init_gicv2() {
@@ -203,10 +211,10 @@ fn init_gicv3() {
     crate::hal::serial::write_string("hal_apic:gicv3_pmr_done\r\n");
 
     // 3. Wake the redistributor by clearing GICR_WAKER.ProcessorSleep.
-    //    GICR_WAKER lives at GICR base + 0x0014. We use the hardcoded
-    //    QEMU `virt` GICR base until the ACPI MADT parser supplies the
-    //    real address.
-    const GICR_WAKER: u64 = 0x0801_0000 + 0x0014;
+    //    GICR_WAKER lives at GICR base + 0x0014. QEMU's `virt` machine
+    //    places the boot CPU redistributor at 0x080A0000; the GICv2
+    //    CPU-interface address is invalid in this mode.
+    const GICR_WAKER: u64 = 0x080A_0000 + 0x0014;
     let waker = unsafe { read_volatile(GICR_WAKER as *mut u32) };
     if waker & 0x2 != 0 {
         // ProcessorSleep is set: clear it and wait for ChildrenAsync.

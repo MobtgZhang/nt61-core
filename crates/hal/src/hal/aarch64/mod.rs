@@ -18,17 +18,24 @@ pub use timer as arch_timer;
 /// controllers + timers.
 pub fn init() {
     crate::hal::serial::write_string("hal_init:serial\r\n");
+    crate::arch::boot::early_write_str(b"[TRACE] hal-aarch64-enter\r\n");
     serial::init();
+    crate::arch::boot::early_write_str(b"[TRACE] hal-serial-done\r\n");
     crate::hal::serial::write_string("hal_init:soc\r\n");
     crate::arch::aarch64::soc::init_soc();
+    crate::arch::boot::early_write_str(b"[TRACE] hal-soc-done\r\n");
     crate::hal::serial::write_string("hal_init:soc_done\r\n");
     crate::hal::serial::write_string("hal_init:apic\r\n");
     apic::init(0x0800_0000, 0x0801_0000);
+    crate::arch::boot::early_write_str(b"[TRACE] hal-gic-done\r\n");
     crate::hal::serial::write_string("hal_init:timer_init\r\n");
     timer::init(1000);
+    crate::arch::boot::early_write_str(b"[TRACE] hal-timer-init-done\r\n");
     crate::hal::serial::write_string("hal_init:timer_mark\r\n");
     timer::mark_boot();
+    crate::arch::boot::early_write_str(b"[TRACE] hal-timer-mark-done\r\n");
     crate::hal::serial::write_string("hal_init:done\r\n");
+    crate::arch::boot::early_write_str(b"[TRACE] hal-aarch64-done\r\n");
 }
 
 /// Print the SoC info on the serial console (used by smoke tests and

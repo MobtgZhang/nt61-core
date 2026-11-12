@@ -8,6 +8,8 @@ pub const SYS_DESKTOP_DRAW_RGBA: u32 = 0x0303;
 pub const SYS_DESKTOP_POLL_KEY: u32 = 0x0304;
 pub const SYS_DESKTOP_POLL_MOUSE: u32 = 0x0305;
 pub const SYS_GET_KEY: u32 = 0x0204;
+#[allow(dead_code)]
+pub const SYS_PUTCHAR: u32 = 0x0202;
 
 /// # Safety
 ///
@@ -154,5 +156,19 @@ pub fn exit_process(exit_code: u32) -> ! {
     syscall5(SYS_EXIT_PROCESS, exit_code as usize, 0, 0, 0, 0);
     loop {
         core::hint::spin_loop();
+    }
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+pub fn debug_putc(byte: u8) {
+    syscall5(SYS_PUTCHAR, byte as usize, 0, 0, 0, 0);
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+pub fn debug_str(s: &str) {
+    for byte in s.as_bytes() {
+        debug_putc(*byte);
     }
 }
