@@ -28,22 +28,22 @@ pub mod smoke;
 /// then bind to whichever devices the controllers discover.
 pub fn init() {
     // kprintln!("    USB drivers: UHCI, EHCI, xHCI, hub, HID");
-    crate::hal::serial::write_string("USB:before_uhci\r\n");
+    crate::hal::serial::write_string_always("USB:before_uhci\r\n");
     uhci::init();
-    crate::hal::serial::write_string("USB:after_uhci\r\n");
-    crate::hal::serial::write_string("USB:before_ehci\r\n");
+    crate::hal::serial::write_string_always("USB:after_uhci\r\n");
+    crate::hal::serial::write_string_always("USB:before_ehci\r\n");
     ehci::init();
-    crate::hal::serial::write_string("USB:after_ehci\r\n");
-    crate::hal::serial::write_string("USB:before_xhci\r\n");
+    crate::hal::serial::write_string_always("USB:after_ehci\r\n");
+    crate::hal::serial::write_string_always("USB:before_xhci\r\n");
     xhci::init();
-    crate::hal::serial::write_string("USB:after_xhci\r\n");
-    crate::hal::serial::write_string("USB:before_hub\r\n");
+    crate::hal::serial::write_string_always("USB:after_xhci\r\n");
+    crate::hal::serial::write_string_always("USB:before_hub\r\n");
     hub::init();
-    crate::hal::serial::write_string("USB:after_hub\r\n");
-    crate::hal::serial::write_string("USB:before_hid\r\n");
+    crate::hal::serial::write_string_always("USB:after_hub\r\n");
+    crate::hal::serial::write_string_always("USB:before_hid\r\n");
     hid::init();
-    crate::hal::serial::write_string("USB:after_hid\r\n");
-    crate::hal::serial::write_string("USB:done\r\n");
+    crate::hal::serial::write_string_always("USB:after_hid\r\n");
+    crate::hal::serial::write_string_always("USB:done\r\n");
     // kprintln!("    USB stack ready");
 }
 

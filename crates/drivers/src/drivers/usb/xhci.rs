@@ -746,14 +746,25 @@ pub fn init() {
     // values. When no xHCI device is present the registry stays
     // empty and `count()` honestly reports 0; no placeholder
     // controller is registered.
-    for dev in crate::hal::common::pci::enumerate() {
+    // Non-x86 platforms do not yet have a device MMIO map for
+    // dynamically assigned PCI BARs. Touching such a BAR faults.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        crate::hal::serial::write_string_always("[XHCI] skipped\r\n");
+        return;
+    }
+    let devices = crate::hal::common::pci::enumerate();
+    crate::hal::serial::write_string_always("[XHCI] devices scanned\r\n");
+    for dev in devices {
         if (dev.class_code, dev.subclass, dev.prog_if) != XHCI_PCI_CLASS {
             continue;
         }
         let info = crate::drivers::bus::pci_bus::find_pci(dev.bus, dev.device, dev.function);
         let bar = info.and_then(|i| first_mmio_bar(&i));
         if let Some(bar_phys) = bar {
+            crate::hal::serial::write_string_always("[XHCI] controller found\r\n");
             if let Some(c) = init_controller(bar_phys) {
+                crate::hal::serial::write_string_always("[XHCI] controller init done\r\n");
                 // Allocate the event ring and transfer ring during
                 // init so control transfers work after enumeration.
                 let mut c = c;
@@ -761,9 +772,13 @@ pub fn init() {
                     && init_dcbaa(&mut c).is_ok()
                     && init_command_ring(&mut c).is_ok()
                 {
+                    crate::hal::serial::write_string_always("[XHCI] rings init done\r\n");
                     let _ = ensure_ep0_ring(&mut c);
+                    crate::hal::serial::write_string_always("[XHCI] ep0 ring ready\r\n");
                     push_xhci(c);
+                    crate::hal::serial::write_string_always("[XHCI] controller registered\r\n");
                 }
+                crate::hal::serial::write_string_always("[XHCI] controller processed\r\n");
             }
         }
     }

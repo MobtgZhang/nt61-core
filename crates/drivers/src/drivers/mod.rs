@@ -84,14 +84,30 @@ pub mod volsnap;
 /// every inner `init()` is a no-op if it has already run.
 pub fn init() {
     // // kprintln!("  Initialising driver subsystem...");
+    crate::hal::serial::write_string_always("[DRV] bus begin\r\n");
     bus::init();
+    crate::hal::serial::write_string_always("[DRV] bus done\r\n");
+    crate::hal::serial::write_string_always("[DRV] storage begin\r\n");
     storage::init();
+    crate::hal::serial::write_string_always("[DRV] storage done\r\n");
+    crate::hal::serial::write_string_always("[DRV] clfs begin\r\n");
     clfs::init();
+    crate::hal::serial::write_string_always("[DRV] clfs done\r\n");
+    crate::hal::serial::write_string_always("[DRV] usb begin\r\n");
     usb::init();
+    crate::hal::serial::write_string_always("[DRV] usb done\r\n");
+    crate::hal::serial::write_string_always("[DRV] net begin\r\n");
     net::init();
+    crate::hal::serial::write_string_always("[DRV] net done\r\n");
+    crate::hal::serial::write_string_always("[DRV] audio begin\r\n");
     audio::init();
+    crate::hal::serial::write_string_always("[DRV] audio done\r\n");
+    crate::hal::serial::write_string_always("[DRV] input begin\r\n");
     input::init();
+    crate::hal::serial::write_string_always("[DRV] input done\r\n");
+    crate::hal::serial::write_string_always("[DRV] video begin\r\n");
     video::init();
+    crate::hal::serial::write_string_always("[DRV] video done\r\n");
     // `video::init()` brings up the BOCHS VBE driver (x86_64)
     // which exposes a 1024×768×32 linear framebuffer at the
     // well-known aperture 0xE0_0000_0000. On every architecture

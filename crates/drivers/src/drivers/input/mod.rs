@@ -22,6 +22,16 @@ pub mod smoke;
 pub fn init() {
     // kprintln!("    Input drivers: i8042, USB HID keyboard / mouse");
     crate::drivers::arch::init_i8042();
+    // The modern virtio input device uses 64-bit MMIO BARs above
+    // 4 GiB on aarch64/riscv64. A generic PCI device mapper is not
+    // installed yet, so this bring-up path is disabled until that
+    // mapper is available.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        usb_hid_kbd::init();
+        usb_hid_mouse::init();
+        return;
+    }
     virtio_input::init();
     usb_hid_kbd::init();
     usb_hid_mouse::init();
