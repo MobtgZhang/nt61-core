@@ -1391,7 +1391,9 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
             //      - bootvid LFB (via put_byte_vga → put_byte_to_active_console)
             //    CR/LF/BS are handled here too. This is the only
             //    path that writes to the LFB on a normal boot.
-            crate::hal::x86_64::serial::write_char(ch);
+            crate::hal::common::serial_disable::with_serial_unmasked(|| {
+                crate::hal::x86_64::serial::write_char(ch);
+            });
             if !crate::drivers::bootvid::gui_console_active() {
                 crate::hal::x86_64::text_console::put_byte(ch);
                 // Safety net for the no-VGA fallback: when the

@@ -29,6 +29,10 @@ fn bridge_diag() {
     crate::hal::serial::write_string_always(" bpp=");
     crate::hal::serial::write_hex_u64_always(info.bpp as u64);
     crate::hal::serial::write_string_always("\r\n");
+    crate::drivers::input::virtio_input::set_mouse_screen_bounds(
+        info.width,
+        info.height,
+    );
 }
 
 pub const SYS_DESKTOP_INFO: u32 = 0x0300;
@@ -86,10 +90,11 @@ pub unsafe fn info(buffer: *mut DesktopFramebufferInfo) -> u64 {
     let bytes = core::mem::size_of::<DesktopFramebufferInfo>();
     let raw = core::ptr::from_ref(&info) as *const u8;
     let slice = unsafe { core::slice::from_raw_parts(raw, bytes) };
-    match crate::ntoskrnl::mm::user_copy::copy_to_user(buffer as u64, slice) {
+    let result = match crate::ntoskrnl::mm::user_copy::copy_to_user(buffer as u64, slice) {
         Ok(()) => bytes as u64,
-        Err(_) => STATUS_INVALID_PARAMETER,
-    }
+        Err(status) => status as u64,
+    };
+    result
 }
 
 fn clipped_rect(x: u32, y: u32, width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
@@ -183,11 +188,10 @@ pub unsafe fn draw_rgba(
             let source_red = source_row[offset];
             let source_green = source_row[offset + 1];
             let source_blue = source_row[offset + 2];
-            // The framebuffer stores 0x00RRGGBB (set_pixel writes the u32
-            // verbatim) while color32 packs its arguments as BGR. Swap the
-            // channels at this boundary so RGBA bitmaps keep true colors.
+            // Surface colors are packed 0x00BBGGRR, matching the linear
+            // framebuffer writer's little-endian byte order.
             let color = if alpha == 255 {
-                framebuffer_impl::color32(source_blue, source_green, source_red)
+                framebuffer_impl::color32(source_red, source_green, source_blue)
             } else if let Some(background) =
                 framebuffer_impl::get_pixel(destination_x + column, destination_y + row)
             {
@@ -197,12 +201,12 @@ pub unsafe fn draw_rgba(
                 let alpha = alpha as u32;
                 let inverse = 255 - alpha;
                 framebuffer_impl::color32(
-                    ((source_blue as u32 * alpha + background_blue * inverse) / 255) as u8,
-                    ((source_green as u32 * alpha + background_green * inverse) / 255) as u8,
                     ((source_red as u32 * alpha + background_red * inverse) / 255) as u8,
+                    ((source_green as u32 * alpha + background_green * inverse) / 255) as u8,
+                    ((source_blue as u32 * alpha + background_blue * inverse) / 255) as u8,
                 )
             } else {
-                framebuffer_impl::color32(source_blue, source_green, source_red)
+                framebuffer_impl::color32(source_red, source_green, source_blue)
             };
             framebuffer_impl::set_pixel(destination_x + column, destination_y + row, color);
         }
@@ -248,6 +252,7 @@ pub unsafe fn poll_mouse(state_pointer: *mut DesktopMouseState) -> u64 {
     }
     crate::drivers::input::virtio_input::poll();
     let (x, y, buttons) = crate::drivers::input::virtio_input::get_mouse_state();
+    let update = crate::drivers::input::virtio_input::has_mouse_update();
     let state = DesktopMouseState {
         x: i32::from(x),
         y: i32::from(y),
@@ -256,6 +261,9 @@ pub unsafe fn poll_mouse(state_pointer: *mut DesktopMouseState) -> u64 {
     let bytes = core::mem::size_of::<DesktopMouseState>();
     let raw = core::ptr::from_ref(&state) as *const u8;
     let slice = core::slice::from_raw_parts(raw, bytes);
+    if !update {
+        return 0;
+    }
     match crate::ntoskrnl::mm::user_copy::copy_to_user(state_pointer as u64, slice) {
         Ok(()) => bytes as u64,
         Err(_) => STATUS_INVALID_PARAMETER,
