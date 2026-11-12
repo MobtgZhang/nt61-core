@@ -6,7 +6,7 @@
 use crate::hal::common::pci;
 use crate::mm::pool::{self, PoolType};
 use core::sync::atomic::{
-    AtomicBool, AtomicI16, AtomicPtr, AtomicU16, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicI16, AtomicPtr, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering,
 };
 
 const VENDOR_VIRTIO: u16 = 0x1AF4;
@@ -65,14 +65,16 @@ const FEATURE_VERSION_1_WORD1_BIT: u32 = 1;
 const CAP_COMMON_CFG: u8 = 1;
 const CAP_NOTIFY_CFG: u8 = 2;
 const CAP_ISR_CFG: u8 = 3;
+const CAP_DEVICE_CFG: u8 = 4;
 
 const DESC_F_WRITE: u16 = 2;
 const EVENT_TYPE_KEY: u16 = 1;
 const EVENT_TYPE_REL: u16 = 2;
 const KEY_VALUE_RELEASE: i32 = 0;
-const BTN_LEFT: u16 = 0x130;
-const BTN_RIGHT: u16 = 0x131;
-const BTN_MIDDLE: u16 = 0x132;
+const INPUT_CFG_ID_NAME: u8 = 0x01;
+const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
+const BTN_MIDDLE: u16 = 0x112;
 
 const QUEUE_SIZE: u16 = 64;
 const EVENT_SIZE: usize = 8;
@@ -137,6 +139,12 @@ struct Device {
     queue: Queue,
     shift: bool,
     caps_lock: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputDeviceKind {
+    Keyboard,
+    Mouse,
 }
 
 impl Queue {
@@ -228,6 +236,7 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
     let code = u16::from_le_bytes([event[2], event[3]]);
     let value = i32::from_le_bytes([event[4], event[5], event[6], event[7]]);
     if event_type == EVENT_TYPE_REL {
+        MOUSE_EVENTS.fetch_add(1, Ordering::AcqRel);
         let delta = i16::try_from(value).unwrap_or(0);
         if code == 0 {
             let x = MOUSE_X.load(Ordering::Relaxed);
@@ -242,6 +251,7 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         return;
     }
     if (BTN_LEFT..=BTN_MIDDLE).contains(&code) {
+        MOUSE_EVENTS.fetch_add(1, Ordering::AcqRel);
         let bit = 1u8 << (code - BTN_LEFT);
         let buttons = MOUSE_BUTTONS.load(Ordering::Relaxed);
         if value == KEY_VALUE_RELEASE {
@@ -289,6 +299,14 @@ pub fn get_mouse_state() -> (i16, i16, u8) {
         .load(Ordering::Relaxed)
         .min(MOUSE_SCREEN_HEIGHT.load(Ordering::Relaxed));
     (x, y, MOUSE_BUTTONS.load(Ordering::Relaxed))
+}
+
+/// Report whether the pointer changed since the previous desktop poll.
+pub fn has_mouse_update() -> bool {
+    let events = MOUSE_EVENTS.load(Ordering::Acquire);
+    let polled = MOUSE_POLLED_EVENTS.load(Ordering::Acquire);
+    MOUSE_POLLED_EVENTS.store(events, Ordering::Release);
+    events != polled
 }
 
 fn translate_key(code: u16) -> &'static [u8] {
@@ -652,6 +670,7 @@ fn translate(virtual_address: u64) -> Option<u64> {
 }
 
 static DEVICE: AtomicPtr<Device> = AtomicPtr::new(core::ptr::null_mut());
+static MOUSE_DEVICE: AtomicPtr<Device> = AtomicPtr::new(core::ptr::null_mut());
 static INITIALISED: AtomicBool = AtomicBool::new(false);
 static FIRST_EVENT_SEEN: AtomicUsize = AtomicUsize::new(0);
 static RING_HEAD: AtomicUsize = AtomicUsize::new(0);
@@ -662,6 +681,8 @@ static MOUSE_Y: AtomicI16 = AtomicI16::new(0);
 static MOUSE_BUTTONS: AtomicU8 = AtomicU8::new(0);
 static MOUSE_SCREEN_WIDTH: AtomicI16 = AtomicI16::new(i16::MAX);
 static MOUSE_SCREEN_HEIGHT: AtomicI16 = AtomicI16::new(i16::MAX);
+static MOUSE_EVENTS: AtomicU32 = AtomicU32::new(0);
+static MOUSE_POLLED_EVENTS: AtomicU32 = AtomicU32::new(0);
 
 /// One decoded virtio-pci capability region (BAR-relative).
 struct CapRegion {
@@ -672,12 +693,15 @@ struct CapRegion {
 
 /// Walk the vendor-specific PCI capabilities and return the
 /// (common, notify, isr) regions plus the notify multiplier.
-fn decode_pci_caps(dev: &pci::PciDevice) -> Option<(CapRegion, CapRegion, CapRegion, u32)> {
+fn decode_pci_caps(
+    dev: &pci::PciDevice,
+) -> Option<(CapRegion, CapRegion, CapRegion, Option<CapRegion>, u32)> {
     use crate::hal::common::pci as pcicfg;
     let (bus, slot, func) = (dev.bus, dev.device, dev.function);
     let mut common: Option<CapRegion> = None;
     let mut notify: Option<CapRegion> = None;
     let mut isr: Option<CapRegion> = None;
+    let mut device_config: Option<CapRegion> = None;
     let mut multiplier: u32 = 0;
 
     let mut ptr = pcicfg::read_config_byte(bus, slot, func, 0x34);
@@ -715,12 +739,15 @@ fn decode_pci_caps(dev: &pci::PciDevice) -> Option<(CapRegion, CapRegion, CapReg
                 CAP_ISR_CFG if isr.is_none() => {
                     isr = Some(region);
                 }
+                CAP_DEVICE_CFG if device_config.is_none() => {
+                    device_config = Some(region);
+                }
                 _ => {}
             }
         }
         ptr = next;
     }
-    Some((common?, notify?, isr?, multiplier))
+    Some((common?, notify?, isr?, device_config, multiplier))
 }
 
 /// Map one capability region into kernel VA space.
@@ -758,6 +785,7 @@ pub fn init() {
     if INITIALISED.swap(true, Ordering::AcqRel) {
         return;
     }
+    crate::hal::serial::write_string_always("[VIO-IN] init enter\r\n");
     trace("virtio-input: probe begin\r\n");
     // The virtio keyboard may not yet be visible to PCI enumeration on
     // some boot paths (device enumeration racing with bus bring-up),
@@ -765,6 +793,10 @@ pub fn init() {
     // few times before giving up.
     for attempt in 0..4 {
         let mut candidate_seen = false;
+        crate::hal::serial::write_string_always(&alloc::format!(
+            "[VIO-IN] attempt {}\r\n",
+            attempt
+        ));
         for pci_dev in pci::enumerate() {
             virtio_trace_fmt!(
                 "virtio-input: pci {:02x}:{:02x}.{:02x} vendor={:04x} device={:04x}\r\n",
@@ -781,25 +813,35 @@ pub fn init() {
                 continue;
             }
             candidate_seen = true;
+            crate::hal::serial::write_string_always("[VIO-IN] candidate found\r\n");
             // Memory/BAR access must be enabled before any BAR read.
             enable_pci_decode(pci_dev);
 
-            let Some((common_cap, notify_cap, isr_cap, multiplier)) = decode_pci_caps(pci_dev)
+            let Some((common_cap, notify_cap, isr_cap, device_cap, multiplier)) =
+                decode_pci_caps(pci_dev)
             else {
+                crate::hal::serial::write_string_always("[VIO-IN] caps decode failed\r\n");
                 trace("virtio-input: cap decode FAILED\r\n");
                 continue;
             };
             let Some(common) = map_region(pci_dev, &common_cap) else {
+                crate::hal::serial::write_string_always("[VIO-IN] common map failed\r\n");
                 trace("virtio-input: common cfg map FAILED\r\n");
                 continue;
             };
             let Some(notify) = map_region(pci_dev, &notify_cap) else {
+                crate::hal::serial::write_string_always("[VIO-IN] notify map failed\r\n");
                 trace("virtio-input: notify map FAILED\r\n");
                 continue;
             };
             let Some(isr) = map_region(pci_dev, &isr_cap) else {
+                crate::hal::serial::write_string_always("[VIO-IN] isr map failed\r\n");
                 trace("virtio-input: isr map FAILED\r\n");
                 continue;
+            };
+            let device_config = match device_cap {
+                Some(cap) => map_region(pci_dev, &cap),
+                None => None,
             };
             virtio_trace_fmt!(
                 "virtio-input: caps common={:p} notify={:p} isr={:p} mult={}\r\n",
@@ -810,16 +852,24 @@ pub fn init() {
             );
 
             let Some(queue) = initialise_queue(common) else {
+                crate::hal::serial::write_string_always("[VIO-IN] queue init failed\r\n");
                 trace("virtio-input: queue init FAILED\r\n");
                 continue;
             };
             let Some(device) = allocate_device(notify, isr, multiplier, queue) else {
+                crate::hal::serial::write_string_always("[VIO-IN] device alloc failed\r\n");
                 trace("virtio-input: device alloc FAILED\r\n");
                 continue;
             };
-            DEVICE.store(device, Ordering::Release);
-            trace("virtio-input: keyboard ATTACHED\r\n");
-            return;
+            if input_device_kind(device_config) == InputDeviceKind::Mouse {
+                if MOUSE_DEVICE.load(Ordering::Acquire).is_null() {
+                    MOUSE_DEVICE.store(device, Ordering::Release);
+                    trace("virtio-input: mouse ATTACHED\r\n");
+                }
+            } else if DEVICE.load(Ordering::Acquire).is_null() {
+                DEVICE.store(device, Ordering::Release);
+                trace("virtio-input: keyboard ATTACHED\r\n");
+            }
         }
         if attempt + 1 < 4 {
             // Brief settle delay between probe attempts so a bus that is
@@ -859,10 +909,17 @@ pub fn is_present() -> bool {
 }
 
 pub fn poll() {
-    let device = DEVICE.load(Ordering::Acquire);
-    if device.is_null() {
-        return;
+    let keyboard = DEVICE.load(Ordering::Acquire);
+    if !keyboard.is_null() {
+        unsafe { poll_device(keyboard) };
     }
+    let mouse = MOUSE_DEVICE.load(Ordering::Acquire);
+    if !mouse.is_null() {
+        unsafe { poll_device(mouse) };
+    }
+}
+
+unsafe fn poll_device(device: *mut Device) {
     let device = unsafe { &mut *device };
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -1053,6 +1110,43 @@ fn allocate_device(
         });
     }
     Some(device)
+}
+
+fn contains_ignore_ascii_case(bytes: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || bytes.len() < needle.len() {
+        return false;
+    }
+    for start in 0..=(bytes.len() - needle.len()) {
+        let window = &bytes[start..start + needle.len()];
+        if window
+            .iter()
+            .zip(needle)
+            .all(|(left, right)| left.to_ascii_lowercase() == right.to_ascii_lowercase())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn input_device_kind(device_config: Option<*mut u8>) -> InputDeviceKind {
+    let Some(config) = device_config else {
+        return InputDeviceKind::Keyboard;
+    };
+    unsafe {
+        write_u8(config, 0, INPUT_CFG_ID_NAME);
+        write_u8(config, 1, 0);
+        let length = usize::from(read_u8(config, 2)).min(128);
+        let mut name = [0u8; 128];
+        for (index, byte) in name.iter_mut().enumerate().take(length) {
+            *byte = read_u8(config, 8 + index as u64);
+        }
+        if contains_ignore_ascii_case(&name, b"mouse") {
+            InputDeviceKind::Mouse
+        } else {
+            InputDeviceKind::Keyboard
+        }
+    }
 }
 
 fn allocate_queue(size: u16) -> Option<Queue> {
