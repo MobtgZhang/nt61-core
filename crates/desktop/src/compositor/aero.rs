@@ -133,21 +133,6 @@ pub fn glass_button(surface: &mut Surface, bounds: Rect, selected: bool) {
 
 pub fn taskbar_chrome(surface: &mut Surface, bounds: Rect, glass: &Surface) {
     glass_bar_precomputed(surface, bounds, glass);
-    let denominator = bounds.height.saturating_sub(1).max(1) as u32;
-    for row in 0..bounds.height {
-        let scale = row * 255 / denominator;
-        let color = if scale < 24 {
-            lerp_color(0x66FF_FFFF, 0x14FF_FFFF, scale * 255 / 24)
-        } else if scale < 192 {
-            lerp_color(0x14FF_FFFF, 0x1A00_0000, (scale - 24) * 255 / 168)
-        } else {
-            lerp_color(0x1A00_0000, 0xD800_0000, (scale - 192) * 255 / 63)
-        };
-        surface.blend_rect(
-            Rect::new(bounds.x, bounds.y + row as i32, bounds.width, 1),
-            color,
-        );
-    }
     surface.blend_rect(Rect::new(bounds.x, bounds.y, bounds.width, 1), 0xB4FF_FFFF);
     surface.blend_rect(
         Rect::new(
