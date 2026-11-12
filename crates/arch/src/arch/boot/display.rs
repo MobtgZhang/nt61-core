@@ -168,9 +168,6 @@ pub fn wait_boot_animation_finished() {
 /// desktop shell without depending on IPI delivery.
 pub fn poll_boot_animation() {
     let cpu = crate::ke::scheduler::get_current_cpu();
-    crate::hal::serial::write_string_always("[ANIM] poll enter cpu=");
-    crate::hal::serial::write_hex_u64_always(cpu as u64);
-    crate::hal::serial::write_string_always("\r\n");
     if cpu != 0 {
         crate::drivers::bootvid::poll_animation_strip(cpu as u32);
         return;

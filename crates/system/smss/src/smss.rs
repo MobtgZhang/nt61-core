@@ -2361,24 +2361,33 @@ pub fn start_boot_sequence() {
 /// 0/Session 1 phases as command-prompt mode; only the final shell
 /// differs.
 pub fn start_desktop_boot_sequence() -> ! {
+    crate::hal::serial::write_string_always("[SMSS] desktop sequence enter\r\n");
     boot_println!("[BOOT] ============================================");
     boot_println!("[BOOT] Windows 7 Boot Sequence (Desktop Mode)");
     boot_println!("[BOOT] ============================================");
 
     boot_println!("[BOOT] Phase 1: Initializing Session Manager...");
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 1 begin\r\n");
     phase1_initialize();
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 1 done\r\n");
 
     boot_println!("[BOOT] Phase 2: Creating Sessions...");
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 2 begin\r\n");
     phase2_create_sessions();
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 2 done\r\n");
 
     boot_println!("[BOOT] Phase 3: Starting Subsystems...");
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 3 begin\r\n");
     phase3_start_subsystems();
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 3 done\r\n");
 
     crate::rtl::windows_log::write_phase_header(12);
     boot_println!("    SUBSYSTEMS: csrss / wininit / services / lsass");
 
     boot_println!("[BOOT] Phase 4: Starting WinInit...");
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 4 begin\r\n");
     phase4_start_wininit();
+    crate::hal::serial::write_string_always("[SMSS] desktop phase 4 done\r\n");
 
     boot_println!("[BOOT] Phase 5: Starting Session 1 Logon...");
     crate::hal::serial::write_string_always("[SMSS] desktop phase 5 begin\r\n");

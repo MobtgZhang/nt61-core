@@ -9,6 +9,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::drivers::virtio::gpu::GpuSession;
 use crate::drivers::virtio::pci::PciTransport;
+#[cfg(not(target_arch = "x86_64"))]
+use crate::hal::common::pit;
 #[cfg(target_arch = "x86_64")]
 use crate::hal::x86_64::pit;
 use crate::ke::sync::Spinlock;

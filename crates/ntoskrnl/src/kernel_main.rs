@@ -299,18 +299,22 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
 
     boot_debug_print!("Initializing processor state... ");
     arch::init_hardware();
+    crate::arch::boot::early_write_str(b"[TRACE] hardware-done\r\n");
     boot_println!("OK");
 
     boot_debug_print!("Bringing up secondary processors... ");
     arch::start_smp();
+    crate::arch::boot::early_write_str(b"[TRACE] smp-done\r\n");
     boot_println!("OK");
 
     // Install the early-boot kernel stack before any potentially
     // interruptible code path runs.
     arch::init_kernel_stack();
+    crate::arch::boot::early_write_str(b"[TRACE] stack-done\r\n");
 
     boot_debug_print!("Initializing HAL... ");
     hal::init();
+    crate::arch::boot::early_write_str(b"[TRACE] hal-done\r\n");
     boot_println!("OK");
 
     // Bring up the abstract text console *before* any subsequent
@@ -322,6 +326,7 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // actual boot trace.
 
     crate::hal::text_console::init();
+    crate::arch::boot::early_write_str(b"[TRACE] console-done\r\n");
 
     // ============================================================================
     // PHASE 2: Kernel Executive (ke)
@@ -329,6 +334,7 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
 
     phase_header!(1, "Kernel Executive");
     ke::init();
+    crate::arch::boot::early_write_str(b"[TRACE] ke-done\r\n");
 
     // Windows 7 plays the "Starting Windows" sequence while the rest of
     // the kernel is still coming up. The first frame is visible as soon
