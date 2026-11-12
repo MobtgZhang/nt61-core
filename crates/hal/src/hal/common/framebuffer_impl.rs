@@ -60,7 +60,7 @@ static FB_ATTR: AtomicU8 = AtomicU8::new(0x07);
 /// standard OVMF GOP format byte-for-byte.
 #[inline]
 pub const fn color32(r: u8, g: u8, b: u8) -> u32 {
-    ((b as u32) << 16) | ((g as u32) << 8) | (r as u32)
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
 /// Initialise the framebuffer from a `FramebufferInfo`. Returns the
@@ -211,15 +211,15 @@ pub fn get_pixel(x: u32, y: u32) -> Option<u32> {
             32 => {
                 let value = core::ptr::read_volatile(pointer as *const u32);
                 Some(color32(
-                    (value & 0xFF) as u8,
-                    ((value >> 8) & 0xFF) as u8,
                     ((value >> 16) & 0xFF) as u8,
+                    ((value >> 8) & 0xFF) as u8,
+                    (value & 0xFF) as u8,
                 ))
             }
             24 => Some(color32(
-                core::ptr::read_volatile(pointer),
-                core::ptr::read_volatile(pointer.add(1)),
                 core::ptr::read_volatile(pointer.add(2)),
+                core::ptr::read_volatile(pointer.add(1)),
+                core::ptr::read_volatile(pointer),
             )),
             _ => None,
         }
