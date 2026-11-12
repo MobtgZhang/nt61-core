@@ -365,7 +365,15 @@ pub unsafe fn map_page_in_root(root_pfn: u64, va: u64, pa: u64, flags: u64) -> b
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn map_page_in_root(root_pfn: u64, va: u64, pa: u64, flags: u64) -> bool {
+    aarch64::paging::map_page_in_root(root_pfn, va, pa, flags)
+}
+
+/// # Safety
+///
+/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn map_page_in_root(root_pfn: u64, va: u64, pa: u64, flags: u64) -> bool {
     let previous_root = read_page_root_pfn();
     if previous_root != root_pfn {
@@ -490,17 +498,17 @@ pub const fn identity_mapping_limit() -> Option<u64> {
     return Some(0x1_0000_0000);
     #[cfg(target_arch = "loongarch64")]
     return Some(0x1000_0000); // 256 MB low-RAM identity window
-                              // RISC-V: QEMU virt RAM starts at 0x8000_0000; mapping from PA 0
-                              // would waste 2 GiB of page-table work on non-existent memory.
-                              // The RISC-V-specific block in `vas::init()` maps the RAM window.
     #[cfg(target_arch = "aarch64")]
-    return Some(0x1000_0000); // 256 MB low-RAM identity window
+    return None;
+    // RISC-V: QEMU virt RAM starts at 0x8000_0000; mapping from PA 0
+    // would waste 2 GiB of page-table work on non-existent memory.
+    // The RISC-V-specific block in `vas::init()` maps the RAM window.
     #[cfg(not(any(
         target_arch = "x86_64",
         target_arch = "loongarch64",
         target_arch = "aarch64"
     )))]
-    None
+    return None;
 }
 
 /// Return the NT self-map base and PML4 index for validation.
