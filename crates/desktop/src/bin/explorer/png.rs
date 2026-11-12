@@ -15,7 +15,6 @@ impl Image {
         self.width as usize * 4
     }
 }
-
 #[derive(Default)]
 struct BitReader<'a> {
     data: &'a [u8],
@@ -424,4 +423,23 @@ pub fn decode_png(data: &[u8]) -> Result<Image, DecodeError> {
         height: height as u32,
         pixels,
     })
+}
+
+#[cfg(test)]
+mod temp_tests {
+    use super::*;
+
+    #[test]
+    fn decodes_wallpaper() {
+        let image = decode_png(include_bytes!(
+            "../../../assets/windows7/wallpapers/login-1024.png"
+        ))
+        .expect("wallpaper");
+        let non_black = image
+            .pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] > 8 || pixel[1] > 8 || pixel[2] > 8)
+            .count();
+        assert_eq!(non_black, image.pixels.len() / 4);
+    }
 }
