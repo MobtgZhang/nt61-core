@@ -542,9 +542,10 @@ pub fn parse_uefi_memory_map(map_addr: u64, map_size: u64, entry_size: u64) -> V
         let _ = &desc;
 
         // UEFI memory types we consider usable:
+        // 3 = EfiBootServicesCode (reclaimable after ExitBootServices)
+        // 4 = EfiBootServicesData (reclaimable after ExitBootServices)
         // 7 = EfiConventionalMemory
-        // 9 = EfiBootServicesData (can be reclaimed)
-        // 10 = EfiBootServicesCode (can be reclaimed)
+        // 9 = EfiACPIReclaimMemory
         let memory_type = unsafe { (*desc).type_ };
         let _ = &memory_type;
         let _ = &memory_type;
@@ -559,7 +560,7 @@ pub fn parse_uefi_memory_map(map_addr: u64, map_size: u64, entry_size: u64) -> V
 
         let _ = &size;
         let _ = &size;
-        let usable = memory_type == 7 || memory_type == 9 || memory_type == 10;
+        let usable = matches!(memory_type, 3 | 4 | 7 | 9);
         let _ = &usable;
         let _ = &usable;
 

@@ -111,11 +111,22 @@ fn read_sidecar(path: &str, suffix: &str) -> Option<alloc::vec::Vec<u8>> {
     crate::open_system_file_data(&sidecar)
 }
 
+#[derive(Clone)]
 struct TrustAnchor {
     key: RsaPublicKey,
 }
 
+static mut TRUST_ANCHOR_CACHE: Option<TrustAnchor> = None;
+
 fn load_trust_anchor() -> Option<TrustAnchor> {
+    // SAFETY: the trust anchor is immutable while the loader runs, and
+    // winload is single-threaded before ExitBootServices.
+    unsafe {
+        if let Some(anchor) = (*core::ptr::addr_of!(TRUST_ANCHOR_CACHE)).clone() {
+            return Some(anchor);
+        }
+    }
+
     let data = crate::open_system_file_data(TRUST_ANCHOR_PATH)?;
     let text = core::str::from_utf8(&data).ok()?;
     let mut lines = text.lines();
@@ -124,12 +135,16 @@ fn load_trust_anchor() -> Option<TrustAnchor> {
     if modulus.is_empty() || exponent.is_empty() {
         return None;
     }
-    Some(TrustAnchor {
+    let anchor = TrustAnchor {
         key: RsaPublicKey {
             n: BigUint::from_bytes(&modulus),
             e: BigUint::from_bytes(&exponent),
         },
-    })
+    };
+    unsafe {
+        *core::ptr::addr_of_mut!(TRUST_ANCHOR_CACHE) = Some(anchor.clone());
+    }
+    Some(anchor)
 }
 
 /// Verify one PE image. `path` is the system-partition path the image

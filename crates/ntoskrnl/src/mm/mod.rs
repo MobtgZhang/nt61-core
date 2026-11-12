@@ -91,13 +91,18 @@ pub use crate::boot_types::BootInfo;
 
 #[derive(Debug, Clone, Copy)]
 pub enum MemoryType {
-    Usable = 1,
-    Reserved = 2,
-    ACPIReclaimable = 3,
-    ACPINVS = 4,
-    Bad = 5,
-    Persistent = 7,
-    Hiberbox = 8,
+    Usable = 7,
+    Reserved = 0,
+    LoaderCode = 1,
+    LoaderData = 2,
+    BootServicesCode = 3,
+    BootServicesData = 4,
+    RuntimeServicesCode = 5,
+    RuntimeServicesData = 6,
+    Unusable = 8,
+    ACPIReclaimable = 9,
+    ACPINVS = 10,
+    MMIO = 11,
 }
 
 #[repr(C)]
@@ -258,16 +263,16 @@ pub fn init(boot_info: &BootInfo) {
             let mut best_size: u64 = 0;
             let mut best_high_base: u64 = 0;
             let mut best_high_size: u64 = 0;
+            let mut best_usable_base: u64 = 0;
+            let mut best_usable_size: u64 = 0;
             for i in 0..count {
                 let p = base_ptr.add(i * desc_size) as *const MemoryDescriptor;
                 let entry = core::ptr::read_unaligned(p);
                 let ty = entry.memory_type;
-                let usable = matches!(
-                    ty,
-                    1 | // EfiConventionalMemory
-                    7 | // EfiPersistentMemory
-                    9 // EfiConventionalMemory (alias)
-                );
+                // After ExitBootServices, boot-services code/data and
+                // ACPI-reclaimable memory are safe to reuse alongside
+                // conventional memory.
+                let usable = matches!(ty, 3 | 4 | 7 | 9);
                 if !usable {
                     continue;
                 }
@@ -280,6 +285,10 @@ pub fn init(boot_info: &BootInfo) {
                 // bounded by the 4 GiB bootstrap window).
                 if entry.base_address & 0xFFF != 0 {
                     continue;
+                }
+                if entry.length > best_usable_size {
+                    best_usable_size = entry.length;
+                    best_usable_base = entry.base_address;
                 }
                 match crate::arch::identity_mapping_limit() {
                     Some(limit) if entry.base_address >= limit => {
@@ -317,6 +326,98 @@ pub fn init(boot_info: &BootInfo) {
                     chosen_size = 16 * 1024 * 1024;
                 }
             }
+
+            crate::hal::serial::write_string_always("[mm] map entries=");
+            write_decimal_u64(count as u64);
+            crate::hal::serial::write_string_always(" descriptor=");
+            write_decimal_u64(desc_size as u64);
+            crate::hal::serial::write_string_always("\r\n");
+            for i in 0..count.min(80) {
+                let p = base_ptr.add(i * desc_size) as *const MemoryDescriptor;
+                let entry = core::ptr::read_unaligned(p);
+                crate::hal::serial::write_string_always("[mm] map[");
+                write_decimal_u64(i as u64);
+                crate::hal::serial::write_string_always("] base=");
+                crate::hal::serial::write_hex_u64_always(entry.base_address);
+                crate::hal::serial::write_string_always(" size=");
+                crate::hal::serial::write_hex_u64_always(entry.length);
+                crate::hal::serial::write_string_always(" type=");
+                write_decimal_u64(entry.memory_type as u64);
+                crate::hal::serial::write_string_always("\r\n");
+            }
+            crate::hal::serial::write_string_always("[mm] best low=");
+            write_decimal_u64(best_size);
+            crate::hal::serial::write_string_always(" high=");
+            write_decimal_u64(best_high_size);
+            crate::hal::serial::write_string_always("\r\n");
+
+            // A tiny low-memory island cannot host both the heap and
+            // the page allocator. Prefer a large high-memory region in
+            // that case; AArch64/RISC-V/LoongArch map such pages on
+            // demand, and x86_64 can already address them directly.
+            if best_size < 64 * 1024 * 1024 && best_high_size >= 64 * 1024 * 1024 {
+                crate::hal::serial::write_string_always(
+                    "[mm] low region too small; using high memory for bootstrap\r\n",
+                );
+                chosen_base = best_high_base;
+                chosen_size = best_high_size;
+            }
+
+            if best_usable_size >= 64 * 1024 * 1024 {
+                chosen_base = best_usable_base;
+                chosen_size = best_usable_size;
+            }
+        }
+    }
+
+    // EDK2/AArch64 can report only a tiny low-memory island in its UEFI
+    // memory map even when QEMU's Device Tree advertises the full RAM.
+    // Use the FDT `memory` node as the authoritative fallback so PFN
+    // initialization does not exhaust the 16 MiB island.
+    if boot_info.device_tree_base != 0 && boot_info.device_tree_size != 0 {
+        let fdt_base = boot_info.device_tree_base;
+        let fdt_size = boot_info.device_tree_size;
+        if crate::arch::identity_map_region(fdt_base, fdt_size as u64) {
+            // SAFETY: the loader captures a runtime-surviving FDT and we
+            // have just mapped it into the kernel identity window.
+            if let Some(tree) = unsafe {
+                crate::arch::common::device_tree::DeviceTree::new(fdt_base as *const u8, fdt_size)
+            } {
+                let mut fdt_base = 0u64;
+                let mut fdt_size = 0u64;
+                tree.for_each_property(|node, name, value, address_cells, size_cells| {
+                    if name != b"reg" || !node.starts_with(b"memory") {
+                        return false;
+                    }
+                    let ranges = crate::arch::common::device_tree::parse_reg_ranges_public(
+                        value,
+                        address_cells,
+                        size_cells,
+                    );
+                    for range in ranges.iter().filter(|range| range.size != 0) {
+                        if range.size > fdt_size {
+                            fdt_base = range.base;
+                            fdt_size = range.size;
+                        }
+                    }
+                    false
+                });
+                crate::hal::serial::write_string_always("[mm] fdt memory=");
+                crate::hal::serial::write_hex_u64_always(fdt_base);
+                crate::hal::serial::write_string_always(" size=");
+                crate::hal::serial::write_hex_u64_always(fdt_size);
+                crate::hal::serial::write_string_always("\r\n");
+                if fdt_size >= 64 * 1024 * 1024
+                    && chosen_size < 64 * 1024 * 1024
+                    && fdt_size > chosen_size
+                {
+                    chosen_base = fdt_base;
+                    chosen_size = fdt_size;
+                    crate::hal::serial::write_string_always(
+                        "[mm] using FDT memory for bootstrap\r\n",
+                    );
+                }
+            }
         }
     }
 
@@ -333,7 +434,15 @@ pub fn init(boot_info: &BootInfo) {
     // for it. The buddy's static 64 MiB region is also what the
     // heap and pool are sized against, so keeping chosen_size
     // small keeps the bookkeeping in the BSS FRAME_TABLE.
+    const FRAME_COVERAGE_BYTES: u64 = 131072 * 4096;
     const MAX_RAM_BYTES: u64 = 192 * 1024 * 1024 * 1024;
+    if chosen_size > FRAME_COVERAGE_BYTES {
+        chosen_size = FRAME_COVERAGE_BYTES;
+    }
+    const BOOTSTRAP_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+    if chosen_size > BOOTSTRAP_LIMIT_BYTES {
+        chosen_size = BOOTSTRAP_LIMIT_BYTES;
+    }
     if chosen_size > MAX_RAM_BYTES {
         chosen_size = MAX_RAM_BYTES;
     }
@@ -405,6 +514,100 @@ pub fn init(boot_info: &BootInfo) {
     // ------------------------------------------------------------------
     frame::init_with_range(chosen_base, chosen_size);
 
+    // The loader places ntoskrnl/HAL/BOOTVID inside the same physical
+    // bank the buddy allocator manages. Those images are live before
+    // the PFN database exists, so reserve them before any buddy
+    // allocation can hand out one of their frames.
+    for (image_base, image_size) in [
+        (boot_info.ntoskrnl_image_base, boot_info.ntoskrnl_image_size),
+        (boot_info.hal_image_base, boot_info.hal_image_size),
+        (boot_info.bootvid_image_base, boot_info.bootvid_image_size),
+    ] {
+        if image_base != 0 && image_size != 0 {
+            crate::hal::serial::write_string_always("[mm] loader image reserve base=0x");
+            crate::hal::serial::write_hex_u64_always(image_base);
+            crate::hal::serial::write_string_always(" size=0x");
+            crate::hal::serial::write_hex_u64_always(image_size);
+            crate::hal::serial::write_string_always("\r\n");
+            crate::mm::frame::reserve_range(image_base, image_size);
+        }
+    }
+
+    // The FDT can describe a broad RAM bank, while UEFI exposes reserved,
+    // ACPI, NVS and MMIO holes inside that bank. Reserve those holes before
+    // anything allocates from the buddy; otherwise the PFN allocator can
+    // later zero a live firmware page and silently corrupt boot state.
+    if boot_info.memory_map != 0 && boot_info.memory_map_entries != 0 {
+        let desc_size = if boot_info.memory_descriptor_size != 0 {
+            boot_info.memory_descriptor_size as usize
+        } else {
+            core::mem::size_of::<MemoryDescriptor>()
+        };
+        let count = boot_info.memory_map_entries as usize;
+        let base_ptr = boot_info.memory_map as *const u8;
+        for index in 0..count {
+            let entry = unsafe {
+                core::ptr::read_unaligned(base_ptr.add(index * desc_size) as *const MemoryDescriptor)
+            };
+            if matches!(entry.memory_type, 3 | 4 | 7 | 9) {
+                continue;
+            }
+            let start = entry.base_address.max(chosen_base);
+            let end = entry
+                .base_address
+                .saturating_add(entry.length)
+                .min(chosen_base.saturating_add(chosen_size));
+            if end > start {
+                crate::mm::frame::reserve_range(start, end - start);
+            }
+        }
+
+        // UEFI descriptors do not necessarily tile the FDT's RAM bank.
+        // A descriptor list can leave an unlisted hole between ranges
+        // (QEMU/EDK2 ends the 8 GiB bank with one at 0x47FF0000). The
+        // buddy allocator must never treat such a hole as allocatable.
+        let mut usable_ranges = [(0u64, 0u64); 256];
+        let mut usable_count = 0usize;
+        let chosen_end = chosen_base.saturating_add(chosen_size);
+        for index in 0..count {
+            let entry = unsafe {
+                core::ptr::read_unaligned(base_ptr.add(index * desc_size) as *const MemoryDescriptor)
+            };
+            if !matches!(entry.memory_type, 3 | 4 | 7 | 9) {
+                continue;
+            }
+            let start = entry.base_address.max(chosen_base);
+            let end = entry
+                .base_address
+                .saturating_add(entry.length)
+                .min(chosen_end);
+            if end > start && usable_count < usable_ranges.len() {
+                usable_ranges[usable_count] = (start, end);
+                usable_count += 1;
+            }
+        }
+        for index in 1..usable_count {
+            let mut best = index;
+            for candidate in index + 1..usable_count {
+                if usable_ranges[candidate].0 < usable_ranges[best].0 {
+                    best = candidate;
+                }
+            }
+            usable_ranges.swap(index, best);
+        }
+        let mut cursor = chosen_base;
+        for index in 0..usable_count {
+            let (start, end) = usable_ranges[index];
+            if start > cursor {
+                crate::mm::frame::reserve_range(cursor, start - cursor);
+            }
+            cursor = cursor.max(end);
+        }
+        if chosen_end > cursor {
+            crate::mm::frame::reserve_range(cursor, chosen_end - cursor);
+        }
+    }
+
     crate::hal::serial::write_string("MM3 frame_init_done\r\n");
 
     // The kernel heap owns a contiguous run of physical pages before the
@@ -459,6 +662,9 @@ pub fn init(boot_info: &BootInfo) {
             #[cfg(target_arch = "aarch64")]
             core::arch::asm!("mov {}, sp", out(reg) sp, options(nostack, preserves_flags));
         }
+        crate::hal::serial::write_string_always("[mm] stack sp=0x");
+        crate::hal::serial::write_hex_u64_always(sp);
+        crate::hal::serial::write_string_always("\r\n");
         // Reserve 4 MiB below the current SP (the stack grows down)
         // plus 64 KiB above it (alignment slop).
         let stack_base = sp.saturating_sub(4 * 1024 * 1024);
@@ -478,6 +684,40 @@ pub fn init(boot_info: &BootInfo) {
     write_decimal_u64(pfn_count);
     crate::hal::serial::write_string_always("\r\n");
     pfn::init(base_pfn, pfn_count);
+
+    // `pfn::init` seeds every PFN in the chosen bank as free. Mirror the
+    // buddy allocator's firmware-hole exclusions into the PFN database;
+    // otherwise the zero-page worker can hand out and zero a reserved or
+    // unlisted frame even though the buddy allocator protected it.
+    if boot_info.memory_map != 0 && boot_info.memory_map_entries != 0 {
+        let desc_size = if boot_info.memory_descriptor_size != 0 {
+            boot_info.memory_descriptor_size as usize
+        } else {
+            core::mem::size_of::<MemoryDescriptor>()
+        };
+        let count = boot_info.memory_map_entries as usize;
+        let base_ptr = boot_info.memory_map as *const u8;
+        for index in 0..count {
+            let entry = unsafe {
+                core::ptr::read_unaligned(base_ptr.add(index * desc_size) as *const MemoryDescriptor)
+            };
+            if matches!(entry.memory_type, 3 | 4 | 7 | 9) {
+                continue;
+            }
+            let start = entry.base_address.max(chosen_base);
+            let end = entry
+                .base_address
+                .saturating_add(entry.length)
+                .min(chosen_base.saturating_add(chosen_size));
+            if end > start {
+                let start_pfn = start >> 12;
+                let end_pfn = end >> 12;
+                if end_pfn > start_pfn {
+                    crate::mm::pfn::reserve_pfn_range(start_pfn, end_pfn - start_pfn);
+                }
+            }
+        }
+    }
 
     crate::hal::serial::write_string_always("[MM] heap reserve about\r\n");
 
@@ -716,15 +956,7 @@ pub fn discover_ram(boot_info: &BootInfo) -> (u64, u64) {
         let mut best_size = BOOT_RAM_SIZE;
         for i in 0..n {
             let e = core::ptr::read_unaligned(entries.add(i));
-            // After ExitBootServices the UEFI memory types that may be
-            // consumed are conventional memory plus the reclaimable
-            // OS-specific types (9 and 10). The old dual discovery
-            // path accepted different sets depending on which loop ran.
-            if e.memory_type != MemoryType::Usable as u32
-                && e.memory_type != 7
-                && e.memory_type != 9
-                && e.memory_type != 10
-            {
+            if !matches!(e.memory_type, 3 | 4 | 7 | 9) {
                 continue;
             }
             // Skip the low 1 MiB (real-mode IVT, BDA, VGA).

@@ -274,6 +274,7 @@ struct ListHead {
 }
 
 /// Global PFN database state.
+#[repr(C, align(4096))]
 pub struct PfnDatabase {
     pub pfn_array: *mut MMPFN,
     pub pfn_count: u64,
@@ -851,6 +852,19 @@ impl Default for PfnDatabase {
 
 pub static PFN_DB: Spinlock<PfnDatabase> = Spinlock::new(PfnDatabase::new());
 
+fn reserve_static_page(start_va: u64, len: usize) {
+    if start_va == 0 || len == 0 {
+        return;
+    }
+    let base_pfn = start_va.div_ceil(4096);
+    let end_pfn = start_va.saturating_add(len as u64).div_ceil(4096);
+    if end_pfn > base_pfn && !reserve_pfn_range(base_pfn, end_pfn - base_pfn) {
+        crate::hal::serial::write_string_always("[mm] WARN: kernel static pfn reserve failed\r\n");
+    }
+}
+
+static PFN_RESERVE_TRACE: AtomicU64 = AtomicU64::new(0);
+
 /// Report whether the physical page allocator is ready.
 pub fn is_initialized() -> bool {
     let db = PFN_DB.lock();
@@ -860,7 +874,7 @@ pub fn is_initialized() -> bool {
 /// Static BSS storage used as a bootstrap fallback. Holds 128K PFNs
 /// (~2 MiB), enough to track the first 512 MiB of RAM during early boot
 /// when the buddy allocator hasn't been fully initialized yet.
-static mut PFN_STORAGE_BOOTSTRAP: [u8; 2 * 1024 * 1024] = [0; 2 * 1024 * 1024];
+static mut PFN_STORAGE_BOOTSTRAP: [u8; 4 * 1024 * 1024] = [0; 4 * 1024 * 1024];
 
 /// Physical address of the dynamic PFN database storage (set by
 /// `init`). Kept so the arch code can register it with the
@@ -898,6 +912,11 @@ pub fn init(base_pfn: PfnNumber, pfn_count: PfnNumber) {
             PFN_STORAGE_USED = (*core::ptr::addr_of!(PFN_STORAGE_BOOTSTRAP)).len();
             PFN_STORAGE_CAPACITY = (*core::ptr::addr_of!(PFN_STORAGE_BOOTSTRAP)).len();
         } else if let Some(phys) = crate::mm::frame::allocate_pages(pages as u64) {
+            crate::hal::serial::write_string_always("[mm] pfn storage: phys=0x");
+            crate::hal::serial::write_hex_u64_always(phys);
+            crate::hal::serial::write_string_always(" pages=");
+            crate::mm::write_decimal_u64(pages as u64);
+            crate::hal::serial::write_string_always("\r\n");
             if !crate::arch::identity_map_region(phys, (pages * 4096) as u64) {
                 crate::hal::serial::write_string_always(
                     "[FATAL] pfn::init: storage map failed\r\n",
@@ -943,6 +962,11 @@ pub fn init(base_pfn: PfnNumber, pfn_count: PfnNumber) {
             // NOTE: bugcheck_with() is ! (never returns), so no code after this
         }
         crate::hal::serial::write_string_always("[mm] pfn::init: before db init\r\n");
+        crate::hal::serial::write_string_always("[mm] pfn::init: storage=0x");
+        crate::hal::serial::write_hex_u64_always(PFN_STORAGE_PTR as u64);
+        crate::hal::serial::write_string_always(" used=");
+        crate::mm::write_decimal_u64(PFN_STORAGE_USED as u64);
+        crate::hal::serial::write_string_always("\r\n");
         let mut db = PFN_DB.lock();
         let usable_pfns = {
             let bytes_needed = (pfn_count as usize) * core::mem::size_of::<MMPFN>();
@@ -958,7 +982,9 @@ pub fn init(base_pfn: PfnNumber, pfn_count: PfnNumber) {
             base_pfn,
             usable_pfns as u64,
         );
+        crate::hal::serial::write_string_always("[mm] pfn::init: db zeroed\r\n");
         db.seed_free(base_pfn, usable_pfns as u64);
+        crate::hal::serial::write_string_always("[mm] pfn::init: db seeded\r\n");
     }
 
     // The heap was allocated from the buddy before this PFN database
@@ -973,6 +999,48 @@ pub fn init(base_pfn: PfnNumber, pfn_count: PfnNumber) {
             crate::hal::serial::write_string_always("[mm] WARN: heap pfn reserve failed\r\n");
         }
     }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Some((base, size)) = crate::arch::aarch64::paging::static_page_table_range() {
+            crate::hal::serial::write_string_always("[mm] aarch64 static page-tables: base=0x");
+            crate::hal::serial::write_hex_u64_always(base);
+            crate::hal::serial::write_string_always(" size=0x");
+            crate::hal::serial::write_hex_u64_always(size);
+            crate::hal::serial::write_string_always("\r\n");
+            if !crate::mm::pfn::reserve_pfn_range(base >> 12, size >> 12) {
+                crate::hal::serial::write_string_always(
+                    "[mm] WARN: AArch64 static page-table reserve failed\r\n",
+                );
+            }
+        } else {
+            crate::hal::serial::write_string_always(
+                "[mm] WARN: AArch64 static page-table range unavailable\r\n",
+            );
+        }
+
+        if let Some((base, size)) = crate::arch::aarch64::paging::cross_root_scratch_range() {
+            crate::hal::serial::write_string_always("[mm] aarch64 cross-root scratch: base=0x");
+            crate::hal::serial::write_hex_u64_always(base);
+            crate::hal::serial::write_string_always(" size=0x");
+            crate::hal::serial::write_hex_u64_always(size);
+            crate::hal::serial::write_string_always("\r\n");
+            reserve_static_page(base, size as usize);
+        } else {
+            crate::hal::serial::write_string_always(
+                "[mm] WARN: AArch64 cross-root scratch range unavailable\r\n",
+            );
+        }
+    }
+
+    reserve_static_page(
+        core::ptr::addr_of!(PFN_DB) as u64,
+        core::mem::size_of_val(&PFN_DB),
+    );
+    reserve_static_page(
+        core::ptr::addr_of!(PFN_STORAGE_BOOTSTRAP) as u64,
+        4 * 1024 * 1024,
+    );
 
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -1130,6 +1198,8 @@ pub fn reserve_pfn(pfn: PfnNumber) -> bool {
             (*entry).share_count = 1;
         }
     }
+    let trace_index = PFN_RESERVE_TRACE.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = trace_index;
     true
 }
 
