@@ -225,9 +225,9 @@ impl Value {
             if cu == 0 {
                 break;
             }
-            match char::from_u32(cu as u32) {
-                Some(c) => out.push(c),
-                None => return None,
+            {
+                let c = char::from_u32(cu as u32)?;
+                out.push(c)
             }
         }
         Some(out)
@@ -613,7 +613,7 @@ impl<'a> Hive<'a> {
     pub fn open(&self, path: &str) -> Result<KeyNode, HiveError> {
         let root = self.root()?;
         let parts: Vec<&str> = path
-            .split(|c| c == '/' || c == '\\')
+            .split(['/', '\\'])
             .filter(|s| !s.is_empty())
             .collect();
         let mut current = root;
@@ -632,7 +632,7 @@ impl<'a> Hive<'a> {
     /// Supports both "/" and "\" as path separators.
     pub fn open_at(&self, base: &KeyNode, relative_path: &str) -> Result<KeyNode, HiveError> {
         let parts: Vec<&str> = relative_path
-            .split(|c| c == '/' || c == '\\')
+            .split(['/', '\\'])
             .filter(|s| !s.is_empty())
             .collect();
         let mut current = base.clone();

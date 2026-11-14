@@ -74,6 +74,7 @@ pub struct BcdEntry {
     pub description: String,
     /// Application device path / file path from `12000002` (FilePath).
     pub application_path: String,
+    pub load_options: String,
 }
 
 // ============================================================================
@@ -189,7 +190,7 @@ impl<'a> BcdHive<'a> {
                 continue;
             }
 
-            let object_type = self.get_object_type(&node);
+            let object_type = self.get_object_type(node);
 
             // Filter by object type: only include entries the Windows 7 boot
             // manager offers in its normal OS menu. Resume objects are BCD
@@ -202,7 +203,7 @@ impl<'a> BcdHive<'a> {
 
             // Get description from 12000004 element (with friendly alias fallback)
             let description = self
-                .get_element_string(&node, "12000004")
+                .get_element_string(node, "12000004")
                 .unwrap_or_else(|| "Unknown".to_string());
 
             // Skip entries with no description
@@ -212,7 +213,7 @@ impl<'a> BcdHive<'a> {
 
             // Get application path from 12000002 element
             let application_path = self
-                .get_element_string(&node, "12000002")
+                .get_element_string(node, "12000002")
                 .unwrap_or_default();
 
             if application_path.is_empty() {
@@ -226,6 +227,7 @@ impl<'a> BcdHive<'a> {
                 guid,
                 description,
                 application_path,
+                load_options: self.get_element_string(node, "22000001").unwrap_or_default(),
             });
         }
 
@@ -369,14 +371,14 @@ impl<'a> BcdHive<'a> {
         None
     }
 
-    /// Look up the boot manager's Timeout value, defaulting to 30s.
+    /// Look up the boot manager timeout, defaulting to five seconds.
     pub fn timeout_seconds(&self) -> u32 {
         if let Some(bm) = self.try_open_boot_manager() {
             if let Some(timeout) = self.get_element_dword(&bm, "15000011") {
                 return timeout;
             }
         }
-        30
+        5
     }
 
     /// Convert the parsed hive into a `BcdStore`.
@@ -384,10 +386,42 @@ impl<'a> BcdHive<'a> {
         use crate::bcd::{BcdStore, BootEntry};
         let mut store = BcdStore::new();
 
-        let entries = match self.boot_entries() {
+        let mut entries = match self.boot_entries() {
             Ok(e) => e,
             Err(_) => return store,
         };
+
+        if let Some(bm) = self.try_open_boot_manager() {
+            store.default = self.get_element_string(&bm, "23000003").and_then(|s| {
+                let mut raw = [0; 16];
+                parse_guid_braced(&s, &mut raw).map(|_| crate::bcd::Guid(raw))
+            });
+            if let Ok(order) = self.hive.open_at(&bm, "Elements/14000006") {
+                if let Ok(Some(value)) = self.hive.get_value(&order, "Element") {
+                    let mut guids = Vec::new();
+                    if value.value_type == 7 && value.data.len() % 2 == 0 {
+                        let words: Vec<u16> = value.data.chunks_exact(2)
+                            .map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
+                        for name in words.split(|&c| c == 0).filter(|s| !s.is_empty()) {
+                            if let Ok(name) = String::from_utf16(name) {
+                                let mut raw = [0; 16];
+                                if parse_guid_braced(&name, &mut raw).is_some() { guids.push(raw); }
+                            }
+                        }
+                    } else if value.value_type == 3 && value.data.len() % 16 == 0 {
+                        for raw in value.data.chunks_exact(16) {
+                            let mut guid: [u8; 16] = raw.try_into().unwrap();
+                            guid[..4].reverse(); guid[4..6].reverse(); guid[6..8].reverse();
+                            guids.push(guid);
+                        }
+                    }
+                    if !guids.is_empty() {
+                        entries.retain(|entry| guids.contains(&entry.guid));
+                        entries.sort_by_key(|entry| guids.iter().position(|g| g == &entry.guid).unwrap_or(usize::MAX));
+                    }
+                }
+            }
+        }
 
         let timeout = self.timeout_seconds();
         store.timeout = timeout;
@@ -402,6 +436,7 @@ impl<'a> BcdHive<'a> {
                 guid,
                 description: crate::bcd::StaticStr::from_str(&e.description),
                 application: crate::bcd::StaticStr::from_str(&e.application_path),
+                load_options: crate::bcd::StaticStr::from_str(&e.load_options),
             };
             store.entries[i] = Some(entry);
             store.display_order[i] = Some(guid);

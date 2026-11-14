@@ -1,10 +1,6 @@
 /// Write raw diagnostic bytes to COM1 before boot services are used.
 #[inline(never)]
 pub fn write_com1_marker(bytes: &[u8]) {
-    if !cfg!(feature = "log_level_debug") {
-        return;
-    }
-
     for byte in bytes {
         unsafe {
             core::arch::asm!(

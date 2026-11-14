@@ -15,6 +15,12 @@
 
 extern crate alloc;
 
+// Share the loader reader: large System32 directories use nonresident NTFS indexes.
+#[path = "../../winload/src/block_read.rs"]
+mod block_read;
+#[path = "../../winload/src/ntfs_boot.rs"]
+mod ntfs_boot;
+
 /// Boot-manager global allocator.
 ///
 /// The `uefi` crate's `global_allocator` feature must stay disabled in this
@@ -91,17 +97,10 @@ fn bootmgr_panic(info: &core::panic::PanicInfo) -> ! {
 macro_rules! debug_println {
     ($fmt:expr $(, $arg:expr)*) => {{
         use ::alloc::format;
-        crate::arch::current::write_com1_marker(
+        #[cfg(feature = "log_level_debug")]
+        $crate::arch::current::write_com1_marker(
             format!("{}\r\n", format!($fmt, $($arg),*)).as_bytes(),
         );
-        #[cfg(not(feature = "log_level_debug"))]
-        if false {
-            uefi::println!($fmt, $($arg),*);
-        }
-        #[cfg(feature = "log_level_debug")]
-        {
-            uefi::println!($fmt, $($arg),*);
-        }
     }};
 }
 
@@ -117,7 +116,10 @@ mod font;
 mod graphics;
 mod input;
 mod loader;
+mod memory_test;
 mod menu;
+#[path = "../../winload/src/refs_boot.rs"]
+mod refs_boot;
 mod renderer;
 
 use alloc::string::{String, ToString};
@@ -202,7 +204,7 @@ fn has_sfs_protocol(handle: uefi::Handle) -> bool {
             OpenProtocolAttributes::GetProtocol,
         )
     };
-    matches!(r, Ok(_))
+    r.is_ok()
 }
 
 // =====================================================================
@@ -227,7 +229,7 @@ const BCD_MAILBOX_TABLE_GUID: uefi::Guid = uefi::Guid::from_bytes([
 ]);
 
 /// BCD mailbox signature "BCDE"
-const BCD_MAILBOX_SIGNATURE: [u8; 4] = [b'B', b'C', b'D', b'E'];
+const BCD_MAILBOX_SIGNATURE: [u8; 4] = *b"BCDE";
 
 /// BCD mailbox version for Windows 7
 const BCD_MAILBOX_VERSION: u32 = 0x00000003;
@@ -327,6 +329,7 @@ enum AdvancedAction {
     Debugging,
     DisableAutoRestart,
     DisableDriverSignature,
+    StartNormally,
 }
 
 impl AdvancedAction {
@@ -336,13 +339,31 @@ impl AdvancedAction {
             AdvancedAction::SafeModeNetworking => Some("/safeboot:network"),
             AdvancedAction::SafeModeCommandPrompt => Some("/safeboot:minimal /safeboot:shell"),
             AdvancedAction::BootLogging => Some("/bootlog"),
-            AdvancedAction::LowResolution => Some("/safeboot:minimal /lowres"),
+            AdvancedAction::LowResolution => Some("/lowres"),
+            AdvancedAction::LastKnownGood => Some("/lastknowngood"),
+            AdvancedAction::DisableAutoRestart => Some("/norebootoncrash"),
+            AdvancedAction::DisableDriverSignature => Some("/disableintegritychecks"),
             AdvancedAction::DirectoryServices => Some("/safeboot:dsrepair"),
             AdvancedAction::Debugging => Some("/debug /debugport=COM1 /baudrate=115200"),
             _ => None,
         }
     }
 }
+
+const ADV_OPTIONS: [(AdvancedAction, &str, &str); 12] = [
+        (AdvancedAction::Repair, "Repair Your Computer", "View a list of system recovery tools you can use to repair startup problems, run diagnostics, or restore your system."),
+        (AdvancedAction::SafeMode, "Safe Mode", "Start Windows with only the core drivers and services. Use when you cannot boot after installing a new device or driver."),
+        (AdvancedAction::SafeModeNetworking, "Safe Mode with Networking", "Start Windows in safe mode along with the network drivers and services needed to access the Internet or other computers on your network."),
+        (AdvancedAction::SafeModeCommandPrompt, "Safe Mode with Command Prompt", "Start Windows in safe mode with a command prompt window instead of the usual Windows interface. For advanced users only."),
+        (AdvancedAction::BootLogging, "Enable Boot Logging", "Create a file (ntbtlog.txt) that lists all the drivers that are installed during startup and that might be useful for advanced troubleshooting."),
+        (AdvancedAction::LowResolution, "Enable low resolution video 640x480", "Start Windows using your current video driver and low resolution and refresh rate settings. You can use this mode to reset your display settings."),
+        (AdvancedAction::LastKnownGood, "Last Known Good Configuration advanced", "Start Windows with the last registry and driver configuration that worked successfully."),
+        (AdvancedAction::DirectoryServices, "Directory Services Restore Mode", "Start Windows domain controller running Active Directory so that the directory service can be restored. For advanced users and IT pros only."),
+        (AdvancedAction::Debugging, "Debugging Mode", "Start Windows in an advanced troubleshooting mode intended for IT professionals and system administrators."),
+        (AdvancedAction::DisableAutoRestart, "Disable automatic restart on system failure", "Prevent Windows from automatically restarting if an error causes Windows to fail."),
+        (AdvancedAction::DisableDriverSignature, "Disable Driver Signature Enforcement", "Allows drivers containing improper signatures to be installed."),
+        (AdvancedAction::StartNormally, "Start Windows Normally", "Start the normal Windows desktop without advanced boot switches."),
+    ];
 
 mod colors {
     use crate::renderer::Color;
@@ -807,7 +828,7 @@ fn draw_gop_advanced_screen(
         // Draw the lines
         let mut y_pos = desc_text_y as i32;
         let line_spacing = font.line_height() as i32 + 2;
-        let max_y = (status_bottom as i32 - status_height as i32 - 16) as i32;
+        let max_y = (status_bottom as i32 - status_height as i32 - 16);
         for line in lines {
             if y_pos + font.line_height() as i32 > max_y {
                 // Add ellipsis if no more room
@@ -981,6 +1002,8 @@ fn efi_main_inner() -> Status {
     let entries = get_boot_entry_descriptions(&bcd_store);
     debug_println!("[DEBUG] Got {} boot entries", entries.len());
 
+    let mut con_in = crate::input::Keyboard::new();
+
     // Initialize GOP graphics mode
     //
     // On most firmwares (x86_64 OVMF, aarch64 ArmVirtQemu) the GOP
@@ -1050,7 +1073,7 @@ fn efi_main_inner() -> Status {
             debug_println!(
                 "[BOOT] No GOP available after polling - falling back to text mode auto-boot"
             );
-            return text_mode_auto_boot(&bcd_store, &entries);
+            return text_mode_auto_boot(&bcd_store, &entries, con_in.take());
         }
     };
 
@@ -1077,39 +1100,28 @@ fn efi_main_inner() -> Status {
         let _ = gop.set_mode(&mode);
     }
 
-    // Some EDK2 platforms (notably ArmVirtQemu on aarch64) report a GOP
-    // pixel format of `BltOnly`, which means the firmware refuses to expose
-    // a linear framebuffer pointer. `frame_buffer()` asserts (panics) in
-    // that situation, so we have to inspect the pixel format *before*
-    // touching the framebuffer. When the platform only supports Blt, the
-    // boot manager falls back to text mode, which never touches GOP.
-    if gop.current_mode_info().pixel_format() == PixelFormat::BltOnly {
-        debug_println!("[GOP] Framebuffer in Blt-only mode — falling back to text mode");
-        return text_mode_auto_boot(&bcd_store, &entries);
-    }
-
-    let fb_size = gop.frame_buffer().size();
-    let fb_ptr = gop.frame_buffer().as_mut_ptr();
-    let info = gop.current_mode_info();
-    let (width, height) = info.resolution();
-    let stride = info.stride() * 4;
-
-    debug_println!(
-        "[GOP] Mode: {}x{} format={:?}",
-        width,
-        height,
-        info.pixel_format()
-    );
-    debug_println!("[GOP] Framebuffer: {:016x} size={}", fb_ptr as u64, fb_size);
-
-    let fb_info = FramebufferInfo {
-        base: fb_ptr as u64,
-        size: fb_size as u64,
-        width: width as u32,
-        height: height as u32,
-        stride: stride as u32,
+    // VirtioGpuDxe commonly exposes only BLT. Drawing a linear buffer or
+    // falling back to serial here leaves the user looking at a black screen.
+    let mut fb = if gop.current_mode_info().pixel_format() == PixelFormat::BltOnly {
+        // SAFETY: gop's scoped protocol remains open for this entire menu.
+        unsafe { Framebuffer::with_blt(&mut gop) }
+    } else {
+        let fb_size = gop.frame_buffer().size();
+        let fb_ptr = gop.frame_buffer().as_mut_ptr();
+        let info = gop.current_mode_info();
+        let (width, height) = info.resolution();
+        Framebuffer::with_ptr(
+            FramebufferInfo {
+                base: fb_ptr as u64,
+                size: fb_size as u64,
+                width: width as u32,
+                height: height as u32,
+                stride: (info.stride() * 4) as u32,
+            },
+            fb_ptr,
+        )
     };
-    let mut fb = Framebuffer::with_ptr(fb_info, fb_ptr);
+    let fb_info = fb.info();
     debug_println!("[DEBUG] GOP initialized, fb created");
 
     // Publish the framebuffer info at a fixed physical address
@@ -1137,24 +1149,12 @@ fn efi_main_inner() -> Status {
     // instead of relying on its menu position. Unsupported recovery paths
     // return to the menu with a clear notice rather than booting a normal OS
     // entry by mistake.
-    let adv_options: [(AdvancedAction, &str, &str); 11] = [
-        (AdvancedAction::Repair, "Repair Your Computer", "View a list of system recovery tools you can use to repair startup problems, run diagnostics, or restore your system."),
-        (AdvancedAction::SafeMode, "Safe Mode", "Start Windows with only the core drivers and services. Use when you cannot boot after installing a new device or driver."),
-        (AdvancedAction::SafeModeNetworking, "Safe Mode with Networking", "Start Windows in safe mode along with the network drivers and services needed to access the Internet or other computers on your network."),
-        (AdvancedAction::SafeModeCommandPrompt, "Safe Mode with Command Prompt", "Start Windows in safe mode with a command prompt window instead of the usual Windows interface. For advanced users only."),
-        (AdvancedAction::BootLogging, "Enable Boot Logging", "Create a file (ntbtlog.txt) that lists all the drivers that are installed during startup and that might be useful for advanced troubleshooting."),
-        (AdvancedAction::LowResolution, "Enable low resolution video 640x480", "Start Windows using your current video driver and low resolution and refresh rate settings. You can use this mode to reset your display settings."),
-        (AdvancedAction::LastKnownGood, "Last Known Good Configuration advanced", "Start Windows with the last registry and driver configuration that worked successfully."),
-        (AdvancedAction::DirectoryServices, "Directory Services Restore Mode", "Start Windows domain controller running Active Directory so that the directory service can be restored. For advanced users and IT pros only."),
-        (AdvancedAction::Debugging, "Debugging Mode", "Start Windows in an advanced troubleshooting mode intended for IT professionals and system administrators."),
-        (AdvancedAction::DisableAutoRestart, "Disable automatic restart on system failure", "Prevent Windows from automatically restarting if an error causes Windows to fail."),
-        (AdvancedAction::DisableDriverSignature, "Disable Driver Signature Enforcement", "Allows drivers containing improper signatures to be installed."),
-    ];
+    let adv_options = ADV_OPTIONS;
 
     let mut screen = GraphicsScreen::Main {
         tools_selected: false,
     };
-    let mut tick_counter: u32 = 0;
+    // Start timers only after the menu is actually visible.
 
     // Initial draw
     debug_println!("[DEBUG] About to draw main screen...");
@@ -1168,36 +1168,24 @@ fn efi_main_inner() -> Status {
     );
     debug_println!("[DEBUG] Main screen drawn");
 
-    // Initialize console input for keyboard reading
-    let mut con_in = crate::input::Keyboard::new();
-    debug_println!(
-        "[DEBUG] Console input initialized, con_in.is_some() = {}",
-        con_in.is_some()
-    );
-    debug_println!("[DEBUG] Entering main event loop");
+    fb.present();
+    crate::arch::current::write_com1_marker(b"[BOOT-MENU] ready\r\n");
+    let mut clock = BootClock::new(bcd_store.timeout);
 
     // Main event loop - use text console for keyboard input
     loop {
-        // Read keyboard input from text console (non-blocking check)
-        let mut read = None;
-        if let Some(ref mut stdin) = con_in {
-            read = stdin.wait_for_key(core::time::Duration::from_millis(100));
-        }
-
-        // Handle countdown tick
+        let read = con_in.as_mut().and_then(|input| input.read_key());
+        // Always pace the loop, even with no keyboard or a signalled but
+        // unreadable firmware input event. Input cannot advance time.
+        uefi::boot::stall(core::time::Duration::from_millis(10));
         let mut auto_boot = false;
         let mut countdown_changed = false;
-        if let GraphicsScreen::Main { tools_selected: _ } = screen {
-            if menu.is_counting() {
-                tick_counter += 1;
-                if tick_counter >= 10 {
-                    // 10 * 100ms = 1 second
-                    tick_counter = 0;
-                    if menu.tick() {
-                        auto_boot = true;
-                    }
-                    countdown_changed = true;
-                }
+        if matches!(screen, GraphicsScreen::Main { .. }) && menu.is_counting() {
+            let (expired, tick) = clock.poll();
+            auto_boot = expired;
+            if tick {
+                menu.tick();
+                countdown_changed = true;
             }
         }
 
@@ -1249,8 +1237,8 @@ fn efi_main_inner() -> Status {
                         );
                     }
                 },
-                Key::Special(ScanCode::ESCAPE) => match screen {
-                    GraphicsScreen::Advanced { .. } => {
+                Key::Special(ScanCode::ESCAPE) => {
+                    if let GraphicsScreen::Advanced { .. } = screen {
                         screen = GraphicsScreen::Main {
                             tools_selected: false,
                         };
@@ -1263,8 +1251,7 @@ fn efi_main_inner() -> Status {
                             false,
                         );
                     }
-                    _ => {}
-                },
+                }
                 // Handle Enter key as printable '\r' or '\n'
                 Key::Printable(c)
                     if c == uefi::Char16::try_from('\r' as u16).unwrap()
@@ -1291,6 +1278,7 @@ fn efi_main_inner() -> Status {
                                         colors::FG,
                                         None,
                                     );
+                                    fb.present();
                                     match launch_selected(&menu) {
                                         Ok(()) => {} // Does not return
                                         Err(e) => {
@@ -1329,6 +1317,7 @@ fn efi_main_inner() -> Status {
                                                 colors::FG,
                                                 None,
                                             );
+                                            fb.present();
                                             if let Some(ref mut stdin) = con_in {
                                                 loop {
                                                     match stdin.read_key() {
@@ -1355,44 +1344,84 @@ fn efi_main_inner() -> Status {
                         GraphicsScreen::Advanced { selected } => {
                             let action = adv_options[*selected].0;
                             match action {
-                                AdvancedAction::SafeMode
-                                | AdvancedAction::SafeModeNetworking
-                                | AdvancedAction::DirectoryServices => {
-                                    launch_advanced_action(
-                                        &bcd_store,
-                                        bcd::wellknown::ENTRY_SAFE_MODE,
-                                        action.boot_options(),
-                                    );
+                                AdvancedAction::Repair => run_recovery_tools(
+                                    &mut fb,
+                                    &mut font,
+                                    con_in.as_mut(),
+                                    &bcd_store,
+                                ),
+                                AdvancedAction::DirectoryServices => {
+                                    show_advanced_notice(&mut fb, &mut font, con_in.as_mut(),
+                                        "Active Directory restore requires a domain controller; Windows 7 is a client OS.");
                                 }
-                                AdvancedAction::SafeModeCommandPrompt => {
-                                    launch_advanced_action(
-                                        &bcd_store,
-                                        bcd::wellknown::ENTRY_SAFE_MODE,
-                                        action.boot_options(),
-                                    );
-                                }
-                                AdvancedAction::BootLogging | AdvancedAction::Debugging => {
-                                    launch_advanced_action(
-                                        &bcd_store,
-                                        if action == AdvancedAction::Debugging {
-                                            bcd::wellknown::ENTRY_DEBUG_CMD
+                                _ => {
+                                    if action == AdvancedAction::LowResolution {
+                                        // Change hardware GOP mode before publishing the handoff.
+                                        if let Some(mode) = gop
+                                            .modes()
+                                            .find(|mode| mode.info().resolution() == (640, 480))
+                                        {
+                                            if gop.set_mode(&mode).is_ok() {
+                                                fb = if gop.current_mode_info().pixel_format()
+                                                    == PixelFormat::BltOnly
+                                                {
+                                                    // SAFETY: scoped GOP remains open, no concurrent access.
+                                                    unsafe { Framebuffer::with_blt(&mut gop) }
+                                                } else {
+                                                    let info = gop.current_mode_info();
+                                                    let ptr = gop.frame_buffer().as_mut_ptr();
+                                                    Framebuffer::with_ptr(
+                                                        FramebufferInfo {
+                                                            base: ptr as u64,
+                                                            size: gop.frame_buffer().size() as u64,
+                                                            width: 640,
+                                                            height: 480,
+                                                            stride: info.stride() as u32 * 4,
+                                                        },
+                                                        ptr,
+                                                    )
+                                                };
+                                                write_fb_mailbox(&fb.info());
+                                            } else {
+                                                show_advanced_notice(
+                                                    &mut fb,
+                                                    &mut font,
+                                                    con_in.as_mut(),
+                                                    "Firmware rejected 640x480 video mode.",
+                                                );
+                                                continue;
+                                            }
                                         } else {
-                                            bcd::wellknown::ENTRY_WINDOWS_7
-                                        },
+                                            show_advanced_notice(
+                                                &mut fb,
+                                                &mut font,
+                                                con_in.as_mut(),
+                                                "Firmware does not provide 640x480 video mode.",
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    // F8 switches apply to the selected OS entry. They must
+                                    // not silently pick a different shell or BCD object.
+                                    let requested = if action == AdvancedAction::StartNormally {
+                                        bcd::wellknown::ENTRY_WINDOWS_7
+                                    } else {
+                                        menu.select()
+                                            .map(|entry| entry.guid)
+                                            .unwrap_or(bcd::wellknown::ENTRY_WINDOWS_7)
+                                    };
+                                    if let Err(error) = launch_advanced_action(
+                                        &bcd_store,
+                                        requested,
                                         action.boot_options(),
-                                    );
-                                }
-                                AdvancedAction::Repair
-                                | AdvancedAction::LowResolution
-                                | AdvancedAction::LastKnownGood
-                                | AdvancedAction::DisableAutoRestart
-                                | AdvancedAction::DisableDriverSignature => {
-                                    show_advanced_notice(
-                                        &mut fb,
-                                        &mut font,
-                                        con_in.as_mut(),
-                                        "This option is not available in this build.",
-                                    );
+                                    ) {
+                                        show_advanced_notice(
+                                            &mut fb,
+                                            &mut font,
+                                            con_in.as_mut(),
+                                            error,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1440,6 +1469,7 @@ fn efi_main_inner() -> Status {
                     colors::FG,
                     None,
                 );
+                fb.present();
                 match launch_selected(&menu) {
                     Ok(()) => {} // Does not return
                     Err(e) => {
@@ -1478,7 +1508,8 @@ fn efi_main_inner() -> Status {
                             colors::FG,
                             None,
                         );
-                        // Drain any pending input, then block until a key is pressed.
+                        fb.present();
+                        // Wait until a key is pressed.
                         if let Some(ref mut stdin) = con_in {
                             loop {
                                 match stdin.read_key() {
@@ -1501,24 +1532,19 @@ fn efi_main_inner() -> Status {
             }
         } else if countdown_changed {
             // Redraw only when countdown changes (every second)
-            match screen {
-                GraphicsScreen::Main { tools_selected } => {
-                    draw_gop_main_screen(
-                        &mut fb,
-                        &mut font,
-                        &entries,
-                        menu.selected_index(),
-                        menu.countdown(),
-                        tools_selected,
-                    );
-                }
-                _ => {}
+            if let GraphicsScreen::Main { tools_selected } = screen {
+                draw_gop_main_screen(
+                    &mut fb,
+                    &mut font,
+                    &entries,
+                    menu.selected_index(),
+                    menu.countdown(),
+                    tools_selected,
+                );
             }
         }
 
-        // Stall to prevent busy spinning (100ms per iteration)
-        use uefi::boot as ub;
-        ub::stall(core::time::Duration::from_millis(100)); // 100ms
+        fb.present();
     }
 }
 
@@ -1922,68 +1948,16 @@ fn device_has_simple_filesystem(handle: uefi::Handle) -> bool {
 fn read_boot_file(rel_path: &str) -> Result<Vec<u8>, &'static str> {
     use core::mem::ManuallyDrop;
 
-    // Path-classified dispatch. Windows 7 boot paths fall into two
-    // disjoint buckets:
-    //   * ESP paths start with `\EFI\...` or are bare names like `BCD`.
-    //     UEFI's SimpleFileSystem protocol is FAT-only, so these must
-    //     be read through the SFS loop below.
-    //   * System partition paths start with `\Windows\...`. UEFI cannot
-    //     open these via SFS (NTFS has no SFS binding), so we must go
-    //     through the in-tree NTFS/EXT4/FAT32 reader. Skipping the FAT
-    //     loop here avoids the noisy "Trying FAT handle 0 / Failed to
-    //     open directory: Windows / dispatching by partition type"
-    //     sequence that the previous always-try-FAT-first code emitted
-    //     for every winload.efi read.
+    // Prefer the in-tree readers for system partitions (NTFS/ext4/refs).
+    // Optical RAM-backed media keeps EFI and Windows on one FAT boot volume,
+    // so failure to find a separate partition must still fall through to SFS.
     let normalized = rel_path.replace('\\', "/");
-    let is_esp_path = {
-        let lower = normalized.to_ascii_lowercase();
-        lower == "bcd"
-            || lower.starts_with("efi/")
-            || lower.starts_with("/efi/")
-            || lower.starts_with("efi\\")
-    };
-
+    let lower = normalized.trim_start_matches('/').to_ascii_lowercase();
+    let is_esp_path = lower == "bcd" || lower.starts_with("efi/");
     if !is_esp_path {
-        // Probe the BlockIO handles *before* claiming success in the
-        // log. If the platform truly has no NTFS/EXT4 partition we
-        // want the operator to see "no System partition found",
-        // not "dispatching directly to NTFS/EXT4" followed by a
-        // silent fallthrough to `None`.
-        let system_partition_present = probe_system_partition_present();
-        if system_partition_present {
-            debug_println!(
-                "[FILE] System-partition path '{}' - dispatching directly to NTFS/EXT4",
-                rel_path
-            );
-        } else {
-            debug_println!(
-                "[FILE] System-partition path '{}' - no NTFS/EXT4/FAT32 partition present; \
-                 cannot dispatch",
-                rel_path
-            );
-            debug_println!("[FILE] All methods failed for '{}'", rel_path);
-            return Err("no System partition (NTFS/EXT4/FAT32) on this platform");
-        }
-
-        // Strip a leading '/' or '\' before handing the path to the
-        // System-partition reader: BCD paths use the form
-        // `\Windows\System32\winload.efi` (with a backslash and a
-        // leading root-separator), but the NTFS reader's
-        // `resolve_mft_record` treats the input as a path relative to
-        // the volume root and would otherwise try to match an entry
-        // literally named `/Windows/...` and never find it.
-        let stripped = normalized
-            .trim_start_matches(|c| c == '/' || c == '\\')
-            .to_string();
-        if let Some(data) = read_system_partition_file(&stripped) {
-            debug_println!(
-                "[FILE] System-partition read succeeded: {} bytes",
-                data.len()
-            );
+        if let Some(data) = read_system_partition_file(normalized.trim_start_matches('/')) {
             return Ok(data);
         }
-        debug_println!("[FILE] All methods failed for '{}'", rel_path);
-        return Err("failed to load file from System partition");
     }
 
     let sfs_handles = boot::find_handles::<SimpleFileSystem>().map_err(|_| "no SFS handles")?;
@@ -2016,23 +1990,9 @@ fn read_boot_file(rel_path: &str) -> Result<Vec<u8>, &'static str> {
 
     // Try each handle
     for (idx, handle) in handles.iter().enumerate() {
-        // Skip non-FAT partitions when reading BCD/boot files from ESP.
-        // NTFS and EXT4 are only used for winload.efi on the System
-        // partition; the dispatcher below (after the FAT loop) reads
-        // those. If we tried to open_volume on them, the firmware
-        // would return UNSUPPORTED because EFI's SFS protocol is
-        // FAT-only.
-        let pt = probe_partition_type(*handle);
-        if pt != PartitionType::Fat {
-            debug_println!(
-                "[FILE] Skipping non-FAT handle {} (type={:?}, BCD path)",
-                idx,
-                pt
-            );
-            continue;
-        }
-
-        debug_println!("[FILE] Trying FAT handle {}...", idx);
+        // SFS is authoritative for file access. El Torito boot images can
+        // expose a block geometry that the GPT partition probe cannot classify.
+        debug_println!("[FILE] Trying SFS handle {}...", idx);
         let mut sfs = match boot::open_protocol_exclusive::<SimpleFileSystem>(*handle) {
             Ok(s) => ManuallyDrop::new(s),
             Err(_) => continue,
@@ -2120,43 +2080,6 @@ fn read_boot_file(rel_path: &str) -> Result<Vec<u8>, &'static str> {
     Err("failed to load file from any SFS handle")
 }
 
-/// Dispatch to the correct in-tree filesystem reader for the System
-/// partition. Walks every `BlockIO` handle exactly once, classifies it
-/// via [`probe_partition_type`], and:
-///   * on `Ntfs` -> [`read_ntfs_boot_file_for`]
-///   * on `Ext4` -> `ext4_boot::read_ext4_system_file`
-///   * on `Fat`  -> `fat32_boot::read_fat32_system_file` (in-tree reader,
-///     symmetric with the winload-side FAT32 reader)
-///   * on `Unknown` -> skip
-///
-/// Returns the first successful read. The probe-then-dispatch shape
-/// avoids the previous bug where every handle ran a full NTFS GPT
-/// parse and a path that was actually EXT4 was misclassified as
-/// "no NTFS partition found".
-/// Walk the BlockIO handles once and report whether the platform has
-/// any partition that the System-partition reader can consume (NTFS
-/// EXT4 or FAT32). Used by `read_boot_file` to keep its log honest: it
-/// must not claim "dispatching directly to NTFS/EXT4/FAT32" if no such
-/// partition exists.
-fn probe_system_partition_present() -> bool {
-    use uefi::proto::media::block::BlockIO;
-    let Ok(handles) = boot::find_handles::<BlockIO>() else {
-        return false;
-    };
-    for handle in handles.iter() {
-        if matches!(
-            probe_partition_type(*handle),
-            PartitionType::Ntfs { .. }
-                | PartitionType::Refs { .. }
-                | PartitionType::Ext4 { .. }
-                | PartitionType::Fat
-        ) {
-            return true;
-        }
-    }
-    false
-}
-
 /// Read a file from a ReFS System partition using the simplified
 /// self-describing layout produced by the in-tree builder. The directory
 /// index lives at byte 0x2000 (LBA 16) and consists of fixed-size entries:
@@ -2167,94 +2090,18 @@ fn read_refs_boot_file_for(
     block_io: &uefi::proto::media::block::BlockIO,
     partition_start_lba: u64,
 ) -> Option<Vec<u8>> {
-    let media = block_io.media();
-    let media_id = media.media_id();
-
-    // Read the directory index: LBA 16 .. LBA 24 (8 sectors, 4 KiB)
-    let mut index = [0u8; 4096];
-    if block_io
-        .read_blocks(media_id, partition_start_lba + 16, &mut index)
-        .is_err()
-    {
-        debug_println!(
-            "[REFS] failed to read directory index at LBA {}",
-            partition_start_lba + 16
-        );
-        return None;
-    }
-
-    // Normalise the requested path (strip leading '/' and 'C:' prefix)
-    let path = rel_path
-        .trim_start_matches('/')
-        .trim_start_matches(|c| c == 'C' || c == 'c')
-        .trim_start_matches(':')
-        .trim_start_matches('/')
-        .trim_start_matches('\\')
-        .replace('\\', "/");
-
-    const ENTRY_SIZE: usize = 256 + 16;
-    let mut offset = 0usize;
-    while offset + ENTRY_SIZE <= index.len() {
-        let path_field = &index[offset..offset + 256];
-        let null_pos = path_field.iter().position(|&b| b == 0).unwrap_or(256);
-        let entry_path = core::str::from_utf8(&path_field[..null_pos]).unwrap_or("");
-        if entry_path.is_empty() {
-            break;
-        }
-
-        let start_lba = u64::from_le_bytes(
-            index[offset + 256..offset + 256 + 8]
-                .try_into()
-                .unwrap_or([0u8; 8]),
-        );
-        let file_len = u64::from_le_bytes(
-            index[offset + 264..offset + 264 + 8]
-                .try_into()
-                .unwrap_or([0u8; 8]),
-        );
-
-        // Case-insensitive comparison (NT-style)
-        if entry_path.eq_ignore_ascii_case(&path) {
-            debug_println!(
-                "[REFS] found {} at LBA {} ({} bytes)",
-                entry_path,
-                start_lba,
-                file_len
-            );
-
-            // Read the file data from `start_lba`
-            let mut data = alloc::vec![0u8; file_len as usize];
-            let mut sector_off = 0u64;
-            const CHUNK_SECTORS: u64 = 128; // 64 KiB per read
-            let total_sectors = file_len.div_ceil(512);
-            while sector_off < total_sectors {
-                let count = CHUNK_SECTORS.min(total_sectors - sector_off);
-                let chunk_end = ((sector_off + count) as usize * 512).min(data.len());
-                let chunk_start = sector_off as usize * 512;
-                let chunk = &mut data[chunk_start..chunk_end];
-                if block_io
-                    .read_blocks(
-                        media_id,
-                        partition_start_lba + start_lba + sector_off,
-                        chunk,
-                    )
-                    .is_err()
-                {
-                    debug_println!("[REFS] read failed at sector offset {}", sector_off);
-                    return None;
-                }
-                sector_off += count;
-            }
-            return Some(data);
-        }
-        offset += ENTRY_SIZE;
-    }
-
-    debug_println!("[REFS] {} not found in directory index", rel_path);
-    None
+    refs_boot::read_refs_file(
+        block_io,
+        block_io.media().media_id(),
+        rel_path,
+        partition_start_lba,
+    )
 }
 
 fn read_system_partition_file(rel_path: &str) -> Option<Vec<u8>> {
+    if let Some(data) = ntfs_boot::read_ntfs_system_file(rel_path) {
+        return Some(data);
+    }
     use core::mem::ManuallyDrop;
     use uefi::boot::OpenProtocolAttributes;
     use uefi::boot::OpenProtocolParams;
@@ -2497,7 +2344,9 @@ fn load_bcd_from_esp() -> core::result::Result<BcdStore, &'static str> {
                 Ok(hive) => {
                     let store = hive.into_store();
                     debug_println!("[BCD] Parsed {} entries", store.entry_count);
-                    return Ok(store);
+                    if store.entry_count > 0 {
+                        return Ok(store);
+                    }
                 }
                 Err(e) => {
                     debug_println!("[BCD] Parse error for {}: {:?}", bcd_path, e);
@@ -2509,11 +2358,69 @@ fn load_bcd_from_esp() -> core::result::Result<BcdStore, &'static str> {
     Err("failed to load BCD from any path")
 }
 
+/// A deadline independent of key events, redraw cost, and loop frequency.
+struct BootClock {
+    deadline: Option<uefi::Event>,
+    second: Option<uefi::Event>,
+    fallback_ticks: u64,
+    seconds: u32,
+}
+impl BootClock {
+    fn timer(trigger: uefi::boot::TimerTrigger) -> Option<uefi::Event> {
+        use uefi::boot::{EventType, Tpl};
+        let event =
+            unsafe { uefi::boot::create_event(EventType::TIMER, Tpl::CALLBACK, None, None) }
+                .ok()?;
+        if uefi::boot::set_timer(&event, trigger).is_err() {
+            let _ = uefi::boot::close_event(event);
+            return None;
+        }
+        Some(event)
+    }
+    fn new(seconds: u32) -> Self {
+        use uefi::boot::TimerTrigger;
+        Self {
+            deadline: Self::timer(TimerTrigger::Relative(
+                u64::from(seconds).max(1) * 10_000_000,
+            )),
+            second: Self::timer(TimerTrigger::Periodic(10_000_000)),
+            fallback_ticks: 0,
+            seconds,
+        }
+    }
+    /// Caller stalls 10 ms per iteration; fallback can only run late.
+    fn poll(&mut self) -> (bool, bool) {
+        self.fallback_ticks += 1;
+        let expired = self.seconds == 0
+            || self
+                .deadline
+                .as_ref()
+                .map(|e| uefi::boot::check_event(e).unwrap_or(false))
+                .unwrap_or(self.fallback_ticks >= u64::from(self.seconds) * 100);
+        let tick = self
+            .second
+            .as_ref()
+            .map(|e| uefi::boot::check_event(e).unwrap_or(false))
+            .unwrap_or(self.fallback_ticks % 100 == 0);
+        (expired, tick)
+    }
+}
+impl Drop for BootClock {
+    fn drop(&mut self) {
+        if let Some(event) = self.deadline.take() {
+            let _ = uefi::boot::close_event(event);
+        }
+        if let Some(event) = self.second.take() {
+            let _ = uefi::boot::close_event(event);
+        }
+    }
+}
+
 fn launch_advanced_action(
     bcd_store: &BcdStore,
     requested_guid: bcd::Guid,
     boot_options: Option<&'static str>,
-) {
+) -> Result<(), &'static str> {
     let mut menu = BootMenu::new(bcd_store);
     for _ in 0..bcd_store.entry_count {
         if menu.select().map(|entry| entry.guid) == Some(requested_guid) {
@@ -2521,8 +2428,9 @@ fn launch_advanced_action(
             // when launch_selected writes the mailbox before loading the
             // target image.
             unsafe { BOOT_OPTIONS_OVERRIDE = boot_options };
-            let _ = launch_selected(&menu);
-            return;
+            let result = launch_selected(&menu);
+            unsafe { BOOT_OPTIONS_OVERRIDE = None };
+            return result;
         }
         menu.move_down();
     }
@@ -2534,6 +2442,143 @@ fn launch_advanced_action(
         requested_guid.0[2],
         requested_guid.0[3]
     );
+    Err("Selected BCD boot entry is missing.")
+}
+
+/// Boot-environment recovery tools operate on the actual boot volume.
+/// Never replace a missing WinRE image with an apparently successful repair.
+fn run_recovery_tools(
+    fb: &mut Framebuffer,
+    font: &mut BitmapFont,
+    mut input: Option<&mut crate::input::Keyboard>,
+    bcd: &BcdStore,
+) {
+    let choices = [
+        "Startup Diagnostics",
+        "Windows Memory Diagnostic",
+        "Command Prompt (Safe Mode)",
+        "Return to Boot Manager",
+    ];
+    let mut selected = 0;
+    loop {
+        if fb.is_text_console() {
+            uefi::system::with_stdout(|out| {
+                let _ = out.clear();
+            });
+            uefi::println!("System Recovery Options");
+            for (index, title) in choices.iter().enumerate() {
+                uefi::println!("{} {}", if index == selected { ">" } else { " " }, title);
+            }
+        }
+        let (w, h) = (fb.width(), fb.height());
+        fb.fill_rect_fast(0, 0, w, h, colors::BG);
+        font.draw_text_centered(
+            fb,
+            "System Recovery Options",
+            (w / 2) as i32,
+            80,
+            colors::FG,
+            None,
+        );
+        for (index, title) in choices.iter().enumerate() {
+            let y = 160 + index as u32 * 40;
+            if index == selected {
+                fb.fill_rect_fast(w / 8, y, w * 3 / 4, 28, colors::SEL_BG);
+            }
+            font.draw_text(
+                fb,
+                title,
+                (w / 8 + 12) as i32,
+                y as i32 + 4,
+                if index == selected {
+                    colors::SEL_FG
+                } else {
+                    colors::FG
+                },
+                None,
+            );
+        }
+        font.draw_text_centered(
+            fb,
+            "UP/DOWN: select  ENTER: continue  ESC: return",
+            (w / 2) as i32,
+            h as i32 - 64,
+            colors::FG,
+            None,
+        );
+        fb.present();
+        let Some(keyboard) = input.as_mut() else {
+            return;
+        };
+        match keyboard.read_key() {
+            Some(Key::Special(ScanCode::ESCAPE)) => return,
+            Some(Key::Special(ScanCode::UP)) => selected = selected.saturating_sub(1),
+            Some(Key::Special(ScanCode::DOWN)) => selected = (selected + 1).min(choices.len() - 1),
+            Some(Key::Printable(c)) if u16::from(c) == 13 => match selected {
+                0 => {
+                    let mut problems = 0;
+                    let mut checked = 0;
+                    for path in [
+                        "EFI/Microsoft/Boot/BCD",
+                        "Windows/System32/winload.efi",
+                        "Windows/System32/ntoskrnl.exe",
+                        "Windows/System32/hal.dll",
+                        "Windows/System32/config/SYSTEM",
+                    ] {
+                        let result = read_boot_file(path);
+                        let valid = result
+                            .as_ref()
+                            .map(|bytes| {
+                                if path.ends_with("BCD") {
+                                    bcd_parser::BcdHive::parse(bytes)
+                                        .map(|h| h.into_store().entry_count > 0)
+                                        .unwrap_or(false)
+                                } else if path.ends_with("SYSTEM") {
+                                    bcd_registry::Hive::parse(bytes).is_ok()
+                                } else {
+                                    bytes.len() >= 64 && &bytes[..2] == b"MZ" && {
+                                        let pe =
+                                            u32::from_le_bytes(bytes[60..64].try_into().unwrap())
+                                                as usize;
+                                        bytes.get(pe..pe.saturating_add(4)) == Some(b"PE\0\0")
+                                    }
+                                }
+                            })
+                            .unwrap_or(false);
+                        checked += 1;
+                        if !valid {
+                            problems += 1;
+                        }
+                        diagnostic_screen(
+                            fb,
+                            font,
+                            "Startup Diagnostics",
+                            path,
+                            if valid {
+                                "Readable; header valid"
+                            } else {
+                                "Missing or invalid; no files changed"
+                            },
+                        );
+                        uefi::boot::stall(core::time::Duration::from_millis(300));
+                    }
+                    show_advanced_notice(fb, font, input.as_deref_mut(), &alloc::format!("Checked {} boot files; {} problems. No automatic repair was performed.", checked, problems));
+                }
+                1 => run_memory_diagnostic(fb, font, input.as_deref_mut()),
+                2 => {
+                    if let Err(error) = launch_advanced_action(
+                        bcd,
+                        bcd::wellknown::ENTRY_WINDOWS_7,
+                        Some("/safeboot:minimal /safeboot:shell"),
+                    ) {
+                        show_advanced_notice(fb, font, input.as_deref_mut(), error);
+                    }
+                }
+                _ => return,
+            },
+            _ => uefi::boot::stall(core::time::Duration::from_millis(50)),
+        }
+    }
 }
 
 /// Wait for any key so a diagnostic/notice screen is visible. If no input
@@ -2558,6 +2603,11 @@ fn show_advanced_notice(
     con_in: Option<&mut crate::input::Keyboard>,
     message: &str,
 ) {
+    if fb.is_text_console() {
+        uefi::println!("\n{}\nPress any key to continue", message);
+        wait_for_any_key(con_in);
+        return;
+    }
     let width = fb.width();
     let height = fb.height();
     fb.fill_rect_fast(0, 0, width, height, colors::BG);
@@ -2585,113 +2635,213 @@ fn show_advanced_notice(
         colors::FG,
         None,
     );
+    fb.present();
     wait_for_any_key(con_in);
 }
 
-/// Test one page of conventional UEFI memory with alternating bit patterns,
-/// restoring the original value so the firmware boot environment is unchanged.
-/// Returns the number of bytes successfully tested or the failing address.
-fn test_conventional_memory_page(base: u64, page: u64) -> Result<u64, u64> {
-    let pointer = (base + page * 4096) as *mut u64;
-    let original = unsafe { pointer.read_volatile() };
-
-    unsafe {
-        pointer.write_volatile(0x5555_5555_5555_5555);
-        if pointer.read_volatile() != 0x5555_5555_5555_5555 {
-            return Err(base + page * 4096);
-        }
-        pointer.write_volatile(0xAAAA_AAAA_AAAA_AAAA);
-        if pointer.read_volatile() != 0xAAAA_AAAA_AAAA_AAAA {
-            return Err(base + page * 4096);
-        }
-        pointer.write_volatile(original);
-    }
-
-    Ok(4096)
-}
-
-/// Run Windows Memory Diagnostic directly from the boot manager. This uses the
-/// real UEFI memory map and only probes ranges firmware reports as
-/// conventional (free) memory; loader/runtime/firmware-owned memory is skipped.
+/// Test only pages successfully reserved with AllocatePages(Address).
+/// Firmware/loader/runtime regions are excluded. Pages allocated after the
+/// snapshot are skipped if they can no longer be reserved, never overwritten.
 fn run_memory_diagnostic(
     fb: &mut Framebuffer,
     font: &mut BitmapFont,
-    con_in: Option<&mut crate::input::Keyboard>,
+    mut con_in: Option<&mut crate::input::Keyboard>,
 ) {
-    use uefi::boot::MemoryType;
+    use memory_test::{OwnedRegion, TestError, TestMix};
+    use uefi::boot::{AllocateType, MemoryType};
     use uefi::mem::memory_map::MemoryMap;
-
-    let width = fb.width();
-    let height = fb.height();
-    fb.fill_rect_fast(0, 0, width, height, colors::BG);
-    font.draw_text_centered(
-        fb,
-        "Windows Memory Diagnostic",
-        (width / 2) as i32,
-        (height / 2 - 40) as i32,
-        colors::FG,
-        None,
+    let mut mix = TestMix::Standard;
+    let mut passes = 2u32;
+    let mut field = 0usize;
+    let mut redraw = true;
+    crate::arch::current::write_com1_marker(b"[MEMORY] configure\r\n");
+    loop {
+        if redraw {
+            let lines = alloc::format!(
+                "{}Test mix: {}    {}Passes: {}",
+                if field == 0 { "> " } else { "" },
+                mix.name(),
+                if field == 1 { "> " } else { "" },
+                passes
+            );
+            diagnostic_screen(
+                fb,
+                font,
+                "Windows Memory Diagnostic",
+                &lines,
+                "TAB: select field  UP/DOWN: change  ENTER: run  ESC: return",
+            );
+            redraw = false;
+        }
+        match con_in.as_mut().and_then(|input| input.read_key()) {
+            Some(Key::Special(ScanCode::ESCAPE)) => return,
+            Some(Key::Special(code)) if code == ScanCode::UP || code == ScanCode::DOWN => {
+                if field == 0 {
+                    mix = if code == ScanCode::UP {
+                        mix.next().next()
+                    } else {
+                        mix.next()
+                    };
+                } else {
+                    passes = if code == ScanCode::UP {
+                        (passes + 8) % 10 + 1
+                    } else {
+                        passes % 10 + 1
+                    };
+                }
+                redraw = true;
+            }
+            Some(Key::Printable(c)) if u16::from(c) == 9 => {
+                field ^= 1;
+                redraw = true;
+            }
+            Some(Key::Printable(c)) if u16::from(c) == 13 => break,
+            _ => uefi::boot::stall(core::time::Duration::from_millis(10)),
+        }
+        if con_in.is_none() {
+            break;
+        }
+    }
+    crate::arch::current::write_com1_marker(
+        alloc::format!("[MEMORY] begin mix={} passes={}\r\n", mix.name(), passes).as_bytes(),
     );
-    font.draw_text_centered(
-        fb,
-        "Testing conventional memory...",
-        (width / 2) as i32,
-        (height / 2) as i32,
-        colors::FG,
-        None,
-    );
-
-    let memory_map = match uefi::boot::memory_map(uefi::boot::MemoryType::LOADER_DATA) {
-        Ok(map) => map,
+    let ranges: Vec<(u64, u64)> = match uefi::boot::memory_map(MemoryType::LOADER_DATA) {
+        Ok(map) => map
+            .entries()
+            .filter(|d| d.ty == MemoryType::CONVENTIONAL && d.page_count > 0)
+            .map(|d| (d.phys_start, d.page_count))
+            .collect(),
         Err(_) => {
             show_advanced_notice(fb, font, con_in, "Could not read the UEFI memory map.");
             return;
         }
     };
-
-    let mut bytes_tested = 0u64;
-    for descriptor in memory_map.entries() {
-        if descriptor.ty != MemoryType::CONVENTIONAL || descriptor.page_count == 0 {
-            continue;
-        }
-
-        let status = alloc::format!(
-            "Testing 0x{:016x} ({} pages)",
-            descriptor.phys_start,
-            descriptor.page_count
-        );
-        fb.fill_rect_fast(0, 0, width, height, colors::BG);
-        font.draw_text_centered(
-            fb,
-            "Windows Memory Diagnostic",
-            (width / 2) as i32,
-            (height / 2 - 40) as i32,
-            colors::FG,
-            None,
-        );
-        font.draw_text_centered(
-            fb,
-            &status,
-            (width / 2) as i32,
-            (height / 2) as i32,
-            colors::FG,
-            None,
-        );
-
-        for page in 0..descriptor.page_count {
-            match test_conventional_memory_page(descriptor.phys_start, page) {
-                Ok(tested) => bytes_tested += tested,
-                Err(address) => {
-                    let failure = alloc::format!("Memory test failed at 0x{:016x}", address);
-                    show_advanced_notice(fb, font, con_in, &failure);
-                    return;
+    let available: u64 = ranges.iter().map(|(_, pages)| pages * 4096).sum();
+    let mut total_tested = 0u64;
+    for pass in 0..passes {
+        let mut tested = 0u64;
+        let mut skipped = 0u64;
+        let mut last_percent = 101u64;
+        for &(base, pages) in &ranges {
+            let mut page = 0;
+            while page < pages {
+                let count = (pages - page).min(256) as usize;
+                let address = base + page * 4096;
+                page += count as u64;
+                // The live memory map, not the stale snapshot, decides ownership.
+                let pointer = match uefi::boot::allocate_pages(
+                    AllocateType::Address(address),
+                    MemoryType::LOADER_DATA,
+                    count,
+                ) {
+                    Ok(pointer) => pointer,
+                    Err(_) => {
+                        skipped += count as u64 * 4096;
+                        continue;
+                    }
+                };
+                let mut region =
+                    unsafe { OwnedRegion::new(pointer.as_ptr() as *mut u64, count * 512) };
+                let result = memory_test::test(&mut region, mix, || {
+                    !matches!(
+                        con_in.as_mut().and_then(|input| input.read_key()),
+                        Some(Key::Special(ScanCode::ESCAPE))
+                    )
+                });
+                // This allocation is no longer accessed, including failure/cancel paths.
+                let _ = unsafe { uefi::boot::free_pages(pointer, count) };
+                match result {
+                    Ok(bytes) => tested += bytes,
+                    Err(TestError::Cancelled) => {
+                        crate::arch::current::write_com1_marker(b"[MEMORY] cancelled\r\n");
+                        show_advanced_notice(
+                            fb,
+                            font,
+                            con_in,
+                            &alloc::format!("Cancelled: {} bytes fully verified this pass", tested),
+                        );
+                        return;
+                    }
+                    Err(TestError::Fault(fault)) => {
+                        crate::arch::current::write_com1_marker(b"[MEMORY] fault\r\n");
+                        show_advanced_notice(
+                            fb,
+                            font,
+                            con_in,
+                            &alloc::format!(
+                                "Fault at {:x}: expected {:x}, read {:x}",
+                                fault.address,
+                                fault.expected,
+                                fault.actual
+                            ),
+                        );
+                        return;
+                    }
+                }
+                let percent = (tested + skipped) * 100 / available.max(1);
+                if percent != last_percent {
+                    last_percent = percent;
+                    let status = alloc::format!(
+                        "Pass {}/{}: {}%  verified {} MiB  skipped {} MiB",
+                        pass + 1,
+                        passes,
+                        percent,
+                        tested / 1048576,
+                        skipped / 1048576
+                    );
+                    diagnostic_screen(
+                        fb,
+                        font,
+                        "Windows Memory Diagnostic",
+                        &status,
+                        "ESC: cancel. Firmware/loader pages excluded; CPU cache remains enabled.",
+                    );
                 }
             }
         }
+        total_tested += tested;
     }
-
-    let summary = alloc::format!("Tested {} bytes", bytes_tested);
+    let summary = if total_tested == 0 {
+        String::from("No reservable memory was tested; result is inconclusive.")
+    } else {
+        alloc::format!(
+            "No errors in {} byte-passes ({} passes).",
+            total_tested,
+            passes
+        )
+    };
+    crate::arch::current::write_com1_marker(
+        alloc::format!(
+            "[MEMORY] completed bytes={} passes={}\r\n",
+            total_tested,
+            passes
+        )
+        .as_bytes(),
+    );
     show_advanced_notice(fb, font, con_in, &summary);
+}
+
+fn diagnostic_screen(
+    fb: &mut Framebuffer,
+    font: &mut BitmapFont,
+    title: &str,
+    status: &str,
+    hint: &str,
+) {
+    if fb.is_text_console() {
+        uefi::println!("{}: {}\n{}", title, status, hint);
+        return;
+    }
+    let (width, height) = (fb.width(), fb.height());
+    fb.fill_rect_fast(0, 0, width, height, colors::BG);
+    for (text, y) in [
+        (title, height / 2 - 60),
+        (status, height / 2),
+        (hint, height / 2 + 60),
+    ] {
+        font.draw_text_centered(fb, text, (width / 2) as i32, y as i32, colors::FG, None);
+    }
+    fb.present();
 }
 
 /// Load and start the UEFI image referenced by the currently-selected
@@ -2704,6 +2854,9 @@ fn run_memory_diagnostic(
 fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
     debug_println!("[LAUNCH] launch_selected() - using manual PE loader");
     let entry = menu.select().ok_or("no entry selected")?;
+    crate::arch::current::write_com1_marker(
+        alloc::format!("[BOOT-MENU] selected index={}\r\n", menu.selected_index()).as_bytes(),
+    );
     let path = ucs2_to_string(entry.application.as_slice());
     debug_println!("[LAUNCH] Selected entry: {}", path);
     if path.is_empty() {
@@ -2721,7 +2874,10 @@ fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
 
     debug_println!("[LAUNCH] Writing BCD mailbox...");
     // Write BCD mailbox first
-    write_bcd_mailbox(&entry.guid.0);
+    write_bcd_mailbox(
+        &entry.guid.0,
+        &ucs2_to_string(entry.load_options.as_slice()),
+    );
     debug_println!("[LAUNCH] BCD mailbox written");
 
     // Now use manual PE loader
@@ -2809,7 +2965,7 @@ fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
     use uefi::boot::{AllocateType, MemoryType};
     const EFI_PAGE_SIZE: usize = 4096;
     const CHUNK_PAGES: usize = 16; // 64 KiB per chunk — safely under OVMF's cap.
-    let total_pages = (image_size + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE;
+    let total_pages = image_size.div_ceil(EFI_PAGE_SIZE);
     let mut allocated_base_holder: Option<u64> = None;
     // Use BOOT_SERVICES_DATA: the firmware reserves this memory for our
     // exclusive use until ExitBootServices.  We deliberately do NOT use
@@ -3215,116 +3371,115 @@ fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
 /// default selection after a brief countdown. Keyboard input is
 /// honoured via Simple Text Input so the user can still pick a
 /// different entry with arrow keys + ENTER.
-fn text_mode_auto_boot(bcd_store: &BcdStore, entries: &[String]) -> Status {
-    use uefi::boot as ub;
-
-    uefi::println!("[BOOTMGR] text mode boot: GOP unavailable");
-    debug_println!("[TEXT-BOOT] No graphics output - using text mode boot menu");
-    debug_println!("===========================================");
-    debug_println!("Windows Boot Manager (Text Mode)");
-    debug_println!("===========================================");
-    for (i, desc) in entries.iter().enumerate() {
-        debug_println!("  [{}] {}", i + 1, desc);
-    }
-    debug_println!("");
-    debug_println!("Auto-booting default entry in 5 seconds...");
-    debug_println!("(Use UP/DOWN arrow keys to choose, ENTER to boot immediately.)");
-
+fn text_mode_auto_boot(
+    bcd_store: &BcdStore,
+    entries: &[String],
+    mut input: Option<crate::input::Keyboard>,
+) -> Status {
     let mut menu = BootMenu::new(bcd_store);
-    let mut selected = menu.selected_index();
-
-    // Try to open the Simple Text Input protocol for arrow-key support
-    let mut con_in = crate::input::Keyboard::new();
-
-    let mut seconds_remaining: u32 = 5;
+    let mut advanced: Option<usize> = None;
+    let mut tools = false;
+    let mut redraw = true;
+    let mut clock = BootClock::new(bcd_store.timeout);
+    let mut text_fb = Framebuffer::text_console();
+    let mut font = BitmapFont::new();
+    crate::arch::current::write_com1_marker(b"[BOOT-MENU] ready text\r\n");
     loop {
-        // Print current selection and countdown once per second
-        debug_println!(
-            "[TEXT-BOOT] Selected: [{}] {} ({}s)",
-            selected + 1,
-            entries.get(selected).map(|s| s.as_str()).unwrap_or("?"),
-            seconds_remaining
-        );
-
-        // Wait up to 1 second for a key press
-        if let Some(ref mut stdin) = con_in {
-            // Poll for ~1 second (10 * 100ms)
-            for _ in 0..10 {
-                if let Some(key) = stdin.read_key() {
-                    match key {
-                        Key::Special(ScanCode::UP) => {
-                            if selected > 0 {
-                                selected -= 1;
-                                menu.cancel_auto();
-                                seconds_remaining = 5;
-                                debug_println!(
-                                    "[TEXT-BOOT] -> [{}] {}",
-                                    selected + 1,
-                                    entries.get(selected).map(|s| s.as_str()).unwrap_or("?")
-                                );
-                            }
-                        }
-                        Key::Special(ScanCode::DOWN) => {
-                            if selected + 1 < entries.len() {
-                                selected += 1;
-                                menu.cancel_auto();
-                                seconds_remaining = 5;
-                                debug_println!(
-                                    "[TEXT-BOOT] -> [{}] {}",
-                                    selected + 1,
-                                    entries.get(selected).map(|s| s.as_str()).unwrap_or("?")
-                                );
-                            }
-                        }
-                        Key::Printable(c)
-                            if c == uefi::Char16::try_from('\r' as u16).unwrap()
-                                || c == uefi::Char16::try_from('\n' as u16).unwrap() =>
-                        {
-                            debug_println!(
-                                "[TEXT-BOOT] ENTER - booting [{}] {}",
-                                selected + 1,
-                                entries.get(selected).map(|s| s.as_str()).unwrap_or("?")
-                            );
-                            seconds_remaining = 0;
-                            break;
-                        }
-                        _ => {}
+        if redraw {
+            uefi::system::with_stdout(|out| {
+                let _ = out.clear();
+            });
+            uefi::println!("Windows Boot Manager\n");
+            if let Some(selected) = advanced {
+                uefi::println!("Advanced Boot Options\n");
+                for (index, (_, title, _)) in ADV_OPTIONS.iter().enumerate() {
+                    uefi::println!("{} {}", if index == selected { ">" } else { " " }, title);
+                }
+                uefi::println!("\nUP/DOWN: select  ENTER: continue  ESC: return");
+            } else {
+                for (index, title) in entries.iter().enumerate() {
+                    uefi::println!(
+                        "{} {}",
+                        if !tools && index == menu.selected_index() {
+                            ">"
+                        } else {
+                            " "
+                        },
+                        title
+                    );
+                }
+                uefi::println!(
+                    "\n{} Windows Memory Diagnostic",
+                    if tools { ">" } else { " " }
+                );
+                if menu.is_counting() {
+                    uefi::println!("\nAutomatic startup in {} seconds.", menu.countdown());
+                }
+                uefi::println!("\nUP/DOWN: select  ENTER: boot  TAB: tools  F8: advanced options");
+            }
+            redraw = false;
+        }
+        let key = input.as_mut().and_then(|keyboard| keyboard.read_key());
+        let (expired, tick) = clock.poll();
+        let mut launch = expired && menu.is_counting() && advanced.is_none();
+        if let Some(key) = key {
+            menu.cancel_auto();
+            launch = false;
+            redraw = true;
+            match key {
+                Key::Special(ScanCode::UP) => {
+                    if let Some(ref mut selected) = advanced {
+                        *selected = selected.saturating_sub(1);
+                    } else {
+                        tools = false;
+                        menu.move_up();
                     }
                 }
-                ub::stall(core::time::Duration::from_millis(100));
+                Key::Special(ScanCode::DOWN) => {
+                    if let Some(ref mut selected) = advanced {
+                        *selected = (*selected + 1).min(ADV_OPTIONS.len() - 1);
+                    } else {
+                        menu.move_down();
+                    }
+                }
+                Key::Special(ScanCode::FUNCTION_8) => advanced = Some(0),
+                Key::Special(ScanCode::ESCAPE) => advanced = None,
+                Key::Printable(c) if u16::from(c) == 9 => tools = !tools,
+                Key::Printable(c) if u16::from(c) == 13 || u16::from(c) == 10 => {
+                    if let Some(selected) = advanced {
+                        let action = ADV_OPTIONS[selected].0;
+                        match action {
+                            AdvancedAction::Repair => run_recovery_tools(&mut text_fb, &mut font, input.as_mut(), bcd_store),
+                            AdvancedAction::DirectoryServices => show_advanced_notice(&mut text_fb, &mut font, input.as_mut(),
+                                "Active Directory restore requires a domain controller; Windows 7 is a client OS."),
+                            AdvancedAction::LowResolution => show_advanced_notice(&mut text_fb, &mut font, input.as_mut(),
+                                "640x480 requires a GOP graphics device; this firmware provides only a text console."),
+                            _ => if let Some(entry) = menu.select() {
+                                if let Err(error) = launch_advanced_action(bcd_store, if action == AdvancedAction::StartNormally { bcd::wellknown::ENTRY_WINDOWS_7 } else { entry.guid }, action.boot_options()) {
+                                    show_advanced_notice(&mut text_fb, &mut font, input.as_mut(), error);
+                                }
+                            },
+                        }
+                    } else if tools {
+                        run_memory_diagnostic(&mut text_fb, &mut font, input.as_mut());
+                    } else {
+                        launch = true;
+                    }
+                }
+                _ => {}
             }
-        } else {
-            // No keyboard - just wait the full countdown
-            ub::stall(core::time::Duration::from_secs(1));
+        } else if tick && menu.is_counting() {
+            menu.tick();
+            redraw = true;
         }
-
-        if seconds_remaining == 0 {
-            break;
+        if launch {
+            if let Err(error) = launch_selected(&menu) {
+                menu.cancel_auto();
+                show_advanced_notice(&mut text_fb, &mut font, input.as_mut(), error);
+                redraw = true;
+            }
         }
-        seconds_remaining = seconds_remaining.saturating_sub(1);
-    }
-
-    // Re-create the BootMenu at the user's chosen index and launch it.
-    // (BootMenu::new always picks index 1 by default; we move up/down to
-    // match the user's selection.)
-    let mut final_menu = BootMenu::new(bcd_store);
-    let default_idx = final_menu.selected_index();
-    if selected >= default_idx {
-        for _ in 0..(selected - default_idx) {
-            final_menu.move_down();
-        }
-    } else {
-        for _ in 0..(default_idx - selected) {
-            final_menu.move_up();
-        }
-    }
-
-    match launch_selected(&final_menu) {
-        Ok(()) => Status::SUCCESS,
-        Err(e) => {
-            debug_println!("[TEXT-BOOT] launch_selected failed: {}", e);
-            Status::ABORTED
-        }
+        uefi::boot::stall(core::time::Duration::from_millis(10));
     }
 }
 
@@ -3337,27 +3492,11 @@ fn text_mode_auto_boot(bcd_store: &BcdStore, entries: &[String]) -> Status {
 /// - Entry GUID: 16 bytes
 /// - Boot options: variable
 ///
-/// On architectures that permit low-memory access (x86_64), the
-/// mailbox is written to a fixed physical address (`BCD_MAILBOX_PHYS`).
-/// On architectures with stricter UEFI memory protections (aarch64,
-/// riscv64), we allocate one page from the firmware, write the
-/// mailbox there, and install the physical address as a UEFI
-/// Configuration Table so winload can discover it.
-fn write_bcd_mailbox(guid: &[u8; 16]) {
+/// Allocate a persistent page and publish it through a vendor configuration
+/// table on every architecture. Never write unreserved low physical memory.
+fn write_bcd_mailbox(guid: &[u8; 16], load_options: &str) {
     use uefi::boot as ub;
-
-    // Decide whether to use the fixed low address or a freshly
-    // allocated page. We probe by trying to map the fixed address;
-    // if the probe faults we fall back to allocation. Since we
-    // can't catch a memory fault in UEFI directly, we instead
-    // always use the safer allocation path on architectures that
-    // we know have stricter protections. We identify those by
-    // compiling in a target-specific constant below.
-    let use_allocated = cfg!(any(
-        target_arch = "aarch64",
-        target_arch = "riscv64",
-        target_arch = "loongarch64",
-    ));
+    let use_allocated = true;
 
     let mailbox_phys: u64 = if use_allocated {
         // Allocate a single page for the mailbox.
@@ -3385,7 +3524,7 @@ fn write_bcd_mailbox(guid: &[u8; 16]) {
         core::ptr::copy_nonoverlapping(guid.as_ptr(), mailbox.add(0x0C), 16);
         // Write boot options (e.g. "/safeboot:minimal") or clear the area.
         // The area is 224 bytes from offset 0x1C, NUL-terminated.
-        let opts = BOOT_OPTIONS_OVERRIDE;
+        let opts = Some(BOOT_OPTIONS_OVERRIDE.unwrap_or(load_options));
         if let Some(opts_str) = opts {
             let bytes = opts_str.as_bytes();
             let len = core::cmp::min(bytes.len(), 223);
@@ -3405,8 +3544,9 @@ fn write_bcd_mailbox(guid: &[u8; 16]) {
         // Publish the mailbox's physical address as a Configuration
         // Table entry. Winload looks for this GUID to find the
         // mailbox at runtime.
-        let addr_bytes = mailbox_phys.to_le_bytes();
-        let ptr = addr_bytes.as_ptr() as *const core::ffi::c_void;
+        // VendorTable must point at the persistent BCDE page itself, not
+        // a temporary stack slot containing its address.
+        let ptr = mailbox_phys as *const core::ffi::c_void;
         unsafe {
             let _ = ub::install_configuration_table(&BCD_MAILBOX_TABLE_GUID, ptr);
         }
@@ -3490,7 +3630,7 @@ impl NtfsBoot {
         // 2^10 = 1024 bytes per MFT record.
         let mft_raw = buf[0x40] as i8;
         let mft_record_size: u32 = if mft_raw >= 0 {
-            (sectors_per_cluster as u32) * (bytes_per_sector as u32) << mft_raw
+            ((sectors_per_cluster as u32) * (bytes_per_sector as u32)) << mft_raw
         } else {
             1u32 << (-mft_raw as u32)
         };
@@ -3525,7 +3665,7 @@ fn read_mft_record(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
     //   3. Record disk LBA = MFT disk LBA + record_num * records_per_sector
     let mft_partition_lba = ntfs.mft_start_lcn * (ntfs.sectors_per_cluster as u64);
     let mft_disk_lba = ntfs.partition_start_lba + mft_partition_lba;
-    let sectors_per_record = ((ntfs.mft_record_size as u64 + 511) / 512) as u32;
+    let sectors_per_record = (ntfs.mft_record_size as u64).div_ceil(512) as u32;
     let record_rel_lba = record_num * (ntfs.mft_record_size as u64) / 512;
     let disk_lba = mft_disk_lba + record_rel_lba;
 
@@ -3585,7 +3725,7 @@ fn read_mft_record(ntfs: &NtfsBoot, record_num: u64) -> Option<Vec<u8>> {
             let body = off + 0x18;
             let ih_base = body + 0x0C;
             let e_off_rel = u32::from_le_bytes([
-                buf[ih_base + 0x00],
+                buf[ih_base],
                 buf[ih_base + 0x01],
                 buf[ih_base + 0x02],
                 buf[ih_base + 0x03],
@@ -3642,7 +3782,7 @@ fn apply_mft_update_sequence_fixups(record: &mut [u8]) -> bool {
     fixups.copy_from_slice(&record[usa_offset + 2..fixups_end]);
     let sequence_number = u16::from_le_bytes([record[usa_offset], record[usa_offset + 1]]);
 
-    for (fixup_index, original) in fixups.chunks_exact(2).enumerate() {
+    for (fixup_index, original) in fixups.as_chunks::<2>().0.iter().enumerate() {
         let protected_offset = ((fixup_index + 1) * 512) - 2;
         if protected_offset + 2 > record.len() {
             return false;
@@ -3689,8 +3829,8 @@ fn resolve_mft_record(ntfs: &NtfsBoot, path: &str) -> Option<u64> {
     // `Windows/...` form both recurse correctly through
     // Windows -> System32 -> winload.efi.
     let parts: alloc::vec::Vec<&str> = path
-        .trim_start_matches(|c| c == '\\' || c == '/')
-        .split(|c| c == '\\' || c == '/')
+        .trim_start_matches(['\\', '/'])
+        .split(['\\', '/'])
         .filter(|s| !s.is_empty())
         .collect();
     if DEBUG_NTFS {
@@ -3801,7 +3941,7 @@ fn find_child_in_index(ntfs: &NtfsBoot, parent_record: u64, name: &str) -> Optio
             // first_entry_offset from body + 0x10 + 0x00 = body + 0x10.
             let ih_base = body + 0x10;
             let first_entry_offset = u32::from_le_bytes([
-                record[ih_base + 0x00],
+                record[ih_base],
                 record[ih_base + 0x01],
                 record[ih_base + 0x02],
                 record[ih_base + 0x03],
@@ -3985,7 +4125,7 @@ fn find_child_in_index(ntfs: &NtfsBoot, parent_record: u64, name: &str) -> Optio
                 let decoded_lower: alloc::string::String = decoded_name
                     .chars()
                     .map(|c| {
-                        if c >= 'A' && c <= 'Z' {
+                        if ('A'..='Z').contains(&c) {
                             (c as u8 + 0x20) as char
                         } else {
                             c
@@ -3995,7 +4135,7 @@ fn find_child_in_index(ntfs: &NtfsBoot, parent_record: u64, name: &str) -> Optio
                 let name_lower: alloc::string::String = name
                     .chars()
                     .map(|c| {
-                        if c >= 'A' && c <= 'Z' {
+                        if ('A'..='Z').contains(&c) {
                             (c as u8 + 0x20) as char
                         } else {
                             c

@@ -6,7 +6,6 @@ description = "NT6.1.7601 UEFI Boot Manager"
 authors = ["NT6.1.7601 Team"]
 
 [dependencies]
-nt61-boot-types = { path = "../boot-types" }
 uefi = { version = "0.37.0", features = ["alloc", "logger"] }
 uefi-raw = "0.14.0"
 nt61-bootfs = { path = "../bootfs" }
@@ -18,12 +17,7 @@ path = "src/main.rs"
 test = false
 
 [features]
-# nt61-boot.efi is currently an x86_64-only UEFI binary. The
-# boot manager contains inline-asm that targets the AMD64
-# register set (al, rdi) and a graphics module that hard-codes
-# the GOP linear framebuffer layout. The Makefile and QEMU
-# harness also only exercise x86_64. Other architectures should
-# be gated here until the boot manager is properly ported.
+# Architecture-specific UEFI entry points and console I/O are selected by target.
 x86_64 = []
 aarch64 = []
 riscv64 = []

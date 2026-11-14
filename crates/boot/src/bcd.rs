@@ -105,6 +105,7 @@ pub struct BootEntry {
     /// point at winload.efi. The memory diagnostic runs directly in
     /// bootmgr rather than through a placeholder Tool entry.
     pub application: StaticStr,
+    pub load_options: StaticStr,
 }
 
 /// BCD Store with static storage
@@ -115,6 +116,7 @@ pub struct BcdStore {
     pub entry_count: usize,
     pub display_count: usize,
     pub timeout: u32,
+    pub default: Option<Guid>,
 }
 
 impl BcdStore {
@@ -124,7 +126,8 @@ impl BcdStore {
             display_order: [None; MAX_ENTRIES],
             entry_count: 0,
             display_count: 0,
-            timeout: 10,
+            timeout: 5,
+            default: None,
         }
     }
 
@@ -137,6 +140,7 @@ impl BcdStore {
             guid: wellknown::ENTRY_WINDOWS_7,
             description: StaticStr::from_str("Windows 7"),
             application: StaticStr::from_str(DEFAULT_WINLOAD_PATH),
+            load_options: StaticStr::from_str(""),
         });
         store.display_order[0] = Some(wellknown::ENTRY_WINDOWS_7);
         store.entry_count = 1;
@@ -148,6 +152,7 @@ impl BcdStore {
             guid: wellknown::ENTRY_CMD,
             description: StaticStr::from_str("Windows 7 (Command Prompt)"),
             application: StaticStr::from_str(DEFAULT_WINLOAD_PATH),
+            load_options: StaticStr::from_str(""),
         });
         store.display_order[1] = Some(wellknown::ENTRY_CMD);
         store.entry_count = 2;
@@ -159,6 +164,7 @@ impl BcdStore {
             guid: wellknown::ENTRY_DEBUG_CMD,
             description: StaticStr::from_str("Windows 7 (Debug CMD)"),
             application: StaticStr::from_str(DEFAULT_WINLOAD_PATH),
+            load_options: StaticStr::from_str("/debug /debugport=COM1 /baudrate=115200"),
         });
         store.display_order[2] = Some(wellknown::ENTRY_DEBUG_CMD);
         store.entry_count = 3;
@@ -171,12 +177,14 @@ impl BcdStore {
             guid: wellknown::ENTRY_SAFE_MODE,
             description: StaticStr::from_str("Windows 7 (Safe Mode)"),
             application: StaticStr::from_str(DEFAULT_WINLOAD_PATH),
+            load_options: StaticStr::from_str("/safeboot:minimal"),
         });
         store.display_order[3] = Some(wellknown::ENTRY_SAFE_MODE);
         store.entry_count = 4;
         store.display_count = 4;
 
         store.timeout = 5;
+        store.default = Some(wellknown::ENTRY_WINDOWS_7);
         store
     }
 

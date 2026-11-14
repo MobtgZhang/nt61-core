@@ -7,10 +7,6 @@ const PL011_DATA_REGISTER: u64 = 0x0900_0000;
 /// Write raw diagnostic bytes to the firmware debug UART.
 #[inline(never)]
 pub fn write_com1_marker(bytes: &[u8]) {
-    if !cfg!(feature = "log_level_debug") {
-        return;
-    }
-
     for byte in bytes {
         unsafe {
             core::ptr::write_volatile(PL011_DATA_REGISTER as *mut u8, *byte);

@@ -9,10 +9,6 @@ const UART_LSR: u64 = 5;
 const UART_LSR_THR_EMPTY: u8 = 0x20;
 
 pub fn write_com1_marker(bytes: &[u8]) {
-    if !cfg!(feature = "log_level_debug") {
-        return;
-    }
-
     for byte in bytes {
         unsafe {
             while core::ptr::read_volatile((UART0_BASE + UART_LSR) as *const u8)

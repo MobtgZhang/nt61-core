@@ -9,18 +9,17 @@ pub struct BootMenu<'a> {
     pub(crate) bcd: &'a BcdStore,
     pub(crate) selected_index: usize,
     countdown: u32,
+    automatic: bool,
 }
 
 impl<'a> BootMenu<'a> {
     pub fn new(bcd: &'a BcdStore) -> Self {
-        // Default: highlight the first entry (Windows 7). This is
-        // the canonical NT 6.1 boot-manager behaviour: the default
-        // entry boots the normal OS into Ring 3; Safe Mode entries
-        // are opt-in via the menu.
         Self {
             bcd,
-            selected_index: 0,
+            selected_index: bcd.default.and_then(|guid| bcd.entries[..bcd.entry_count].iter()
+                .position(|entry| entry.as_ref().map(|e| e.guid) == Some(guid))).unwrap_or(0),
             countdown: bcd.timeout,
+            automatic: true,
         }
     }
 
@@ -44,15 +43,15 @@ impl<'a> BootMenu<'a> {
         }
     }
 
-    /// Stop the auto-boot countdown. After this, `countdown()` returns `None`
-    /// until `reset_countdown()` is called.
+    /// Stop automatic boot until the user explicitly selects an entry.
     pub fn cancel_auto(&mut self) {
         self.countdown = 0;
+        self.automatic = false;
     }
 
     /// True while the auto-boot countdown is still running.
     pub fn is_counting(&self) -> bool {
-        self.countdown > 0
+        self.automatic
     }
 
     pub fn select(&self) -> Option<&BootEntry> {
@@ -60,6 +59,7 @@ impl<'a> BootMenu<'a> {
     }
 
     pub fn tick(&mut self) -> bool {
+        if !self.automatic { return false; }
         if self.countdown > 0 {
             self.countdown -= 1;
             self.countdown == 0
