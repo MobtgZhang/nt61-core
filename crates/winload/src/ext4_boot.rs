@@ -685,7 +685,7 @@ pub fn log_ext4_layout() {
 }
 
 // Suppress dead-code warnings for diagnostic helpers.
-fn _unused(_s: &str) {
-    let _ = String::from(_s);
+fn _unused(s: &str) {
+    let _ = String::from(s);
     let _ = _unused;
 }

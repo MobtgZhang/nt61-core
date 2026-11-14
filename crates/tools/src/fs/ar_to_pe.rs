@@ -169,7 +169,7 @@ pub fn parse_elf_segments(elf: &[u8]) -> Option<Vec<ElfSegment>> {
             .and_then(|rest| rest.iter().position(|b| *b == 0))
             .map(|end| sh_name + end)
             .unwrap_or(sh_name);
-        let _name = String::from_utf8_lossy(
+        let name = String::from_utf8_lossy(
             shstr_data
                 .get(sh_name..name_end)
                 .unwrap_or_default(),

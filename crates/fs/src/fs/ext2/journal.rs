@@ -472,7 +472,7 @@ pub fn journal_abort_transaction(_device: *mut (), _sb: &Ext2SuperBlock, _transa
     // In a full implementation, we would:
     // 1. Stop logging
     // 2. Mark filesystem as needing fsck
-    // kprintln!("[EXT3] Journal transaction {} aborted", _transaction_id);
+    // kprintln!("[EXT3] Journal transaction {} aborted", transaction_id);
 }
 
 // ============================================================================

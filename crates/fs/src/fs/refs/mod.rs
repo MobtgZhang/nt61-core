@@ -359,8 +359,8 @@ pub fn mount(device: *mut ()) -> Option<&'static mut RefsFileSystem> {
 }
 
 /// Unmount a ReFS filesystem
-pub fn unmount(_fs: *mut RefsFileSystem) {
-    if !_fs.is_null() {
+pub fn unmount(fs: *mut RefsFileSystem) {
+    if !fs.is_null() {
         // kprintln!("[REFS] Filesystem unmounted");
     }
 }

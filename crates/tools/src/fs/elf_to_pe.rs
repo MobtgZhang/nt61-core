@@ -164,7 +164,7 @@ pub fn elf_to_pe(elf: &[u8], arch: &str) -> Option<Vec<u8>> {
     const DATA_RW: u32 = 0xC000_0040; // CNT_DATA | READ | WRITE
     const DATA_RO: u32 = 0x4000_0040; // CNT_DATA | READ
     for (index, (vaddr, filesz, memsz, flags, file_off)) in segments.iter().enumerate() {
-        let header = sect_table as usize + index * 40;
+        let header = sect_table + index * 40;
         if header + 40 > HEADER_SIZE as usize {
             return None;
         }

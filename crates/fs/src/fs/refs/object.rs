@@ -330,7 +330,7 @@ impl ObjectLookupResult {
 
 /// Look up an object by ID from the B+ tree
 pub fn lookup_object(
-    _table: &ObjectIdTable,
+    table: &ObjectIdTable,
     object_id: u64,
     sub_sequence: u64,
 ) -> Option<ObjectLookupResult> {
@@ -338,7 +338,7 @@ pub fn lookup_object(
     // For now, return None as we don't have the B+ tree loaded
 
     // Check if it's in our cached entries
-    if let Some(entry) = _table.find_by_id(object_id) {
+    if let Some(entry) = table.find_by_id(object_id) {
         if entry.key.sub_sequence == sub_sequence {
             return Some(ObjectLookupResult::new(
                 object_id,

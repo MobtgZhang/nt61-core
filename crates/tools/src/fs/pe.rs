@@ -692,8 +692,7 @@ fn build_export_directory(spec: &PeImageSpec) -> ExportBlob {
     let ordinals_off = names_off + named_indices.len() * 4;
     let strings_off = ordinals_off + named_indices.len() * 2;
 
-    let mut blob: Vec<u8> = Vec::new();
-    blob.resize(strings_off, 0);
+    let mut blob: Vec<u8> = vec![0; strings_off];
 
     // Helper that appends a NUL-terminated ASCII string and returns
     // its blob-relative offset.

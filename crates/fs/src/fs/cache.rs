@@ -467,7 +467,7 @@ impl CacheManager {
                 }
 
                 // Allocate and initiate read
-                if let Some(_idx) = self.allocate(file_id, block_num) {
+                if let Some(idx) = self.allocate(file_id, block_num) {
                     self.stats.reads.fetch_add(1, Ordering::Relaxed);
                     // Read the block from disk into the pre-allocated
                     // cache block. The cache manager runs in kernel
@@ -480,7 +480,7 @@ impl CacheManager {
                         &mut buf,
                     );
                     if bytes > 0 {
-                        self.data[_idx][..bytes].copy_from_slice(&buf[..bytes]);
+                        self.data[idx][..bytes].copy_from_slice(&buf[..bytes]);
                     }
                 } else {
                     self.stats.readahead_misses.fetch_add(1, Ordering::Relaxed);

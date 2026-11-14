@@ -37,7 +37,7 @@
 //!    block, scan entries to find the next path component.
 //! 5. Repeat down the tree.
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 // =====================================================================
 // Constants
@@ -58,8 +58,7 @@ fn read_partition_sectors(
     start_lba: u64,
     count: u32,
 ) -> Option<Vec<u8>> {
-    let mut buf = Vec::with_capacity((count as usize) * 512);
-    buf.resize((count as usize) * 512, 0u8);
+    let mut buf = vec![0; (count as usize) * 512];
     // read one sector at a time to avoid large stack frames.
     for i in 0..count as usize {
         let sector_buf = &mut buf[i * 512..(i + 1) * 512];
@@ -254,9 +253,8 @@ fn read_extents(
 
         let ee_start_hi = (start_word >> 16) & 0xFFFF;
         let ee_start_lo = start_word;
-        let physical = ((ee_start_hi << 16) | ee_start_lo) as u32;
-        let sectors = ((block_count as usize + ext4.block_size as usize - 1)
-            / ext4.block_size as usize
+        let physical = ((ee_start_hi << 16) | ee_start_lo);
+        let sectors = ((block_count as usize).div_ceil(ext4.block_size as usize)
             * (ext4.block_size / 512) as usize) as u32;
         let lba = partition_start_lba + (physical as u64) * (ext4.block_size / 512) as u64;
         let data = read_partition_sectors(block_io, media_id, lba, sectors)?;
@@ -291,7 +289,7 @@ fn read_extents(
             let _ei_block = w0 & 0xFFFF;
             let ei_leaf_lo = w1;
             let ei_leaf_hi = (w2 >> 16) & 0xFFFF;
-            let leaf_block = ((ei_leaf_hi << 16) | ei_leaf_lo) as u32;
+            let leaf_block = ((ei_leaf_hi << 16) | ei_leaf_lo);
             let leaf_lba =
                 partition_start_lba + (leaf_block as u64) * (ext4.block_size / 512) as u64;
             let sectors_per_block = ext4.block_size / 512;
@@ -393,8 +391,8 @@ fn resolve_path(
     partition_start_lba: u64,
 ) -> Option<u32> {
     let parts: Vec<&str> = path
-        .trim_start_matches(|c| c == '/' || c == '\\')
-        .split(|c| c == '/' || c == '\\')
+        .trim_start_matches(['/', '\\'])
+        .split(['/', '\\'])
         .filter(|s| !s.is_empty())
         .collect();
     let mut current = start_ino;

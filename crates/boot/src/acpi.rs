@@ -122,7 +122,7 @@ unsafe fn child_table_addresses(
     let header = unsafe { table_header(root_address)? };
     let body_start = 36usize;
     let body_len = header.length as usize - body_start;
-    if body_len == 0 || body_len % pointer_size != 0 {
+    if body_len == 0 || !body_len.is_multiple_of(pointer_size) {
         return None;
     }
     let mut addresses = alloc::vec::Vec::new();
@@ -201,10 +201,7 @@ pub unsafe fn parse_rsdp(rsdp_address: u64) -> Result<AcpiSummary, AcpiError> {
 
 pub fn parse_firmware_tables() -> Option<AcpiSummary> {
     let address = find_rsdp_address()?;
-    match unsafe { parse_rsdp(address) } {
-        Ok(summary) => Some(summary),
-        Err(_) => None,
-    }
+    unsafe { parse_rsdp(address) }.ok()
 }
 
 impl AcpiSummary {
