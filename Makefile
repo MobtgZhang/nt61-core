@@ -30,9 +30,42 @@ SYSTEM_DIR = $(BLD)/system
 
 # Default arch and format
 # ARCH: x86_64, aarch64, riscv64, loongarch64
-# FORMAT: ntfs, fat32, ext4, iso
+# FORMAT: ntfs, fat32, ext4, refs, qcow2, ramfs (or img), iso
+SUPPORTED_ARCHES := x86_64 aarch64 riscv64 loongarch64
+# Accept `make run riscv64` as well as `make run ARCH=riscv64`.
+# Select the architecture before recursive make or any build can start.
+ifneq ($(filter run run-serial run-gtk,$(MAKECMDGOALS)),)
+RUN_ARCH_GOALS := $(filter $(SUPPORTED_ARCHES),$(MAKECMDGOALS))
+ifneq ($(RUN_ARCH_GOALS),)
+ifneq ($(words $(RUN_ARCH_GOALS)),1)
+$(error Conflicting architectures: $(RUN_ARCH_GOALS))
+endif
+ifneq ($(origin ARCH),undefined)
+ifneq ($(ARCH),$(RUN_ARCH_GOALS))
+$(error Conflicting architectures: ARCH=$(ARCH) and $(RUN_ARCH_GOALS))
+endif
+endif
+ARCH := $(RUN_ARCH_GOALS)
+.PHONY: $(RUN_ARCH_GOALS)
+$(RUN_ARCH_GOALS):
+	@:
+endif
+endif
 ARCH ?= x86_64
 FORMAT ?= ntfs
+# img is the raw FAT32 RAM-backed boot image.
+ifeq ($(FORMAT),img)
+override FORMAT := ramfs
+endif
+
+# Reject malformed command-line/environment values before recursive make can
+# interpret a target such as run-=riscv64-ntfs as a variable assignment.
+ifneq ($(words $(ARCH)),1)
+$(error Invalid ARCH '$(ARCH)'. Use one of: $(SUPPORTED_ARCHES))
+endif
+ifeq ($(filter $(SUPPORTED_ARCHES),$(ARCH)),)
+$(error Invalid ARCH '$(ARCH)'. Use make run ARCH=riscv64 with one '='; supported: $(SUPPORTED_ARCHES))
+endif
 
 # EDK2 firmware directory (from download.sh)
 SCRIPT_DIR := $(shell cd "$(shell dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -78,20 +111,25 @@ EDK2_LOONGARCH64_VARS = $(IMAGES_DIR)/edk2_loongarch64_vars.fd
 
 # QEMU
 QEMU_X86 := qemu-system-x86_64
-# Safe mode uses the stable GTK framebuffer path. Pass QEMU_GPU_MODE=gl only
-# when the host EGL/GLX stack is known to work with virgl/QEMU.
+# All architectures use the VirtIO basic-display driver by default.
+# ramfb keeps the firmware framebuffer fallback; gl requires host EGL/GLX.
 QEMU_GPU_MODE ?= safe
 ifeq ($(QEMU_GPU_MODE),gl)
 QEMU_GPU_DEVICE := -device virtio-gpu-gl-pci,xres=1024,yres=768,blob=on
 QEMU_DISPLAY := -display gtk,gl=on,zoom-to-fit=off
-else
+else ifeq ($(QEMU_GPU_MODE),ramfb)
+QEMU_GPU_DEVICE := -device ramfb
+QEMU_DISPLAY := -display gtk,zoom-to-fit=off
+else ifeq ($(QEMU_GPU_MODE),safe)
 QEMU_GPU_DEVICE := -device virtio-gpu-pci,xres=1024,yres=768
 QEMU_DISPLAY := -display gtk,zoom-to-fit=off
+else
+$(error Invalid QEMU_GPU_MODE '$(QEMU_GPU_MODE)'. Use safe, ramfb, or gl)
 endif
 QEMU_AARCH64 := qemu-system-aarch64
 QEMU_RISCV64 := qemu-system-riscv64
 QEMU_LOONGARCH64 := qemu-system-loongarch64
-QEMU_GENERIC_DISPLAY ?= -display gtk
+QEMU_GENERIC_DISPLAY ?= $(QEMU_DISPLAY)
 
 BRIDGE ?= br0
 QEMU_NET_BRIDGE := -netdev bridge,id=n0,br=$(BRIDGE) -device virtio-net-pci,netdev=n0
@@ -118,7 +156,8 @@ DISK_DEV_PCI := virtio-blk-pci
 # raw disk images we use the dual-step `if=none + -device ... -drive`
 # form so the disk controller and the disk itself can be referenced
 # by `id=hd0` regardless of which virtio device we end up attaching.
-DISK_FLAGS = $(if $(filter iso,$(FORMAT)),-cdrom $(ISO_IMG),-drive if=none,file=$(DISK_IMG),format=$(if $(filter qcow2,$(FORMAT)),qcow2,raw),id=hd0 -device $(DISK_DEV_PCI),drive=hd0)
+QEMU_COMMA := ,
+DISK_FLAGS = $(if $(filter iso,$(FORMAT)),-drive if=none$(QEMU_COMMA)file=$(ISO_IMG)$(QEMU_COMMA)format=raw$(QEMU_COMMA)media=cdrom$(QEMU_COMMA)id=cd0 -device virtio-scsi-pci$(QEMU_COMMA)id=scsi0 -device scsi-cd$(QEMU_COMMA)drive=cd0$(QEMU_COMMA)bus=scsi0.0$(QEMU_COMMA)bootindex=1,-drive if=none,file=$(DISK_IMG),format=$(if $(filter qcow2,$(FORMAT)),qcow2,raw),id=hd0 -device $(DISK_DEV_PCI),drive=hd0)
 
 # Disk image names — `=` for the same reason as above.
 DISK_IMG = $(if $(filter qcow2,$(FORMAT)),$(IMAGES_DIR)/disk.qcow2,$(IMAGES_DIR)/disk.img)
@@ -159,17 +198,20 @@ VERIFY_DIR ?= build/verify-strict
 # ============================================================
 # Main targets
 # ============================================================
+SYSTEM_SIZE_MB ?= 512
+
 all: build
 
 build:
-	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag $(FORMAT) --size-mb 64 --arch $(ARCH)
+	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag $(FORMAT) --size-mb $(SYSTEM_SIZE_MB) --arch $(ARCH)
 
 
 # ============================================================
 # Per-filesystem build targets
 # ============================================================
+build-ntfs: FORMAT = ntfs
 build-ntfs:
-	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag ntfs --size-mb 64 --arch $(ARCH)
+	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag ntfs --size-mb $(SYSTEM_SIZE_MB) --arch $(ARCH)
 
 system-pe:
 	cargo build --release -p nt61-init --target x86_64-unknown-uefi --features "x86_64,binary_panic,alloc,$(SYSTEM_PE_LOG_FEATURE)"
@@ -178,114 +220,114 @@ system-pe:
 
 build-fat32: FORMAT=fat32
 build-fat32:
-	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag fat32 --size-mb 64 --arch $(ARCH)
+	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag fat32 --size-mb $(SYSTEM_SIZE_MB) --arch $(ARCH)
 
 build-ext4: FORMAT=ext4
 build-ext4:
-	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag ext4 --size-mb 64 --arch $(ARCH)
+	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag ext4 --size-mb $(SYSTEM_SIZE_MB) --arch $(ARCH)
 
 build-iso: FORMAT=iso
 build-iso:
-	$(BUILD_TOOL) --build iso --build-dir $(BLD) --format-flag iso --size-mb 64 --arch $(ARCH)
+	$(BUILD_TOOL) --build iso --build-dir $(BLD) --format-flag iso --size-mb $(SYSTEM_SIZE_MB) --arch $(ARCH)
 
 build-refs: FORMAT=refs
 build-refs:
-	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag refs --size-mb 64 --arch $(ARCH)
+	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag refs --size-mb $(SYSTEM_SIZE_MB) --arch $(ARCH)
 
 build-qcow2: FORMAT=qcow2
 build-qcow2:
-	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag qcow2 --size-mb 64 --arch $(ARCH)
+	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag qcow2 --size-mb $(SYSTEM_SIZE_MB) --arch $(ARCH)
 
 build-ramfs: FORMAT=ramfs
 build-ramfs:
-	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag ramfs --size-mb 64 --arch $(ARCH)
+	$(BUILD_TOOL) --build all --build-dir $(BLD) --format-flag ramfs --size-mb $(SYSTEM_SIZE_MB) --arch $(ARCH)
 
 # ============================================================
 # Arch-format specific build targets
 # ============================================================
 build-x86_64-ntfs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/ntfs --format-flag ntfs --size-mb 64 --arch x86_64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/ntfs --format-flag ntfs --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 
 build-x86_64-fat32:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/fat32 --format-flag fat32 --size-mb 64 --arch x86_64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/fat32 --format-flag fat32 --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 
 build-x86_64-ext4:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/ext4 --format-flag ext4 --size-mb 64 --arch x86_64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/ext4 --format-flag ext4 --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 
 build-aarch64-ntfs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/ntfs --format-flag ntfs --size-mb 64 --arch aarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/ntfs --format-flag ntfs --size-mb $(SYSTEM_SIZE_MB) --arch aarch64
 
 build-aarch64-fat32:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/fat32 --format-flag fat32 --size-mb 64 --arch aarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/fat32 --format-flag fat32 --size-mb $(SYSTEM_SIZE_MB) --arch aarch64
 
 build-aarch64-ext4:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/ext4 --format-flag ext4 --size-mb 64 --arch aarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/ext4 --format-flag ext4 --size-mb $(SYSTEM_SIZE_MB) --arch aarch64
 
 build-riscv64-ntfs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/ntfs --format-flag ntfs --size-mb 64 --arch riscv64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/ntfs --format-flag ntfs --size-mb $(SYSTEM_SIZE_MB) --arch riscv64
 
 build-riscv64-fat32:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/fat32 --format-flag fat32 --size-mb 64 --arch riscv64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/fat32 --format-flag fat32 --size-mb $(SYSTEM_SIZE_MB) --arch riscv64
 
 build-riscv64-ext4:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/ext4 --format-flag ext4 --size-mb 64 --arch riscv64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/ext4 --format-flag ext4 --size-mb $(SYSTEM_SIZE_MB) --arch riscv64
 
 build-loongarch64-ntfs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/ntfs --format-flag ntfs --size-mb 64 --arch loongarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/ntfs --format-flag ntfs --size-mb $(SYSTEM_SIZE_MB) --arch loongarch64
 
 build-loongarch64-fat32:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/fat32 --format-flag fat32 --size-mb 64 --arch loongarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/fat32 --format-flag fat32 --size-mb $(SYSTEM_SIZE_MB) --arch loongarch64
 
 build-loongarch64-ext4:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/ext4 --format-flag ext4 --size-mb 64 --arch loongarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/ext4 --format-flag ext4 --size-mb $(SYSTEM_SIZE_MB) --arch loongarch64
 
 build-x86_64-refs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/refs --format-flag refs --size-mb 64 --arch x86_64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/refs --format-flag refs --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 
 build-x86_64-qcow2:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/qcow2 --format-flag qcow2 --size-mb 64 --arch x86_64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/qcow2 --format-flag qcow2 --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 
 build-x86_64-ramfs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/ramfs --format-flag ramfs --size-mb 64 --arch x86_64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/x86_64/ramfs --format-flag ramfs --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 
 build-aarch64-refs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/refs --format-flag refs --size-mb 64 --arch aarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/refs --format-flag refs --size-mb $(SYSTEM_SIZE_MB) --arch aarch64
 
 build-aarch64-qcow2:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/qcow2 --format-flag qcow2 --size-mb 64 --arch aarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/qcow2 --format-flag qcow2 --size-mb $(SYSTEM_SIZE_MB) --arch aarch64
 
 build-aarch64-ramfs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/ramfs --format-flag ramfs --size-mb 64 --arch aarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/aarch64/ramfs --format-flag ramfs --size-mb $(SYSTEM_SIZE_MB) --arch aarch64
 
 build-riscv64-refs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/refs --format-flag refs --size-mb 64 --arch riscv64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/refs --format-flag refs --size-mb $(SYSTEM_SIZE_MB) --arch riscv64
 
 build-riscv64-qcow2:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/qcow2 --format-flag qcow2 --size-mb 64 --arch riscv64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/qcow2 --format-flag qcow2 --size-mb $(SYSTEM_SIZE_MB) --arch riscv64
 
 build-riscv64-ramfs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/ramfs --format-flag ramfs --size-mb 64 --arch riscv64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/riscv64/ramfs --format-flag ramfs --size-mb $(SYSTEM_SIZE_MB) --arch riscv64
 
 build-loongarch64-refs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/refs --format-flag refs --size-mb 64 --arch loongarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/refs --format-flag refs --size-mb $(SYSTEM_SIZE_MB) --arch loongarch64
 
 build-loongarch64-qcow2:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/qcow2 --format-flag qcow2 --size-mb 64 --arch loongarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/qcow2 --format-flag qcow2 --size-mb $(SYSTEM_SIZE_MB) --arch loongarch64
 
 build-loongarch64-ramfs:
-	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/ramfs --format-flag ramfs --size-mb 64 --arch loongarch64
+	$(BUILD_TOOL) --build all --build-dir $(BUILD_DIR)/loongarch64/ramfs --format-flag ramfs --size-mb $(SYSTEM_SIZE_MB) --arch loongarch64
 
 build-x86_64-iso:
-	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/x86_64/iso --format-flag iso --size-mb 64 --arch x86_64
+	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/x86_64/iso --format-flag iso --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 
 build-aarch64-iso:
-	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/aarch64/iso --format-flag iso --size-mb 64 --arch aarch64
+	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/aarch64/iso --format-flag iso --size-mb $(SYSTEM_SIZE_MB) --arch aarch64
 
 build-riscv64-iso:
-	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/riscv64/iso --format-flag iso --size-mb 64 --arch riscv64
+	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/riscv64/iso --format-flag iso --size-mb $(SYSTEM_SIZE_MB) --arch riscv64
 
 build-loongarch64-iso:
-	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/loongarch64/iso --format-flag iso --size-mb 64 --arch loongarch64
+	$(BUILD_TOOL) --build iso --build-dir $(BUILD_DIR)/loongarch64/iso --format-flag iso --size-mb $(SYSTEM_SIZE_MB) --arch loongarch64
 
 # ============================================================
 # Firmware setup macros (per architecture)
@@ -462,15 +504,16 @@ define _run_x86_64
 	@rm -f /tmp/nt61-qmp-$(ARCH).sock
 	@echo "Starting QEMU (x86_64/$(FORMAT))..."
 	@echo "QEMU_GPU_MODE=$(QEMU_GPU_MODE)"
-	env GDK_BACKEND=x11 GDK_SCALE=1 GDK_DPI_SCALE=1 $(QEMU_X86) -machine q35 -m 8G -smp 4 \
+	env GDK_BACKEND=x11 GDK_SCALE=1 GDK_DPI_SCALE=1 $(QEMU_X86) -machine q35 -cpu max -m 8G -smp 4 \
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		$(DISK_FLAGS) \
 		-boot $(if $(filter iso,$(FORMAT)),d,c) $(QEMU_NET_BRIDGE) \
 		-device virtio-keyboard-pci \
 		-device virtio-mouse-pci \
+		-device virtio-tablet-pci \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		$(QEMU_GPU_DEVICE) \
+		-vga none $(QEMU_GPU_DEVICE) \
 		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY)
 endef
 
@@ -482,7 +525,8 @@ define _run_aarch64
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(EDK2_AARCH64_EFI_PADDED) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_AARCH64_VARS) \
 		$(DISK_FLAGS) \
-		-device ramfb -device qemu-xhci -device virtio-keyboard-pci \
+		$(QEMU_GPU_DEVICE) -device qemu-xhci -device usb-kbd -device virtio-keyboard-pci \
+		-device virtio-mouse-pci -device virtio-tablet-pci \
 		-boot order=c $(QEMU_NET_BRIDGE) \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY)
@@ -504,11 +548,12 @@ define _run_riscv64
 	# not ship a virtio-mmio driver — only the PCI transport.
 	$(QEMU_RISCV64) -machine virt -m 8G -smp 4 $(QEMU_CPU_riscv64) \
 		-bios /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
-		-drive if=pflash,format=raw,unit=0,file=$(EDK2_RISCV64_VIRT_PADDED) \
+		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(EDK2_RISCV64_VIRT_PADDED) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		$(DISK_FLAGS) \
-		-device ramfb \
-		-device qemu-xhci -device virtio-keyboard-pci \
+		$(QEMU_GPU_DEVICE) \
+		-device qemu-xhci -device usb-kbd -device virtio-keyboard-pci \
+		-device virtio-mouse-pci -device virtio-tablet-pci \
 		$(QEMU_NET_BRIDGE) \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY)
@@ -519,12 +564,13 @@ define _run_loongarch64
 	@rm -f /tmp/nt61-qmp-$(ARCH).sock
 	@echo "Starting QEMU (loongarch64/$(FORMAT)) with EDK2 Nightly UEFI..."
 	$(QEMU_LOONGARCH64) -machine virt -m 8G -smp 4 $(QEMU_CPU_loongarch64) \
-		-pflash $(EDK2_LOONGARCH64_EFI) \
-		-pflash $(EDK2_LOONGARCH64_VARS) \
-		$(DISK_FLAGS) -device ramfb -device qemu-xhci -device virtio-keyboard-pci \
+		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(EDK2_LOONGARCH64_EFI) \
+		-drive if=pflash,format=raw,unit=1,file=$(EDK2_LOONGARCH64_VARS) \
+		$(DISK_FLAGS) $(QEMU_GPU_DEVICE) -device qemu-xhci -device usb-kbd -device virtio-keyboard-pci \
+		-device virtio-mouse-pci -device virtio-tablet-pci \
 		-boot order=c $(QEMU_NET_BRIDGE) \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
-		-serial file:$(SERIAL_LOG) $(QEMU_DISPLAY)
+		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY)
 endef
 
 # ============================================================
@@ -840,7 +886,8 @@ run-x86_64-ntfs-serial: build-x86_64-ntfs
 		-boot c -net none \
 		-device virtio-keyboard-pci \
 		-device virtio-mouse-pci \
-		-device virtio-gpu-pci,xres=1024,yres=768 \
+		-device virtio-tablet-pci \
+		$(QEMU_GPU_DEVICE) \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
 
@@ -858,7 +905,8 @@ run-x86_64-fat32-serial: build-x86_64-fat32
 		-boot c -net none \
 		-device virtio-keyboard-pci \
 		-device virtio-mouse-pci \
-		-device virtio-gpu-pci,xres=1024,yres=768 \
+		-device virtio-tablet-pci \
+		$(QEMU_GPU_DEVICE) \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
 
@@ -876,7 +924,8 @@ run-x86_64-ext4-serial: build-x86_64-ext4
 		-boot c -net none \
 		-device virtio-keyboard-pci \
 		-device virtio-mouse-pci \
-		-device virtio-gpu-pci,xres=1024,yres=768 \
+		-device virtio-tablet-pci \
+		$(QEMU_GPU_DEVICE) \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
 
@@ -950,7 +999,8 @@ define _run_aarch64_serial
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_AARCH64_VARS) \
 		-drive if=none,file=$(DISK_IMG),format=raw,id=hd0 \
 		-device $(DISK_DEV_PCI),drive=hd0 \
-		-device ramfb -device qemu-xhci -device virtio-keyboard-pci \
+		$(QEMU_GPU_DEVICE) -device qemu-xhci -device usb-kbd -device virtio-keyboard-pci \
+		-device virtio-mouse-pci -device virtio-tablet-pci \
 		-boot order=c -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
@@ -959,11 +1009,12 @@ endef
 define _run_riscv64_serial
 	@timeout $(TIMEOUT)s $(QEMU_RISCV64) -machine virt -m 8G -smp 4 $(QEMU_CPU_riscv64) \
 		-bios /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin \
-		-drive if=pflash,format=raw,unit=0,file=$(EDK2_RISCV64_VIRT_PADDED) \
+		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(EDK2_RISCV64_VIRT_PADDED) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		-drive if=none,file=$(DISK_IMG),format=raw,id=hd0 \
 		-device $(DISK_DEV_PCI),drive=hd0 \
-		-device ramfb -device qemu-xhci -device virtio-keyboard-pci \
+		$(QEMU_GPU_DEVICE) -device qemu-xhci -device usb-kbd -device virtio-keyboard-pci \
+		-device virtio-mouse-pci -device virtio-tablet-pci \
 		-boot order=c -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
@@ -975,7 +1026,8 @@ define _run_loongarch64_serial
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_LOONGARCH64_VARS) \
 		-drive if=none,file=$(DISK_IMG),format=raw,id=hd0 \
 		-device $(DISK_DEV_PCI),drive=hd0 \
-		-device ramfb -device qemu-xhci -device virtio-keyboard-pci \
+		$(QEMU_GPU_DEVICE) -device qemu-xhci -device usb-kbd -device virtio-keyboard-pci \
+		-device virtio-mouse-pci -device virtio-tablet-pci \
 		-boot order=c -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 		-qmp unix:/tmp/nt61-qmp-$(ARCH).sock,server,nowait \
 		-serial file:$(SERIAL_LOG) $(QEMU_GENERIC_DISPLAY) || true
@@ -1090,8 +1142,9 @@ run-x86_64-gtk: build-x86_64-ntfs
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		-drive format=raw,file=$(DISK_IMG) \
-		-boot c -net none \
-		-serial null -display gtk || true
+		-boot c -net none -vga none $(QEMU_GPU_DEVICE) \
+		-device virtio-keyboard-pci -device virtio-mouse-pci -device virtio-tablet-pci \
+		-serial null $(QEMU_GENERIC_DISPLAY) || true
 
 run-aarch64-gtk: ARCH=aarch64
 run-aarch64-gtk: FORMAT=ntfs
@@ -1105,9 +1158,10 @@ run-aarch64-gtk: build-aarch64-ntfs
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_AARCH64_VARS) \
 		-drive if=none,file=$(DISK_IMG),format=raw,id=hd0 \
 		-device $(DISK_DEV_PCI),drive=hd0 \
-		-device ramfb \
+		$(QEMU_GPU_DEVICE) -device qemu-xhci -device usb-kbd -device virtio-keyboard-pci \
+		-device virtio-mouse-pci -device virtio-tablet-pci \
 		-boot order=c -net none \
-		-serial null -display gtk || true
+		-serial null $(QEMU_GENERIC_DISPLAY) || true
 
 run-riscv64-gtk: ARCH=riscv64
 run-riscv64-gtk: FORMAT=ntfs
@@ -1121,9 +1175,10 @@ run-riscv64-gtk: build-riscv64-ntfs
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		-drive if=none,file=$(DISK_IMG),format=raw,id=hd0 \
 		-device $(DISK_DEV_PCI),drive=hd0 \
-		-device ramfb \
+		$(QEMU_GPU_DEVICE) -device qemu-xhci -device usb-kbd -device virtio-keyboard-pci \
+		-device virtio-mouse-pci -device virtio-tablet-pci \
 		-boot order=c -net none \
-		-serial null -display gtk || true
+		-serial null $(QEMU_GENERIC_DISPLAY) || true
 
 run-loongarch64-gtk: ARCH=loongarch64
 run-loongarch64-gtk: FORMAT=ntfs
@@ -1133,13 +1188,14 @@ run-loongarch64-gtk: build-loongarch64-ntfs
 	$(call _setup_firmware_loongarch64)
 	@echo "Launching QEMU (loongarch64/ntfs) GUI-only..."
 	@timeout $(TIMEOUT)s $(QEMU_LOONGARCH64) -machine virt -m 8G -smp 4 $(QEMU_CPU_loongarch64) \
-		-pflash $(EDK2_LOONGARCH64_EFI) \
-		-pflash $(EDK2_LOONGARCH64_VARS) \
+		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(EDK2_LOONGARCH64_EFI) \
+		-drive if=pflash,format=raw,unit=1,file=$(EDK2_LOONGARCH64_VARS) \
 		-drive if=none,file=$(DISK_IMG),format=raw,id=hd0 \
 		-device $(DISK_DEV_PCI),drive=hd0 \
-		-device ramfb \
+		$(QEMU_GPU_DEVICE) -device qemu-xhci -device usb-kbd -device virtio-keyboard-pci \
+		-device virtio-mouse-pci -device virtio-tablet-pci \
 		-boot order=c -net none \
-		-serial null -display gtk || true
+		-serial null $(QEMU_GENERIC_DISPLAY) || true
 
 # ============================================================
 # Short-form aliases for the per-arch serial smoke tests.
@@ -1233,8 +1289,8 @@ test-qemu: build-$(FORMAT)
 #                                   (12 combinations). Mirrors the
 #                                   user's `make-{fs}-serial` request.
 #   * `make test-arches-fs-qemu` — same 12, listed per arch.
-#   * `make test-all-qemu`        — FAT32 / NTFS / EXT4 / ISO × 4 arches
-#                                   (16 combinations). The full grid
+#   * `make test-all-qemu`        — 7 containers × 4 arches
+#                                   (28 combinations). The full grid
 #                                   used by the project's CI harness.
 #
 # The output of each cell is a single line of the form:
@@ -1266,31 +1322,13 @@ test-arches-fs-qemu:
 # keep both names so people can run whichever phrase they prefer.
 test-all-fs-qemu: test-arches-fs-qemu
 
-# `make test-all-qemu` performs the same grid but with the ISO
-# column added. ISO boot for non-x86 arches is not yet wired, so
-# only x86_64 will be exercised against the ISO image.
+# Full desktop validation: all four architectures and all seven containers.
+# Build once per architecture, package one temporary volume at a time, and
+# require animation frames, complete login/desktop frames and real mouse input.
+DESKTOP_BOOT_TIMEOUT ?= 600
+BOOT_MATRIX_ARGS ?=
 test-all-qemu:
-	@mkdir -p $(IMAGES_DIR)
-	@BOOT_TIMEOUT=$(BOOT_TIMEOUT) BUILD_DIR=$(BLD) bash $(HARNESS_SCRIPT)
-	@echo
-	@echo "--- iso (x86_64 only — see notes) ---"
-	@mkdir -p $(IMAGES_DIR)
-	@echo "  Building ISO image..."
-	@$(BUILD_TOOL) --build iso --build-dir $(BLD) --format-flag iso --size-mb 64 --arch x86_64
-	@logfile=$(QEMU_HARNESS_LOGDIR)/x86_64-iso.log; \
-	  echo "  x86_64 / iso :"; \
-	  timeout_cmd=""; \
-	  if [ "$(BOOT_TIMEOUT)" -gt 0 ] 2>/dev/null; then timeout_cmd="timeout $(BOOT_TIMEOUT)s"; fi; \
-	  $$timeout_cmd qemu-system-x86_64 -machine q35 -m 4G -smp 4 \
-	    -drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
-	    -drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
-	    -cdrom $(ISO_IMG) -boot d -net none -display none \
-	    -serial file:$$logfile >/dev/null 2>&1 || true; \
-	  if [ -f $$logfile ] && grep -qE "C:\\\\>|^Phase 15|Boot mode: Safe Mode" $$logfile; then \
-	    echo "    PASS (cmd.exe reached)"; \
-	  else \
-	    echo "    FAIL (see $$logfile)"; \
-	  fi
+	python3 $(SCRIPT_DIR)/scripts/test-boot-matrix.py --compact --timeout $(DESKTOP_BOOT_TIMEOUT) --size-mb $(SYSTEM_SIZE_MB) $(BOOT_MATRIX_ARGS)
 
 # ============================================================
 # Clean
@@ -1359,13 +1397,13 @@ verify-strict:
 	@echo "=== image matrix smoke: fat32 / ntfs / ext4 / iso ==="
 	cargo build -p nt61-tools --bin build-tool
 	./target/debug/build-tool --build all --build-dir $(VERIFY_DIR)-fat32 \
-		--format-flag fat32 --size-mb 64 --arch x86_64
+		--format-flag fat32 --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 	./target/debug/build-tool --build all --build-dir $(VERIFY_DIR)-ntfs \
-		--format-flag ntfs --size-mb 64 --arch x86_64
+		--format-flag ntfs --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 	./target/debug/build-tool --build all --build-dir $(VERIFY_DIR)-ext4 \
-		--format-flag ext4 --size-mb 64 --arch x86_64
+		--format-flag ext4 --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 	./target/debug/build-tool --build iso --build-dir $(VERIFY_DIR)-iso \
-		--format-flag iso --size-mb 64 --arch x86_64
+		--format-flag iso --size-mb $(SYSTEM_SIZE_MB) --arch x86_64
 	@echo "=== verify-strict: all green ==="
 
 # ============================================================
@@ -1395,7 +1433,7 @@ help:
 	@echo ""
 	@echo "Parameters:"
 	@echo "  ARCH   - Architecture: x86_64, aarch64, riscv64, loongarch64 [default: x86_64]"
-	@echo "  FORMAT - Disk format: ntfs, fat32, ext4, iso [default: ntfs]"
+	@echo "  FORMAT - ntfs, fat32, ext4, refs, qcow2, ramfs (img), iso [default: ntfs]"
 	@echo ""
 	@echo "Host prerequisites (one-time):"
 	@echo "  - OVMF firmware (Debian/Ubuntu): apt install ovmf"
@@ -1418,10 +1456,10 @@ help:
 	@echo "      * host tools (build-tool, cmd-stub-gen)"
 	@echo "      * nt61-kernel for x86_64 / aarch64 / riscv64 / loongarch64"
 	@echo "      * nt61-boot + nt61-winload for x86_64 UEFI"
-	@echo "      * 4 image formats (fat32 / ntfs / ext4 / iso)"
+	@echo "      * 7 containers (ntfs / fat32 / ext4 / refs / qcow2 / ramfs / iso)"
 	@echo "    Returns non-zero exit on the first warning/error."
 	@echo ""
-	@echo "Run targets (all 16 arch x format combos):"
+	@echo "Run targets (all 28 arch x format combos):"
 	@echo "  make run-x86_64-ntfs     - x86_64  + NTFS (GUI)"
 	@echo "  make run-x86_64-fat32    - x86_64  + FAT32 (GUI)"
 	@echo "  make run-x86_64-ext4     - x86_64  + EXT4 (GUI)"
@@ -1457,7 +1495,7 @@ help:
 	@echo "Multi-arch serial smoke tests (headless, with timeout):"
 	@echo "  make test-all-fs-qemu        # 4 arches × {fat32,ntfs,ext4}, per-FS"
 	@echo "  make test-arches-fs-qemu     # 4 arches × {fat32,ntfs,ext4}, per-arch"
-	@echo "  make test-all-qemu           # 4 arches × 4 formats (ISO included)"
+	@echo "  make test-all-qemu           # 4 arches × 7 containers; desktop checks"
 	@echo "  BOOT_TIMEOUT=<seconds> overrides the 35 s default watchdog."
 	@echo ""
 	@echo "Or use generic run with parameters:"
@@ -1480,9 +1518,11 @@ help:
 	@echo "  make test-qemu         - Run QEMU smoke tests (x86_64/ntfs, 120 s timeout)"
 	@echo "  make test-all-fs-qemu   - 4 arches × {fat32,ntfs,ext4} (headless, default 35 s)"
 	@echo "  make test-arches-fs-qemu - 4 arches × {fat32,ntfs,ext4} (per-arch grouping)"
-	@echo "  make test-all-qemu      - 4 arches × {fat32,ntfs,ext4,iso}"
+	@echo "  make test-all-qemu      - 4 arches × 7 containers; full desktop checks"
 	@echo ""
 	@echo "Examples:"
+	@echo "  make run loongarch64       # same as make run ARCH=loongarch64"
+	@echo "  make run riscv64          # same as make run ARCH=riscv64"
 	@echo "  make run-x86_64-iso"
 	@echo "  make run-aarch64-fat32"
 	@echo "  make run-riscv64-ntfs"
