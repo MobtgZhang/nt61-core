@@ -46,7 +46,7 @@ pub fn decode_bmp(bytes: &[u8]) -> Result<Image, DecodeError> {
     }
     let height = stored_height as usize;
     let width = width as usize;
-    let pixel_stride = ((width * bit_count as usize + 31) / 32) * 4;
+    let pixel_stride = (width * bit_count as usize).div_ceil(32) * 4;
     let mut pixels = alloc::vec![0u8; width * height * 4];
     for source_row in 0..height {
         let destination_row = (height - source_row - 1) * width * 4;

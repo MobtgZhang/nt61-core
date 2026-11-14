@@ -157,7 +157,7 @@ impl Session {
     }
 
     pub fn create_window(&mut self, class: &str, title: &str, rect: Rect) -> WindowHandle {
-        let index = self.next_handle.min(0xFFFF) as u32;
+        let index = self.next_handle.min(0xFFFF);
         self.next_handle += 1;
         let handle = WindowHandle(0x0100_0000 | index);
         let next_z = self.windows.last().map_or(1, |window| window.z_order + 1);
@@ -543,9 +543,8 @@ mod tests {
         assert_eq!(message.kind, WM_LBUTTONDOWN);
         assert_eq!(session.pop_message().unwrap().window, top);
         session.destroy_window(top);
-        assert_eq!(
-            session.queue.iter().any(|message| message.window == top),
-            false
+        assert!(
+            !session.queue.iter().any(|message| message.window == top)
         );
     }
 

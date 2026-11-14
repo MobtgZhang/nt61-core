@@ -67,7 +67,7 @@ impl ControlWindow {
         self.controls.push(Control {
             id,
             kind: ControlKind::List,
-            text: items.join("|").into(),
+            text: items.join("|"),
             enabled: true,
             checked: false,
             selected: false,

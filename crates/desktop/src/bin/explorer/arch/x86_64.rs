@@ -84,7 +84,7 @@ pub unsafe fn draw_text(
         x as usize,
         y as usize,
         (((foreground as u64) << 32) | background as u64) as usize,
-    ) as u64
+    )
 }
 
 /// # Safety

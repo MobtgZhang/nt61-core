@@ -39,6 +39,24 @@ impl Rect {
     }
 }
 
+impl Rect {
+    pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x
+            && x < self.x.saturating_add(self.width as i32)
+            && y >= self.y
+            && y < self.y.saturating_add(self.height as i32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,23 +75,5 @@ mod tests {
             Rect::new(0, 0, 2, 2).translate(-10, -10),
             Rect::new(-10, -10, 2, 2)
         );
-    }
-}
-
-impl Rect {
-    pub fn new(x: i32, y: i32, width: u32, height: u32) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    pub fn contains(&self, x: i32, y: i32) -> bool {
-        x >= self.x
-            && x < self.x.saturating_add(self.width as i32)
-            && y >= self.y
-            && y < self.y.saturating_add(self.height as i32)
     }
 }

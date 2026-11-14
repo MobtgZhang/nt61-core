@@ -45,6 +45,12 @@ impl DamageTracker {
     }
 }
 
+impl Default for DamageTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
