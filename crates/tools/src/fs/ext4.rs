@@ -38,7 +38,8 @@ pub const SUPERBLOCK_OFFSET: u64 = 1024;
 
 /// EXT4 Feature Incompat flags
 pub const EXT3_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
-pub const EXT4_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0020;
+pub const EXT4_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200;
+pub const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 pub const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
 
 /// EXT4 Feature Ro Compat flags
@@ -295,7 +296,7 @@ impl Ext4Image {
         }
 
         let total_blocks = (size_mb as u64) * 1024 * 1024 / (block_size as u64);
-        let blocks_per_group = 32768; // Standard for ext4
+        let blocks_per_group = block_size * 8; // One block bitmap per group
         let inodes_per_group = blocks_per_group / 8;
         let inode_size: u16 = 256; // Standard for ext4
 
@@ -375,11 +376,7 @@ impl Ext4Image {
         // - 4096-byte blocks: superblock at byte 1024 of block 0, BGDT at block 1
         // In practice: BGDT at block first_data_block + 1 (for non-1024 blocks)
         // and at block first_data_block + 2 for 1024 blocks.
-        let bgdt_block = if block_size == 1024 {
-            first_data_block + 2
-        } else {
-            first_data_block + 1
-        };
+        let bgdt_block = first_data_block + 1;
         let bgdt_off = (bgdt_block as usize) * (block_size as usize);
         if bgdt_off + 32 > data.len() {
             return Err(BuildError::Ext4Error("BGDT past end of image".into()));
@@ -389,7 +386,7 @@ impl Ext4Image {
         let bg0 = &data[bgdt_off..bgdt_off + 64];
         let block_bitmap_lo = u32::from_le_bytes([bg0[0], bg0[1], bg0[2], bg0[3]]);
         let inode_bitmap_lo = u32::from_le_bytes([bg0[4], bg0[5], bg0[6], bg0[7]]);
-        let inode_table_lo = u32::from_le_bytes([bg0[8], bg0[9], bg0[10], bg0[11]]);
+        let _inode_table_lo = u32::from_le_bytes([bg0[8], bg0[9], bg0[10], bg0[11]]);
         let _ = block_bitmap_lo;
         let _ = inode_bitmap_lo;
 
@@ -398,10 +395,13 @@ impl Ext4Image {
             if ino == 0 || ino > inodes_count {
                 return None;
             }
-            let _group = (ino - 1) / inodes_per_group;
+            let group = (ino - 1) / inodes_per_group;
             let local = (ino - 1) % inodes_per_group;
-            let inode_off = (inode_table_lo as usize) * (block_size as usize)
-                + (local as usize) * (inode_size as usize);
+            let desc_offset = bgdt_off + group as usize * 32;
+            let desc = data.get(desc_offset..desc_offset + 32)?;
+            let table = u32::from_le_bytes(desc[8..12].try_into().ok()?);
+            let inode_off =
+                (table as usize) * (block_size as usize) + (local as usize) * (inode_size as usize);
             if inode_off + inode_size as usize > data.len() {
                 return None;
             }
@@ -539,16 +539,14 @@ impl Ext4Image {
         let mut level: &Vec<FileEntry> = &self.parsed_root;
         for p in parts {
             let found = level.iter().find(|e| e.name == *p);
-            match found {
-                Some(e) => {
-                    cur = Some(e);
-                    if e.is_dir {
-                        level = &e.children;
-                    } else {
-                        return cur;
-                    }
+            {
+                let e = found?;
+                cur = Some(e);
+                if e.is_dir {
+                    level = &e.children;
+                } else {
+                    return cur;
                 }
-                None => return None,
             }
         }
         cur
@@ -713,12 +711,8 @@ impl Ext4Image {
             s_inode_size: self.inode_size,
             s_block_group_nr: 0,
             s_features_compat: 0,
-            s_features_incompat: EXT3_FEATURE_INCOMPAT_FILETYPE
-                | EXT4_FEATURE_INCOMPAT_FLEX_BG
-                | EXT4_FEATURE_INCOMPAT_64BIT,
-            s_features_ro_compat: EXT4_FEATURE_RO_COMPAT_GDT_CSUM
-                | EXT4_FEATURE_RO_COMPAT_DIR_NLINK
-                | EXT4_FEATURE_RO_COMPAT_SPARSESUPER2,
+            s_features_incompat: EXT3_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_EXTENTS,
+            s_features_ro_compat: 0, // Superblock/GDT backups in every group; no checksums.
             s_uuid: [0; 16],
             s_volume_name: [0; 16],
             s_last_mounted: [0; 64],
@@ -819,15 +813,18 @@ impl Ext4Image {
         let bs = self.block_size as usize;
         let inodes_per_group = self.inodes_per_group as usize;
 
-        let bgdt_block: u32 = 1;
-        let block_bitmap_block: u32 = 2;
-        let inode_bitmap_block: u32 = 3;
+        let first_data_block = if bs == 1024 { 1 } else { 0 };
+        let groups = (self.total_blocks as usize - first_data_block)
+            .div_ceil(self.blocks_per_group as usize);
+        let gdt_blocks = (groups * 32).div_ceil(bs);
+        let table_blocks = (inodes_per_group * 256).div_ceil(bs);
+        let metadata_blocks = 1 + gdt_blocks + 2 + table_blocks;
 
         // Pass 1: DFS through parsed_root assigning inodes.
         let mut allocs: Vec<Ext4Alloc> = Vec::new();
         // Build root (inode 2) dir_block up front so we have patches for it.
         let root_children_refs: Vec<&FileEntry> = self.parsed_root.iter().collect();
-        let (root_dir_block, root_patches) = build_dir_block(&root_children_refs, 2, 2);
+        let (root_dir_block, root_patches) = build_dir_block(&root_children_refs, 2, 2, bs);
         allocs.push(Ext4Alloc {
             ino: 2,
             is_dir: true,
@@ -835,10 +832,9 @@ impl Ext4Image {
             children: Vec::new(),
             dir_block: root_dir_block,
             patches: root_patches,
-            first_block: 0,
-            blocks_in_file: 0,
+            extents: Vec::new(),
         });
-        let mut next_ino: u32 = 3;
+        let mut next_ino: u32 = 11;
         let mut stack: Vec<(usize, &FileEntry)> = Vec::new();
         for child in self.parsed_root.iter().rev() {
             stack.push((0, child));
@@ -858,12 +854,12 @@ impl Ext4Image {
                 children: Vec::new(),
                 dir_block: Vec::new(),
                 patches: Vec::new(),
-                first_block: 0,
-                blocks_in_file: 0,
+                extents: Vec::new(),
             };
             if entry.is_dir {
                 let children_refs: Vec<&FileEntry> = entry.children.iter().collect();
-                let (buf, patches) = build_dir_block(&children_refs, ino, allocs[parent_idx].ino);
+                let (buf, patches) =
+                    build_dir_block(&children_refs, ino, allocs[parent_idx].ino, bs);
                 alloc.dir_block = buf;
                 alloc.patches = patches;
             }
@@ -874,28 +870,54 @@ impl Ext4Image {
             }
         }
 
-        // Pass 2: assign data blocks. Inode table comes first.
-        let total_inodes = (next_ino as usize + 32).max(inodes_per_group);
-        let inode_table_blocks = (total_inodes * 256).div_ceil(bs);
-        let inode_table_start: u32 = 4;
-        let mut data_block: u32 = inode_table_start + inode_table_blocks as u32;
-        for alloc in allocs.iter_mut() {
-            let data = if alloc.is_dir {
-                &alloc.dir_block
-            } else {
-                &alloc.data
-            };
-            if data.is_empty() {
-                alloc.first_block = 0;
-                alloc.blocks_in_file = 0;
-                continue;
-            }
-            alloc.first_block = data_block;
-            let blocks = data.len().div_ceil(bs) as u32;
-            alloc.blocks_in_file = blocks;
-            data_block += blocks;
+        if next_ino as usize > groups * inodes_per_group {
+            return Err(BuildError::Ext4Error("inode table is full".into()));
         }
-        let total_used = data_block;
+        // Reserve superblock, GDT, bitmaps and inode table in every group.
+        // Allocate only the remaining blocks; extents may cross group boundaries.
+        let mut used = vec![false; self.total_blocks as usize];
+        let mut cursor = first_data_block + metadata_blocks;
+        for group in 0..groups {
+            let start = first_data_block + group * self.blocks_per_group as usize;
+            if start + metadata_blocks > used.len() {
+                return Err(BuildError::Ext4Error(
+                    "last block group is too small".into(),
+                ));
+            }
+            used[start..start + metadata_blocks].fill(true);
+        }
+        for alloc in &mut allocs {
+            let length = if alloc.is_dir {
+                alloc.dir_block.len()
+            } else {
+                alloc.data.len()
+            };
+            let mut remaining = length.div_ceil(bs);
+            let mut logical = 0u32;
+            while remaining > 0 {
+                while cursor < used.len() && used[cursor] {
+                    cursor += 1;
+                }
+                let start = cursor;
+                while cursor < used.len() && !used[cursor] && cursor - start < remaining.min(32768)
+                {
+                    cursor += 1;
+                }
+                let count = cursor - start;
+                if count == 0 {
+                    return Err(BuildError::Ext4Error("volume is full".into()));
+                }
+                used[start..cursor].fill(true);
+                alloc.extents.push((logical, start as u32, count as u16));
+                logical += count as u32;
+                remaining -= count;
+            }
+            if alloc.extents.len() > 4 {
+                return Err(BuildError::Ext4Error(
+                    "file requires more than four extents".into(),
+                ));
+            }
+        }
 
         // Pass 3: patch child inode numbers into parent dir blocks.
         for alloc_idx in 0..allocs.len() {
@@ -908,83 +930,88 @@ impl Ext4Image {
             }
         }
 
-        // Build superblock.
         let mut superblock = self.build_superblock();
-        let free_blocks = (self.total_blocks as u32).saturating_sub(total_used);
-        let free_inodes = (inodes_per_group as u32).saturating_sub(next_ino);
-        superblock.s_free_blocks_count_lo = free_blocks;
-        superblock.s_free_inodes_count = free_inodes;
-        superblock.s_first_data_block = 0;
-        superblock.s_blocks_count_lo = self.total_blocks as u32;
-
-        // Build bitmaps.
-        let mut block_bitmap = vec![0u8; bs];
-        for b in 0..total_used {
-            set_bit(&mut block_bitmap, b);
-        }
-        let mut inode_bitmap = vec![0u8; bs];
-        set_bit(&mut inode_bitmap, 1);
-        for alloc in &allocs {
-            set_bit(&mut inode_bitmap, alloc.ino);
-        }
-
-        // Build BGDT (32-byte entry).
-        let mut bgdt = vec![0u8; 32];
-        bgdt[0..4].copy_from_slice(&block_bitmap_block.to_le_bytes());
-        bgdt[4..8].copy_from_slice(&inode_bitmap_block.to_le_bytes());
-        bgdt[8..12].copy_from_slice(&inode_table_start.to_le_bytes());
-
-        // Build inode table.
-        let mut inode_table = vec![0u8; inode_table_blocks * bs];
-        for alloc in &allocs {
-            let local = (alloc.ino - 1) as usize;
-            let off = local * 256;
-            if off + 256 > inode_table.len() {
-                continue;
-            }
-            let content = if alloc.is_dir {
-                build_inode_bytes_dir(
-                    0o755,
-                    alloc.dir_block.len() as u32,
-                    alloc.first_block,
-                    alloc.blocks_in_file,
-                )
-            } else {
-                build_inode_bytes_file(
-                    0o644,
-                    alloc.data.len() as u32,
-                    alloc.first_block,
-                    alloc.blocks_in_file,
-                )
-            };
-            inode_table[off..off + content.len().min(256)]
-                .copy_from_slice(&content[..content.len().min(256)]);
-        }
-
-        // Assemble the image.
+        superblock.s_first_data_block = first_data_block as u32;
+        superblock.s_inodes_count = (groups * inodes_per_group) as u32;
+        superblock.s_free_blocks_count_lo =
+            used[first_data_block..].iter().filter(|&&b| !b).count() as u32;
+        superblock.s_free_inodes_count = superblock.s_inodes_count - (next_ino - 1);
         let mut image = vec![0u8; total_size];
-        let sb_bytes = superblock.as_bytes();
-        image[SUPERBLOCK_OFFSET as usize..SUPERBLOCK_OFFSET as usize + sb_bytes.len()]
-            .copy_from_slice(&sb_bytes);
-        let bgdt_off = (bgdt_block as usize) * bs;
-        image[bgdt_off..bgdt_off + bgdt.len()].copy_from_slice(&bgdt);
-        let bb_off = (block_bitmap_block as usize) * bs;
-        image[bb_off..bb_off + block_bitmap.len()].copy_from_slice(&block_bitmap);
-        let ib_off = (inode_bitmap_block as usize) * bs;
-        image[ib_off..ib_off + inode_bitmap.len()].copy_from_slice(&inode_bitmap);
-        let it_off = (inode_table_start as usize) * bs;
-        image[it_off..it_off + inode_table.len()].copy_from_slice(&inode_table);
+        let mut bgdt = vec![0u8; gdt_blocks * bs];
+        for group in 0..groups {
+            let start = first_data_block + group * self.blocks_per_group as usize;
+            let end = (start + self.blocks_per_group as usize).min(used.len());
+            let bitmap = start + 1 + gdt_blocks;
+            let inode_bitmap = bitmap + 1;
+            let table = inode_bitmap + 1;
+            let desc = &mut bgdt[group * 32..group * 32 + 32];
+            desc[..4].copy_from_slice(&(bitmap as u32).to_le_bytes());
+            desc[4..8].copy_from_slice(&(inode_bitmap as u32).to_le_bytes());
+            desc[8..12].copy_from_slice(&(table as u32).to_le_bytes());
+            let free_blocks = used[start..end].iter().filter(|&&b| !b).count() as u16;
+            let first_inode = group * inodes_per_group + 1;
+            let allocated_inodes = (next_ino as usize)
+                .saturating_sub(first_inode)
+                .min(inodes_per_group);
+            let directories = allocs
+                .iter()
+                .filter(|a| a.is_dir && (a.ino as usize - 1) / inodes_per_group == group)
+                .count();
+            desc[12..14].copy_from_slice(&free_blocks.to_le_bytes());
+            desc[14..16]
+                .copy_from_slice(&((inodes_per_group - allocated_inodes) as u16).to_le_bytes());
+            desc[16..18].copy_from_slice(&(directories as u16).to_le_bytes());
+            let block_bitmap = &mut image[bitmap * bs..(bitmap + 1) * bs];
+            for bit in 0..bs * 8 {
+                if start + bit >= end || used[start + bit] {
+                    set_bit(block_bitmap, bit as u32);
+                }
+            }
+            let inode_bitmap = &mut image[inode_bitmap * bs..(inode_bitmap + 1) * bs];
+            for bit in 0..bs * 8 {
+                if bit < allocated_inodes || bit >= inodes_per_group {
+                    set_bit(inode_bitmap, bit as u32);
+                }
+            }
+        }
         for alloc in &allocs {
-            let data = if alloc.is_dir {
+            let content = if alloc.is_dir {
                 &alloc.dir_block
             } else {
                 &alloc.data
             };
-            if data.is_empty() {
-                continue;
+            let links = if alloc.is_dir {
+                2 + alloc.children.iter().filter(|&&i| allocs[i].is_dir).count() as u16
+            } else {
+                1
+            };
+            let inode = build_inode_bytes(
+                if alloc.is_dir { 0x41ed } else { 0x81a4 },
+                content.len() as u32,
+                links,
+                &alloc.extents,
+                bs,
+            );
+            let group = (alloc.ino as usize - 1) / inodes_per_group;
+            let local = (alloc.ino as usize - 1) % inodes_per_group;
+            let table = first_data_block + group * self.blocks_per_group as usize + 3 + gdt_blocks;
+            let off = table * bs + local * 256;
+            image[off..off + 256].copy_from_slice(&inode);
+            for &(logical, physical, count) in &alloc.extents {
+                let begin = logical as usize * bs;
+                let end = (begin + count as usize * bs).min(content.len());
+                let off = physical as usize * bs;
+                image[off..off + end - begin].copy_from_slice(&content[begin..end]);
             }
-            let off = (alloc.first_block as usize) * bs;
-            image[off..off + data.len()].copy_from_slice(data);
+        }
+        // Keep each backup superblock's group number accurate and copy the full GDT.
+        for group in 0..groups {
+            let start = first_data_block + group * self.blocks_per_group as usize;
+            superblock.s_block_group_nr = group as u16;
+            let off = if group == 0 { 1024 } else { start * bs };
+            let sb_bytes = superblock.as_bytes();
+            image[off..off + sb_bytes.len()].copy_from_slice(&sb_bytes);
+            image[(start + 1) * bs..(start + 1) * bs + bgdt.len()].copy_from_slice(&bgdt);
         }
 
         Ok(image)
@@ -1120,98 +1147,50 @@ fn parse_inode_recursive(
     }
 }
 
-/// Walk an inode's `i_block` array as an extent tree and return the
-/// flattened `(logical, physical, length)` triples that
-/// `parse_inode_recursive` feeds back to `read_data`. Tree depth > 2
-/// (i.e. interior nodes with index entries pointing at intermediate
-/// L2 tables) is intentionally unsupported — the project's ext4
-/// generator never emits that layout.
+/// Flatten standard inline extent roots and external nodes, with bounded depth.
 fn walk_extents(data: &[u8], bs: u32, i_block: &[u32; 15]) -> Vec<(u32, u32, u16)> {
+    fn walk(data: &[u8], bs: usize, node: &[u8], remaining: u16, out: &mut Vec<(u32, u32, u16)>) {
+        if node.len() < 12 || remaining > 5 {
+            return;
+        }
+        let word = |i| u16::from_le_bytes([node[i], node[i + 1]]);
+        let count = word(2) as usize;
+        let depth = word(6);
+        if word(0) != 0xf30a
+            || depth > remaining
+            || count > word(4) as usize
+            || count > (node.len() - 12) / 12
+        {
+            return;
+        }
+        for entry in node[12..12 + count * 12].chunks_exact(12) {
+            let logical = u32::from_le_bytes(entry[..4].try_into().unwrap());
+            if depth == 0 {
+                let length = u16::from_le_bytes(entry[4..6].try_into().unwrap());
+                let high = u16::from_le_bytes(entry[6..8].try_into().unwrap());
+                let physical = u32::from_le_bytes(entry[8..12].try_into().unwrap());
+                if length > 0 && length <= 32768 && high == 0 {
+                    out.push((logical, physical, length));
+                }
+            } else {
+                let low = u32::from_le_bytes(entry[4..8].try_into().unwrap());
+                let high = u16::from_le_bytes(entry[8..10].try_into().unwrap());
+                let offset = ((high as u64) << 32 | low as u64).checked_mul(bs as u64);
+                if let Some(child) = offset
+                    .and_then(|o| usize::try_from(o).ok())
+                    .and_then(|o| o.checked_add(bs).and_then(|end| data.get(o..end)))
+                {
+                    walk(data, bs, child, depth - 1, out);
+                }
+            }
+        }
+    }
+    let mut root = Vec::with_capacity(60);
+    for word in i_block {
+        root.extend_from_slice(&word.to_le_bytes());
+    }
     let mut out = Vec::new();
-    if i_block[0] == 0 {
-        return out;
-    }
-    let hdr_off = (i_block[0] as usize) * (bs as usize);
-    if hdr_off + 12 > data.len() {
-        return out;
-    }
-    let hdr = &data[hdr_off..hdr_off + 12];
-    let eh_magic = u16::from_le_bytes([hdr[0], hdr[1]]);
-    if eh_magic != 0xF30A {
-        return out;
-    }
-    let eh_entries = u16::from_le_bytes([hdr[2], hdr[3]]);
-    let eh_max = u16::from_le_bytes([hdr[4], hdr[5]]);
-    let eh_depth = u16::from_le_bytes([hdr[6], hdr[7]]);
-    if eh_depth == 0 {
-        // All entries are leaf extents.
-        for i in 0..eh_entries as usize {
-            let idx = 3 + i;
-            if idx + 2 >= 15 {
-                break;
-            }
-            let word1 = i_block[idx];
-            let word2 = i_block[idx + 1];
-            let ee_block = word1 & 0xFFFF;
-            let ee_len = ((word1 >> 16) & 0xFFFF) as u16;
-            let ee_start = ((word2 & 0xFFFF) << 16) | (word2 >> 16);
-            if ee_len == 0 {
-                break;
-            }
-            out.push((ee_block, ee_start, ee_len));
-        }
-    } else {
-        // Each entry is an Ext4ExtentIdx pointing to an L2 block.
-        for i in 0..eh_entries as usize {
-            let idx = 3 + i;
-            if idx + 2 >= 15 {
-                break;
-            }
-            let word = i_block[idx];
-            let ei_block = word & 0xFFFF;
-            let ei_leaf_lo = word >> 16;
-            let ei_leaf_hi = i_block[idx + 1];
-            let leaf_block = (ei_leaf_hi << 16) | ei_leaf_lo;
-            let leaf_off = (leaf_block as usize) * (bs as usize);
-            if leaf_off + 12 > data.len() {
-                continue;
-            }
-            // Parse leaf extent header at leaf_off.
-            let leaf_hdr = &data[leaf_off..leaf_off + 12];
-            let lh_magic = u16::from_le_bytes([leaf_hdr[0], leaf_hdr[1]]);
-            if lh_magic != 0xF30A {
-                continue;
-            }
-            let lh_entries = u16::from_le_bytes([leaf_hdr[2], leaf_hdr[3]]);
-            for j in 0..lh_entries as usize {
-                let e_off = leaf_off + 12 + j * 12;
-                if e_off + 12 > data.len() {
-                    break;
-                }
-                let e_word1 = u32::from_le_bytes([
-                    data[e_off],
-                    data[e_off + 1],
-                    data[e_off + 2],
-                    data[e_off + 3],
-                ]);
-                let e_word2 = u32::from_le_bytes([
-                    data[e_off + 4],
-                    data[e_off + 5],
-                    data[e_off + 6],
-                    data[e_off + 7],
-                ]);
-                let ee_block = e_word1 & 0xFFFF;
-                let ee_len = ((e_word1 >> 16) & 0xFFFF) as u16;
-                let ee_start = ((e_word2 & 0xFFFF) << 16) | (e_word2 >> 16);
-                let logical = ei_block + ee_block;
-                if ee_len == 0 {
-                    break;
-                }
-                out.push((logical, ee_start, ee_len));
-            }
-        }
-    }
-    let _ = eh_max;
+    walk(data, bs as usize, &root, 5, &mut out);
     out
 }
 
@@ -1242,52 +1221,30 @@ fn dir_entry_bytes(
     e
 }
 
-/// Build a directory inode (256 bytes).
-fn build_inode_bytes_dir(mode: u16, size: u32, first_block: u32, blocks_in_file: u32) -> Vec<u8> {
-    let mut b = vec![0u8; 256];
-    b[0..2].copy_from_slice(&mode.to_le_bytes());
-    b[2..4].copy_from_slice(&0u16.to_le_bytes());
-    b[4..8].copy_from_slice(&size.to_le_bytes());
-    b[8..12].copy_from_slice(&0u32.to_le_bytes());
-    b[12..16].copy_from_slice(&0u32.to_le_bytes());
-    b[16..20].copy_from_slice(&0u32.to_le_bytes());
-    b[20..24].copy_from_slice(&0u32.to_le_bytes());
-    b[24..26].copy_from_slice(&0u16.to_le_bytes());
-    b[26..28].copy_from_slice(&2u16.to_le_bytes());
-    b[28..32].copy_from_slice(&(blocks_in_file * 8u32).to_le_bytes());
-    b[32..36].copy_from_slice(&0u32.to_le_bytes());
-    let entries: u16 = if blocks_in_file > 0 { 1 } else { 0 };
-    b[40..44].copy_from_slice(&((0xF30A) | ((entries as u32) << 16)).to_le_bytes());
-    b[44..48].copy_from_slice(&0u32.to_le_bytes());
-    b[48..52].copy_from_slice(&0u32.to_le_bytes());
-    b[52..56].copy_from_slice(&0u32.to_le_bytes());
-    b[56..60].copy_from_slice(&blocks_in_file.to_le_bytes());
-    b[60..64].copy_from_slice(&first_block.to_le_bytes());
-    b
-}
-
-/// Build a file inode (256 bytes).
-fn build_inode_bytes_file(mode: u16, size: u32, first_block: u32, blocks_in_file: u32) -> Vec<u8> {
-    let mut b = vec![0u8; 256];
-    b[0..2].copy_from_slice(&mode.to_le_bytes());
-    b[2..4].copy_from_slice(&0u16.to_le_bytes());
-    b[4..8].copy_from_slice(&size.to_le_bytes());
-    b[8..12].copy_from_slice(&0u32.to_le_bytes());
-    b[12..16].copy_from_slice(&0u32.to_le_bytes());
-    b[16..20].copy_from_slice(&0u32.to_le_bytes());
-    b[20..24].copy_from_slice(&0u32.to_le_bytes());
-    b[24..26].copy_from_slice(&0u16.to_le_bytes());
-    b[26..28].copy_from_slice(&1u16.to_le_bytes());
-    b[28..32].copy_from_slice(&(blocks_in_file * 8u32).to_le_bytes());
-    b[32..36].copy_from_slice(&0u32.to_le_bytes());
-    let entries: u16 = if blocks_in_file > 0 { 1 } else { 0 };
-    b[40..44].copy_from_slice(&((0xF30A) | ((entries as u32) << 16)).to_le_bytes());
-    b[44..48].copy_from_slice(&0u32.to_le_bytes());
-    b[48..52].copy_from_slice(&0u32.to_le_bytes());
-    b[52..56].copy_from_slice(&0u32.to_le_bytes());
-    b[56..60].copy_from_slice(&blocks_in_file.to_le_bytes());
-    b[60..64].copy_from_slice(&first_block.to_le_bytes());
-    b
+/// Standard 256-byte inode with an inline extent root (four entries maximum).
+fn build_inode_bytes(
+    mode: u16,
+    size: u32,
+    links: u16,
+    extents: &[(u32, u32, u16)],
+    bs: usize,
+) -> Vec<u8> {
+    let mut bytes = vec![0; 256];
+    bytes[..2].copy_from_slice(&mode.to_le_bytes());
+    bytes[4..8].copy_from_slice(&size.to_le_bytes());
+    bytes[26..28].copy_from_slice(&links.to_le_bytes());
+    let sectors: u32 = extents.iter().map(|e| e.2 as u32 * (bs as u32 / 512)).sum();
+    bytes[28..32].copy_from_slice(&sectors.to_le_bytes());
+    bytes[32..36].copy_from_slice(&0x80000u32.to_le_bytes());
+    bytes[40..42].copy_from_slice(&0xf30au16.to_le_bytes());
+    bytes[42..44].copy_from_slice(&(extents.len() as u16).to_le_bytes());
+    bytes[44..46].copy_from_slice(&4u16.to_le_bytes());
+    for (entry, &(logical, physical, count)) in bytes[52..100].chunks_exact_mut(12).zip(extents) {
+        entry[..4].copy_from_slice(&logical.to_le_bytes());
+        entry[4..6].copy_from_slice(&count.to_le_bytes());
+        entry[8..12].copy_from_slice(&physical.to_le_bytes());
+    }
+    bytes
 }
 
 fn set_bit(bitmap: &mut [u8], idx: u32) {
@@ -1310,8 +1267,7 @@ struct Ext4Alloc {
     /// known.
     dir_block: Vec<u8>,
     patches: Vec<(usize, u32)>,
-    first_block: u32,
-    blocks_in_file: u32,
+    extents: Vec<(u32, u32, u16)>,
 }
 
 /// Build the directory entry block for a directory that owns `children`.
@@ -1322,28 +1278,41 @@ fn build_dir_block(
     children: &[&FileEntry],
     self_ino: u32,
     parent_ino: u32,
+    bs: usize,
 ) -> (Vec<u8>, Vec<(usize, u32)>) {
     let mut buf = Vec::new();
     let mut patches = Vec::new();
-    buf.extend_from_slice(&dir_entry_bytes(self_ino, EXT4_FT_DIR, 12, ".", 1));
-    buf.extend_from_slice(&dir_entry_bytes(parent_ino, EXT4_FT_DIR, 12, "..", 2));
-    for c in children {
-        let ft = if c.is_dir {
-            EXT4_FT_DIR
-        } else {
-            EXT4_FT_REG_FILE
-        };
-        let name = c.name.clone();
-        let actual_rec_len = 8 + name.len();
-        let rec_len = actual_rec_len.div_ceil(4) * 4;
-        let entry_off = buf.len();
-        buf.extend_from_slice(&dir_entry_bytes(0, ft, rec_len as u16, &name, name.len()));
-        patches.push((entry_off, 0));
+    let mut previous = 0;
+    let mut append = |inode: u32, ft: u8, name: &str| {
+        let length = (8 + name.len()).div_ceil(4) * 4;
+        if buf.len() % bs + length > bs {
+            let end = buf.len().div_ceil(bs) * bs;
+            buf[previous + 4..previous + 6]
+                .copy_from_slice(&((end - previous) as u16).to_le_bytes());
+            buf.resize(end, 0);
+        }
+        let off = buf.len();
+        buf.extend_from_slice(&dir_entry_bytes(inode, ft, length as u16, name, name.len()));
+        previous = off;
+        off
+    };
+    append(self_ino, EXT4_FT_DIR, ".");
+    append(parent_ino, EXT4_FT_DIR, "..");
+    for child in children {
+        let off = append(
+            0,
+            if child.is_dir {
+                EXT4_FT_DIR
+            } else {
+                EXT4_FT_REG_FILE
+            },
+            &child.name,
+        );
+        patches.push((off, 0));
     }
-    let pad_to = buf.len().div_ceil(4) * 4;
-    if pad_to > buf.len() {
-        buf.resize(pad_to, 0);
-    }
+    let end = buf.len().div_ceil(bs) * bs;
+    buf[previous + 4..previous + 6].copy_from_slice(&((end - previous) as u16).to_le_bytes());
+    buf.resize(end, 0);
     (buf, patches)
 }
 
@@ -1507,5 +1476,61 @@ mod tests {
     fn test_invalid_block_size() {
         let result = Ext4Image::new(64, 8192);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn standard_ext4_roundtrip_and_external_filesystem_check() {
+        for bs in [1024, 2048, 4096] {
+            let mut image = Ext4Image::new(32, bs).unwrap();
+            // More than one directory block, plus file data crossing a group boundary.
+            for i in 0..90 {
+                image
+                    .write_file_path(&format!("/Windows/System32/component_{i:03}.dll"), b"MZ")
+                    .unwrap();
+            }
+            let content: Vec<u8> = (0..10_000_000).map(|i| (i % 251) as u8).collect();
+            image
+                .write_file_path("/Windows/System32/winlogon.exe", &content)
+                .unwrap();
+            let bytes = image.finalize().unwrap();
+            let parsed = Ext4Image::from_bytes(&bytes).unwrap();
+            assert_eq!(
+                parsed
+                    .find_parsed(&["Windows", "System32", "winlogon.exe"])
+                    .unwrap()
+                    .data,
+                content
+            );
+            assert_eq!(
+                parsed
+                    .find_parsed(&["Windows", "System32"])
+                    .unwrap()
+                    .children
+                    .len(),
+                91
+            );
+            // An independent filesystem implementation checks allocation and inode metadata.
+            if std::process::Command::new("e2fsck")
+                .arg("-V")
+                .output()
+                .is_ok()
+            {
+                let path =
+                    std::env::temp_dir().join(format!("nt61-ext4-{}-{bs}.img", std::process::id()));
+                std::fs::write(&path, &bytes).unwrap();
+                let result = std::process::Command::new("e2fsck")
+                    .args(["-fn"])
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                std::fs::remove_file(&path).unwrap();
+                assert!(
+                    result.status.success(),
+                    "block size {bs}: {}{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
     }
 }

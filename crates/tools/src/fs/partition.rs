@@ -69,10 +69,7 @@ fn try_gpt(data: &[u8]) -> Option<Vec<PartitionInfo>> {
                 break;
             }
         }
-        match found_lba {
-            Some(lba) => lba,
-            None => return None,
-        }
+        found_lba?
     };
 
     // Read GPT header (we know it's at LBA 1 or 2 — read LBA 1 first,
@@ -145,10 +142,7 @@ fn try_gpt(data: &[u8]) -> Option<Vec<PartitionInfo>> {
         let last_lba = u64::from_le_bytes([
             entry[40], entry[41], entry[42], entry[43], entry[44], entry[45], entry[46], entry[47],
         ]);
-        if first_lba == 0 || last_lba < first_lba {
-            return false;
-        }
-        true
+        !(first_lba == 0 || last_lba < first_lba)
     };
 
     // Try the claimed LBA; if that sector doesn't have valid entries, fall back
@@ -227,7 +221,7 @@ fn utf16le_to_string(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .take_while(|u| *u != 0)
         .collect();

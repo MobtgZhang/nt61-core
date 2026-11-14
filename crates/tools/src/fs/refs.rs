@@ -1,7 +1,7 @@
-//! Minimal ReFS image builder used by the host toolchain.
+//! Experimental project volume builder, selected by the historical `refs` flag.
 //!
 //! ReFS is not part of the Windows 7 client profile, but the project keeps an
-//! in-tree reader for its server volume format. This builder writes the boot
+//! in-tree reader for a simplified private format, not Microsoft ReFS. It writes the boot
 //! sector, superblock, and a sequential data area without exposing host-side
 //! read/modify/write semantics.
 
@@ -61,11 +61,23 @@ impl RefsImage {
             ));
         }
         let cluster_size = u32::from(data[13]) * 512;
-        Ok(Self {
-            size_bytes: data.len() as u64,
-            cluster_size,
-            entries: Vec::new(),
-        })
+        let mut image = Self { size_bytes: data.len() as u64, cluster_size, entries: Vec::new() };
+        let table_len = u64::from_le_bytes(data[0x1058..0x1060].try_into().unwrap()) as usize;
+        let end = 0x2000usize.checked_add(table_len).filter(|end| *end <= data.len())
+            .ok_or_else(|| BuildError::ImageCreateFailed("invalid ReFS extension table".into()))?;
+        for entry in data[0x2000..end].chunks_exact(272) {
+            if entry[0] == 0 { break; }
+            let name_len = entry[..256].iter().position(|b| *b == 0).unwrap_or(256);
+            let path = std::str::from_utf8(&entry[..name_len]).map_err(|_| BuildError::ImageCreateFailed("invalid path".into()))?;
+            let start = u64::from_le_bytes(entry[256..264].try_into().unwrap()).checked_mul(512)
+                .and_then(|x| usize::try_from(x).ok()).ok_or_else(|| BuildError::ImageCreateFailed("invalid extent".into()))?;
+            let len = usize::try_from(u64::from_le_bytes(entry[264..272].try_into().unwrap()))
+                .map_err(|_| BuildError::ImageCreateFailed("invalid length".into()))?;
+            let bytes = data.get(start..start.checked_add(len).ok_or_else(|| BuildError::ImageCreateFailed("extent overflow".into()))?)
+                .ok_or_else(|| BuildError::ImageCreateFailed("extent outside volume".into()))?;
+            image.write_path(path, false, bytes)?;
+        }
+        Ok(image)
     }
 
     fn normalize(path: &str) -> String {
@@ -147,7 +159,7 @@ impl RefsImage {
                 children.push(dir_entry);
             }
         }
-        if path != "/" && path != "" && self.entry(path).is_none() {
+        if path != "/" && !path.is_empty() && self.entry(path).is_none() {
             return Err(BuildError::MissingFile(path.to_string()));
         }
         Ok(children)
@@ -197,7 +209,7 @@ impl RefsImage {
         block[20..24].copy_from_slice(&0x0003u32.to_le_bytes());
         block[32..36].copy_from_slice(&512u32.to_le_bytes());
         block[36..40].copy_from_slice(&0u32.to_le_bytes());
-        block[40..44].copy_from_slice(&((self.cluster_size / 512) as u32).to_le_bytes());
+        block[40..44].copy_from_slice(&(self.cluster_size / 512).to_le_bytes());
         block[80..88]
             .copy_from_slice(&(self.size_bytes / u64::from(self.cluster_size)).to_le_bytes());
         let _ = total_sectors;
@@ -216,19 +228,22 @@ impl RefsImage {
         // allows the boot reader to locate files without a full ReFS b-tree
         // parser while remaining consistent with the simplified layout.
         let mut index_buf = Vec::with_capacity(4096);
-        let mut next_cluster = 16u64;
+        let table_bytes = (self.entries.iter().filter(|entry| !entry.is_dir).count() + 1) * 272;
+        image[0x1058..0x1060].copy_from_slice(&(table_bytes as u64).to_le_bytes());
+        let mut next_cluster = (0x2000 + table_bytes as u64).div_ceil(u64::from(self.cluster_size));
         let sectors_per_cluster = u64::from(self.cluster_size / 512);
         let mut file_layout: Vec<(String, u64, u64)> = Vec::new();
         for entry in &self.entries {
             if entry.is_dir {
                 continue;
             }
-            let start_lba = 8 + next_cluster * sectors_per_cluster;
+            let start_lba = next_cluster * sectors_per_cluster;
             let bytes = entry.data.len() as u64;
             let clusters = bytes.div_ceil(u64::from(self.cluster_size)).max(1);
             file_layout.push((entry.path.clone(), start_lba, bytes));
 
             let path_bytes = entry.path.as_bytes();
+            if path_bytes.len() >= 256 { return Err(BuildError::ImageCreateFailed("ReFS extension path exceeds 255 bytes".into())); }
             index_buf.extend_from_slice(path_bytes);
             index_buf.push(0);
             // Pad path to 256 bytes
@@ -304,5 +319,22 @@ impl FsBackend for RefsImage {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn directory_table_larger_than_one_cluster_preserves_every_extent() {
+        let mut volume = RefsImage::new(4, 4096).unwrap();
+        for n in 0..48 {
+            volume.write_file(&format!("Windows/System32/app{n}.exe"), &vec![n as u8; 513+n]).unwrap();
+        }
+        let bytes = volume.finalize().unwrap();
+        let reopened = RefsImage::from_bytes(&bytes).unwrap();
+        for n in 0..48 {
+            assert_eq!(reopened.read_file(&format!("Windows/System32/app{n}.exe")).unwrap(), vec![n as u8; 513+n]);
+        }
     }
 }

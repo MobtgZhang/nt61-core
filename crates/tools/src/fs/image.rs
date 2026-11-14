@@ -1184,8 +1184,8 @@ pub enum DualPartitionFs {
     Fat32EspNtfsSystem,
     /// ESP is FAT32 (mandatory), System partition is EXT4 (Linux-native).
     Fat32EspExt4System,
-    /// ESP is FAT32 (mandatory), System partition uses the project's ReFS
-    /// volume format. ReFS is a server filesystem and is read-only here.
+    /// ESP is FAT32; System uses the project's experimental `refs` format.
+    /// This simplified directory/extent layout is not Microsoft ReFS.
     Fat32EspRefsSystem,
     /// Bootable FAT32 disk used to stage the RAM-backed combined volume.
     Fat32RamFs,
@@ -1204,7 +1204,7 @@ impl DualPartitionFs {
             "ntfs" => Some(DualPartitionFs::Fat32EspNtfsSystem),
             "ext4" => Some(DualPartitionFs::Fat32EspExt4System),
             "refs" => Some(DualPartitionFs::Fat32EspRefsSystem),
-            "ramfs" => Some(DualPartitionFs::Fat32RamFs),
+            "ramfs" | "img" => Some(DualPartitionFs::Fat32RamFs),
             _ => None,
         }
     }

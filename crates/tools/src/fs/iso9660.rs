@@ -278,7 +278,7 @@ impl IsoImage {
             },
             boot_catalog: None,
             boot_catalog_lba: 0,
-            data_start_lba: 19,
+            data_start_lba: 20,
             root_dir_lba: 0,
         })
     }
@@ -415,7 +415,7 @@ impl IsoImage {
             // Boot catalog at sector 18; updated to 19 once boot catalog is set.
             boot_catalog_lba: 0,
             // Data files start at sector 19 (after PVD=16, BootRecord=17, BootCatalog=18).
-            data_start_lba: 19,
+            data_start_lba: 20,
             // Root directory LBA (computed after all files are added).
             root_dir_lba: 0,
         }
@@ -542,26 +542,19 @@ impl IsoImage {
     }
 
     /// Add the El Torito boot catalog. The boot image must have already been
-    /// added via `add_file` at the path "/EFI/BOOT/BOOTX64.EFI" so its LBA
-    /// can be resolved. The catalog sector LBA is fixed at 18.
+    /// added via `add_file` at "/boot/efisys.bin" as a FAT volume.
+    /// The catalog follows the volume descriptor terminator at sector 19.
     pub fn add_boot_catalog(&mut self, _boot_image: &[u8]) -> Result<&mut Self> {
-        // Look up the LBA of the boot manager (BOOTX64.EFI) in the ISO.
-        // This is the PE executable that UEFI will load and execute.
-        let boot_image_lba = self
+        let boot_image = self
             .files
             .iter()
-            .find(|e| e.path == "/EFI/BOOT/BOOTX64.EFI")
-            .map(|e| e.lba)
-            .unwrap_or(19); // fallback
+            .find(|e| e.path.eq_ignore_ascii_case("/boot/efisys.bin"))
+            .ok_or_else(|| BuildError::MissingFile("/boot/efisys.bin".into()))?;
+        let boot_image_lba = boot_image.lba;
 
         // Sector count: number of 512-byte sectors to load.
-        // Must cover the entire bootx64.efi file.
-        let sector_count = self
-            .files
-            .iter()
-            .find(|e| e.path == "/EFI/BOOT/BOOTX64.EFI")
-            .map(|e| e.data.len().div_ceil(512) as u16)
-            .unwrap_or(1);
+        // UEFI uses zero when the FAT image exceeds the 16-bit sector count.
+        let sector_count = u16::try_from(boot_image.data.len().div_ceil(512)).unwrap_or(0);
 
         crate::debug!(
             "[DEBUG ISO] add_boot_catalog: boot_image_lba={} (0x{:X}), files count={}",
@@ -589,7 +582,7 @@ impl IsoImage {
         // field itself) must equal 0 when added to the checksum.
         let mut sum: u32 = 0;
         sum += validation.header_id as u32;
-        sum += validation.platform_id as u32;
+        sum += (validation.platform_id as u32) << 8;
         sum += u16::from_le_bytes(validation.reserved1) as u32;
         for chunk in validation.id_string.chunks(2) {
             let word = u16::from_le_bytes([chunk[0], chunk[1]]);
@@ -606,7 +599,7 @@ impl IsoImage {
         let boot_entry = ElToritoBootEntry {
             boot_indicator: EL_TORITO_BOOT_INDICATOR,
             boot_media_type: 0, // No emulation
-            load_segment: 0x7C0,
+            load_segment: 0,
             system_type: 0, // Same as disk
             unused1: 0,
             sector_count,
@@ -622,14 +615,11 @@ impl IsoImage {
         );
         catalog.extend_from_slice(&boot_bytes);
 
-        // Section header (for extension)
-        catalog.extend_from_slice(&[0x91, 0x00, 0x00, 0x00]);
-        catalog.extend_from_slice(b"FLOPPY EMULATION BOOT CATALOG");
+
         catalog.resize(2048, 0);
 
         self.boot_catalog = Some(catalog);
-        // PVD at sector 16, Boot Record at sector 17, Boot Catalog at sector 18.
-        self.boot_catalog_lba = 18;
+        self.boot_catalog_lba = 19;
 
         Ok(self)
     }
@@ -1040,23 +1030,29 @@ impl IsoImage {
         // System identifier: "EL TORITO SPECIFICATION" padded to 32 bytes
         let spec_str = b"EL TORITO SPECIFICATION         ";
         boot_record[7..39].copy_from_slice(spec_str);
-        boot_record[40..44].copy_from_slice(&self.boot_catalog_lba.to_le_bytes());
+        boot_record[71..75].copy_from_slice(&self.boot_catalog_lba.to_le_bytes());
         image[17 * ISO_SECTOR_SIZE..18 * ISO_SECTOR_SIZE].copy_from_slice(&boot_record);
 
-        // Write Boot Catalog at sector 18
+        // Write Boot Catalog after the volume descriptor sequence.
         if let Some(ref catalog) = self.boot_catalog {
             crate::debug!(
-                "[DEBUG ISO] finalize: writing catalog {} bytes at sector 18",
+                "[DEBUG ISO] finalize: writing catalog {} bytes at sector 19",
                 catalog.len()
             );
             crate::debug!(
                 "[DEBUG ISO] finalize: catalog[32..44]: {:02X?}",
                 &catalog[32..44]
             );
-            image[18 * ISO_SECTOR_SIZE..18 * ISO_SECTOR_SIZE + 2048].copy_from_slice(catalog);
+            image[19 * ISO_SECTOR_SIZE..20 * ISO_SECTOR_SIZE].copy_from_slice(catalog);
         } else {
             crate::debug!("[DEBUG ISO] finalize: NO BOOT CATALOG!");
         }
+
+        let mut terminator = [0u8; 2048];
+        terminator[0] = 255;
+        terminator[1..6].copy_from_slice(ISO_SIGNATURE);
+        terminator[6] = 1;
+        image[18 * ISO_SECTOR_SIZE..19 * ISO_SECTOR_SIZE].copy_from_slice(&terminator);
 
         // Write files
         for entry in &self.files {
@@ -1384,12 +1380,19 @@ mod tests {
     fn test_iso_with_boot() {
         let mut image = IsoImage::new();
         image
-            .add_file("/EFI/BOOT/BOOTX64.EFI", b"Boot data")
+            .add_file("/boot/efisys.bin", b"FAT boot image")
             .unwrap();
         image.add_boot_catalog(b"Boot catalog").unwrap();
 
         let data = image.finalize().unwrap();
-        assert!(data.len() > 0);
+        assert_eq!(&data[17 * 2048 + 71..17 * 2048 + 75], &19u32.to_le_bytes());
+        assert_eq!(&data[18 * 2048..18 * 2048 + 7], b"\xffCD001\x01");
+        let catalog = &data[19 * 2048..20 * 2048];
+        assert_eq!(catalog[1], 0xEF);
+        assert_eq!(catalog[..32].chunks_exact(2).fold(0u16, |sum, p| sum.wrapping_add(u16::from_le_bytes([p[0], p[1]]))), 0);
+        assert_eq!(catalog[32], 0x88);
+        let lba = u32::from_le_bytes(catalog[40..44].try_into().unwrap()) as usize;
+        assert_eq!(&data[lba * 2048..lba * 2048 + 14], b"FAT boot image");
     }
 }
 

@@ -204,16 +204,8 @@ fn decode_sfn(raw: &[u8; 11]) -> String {
 
 /// Decode an LFN sequence (in correct order — first char first) into a String.
 fn decode_lfn(chars: &[u16]) -> String {
-    let mut out = String::new();
-    for &c in chars {
-        if c == 0x0000 || c == 0xFFFF {
-            break;
-        }
-        if let Some(ch) = char::from_u32(c as u32) {
-            out.push(ch);
-        }
-    }
-    out
+    let end = chars.iter().position(|c| matches!(c, 0 | 0xffff)).unwrap_or(chars.len());
+    String::from_utf16_lossy(&chars[..end])
 }
 
 /// Translate (cluster number, BPB layout) to a byte offset in the image. Returns
@@ -243,11 +235,28 @@ fn parse_dir_static<'a>(
 ) -> Result<Vec<FsNode>> {
     let mut children: Vec<FsNode> = Vec::new();
     let mut lfn_buf: Vec<u16> = Vec::new();
-    let buf = match read_cluster(cluster) {
-        Some(b) => b,
-        None => return Ok(children),
-    };
-    for entry in buf.chunks_exact(32) {
+    // A directory (and even one LFN sequence) can span multiple clusters.
+    let mut buf = Vec::new();
+    let mut current = cluster;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Err(BuildError::InvalidFormat("cyclic FAT directory chain".into()));
+        }
+        let bytes = read_cluster(current).ok_or_else(||
+            BuildError::InvalidFormat("directory cluster outside image".into()))?;
+        buf.extend_from_slice(bytes);
+        let fat_offset = fat_start as usize * SECTOR_SIZE as usize + current as usize * 4;
+        let raw = data.get(fat_offset..fat_offset + 4).ok_or_else(||
+            BuildError::InvalidFormat("directory FAT entry outside image".into()))?;
+        let next = u32::from_le_bytes(raw.try_into().unwrap()) & 0x0fff_ffff;
+        if next >= 0x0fff_fff8 { break; }
+        if next < 2 || next >= 0x0fff_fff0 {
+            return Err(BuildError::InvalidFormat("invalid FAT directory chain".into()));
+        }
+        current = next;
+    }
+    for entry in buf.as_chunks::<32>().0 {
         if entry[0] == 0x00 {
             break;
         }
@@ -516,6 +525,14 @@ impl ClusterAlloc {
         Self::default()
     }
 
+    fn for_volume(fat_sectors: u32, data_clusters: u32) -> Self {
+        let mut fat = vec![0; (fat_sectors * SECTOR_SIZE) as usize];
+        fat[..4].copy_from_slice(&0x0ffffff8u32.to_le_bytes());
+        fat[4..8].copy_from_slice(&0x0fffffffu32.to_le_bytes());
+        let max_clusters = (data_clusters as usize + 2).min(fat.len() / 4);
+        Self { fat, max_clusters, next_free: 2 }
+    }
+
     /// Allocate a new cluster
     pub fn alloc(&mut self) -> Option<u32> {
         for i in self.next_free..self.max_clusters {
@@ -606,6 +623,7 @@ pub struct Fat32ImageBuilder {
     root_cluster: u32,
     sfn_counter: u32,
     size_sectors: u32,
+    fat_sectors: u32,
     /// Partition offset in bytes (used when embedding FAT32 in a GPT partition)
     /// This is added to all absolute offsets when writing to the image
     partition_offset: usize,
@@ -619,12 +637,19 @@ impl Fat32ImageBuilder {
     /// be the partition's starting LBA * 512.
     pub fn new(size_mb: u32, partition_offset: usize) -> Self {
         let size_sectors = size_mb * 1024 * 1024 / SECTOR_SIZE;
+        // One entry per data cluster plus the two reserved entries. Using the
+        // whole volume as an upper bound also accounts for both FAT copies.
+        let fat_sectors = FAT_SIZE_SECTORS.max(
+            (size_sectors / SECTS_PER_CLUSTER as u32 + 2).div_ceil(SECTOR_SIZE / 4));
+        let data_clusters = size_sectors.saturating_sub(
+            RESERVED_SECTORS + NUM_FATS as u32 * fat_sectors) / SECTS_PER_CLUSTER as u32;
         Self {
-            alloc: ClusterAlloc::new(),
+            alloc: ClusterAlloc::for_volume(fat_sectors, data_clusters),
             img: vec![0u8; (size_sectors * SECTOR_SIZE) as usize],
             root_cluster: 0,
             sfn_counter: 1,
             size_sectors,
+            fat_sectors,
             partition_offset,
         }
     }
@@ -634,7 +659,7 @@ impl Fat32ImageBuilder {
     /// NOT including partition_offset. The partition_offset is only used for hidd_sec
     /// in the BPB and when embedding the partition into a larger disk image.
     fn cluster_offset(&self, cluster: u32) -> usize {
-        let first_data = RESERVED_SECTORS + NUM_FATS as u32 * FAT_SIZE_SECTORS;
+        let first_data = RESERVED_SECTORS + NUM_FATS as u32 * self.fat_sectors;
         ((first_data + (cluster - 2) * SECTS_PER_CLUSTER as u32) * SECTOR_SIZE) as usize
     }
 
@@ -715,6 +740,10 @@ impl Fat32ImageBuilder {
     /// The algorithm must be kept in sync with the LFN generation logic in
     /// add_dir_entry and add_file_entry.
     pub fn make_sfn(&mut self, name: &str) -> [u8; 11] {
+        self.make_sfn_alias(name, false)
+    }
+
+    fn make_sfn_alias(&mut self, name: &str, force_suffix: bool) -> [u8; 11] {
         let (base, ext) = if let Some(p) = name.rfind('.') {
             (&name[..p], Some(&name[p + 1..]))
         } else {
@@ -733,8 +762,9 @@ impl Fat32ImageBuilder {
         });
 
         // Check if we need LFN (same logic as in add_dir_entry)
-        let needs_lfn =
-            filtered_base.len() > 8 || filtered_ext.as_ref().map(|e| e.len() > 3).unwrap_or(false);
+        let needs_lfn = force_suffix || filtered_base.is_empty()
+            || filtered_base != base || filtered_ext.as_deref() != ext
+            || filtered_base.len() > 8 || filtered_ext.as_ref().map(|e| e.len() > 3).unwrap_or(false);
 
         let mut sfn = [b' '; 11];
 
@@ -744,7 +774,8 @@ impl Fat32ImageBuilder {
             sfn[..base_bytes.len()].copy_from_slice(&base_bytes);
         } else {
             // Long name: truncated base + ~N suffix
-            let truncated: String = filtered_base.chars().take(6).collect();
+            let truncated: String = if filtered_base.is_empty() { "_".into() }
+                else { filtered_base.chars().take(6).collect() };
             let suffix = format!("~{}", self.sfn_counter);
             self.sfn_counter += 1;
             let base_bytes = truncated.to_uppercase().into_bytes();
@@ -761,7 +792,7 @@ impl Fat32ImageBuilder {
                 base_bytes.truncate(8 - suffix_bytes.len());
             }
             sfn[..base_bytes.len()].copy_from_slice(&base_bytes);
-            sfn[8 - suffix_bytes.len()..8].copy_from_slice(suffix_bytes);
+            sfn[base_bytes.len()..base_bytes.len() + suffix_bytes.len()].copy_from_slice(suffix_bytes);
         }
 
         if let Some(e) = filtered_ext {
@@ -769,7 +800,7 @@ impl Fat32ImageBuilder {
             // the write below can never go out of bounds.
             let ext_full = e.to_uppercase().into_bytes();
             let ext_bytes = &ext_full[..ext_full.len().min(3)];
-            sfn[8..8 + ext_bytes.len()].copy_from_slice(&ext_bytes);
+            sfn[8..8 + ext_bytes.len()].copy_from_slice(ext_bytes);
         }
 
         sfn
@@ -805,9 +836,12 @@ impl Fat32ImageBuilder {
     ) {
         // Decide whether LFN is required (mirrors make_sfn: anything whose
         // 8.3 representation can't fit in 8+3 needs an LFN slot).
-        let needs_lfn = self.requires_lfn(name);
+        let mut sfn = self.make_sfn(name);
+        while buf.chunks_exact(32).any(|entry| entry[11] != 0x0f && entry[..11] == sfn) {
+            sfn = self.make_sfn_alias(name, true);
+        }
+        let needs_lfn = self.requires_lfn(name) || decode_sfn(&sfn) != name;
         if needs_lfn {
-            let sfn = self.make_sfn(name);
             let cs = checksum_83(&sfn);
             let utf16: Vec<u16> = name.encode_utf16().collect();
             let lfn_count = utf16.len().div_ceil(13) as u8;
@@ -839,10 +873,8 @@ impl Fat32ImageBuilder {
             }
             buf.extend_from_slice(&e.to_bytes());
         } else {
-            let e = match kind {
-                EntryKind::Directory => Fat32DirEntry::new_dir(name, cluster),
-                EntryKind::File => Fat32DirEntry::new_file(name, cluster, size),
-            };
+            let mut e = Fat32DirEntry::new_file_from_sfn(&sfn, cluster, size);
+            if kind == EntryKind::Directory { e.attr = 0x10; }
             buf.extend_from_slice(&e.to_bytes());
         }
     }
@@ -863,7 +895,11 @@ impl Fat32ImageBuilder {
                 .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
                 .collect()
         });
+        // The SFN-only writer uppercases and filters characters. Emit an LFN
+        // whenever that would change the visible name, including short names.
         filtered_base.len() > 8 || filtered_ext.as_ref().map(|e| e.len() > 3).unwrap_or(false)
+            || name.chars().any(|c| c.is_ascii_lowercase())
+            || filtered_base != base || filtered_ext.as_deref() != ext
     }
 
     /// Build the filesystem with the given root children
@@ -1028,7 +1064,7 @@ impl Fat32ImageBuilder {
         sector[34] = ((tot_sec >> 16) & 0xFF) as u8;
         sector[35] = ((tot_sec >> 24) & 0xFF) as u8;
         // BPB_FATSz32 (0x24): sectors per FAT.
-        let fat_sz = FAT_SIZE_SECTORS;
+        let fat_sz = self.fat_sectors;
         sector[36] = (fat_sz & 0xFF) as u8;
         sector[37] = ((fat_sz >> 8) & 0xFF) as u8;
         sector[38] = ((fat_sz >> 16) & 0xFF) as u8;
@@ -1062,7 +1098,7 @@ impl Fat32ImageBuilder {
 
         // FAT table offset within the partition (relative to partition start)
         let fat_off = (RESERVED_SECTORS * SECTOR_SIZE) as usize;
-        let fat_size = (FAT_SIZE_SECTORS * SECTOR_SIZE) as usize;
+        let fat_size = (self.fat_sectors * SECTOR_SIZE) as usize;
         // Copy FAT1 (relative to partition start)
         self.img[fat_off..fat_off + fat_size].copy_from_slice(self.alloc.get_fat());
         // Copy FAT1 to FAT2 (required for FAT32)
@@ -1096,15 +1132,16 @@ impl Fat32ImageBuilder {
         // FSInfo signature "RRaA" at offset 0
         sector[0..4].copy_from_slice(b"RRaA");
 
-        // Reserved (offset 0x1E8 = 488)
+        // Structure signature at 0x1E4, followed by four reserved bytes.
+        sector[484..488].copy_from_slice(&0x61417272u32.to_le_bytes());
         // Free cluster count at offset 0x1EC = 492 (0xFFFFFFFF = unknown)
         sector[492..496].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
         // Next free cluster at offset 0x1F0 = 496 (0xFFFFFFFF = unknown)
         sector[496..500].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes());
 
         // Reserved (offset 0x1F4 = 500)
-        // Trailer signature "rrAa" at offset 0x1FC (508)
-        sector[508..512].copy_from_slice(b"rrAa");
+        // Trail signature is 0xAA550000, including the sector signature.
+        sector[508..512].copy_from_slice(&0xaa550000u32.to_le_bytes());
     }
 
     /// Write backup boot sector (sector 6)
@@ -1365,51 +1402,25 @@ impl Fat32Image {
         filename: &str,
         data: Vec<u8>,
     ) {
-        if dir_parts.is_empty() {
-            children.push(FsNode::file(filename, data));
-        } else {
-            let dir_name = dir_parts[0];
-            let remaining = &dir_parts[1..];
-
-            // Find existing directory or create it (case-sensitive)
-            let dir_idx = children.iter().position(|c| match c {
-                FsNode::Dir { name, .. } => name == dir_name,
-                _ => false,
+        if let Some((dir_name, remaining)) = dir_parts.split_first() {
+            let idx = children.iter().position(|node| {
+                matches!(node, FsNode::Dir { name, .. } if name.eq_ignore_ascii_case(dir_name))
+            }).unwrap_or_else(|| {
+                children.push(FsNode::Dir {
+                    name: dir_name.to_string(),
+                    children: Vec::new(),
+                });
+                children.len() - 1
             });
-
-            match dir_idx {
-                Some(idx) => {
-                    // Directory exists, recurse
-                    if let FsNode::Dir { children: cc, .. } = &mut children[idx] {
-                        Self::write_file_recursive(cc, remaining, filename, data);
-                    }
-                }
-                None => {
-                    // Create directory and all remaining. Nested
-                    // placeholder dirs always have an empty children list;
-                    // both branches of the previous `if` produced Vec::new()
-                    // so collapse to a single literal.
-                    let last_idx = dir_parts.len() - 1;
-                    for i in 0..last_idx {
-                        let mut nested = Vec::new();
-                        for name in dir_parts.iter().skip(i + 1) {
-                            nested.push(FsNode::Dir {
-                                name: name.to_string(),
-                                children: Vec::new(),
-                            });
-                        }
-                        children.push(FsNode::Dir {
-                            name: dir_parts[i].to_string(),
-                            children: nested,
-                        });
-                    }
-                    // Last directory gets the file
-                    children.push(FsNode::Dir {
-                        name: dir_parts[last_idx].to_string(),
-                        children: vec![FsNode::file(filename, data)],
-                    });
-                }
+            if let FsNode::Dir { children: nested, .. } = &mut children[idx] {
+                Self::write_file_recursive(nested, remaining, filename, data);
             }
+        } else if let Some(FsNode::File { data: existing, .. }) = children.iter_mut().find(|node| {
+            matches!(node, FsNode::File { name, .. } if name.eq_ignore_ascii_case(filename))
+        }) {
+            *existing = data;
+        } else {
+            children.push(FsNode::file(filename, data));
         }
     }
 
@@ -1555,6 +1566,54 @@ pub fn write_gpt_header(img: &mut [u8], disk_size: u64, esp_lba: u64, esp_size: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merges_case_insensitive_paths_and_creates_nested_parents() {
+        let mut image = Fat32Image::new(64);
+        image.create_dir("EFI/Boot").unwrap();
+        image.write_file("efi/BOOT/BOOTX64.EFI", b"loader").unwrap();
+        image.write_file("Windows/System32/config/SYSTEM", b"hive").unwrap();
+        image.write_file("WINDOWS/system32/CONFIG/system", b"updated").unwrap();
+        assert_eq!(image.read_file("EFI/Boot/bootx64.efi").unwrap(), b"loader");
+        assert_eq!(image.read_file("Windows/System32/config/SYSTEM").unwrap(), b"updated");
+        assert_eq!(image.list_dir("/").unwrap().len(), 2);
+        let bytes = image.finalize().unwrap();
+        let parsed = Fat32Image::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.read_file("EFI/Boot/bootx64.efi").unwrap(), b"loader");
+        assert_eq!(parsed.read_file("Windows/System32/config/SYSTEM").unwrap(), b"updated");
+    }
+
+    #[test]
+    fn short_mixed_case_unicode_and_spaces_survive_serialization() {
+        let mut image = Fat32Image::new(32);
+        for name in ["System32", "config", "ABCD", "含中文", "A B"] {
+            image.create_dir(name).unwrap();
+        }
+        for name in ["ntdll.dll", "Mixed.ExE", "README", "a b.txt", "中文.txt", "😀.txt", "第二个中文.txt"] {
+            image.write_file(name, b"data").unwrap();
+        }
+        let bytes = image.finalize().unwrap();
+        let parsed = Fat32Image::from_bytes(&bytes).unwrap();
+        let names: Vec<_> = parsed.list_dir("/").unwrap().into_iter().map(|(name, _)| name).collect();
+        for name in ["System32", "config", "ABCD", "含中文", "A B", "ntdll.dll", "Mixed.ExE", "README", "a b.txt", "中文.txt", "😀.txt", "第二个中文.txt"] {
+            assert!(names.iter().any(|entry| entry == name), "missing exact name {name}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn large_volume_fat_covers_files_beyond_legacy_limit() {
+        let payload = vec![0x5a; 82 * 1024 * 1024];
+        let mut image = Fat32Image::new(128);
+        image.write_file("Windows/large.bin", &payload).unwrap();
+        let bytes = image.finalize().unwrap();
+        let fat_sectors = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
+        let sectors = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
+        let clusters = (sectors - RESERVED_SECTORS - NUM_FATS as u32 * fat_sectors)
+            / SECTS_PER_CLUSTER as u32;
+        assert!(fat_sectors * SECTOR_SIZE / 4 >= clusters + 2);
+        let parsed = Fat32Image::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.read_file("Windows/large.bin").unwrap(), payload);
+    }
 
     #[test]
     fn test_sfn_conversion() {
