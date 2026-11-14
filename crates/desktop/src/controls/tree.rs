@@ -37,6 +37,25 @@ impl ControlTree {
         }
     }
 
+    /// Reflow without losing pointer capture between mouse-down and mouse-up.
+    pub fn replace_layout(&mut self, mut next: Self) {
+        for (old, slot) in [
+            (self.focus, &mut next.focus),
+            (self.hot, &mut next.hot),
+            (self.pressed, &mut next.pressed),
+            (self.capture, &mut next.capture),
+        ] {
+            if next
+                .controls
+                .iter()
+                .any(|c| c.id == old && c.visible && c.enabled)
+            {
+                *slot = old;
+            }
+        }
+        *self = next;
+    }
+
     pub fn controls(&self) -> &[ControlLayout] {
         &self.controls
     }
@@ -163,6 +182,7 @@ impl ControlTree {
     pub fn hit_test(&self, x: i32, y: i32) -> u32 {
         self.controls
             .iter()
+            .rev()
             .find(|control| control.visible && control.enabled && control.rect.contains(x, y))
             .map_or(CONTROL_NONE, |control| control.id)
     }

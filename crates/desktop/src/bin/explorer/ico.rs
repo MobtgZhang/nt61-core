@@ -15,6 +15,7 @@ pub(crate) struct DirectoryEntry {
     pub(crate) height: u32,
     pub(crate) bit_count: u8,
     pub(crate) payload: Vec<u8>,
+    hotspot: (u16, u16),
 }
 
 impl DirectoryEntry {
@@ -63,10 +64,7 @@ pub(crate) fn directory_entries(bytes: &[u8]) -> Result<Vec<DirectoryEntry>, Dec
         let width = if width == 0 { 256 } else { width };
         let height = *bytes.get(header_offset + 1).ok_or(DecodeError::Truncated)? as u32;
         let height = if height == 0 { 256 } else { height };
-        let color_plane_offset = header_offset + 6;
-        let bit_count = *bytes
-            .get(color_plane_offset + 2)
-            .ok_or(DecodeError::Truncated)?;
+        let bit_count = *bytes.get(header_offset + 6).ok_or(DecodeError::Truncated)?;
         let size = read_u32(bytes, header_offset + 8).ok_or(DecodeError::Truncated)? as usize;
         let offset = read_u32(bytes, header_offset + 12).ok_or(DecodeError::Truncated)? as usize;
         let end = offset.checked_add(size).ok_or(DecodeError::Truncated)?;
@@ -79,6 +77,10 @@ pub(crate) fn directory_entries(bytes: &[u8]) -> Result<Vec<DirectoryEntry>, Dec
             height,
             bit_count,
             payload,
+            hotspot: if type_id == 2 {
+                (read_u16(bytes, header_offset + 4).ok_or(DecodeError::Truncated)?,
+                 read_u16(bytes, header_offset + 6).ok_or(DecodeError::Truncated)?)
+            } else { (0, 0) },
         });
     }
     Ok(entries)
@@ -104,8 +106,8 @@ pub(crate) fn decode_bmp(payload: &[u8]) -> Result<Image, DecodeError> {
         return Err(DecodeError::Unsupported);
     }
 
-    let pixel_stride = ((width as usize * bit_count as usize + 31) / 32) * 4;
-    let mask_stride = ((width as usize + 31) / 32) * 4;
+    let pixel_stride = (width as usize * bit_count as usize).div_ceil(32) * 4;
+    let mask_stride = (width as usize).div_ceil(32) * 4;
     let pixel_bytes = pixel_stride * height as usize;
     let palette_bytes = match bit_count {
         1 => 2usize,
@@ -176,6 +178,7 @@ pub(crate) fn decode_bmp(payload: &[u8]) -> Result<Image, DecodeError> {
     })
 }
 
+#[allow(dead_code)]
 pub fn decode_ico(bytes: &[u8]) -> Result<Image, DecodeError> {
     let mut selected = None;
     let mut selected_area = 0u64;
@@ -204,7 +207,18 @@ pub fn decode_ico(bytes: &[u8]) -> Result<Image, DecodeError> {
     selected.ok_or(DecodeError::Unsupported)
 }
 
+#[allow(dead_code)]
 pub fn decode_ico_preferred(bytes: &[u8], preferred_size: u32) -> Result<Image, DecodeError> {
+    decode_preferred(bytes, preferred_size).map(|(image, _)| image)
+}
+
+#[allow(dead_code)]
+pub fn decode_cur_preferred(bytes: &[u8], preferred_size: u32) -> Result<(Image, (u16, u16)), DecodeError> {
+    if read_u16(bytes, 2) != Some(2) { return Err(DecodeError::Unsupported); }
+    decode_preferred(bytes, preferred_size)
+}
+
+fn decode_preferred(bytes: &[u8], preferred_size: u32) -> Result<(Image, (u16, u16)), DecodeError> {
     let mut selected = None;
     let mut selected_distance = u32::MAX;
     let mut selected_quality = 0u8;
@@ -231,7 +245,7 @@ pub fn decode_ico_preferred(bytes: &[u8], preferred_size: u32) -> Result<Image, 
                 Err(_) => continue,
             }
         };
-        selected = Some(image);
+        selected = Some((image, entry.hotspot));
         selected_distance = distance;
         selected_quality = quality;
         selected_area = area;

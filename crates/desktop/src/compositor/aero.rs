@@ -13,7 +13,9 @@ fn graphics_rect(rect: Rect) -> crate::graphics::Rect {
 }
 
 pub const GLASS_BLUR_RADIUS: u32 = 8;
-pub const GLASS_TINT_STRENGTH: u32 = 96;
+pub const GLASS_TINT_STRENGTH: u32 = 56;
+pub const GLASS_SATURATION: u32 = 208;
+pub const GLASS_TINT: u32 = 0xFF4580A4;
 pub const WINDOW_GLASS: u32 = 0xE845_80C4;
 pub const WINDOW_BODY: u32 = 0xFFF0_F0F0;
 pub const WINDOW_BORDER: u32 = 0xB300_0000;
@@ -82,7 +84,7 @@ pub fn radial_blend(
 }
 
 pub fn glass_bar(surface: &mut Surface, bounds: Rect, wallpaper: &Surface) {
-    let glass = glass_backdrop(wallpaper, 0x10_1B2B40, 96);
+    let glass = glass_backdrop(wallpaper, GLASS_TINT, GLASS_SATURATION);
     let source_bounds = Rect::new(bounds.x, bounds.y, bounds.width, bounds.height);
     surface.copy_region(&glass, source_bounds, bounds.x, bounds.y);
     let highlight = Rect::new(bounds.x, bounds.y, bounds.width, 1);
@@ -146,23 +148,23 @@ pub fn taskbar_chrome(surface: &mut Surface, bounds: Rect, glass: &Surface) {
 }
 
 pub fn superbar_button(surface: &mut Surface, bounds: Rect, selected: bool) {
-    let denominator = bounds.height.saturating_sub(1).max(1) as u32;
+    let denominator = bounds.height.saturating_sub(1).max(1);
     for row in 0..bounds.height {
         let scale = row * 255 / denominator;
         let color = if selected {
             if scale < 128 {
-                lerp_color(0xFFB6_D9EE, 0xFFB6_D9EE, 0)
+                alpha_lerp(0xB8E6_F5FF, 0x7089_C5EA, scale * 255 / 128)
             } else {
-                lerp_color(0xFF1A_6CA1, 0xFF1A_6CA1, 0)
+                alpha_lerp(0x8825_6E9E, 0xC87B_C9F0, (scale - 128) * 255 / 127)
             }
         } else if scale < 115 {
-            lerp_color(0x80FF_FFFF, 0x4DFF_FFFF, scale * 255 / 115)
+            alpha_lerp(0x80FF_FFFF, 0x4DFF_FFFF, scale * 255 / 115)
         } else if scale < 128 {
-            lerp_color(0x4DFF_FFFF, 0x1A00_0000, (scale - 115) * 255 / 13)
+            alpha_lerp(0x4DFF_FFFF, 0x1A00_0000, (scale - 115) * 255 / 13)
         } else if scale < 192 {
             0x1A00_0000
         } else {
-            lerp_color(0x1A00_0000, 0x80FF_FFFF, (scale - 192) * 255 / 63)
+            alpha_lerp(0x1A00_0000, 0x80FF_FFFF, (scale - 192) * 255 / 63)
         };
         surface.blend_rect(
             Rect::new(bounds.x, bounds.y + row as i32, bounds.width, 1),
@@ -214,13 +216,16 @@ pub fn title_bar(surface: &mut Surface, bounds: Rect, glass: &Surface) {
     horizontal_gradient(surface, bounds, 0x66FF_FFFF, 0x1A00_0000, 0x33FF_FFFF);
     let highlight_top = Rect::new(bounds.x, bounds.y, bounds.width, 1);
     surface.blend_rect(highlight_top, 0x59FF_FFFF);
-    let highlight_mid = Rect::new(
-        bounds.x,
-        bounds.y + bounds.height as i32 * 2 / 5,
-        bounds.width,
-        1,
-    );
-    surface.blend_rect(highlight_mid, 0xB3FF_FFFF);
+    // Broad reflection fades into the glass; a bright one-pixel stripe
+    // across the caption made the frame look like an opaque classic title bar.
+    let reflection_height = bounds.height.saturating_mul(2) / 5;
+    for row in 1..reflection_height {
+        let alpha = 40 * (reflection_height - row) / reflection_height.max(1);
+        surface.blend_rect(
+            Rect::new(bounds.x, bounds.y + row as i32, bounds.width, 1),
+            (alpha << 24) | 0x00FFFFFF,
+        );
+    }
     let highlight_bottom = Rect::new(
         bounds.x,
         bounds.y + bounds.height as i32 - 1,
@@ -262,13 +267,7 @@ pub fn window_body(surface: &mut Surface, bounds: Rect) {
 }
 
 pub fn shadow(surface: &mut Surface, bounds: Rect, radius: u32) {
-    let outer = Rect::new(
-        bounds.x - radius as i32,
-        bounds.y - radius as i32,
-        bounds.width + radius * 2,
-        bounds.height + radius * 2,
-    );
-    surface.shadow_rect(outer, radius);
+    surface.shadow_rect(bounds, radius);
 }
 
 pub fn control_group(surface: &mut Surface, bounds: Rect, active: bool) {
@@ -296,7 +295,7 @@ pub fn control_group(surface: &mut Surface, bounds: Rect, active: bool) {
         0x80FF_FFFF,
     );
     for offset in [29, 58] {
-        let separator_x = bounds.x + offset as i32;
+        let separator_x = bounds.x + offset;
         surface.blend_rect(
             Rect::new(separator_x, bounds.y, 1, bounds.height),
             0x4D00_0000,
@@ -305,10 +304,24 @@ pub fn control_group(surface: &mut Surface, bounds: Rect, active: bool) {
 }
 
 pub fn arrow_right(surface: &mut Surface, bounds: Rect, color: u32) {
-    let half_height = bounds.height as f32 / 2.0;
+    arrow_horizontal(surface, bounds, color, false);
+}
+
+pub fn arrow_left(surface: &mut Surface, bounds: Rect, color: u32) {
+    arrow_horizontal(surface, bounds, color, true);
+}
+
+fn arrow_horizontal(surface: &mut Surface, bounds: Rect, color: u32, left: bool) {
+    let half_height = bounds.height.saturating_sub(1) as f32 / 2.0;
     for row in 0..bounds.height {
         for column in 0..bounds.width {
-            let ratio = column as f32 / bounds.width.saturating_sub(1).max(1) as f32;
+            let column_from_base = if left {
+                bounds.width - 1 - column
+            } else {
+                column
+            };
+            let ratio =
+                1.0 - column_from_base as f32 / bounds.width.saturating_sub(1).max(1) as f32;
             let distance = (row as f32 - half_height).abs();
             let coverage = if distance <= half_height * ratio - 1.0 {
                 255
@@ -318,7 +331,7 @@ pub fn arrow_right(surface: &mut Surface, bounds: Rect, color: u32) {
                 0
             };
             if coverage != 0 {
-                let alpha = ((color >> 24) as u32 * coverage as u32 / 255) as u8;
+                let alpha = ((color >> 24) * coverage as u32 / 255) as u8;
                 surface.blend_pixel(
                     bounds.x.saturating_add(column as i32) as u32,
                     bounds.y.saturating_add(row as i32) as u32,
@@ -330,20 +343,7 @@ pub fn arrow_right(surface: &mut Surface, bounds: Rect, color: u32) {
 }
 
 pub fn shadow_rect(surface: &mut Surface, bounds: Rect, radius: u32) {
-    if bounds.width == 0 || bounds.height == 0 {
-        return;
-    }
-    let mut shadow = surface.clone();
-    shadow.fill_rect(bounds.x, bounds.y, bounds.width, bounds.height, 0xFF00_0000);
-    shadow.box_blur(radius);
-    for row in 0..surface.height() {
-        for column in 0..surface.width() {
-            let coverage = (shadow.pixel(column, row).unwrap_or(0) >> 24) & 0xFF;
-            if coverage != 0 {
-                surface.blend_pixel(column, row, coverage << 24);
-            }
-        }
-    }
+    surface.shadow_rect(bounds, radius);
 }
 
 pub fn rounded_window(surface: &mut Surface, bounds: Rect, radius: u32, fill: u32) {
@@ -356,17 +356,29 @@ pub fn rounded_window(surface: &mut Surface, bounds: Rect, radius: u32, fill: u3
     surface.fill_rect(highlight.x, highlight.y, highlight.width, 1, 0xB4FF_FFFF);
 }
 
+/// Paint only the outer and inner outlines. Filling nested rounded rectangles
+/// here darkens the whole glass surface and destroys its transparency.
 pub fn window_border(surface: &mut Surface, bounds: Rect, radius: u32) {
-    let radius = radius.min(bounds.width / 2).min(bounds.height / 2);
-    let border = bounds.width.min(bounds.height) / 4;
-    for index in 0..border.max(1) {
-        let inset = Rect::new(
-            bounds.x + index as i32,
-            bounds.y + index as i32,
-            bounds.width.saturating_sub(index * 2),
-            bounds.height.saturating_sub(index * 2),
-        );
-        surface.blend_rounded_rect(inset, radius, WINDOW_BORDER);
+    surface.stroke_rounded_rect(bounds, radius, 1, 0xA020_3040);
+    let inner = Rect::new(bounds.x + 1, bounds.y + 1,
+        bounds.width.saturating_sub(2), bounds.height.saturating_sub(2));
+    surface.stroke_rounded_rect(inner, radius.saturating_sub(1), 1, 0xA0FF_FFFF);
+}
+
+/// Use the cached blurred backdrop for the visible glass rim, avoiding a new
+/// blur/allocation on every hover or pointer event.
+pub fn window_glass_frame(surface: &mut Surface, bounds: Rect, glass: &Surface, active: bool) {
+    let rim = 6.min(bounds.width / 2).min(bounds.height / 2);
+    let top = 30.min(bounds.height);
+    for strip in [
+        Rect::new(bounds.x, bounds.y, bounds.width, top),
+        Rect::new(bounds.x, bounds.y + top as i32, rim, bounds.height.saturating_sub(top)),
+        Rect::new(bounds.x + bounds.width.saturating_sub(rim) as i32,
+            bounds.y + top as i32, rim, bounds.height.saturating_sub(top)),
+        Rect::new(bounds.x, bounds.y + bounds.height.saturating_sub(rim) as i32, bounds.width, rim),
+    ] {
+        surface.copy_region(glass, strip, strip.x, strip.y);
+        surface.blend_rect(strip, if active { 0x4048_9BD4 } else { 0x606B_879D });
     }
 }
 
@@ -374,6 +386,7 @@ pub fn window_border(surface: &mut Surface, bounds: Rect, radius: u32) {
 pub enum WindowControlButtonKind {
     Minimize,
     Maximize,
+    Restore,
     Close,
 }
 
@@ -386,7 +399,7 @@ pub fn window_control_group(surface: &mut Surface, bounds: Rect, active: bool) {
         0xB4FF_FFFF,
     );
     for offset in [29, 58] {
-        let separator_x = bounds.x + offset as i32;
+        let separator_x = bounds.x + offset;
         surface.blend_rect(
             Rect::new(separator_x, bounds.y, 1, bounds.height),
             0x4D00_0000,
@@ -400,44 +413,37 @@ pub fn window_control_button(
     kind: WindowControlButtonKind,
     hovered: bool,
 ) {
-    let denominator = bounds.height.saturating_sub(1).max(1) as u32;
+    let denominator = bounds.height.saturating_sub(1).max(1);
     for row in 0..bounds.height {
         let scale = row * 255 / denominator;
         let color = match kind {
-            WindowControlButtonKind::Minimize | WindowControlButtonKind::Maximize => {
+            WindowControlButtonKind::Minimize | WindowControlButtonKind::Maximize | WindowControlButtonKind::Restore => {
                 if hovered {
                     if scale < 128 {
-                        lerp_color(0xFFB6_D9EE, 0xFFB6_D9EE, 0)
+                        alpha_lerp(0xB8E6_F5FF, 0x7089_C5EA, scale * 255 / 128)
                     } else {
-                        lerp_color(0xFF1A_6CA1, 0xFF1A_6CA1, 0)
+                        alpha_lerp(0x8825_6E9E, 0xC87B_C9F0, (scale - 128) * 255 / 127)
                     }
                 } else if scale < 115 {
-                    lerp_color(0x80FF_FFFF, 0x4DFF_FFFF, scale * 255 / 115)
+                    alpha_lerp(0x80FF_FFFF, 0x4DFF_FFFF, scale * 255 / 115)
                 } else if scale < 128 {
-                    lerp_color(0x4DFF_FFFF, 0x1A00_0000, (scale - 115) * 255 / 13)
+                    alpha_lerp(0x4DFF_FFFF, 0x1A00_0000, (scale - 115) * 255 / 13)
                 } else if scale < 192 {
                     0x1A00_0000
                 } else {
-                    lerp_color(0x1A00_0000, 0x80FF_FFFF, (scale - 192) * 255 / 63)
+                    alpha_lerp(0x1A00_0000, 0x80FF_FFFF, (scale - 192) * 255 / 63)
                 }
             }
             WindowControlButtonKind::Close => {
-                if hovered {
-                    if scale < 128 {
-                        lerp_color(0xFFE0_A197, 0xFFCF_796A, scale * 255 / 128)
-                    } else {
-                        lerp_color(0xFFCF_796A, 0xFFD5_4F36, (scale - 128) * 255 / 127)
-                    }
-                } else if scale < 115 {
-                    lerp_color(0x80FF_FFFF, 0x4DFF_FFFF, scale * 255 / 115)
+                if !hovered {
+                    alpha_lerp(0xD8CF_8B7E, 0xD89D_3324, scale)
                 } else if scale < 128 {
-                    lerp_color(0x4DFF_FFFF, 0x1A00_0000, (scale - 115) * 255 / 13)
-                } else if scale < 192 {
-                    0x1A00_0000
+                    alpha_lerp(0xFFE0_A197, 0xFFCF_796A, scale * 255 / 128)
                 } else {
-                    lerp_color(0x1A00_0000, 0x80FF_FFFF, (scale - 192) * 255 / 63)
+                    alpha_lerp(0xFFCF_796A, 0xFFD5_4F36, (scale - 128) * 255 / 127)
                 }
             }
+
         };
         surface.blend_rect(
             Rect::new(bounds.x, bounds.y + row as i32, bounds.width, 1),
@@ -454,50 +460,122 @@ pub fn window_control_button(
         ),
         0x4D00_0000,
     );
+    let cx = bounds.x + bounds.width as i32 / 2;
+    let cy = bounds.y + bounds.height as i32 / 2;
+    let ink = if kind == WindowControlButtonKind::Close {
+        0xFFFFFFFF
+    } else {
+        0xFF183046
+    };
+    match kind {
+        WindowControlButtonKind::Minimize => surface.fill_rect(cx - 4, cy + 2, 8, 2, ink),
+        WindowControlButtonKind::Maximize => {
+            surface.fill_rect(cx - 4, cy - 4, 9, 2, ink);
+            surface.fill_rect(cx - 4, cy + 3, 9, 1, ink);
+            surface.fill_rect(cx - 4, cy - 2, 1, 5, ink);
+            surface.fill_rect(cx + 4, cy - 2, 1, 5, ink);
+        }
+        WindowControlButtonKind::Restore => {
+            for (x, y) in [(cx - 1, cy - 4), (cx - 4, cy - 1)] {
+                surface.fill_rect(x, y, 7, 2, ink);
+                surface.fill_rect(x, y + 6, 7, 1, ink);
+                surface.fill_rect(x, y + 2, 1, 4, ink);
+                surface.fill_rect(x + 6, y + 2, 1, 4, ink);
+            }
+        }
+        WindowControlButtonKind::Close => {
+            for n in -4..=4 {
+                surface.fill_rect(cx + n, cy + n, 2, 1, ink);
+                surface.fill_rect(cx - n, cy + n, 2, 1, ink);
+            }
+        }
+    }
 }
 
-pub fn menu_surface(surface: &mut Surface, bounds: Rect) {
-    let shadow = Rect::new(bounds.x + 2, bounds.y + 2, bounds.width, bounds.height);
-    surface.blend_rounded_rect(shadow, 3, 0x8000_0000);
-    surface.fill_rect(
-        bounds.x,
-        bounds.y,
-        bounds.width,
-        bounds.height,
-        ELEMENT_SURFACE,
-    );
-    surface.blend_rounded_rect(bounds, 3, 0x6000_0000);
-    surface.blend_rect(Rect::new(bounds.x, bounds.y, bounds.width, 1), 0xA0FF_FFFF);
-    surface.blend_rect(
-        Rect::new(
-            bounds.x,
-            bounds.y + bounds.height.saturating_sub(1) as i32,
-            bounds.width,
-            1,
-        ),
-        0x80FF_FFFF,
-    );
-    surface.blend_rect(
-        Rect::new(
-            bounds.x + 28,
-            bounds.y + 2,
-            2,
-            bounds.height.saturating_sub(4),
-        ),
-        0x2600_0000,
-    );
+/// Explorer's translucent icon highlight: pale border, inner highlight and
+/// a blue lower gradient. It must be composited before the icon itself.
+pub fn selection(surface: &mut Surface, b: Rect, selected: bool, hovered: bool) {
+    let border = if selected { 0xD06C_AAD9 } else { 0xA0D7_EEFF };
+    surface.blend_rounded_rect(b, 3, border);
+    let inner = Rect::new(b.x+1,b.y+1,b.width.saturating_sub(2),b.height.saturating_sub(2));
+    surface.blend_rounded_rect(inner, 2, 0x80FF_FFFF);
+    let (top, bottom) = if selected {
+        (if hovered { 0x685C_BCFF } else { 0x405C_BCFF }, 0x8862_AFE3)
+    } else { (0x20FF_FFFF, 0x484E_A5DE) };
+    for y in 0..inner.height {
+        let color = alpha_lerp(top, bottom, y * 255 / inner.height.max(1));
+        surface.blend_rect(Rect::new(inner.x+1,inner.y+y as i32,inner.width.saturating_sub(2),1),color);
+    }
 }
 
-pub fn menu_item(surface: &mut Surface, bounds: Rect, hovered: bool) {
-    if hovered {
-        surface.blend_rounded_rect(bounds, 3, 0xCCFF_FFFF);
-        surface.blend_rect(bounds, 0xAA_DD_FA);
+fn alpha_lerp(a: u32, b: u32, t: u32) -> u32 {
+    let alpha = ((a >> 24) * (255-t) + (b >> 24) * t) / 255;
+    (alpha << 24) | (lerp_color(a,b,t) & 0xffffff)
+}
+
+/// Win7 context menus have an opaque neutral body; the glass belongs to
+/// the window frame and Start panel, while menu shadows remain translucent.
+pub fn menu_surface(surface: &mut Surface, b: Rect) {
+    shadow(surface, b, 5);
+    surface.fill_rect(b.x,b.y,b.width,b.height,0xFF979797);
+    surface.fill_rect(b.x+1,b.y+1,b.width.saturating_sub(2),b.height.saturating_sub(2),0xFFF5F5F5);
+    surface.fill_rect(b.x+2,b.y+2,26,b.height.saturating_sub(4),0xFFF0F0F0);
+    surface.fill_rect(b.x+28,b.y+3,1,b.height.saturating_sub(6),0xFFE1E1E1);
+    surface.fill_rect(b.x+29,b.y+3,1,b.height.saturating_sub(6),0xFFFFFFFF);
+}
+
+pub fn menu_item(surface: &mut Surface, b: Rect, hovered: bool) {
+    if !hovered { return; }
+    surface.blend_rounded_rect(b,3,0xFFAECEE7);
+    let inner = Rect::new(b.x+1,b.y+1,b.width.saturating_sub(2),b.height.saturating_sub(2));
+    surface.blend_rounded_rect(inner,2,0xFFF0F8FF);
+    for y in 1..inner.height.saturating_sub(1) {
+        let color = lerp_color(0xFFF2F8FD,0xFFD9EBFA,y*255/inner.height.max(1));
+        surface.fill_rect(inner.x+1,inner.y+y as i32,inner.width.saturating_sub(2),1,color);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_outline_preserves_the_glass_interior() {
+        let mut surface = Surface::new(80, 60);
+        surface.fill_rect(0, 0, 80, 60, 0xFF4080C0);
+        window_border(&mut surface, Rect::new(8, 8, 64, 44), 6);
+        assert_eq!(surface.pixel(40, 20), Some(0xFF4080C0));
+        assert_eq!(surface.pixel(7, 20), Some(0xFF4080C0));
+        assert_ne!(surface.pixel(8, 20), Some(0xFF4080C0));
+        assert_ne!(surface.pixel(9, 20), Some(0xFF4080C0));
+    }
+
+    #[test]
+    fn caption_gradients_retain_the_backdrop() {
+        let bounds = Rect::new(0, 0, 29, 20);
+        let mut dark = Surface::new(29, 20);
+        let mut light = Surface::new(29, 20);
+        dark.fill_rect(0, 0, 29, 20, 0xFF104060);
+        light.fill_rect(0, 0, 29, 20, 0xFFA0C0E0);
+        window_control_button(&mut dark, bounds, WindowControlButtonKind::Minimize, false);
+        window_control_button(&mut light, bounds, WindowControlButtonKind::Minimize, false);
+        // Away from the glyph, a translucent gradient must depend on the backdrop.
+        assert_ne!(dark.pixel(2, 4), light.pixel(2, 4));
+        assert_eq!(alpha_lerp(0x40FFFFFF, 0x80000000, 128) >> 24, 96);
+    }
+
+    #[test]
+    fn menu_arrow_points_right() {
+        let mut surface = Surface::new(9, 11);
+        arrow_right(&mut surface, Rect::new(0, 0, 9, 11), 0xFFFFFFFF);
+        let left = (0..11)
+            .filter(|y| surface.pixel(1, *y).unwrap() != 0)
+            .count();
+        let right = (0..11)
+            .filter(|y| surface.pixel(7, *y).unwrap() != 0)
+            .count();
+        assert!(left > right, "the triangle base must be on the left");
+    }
 
     #[test]
     fn glass_backdrop_blurs_tints_and_saturates() {

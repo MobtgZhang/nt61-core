@@ -77,6 +77,31 @@ impl FontPack {
         let _ = self.font.draw_text(surface, text, x, y, self.size, color);
     }
 
+    pub fn draw_color(&self, surface: &mut Surface, text: &str, x: i32, y: i32, color: u32) {
+        let _ = self.font.draw_text(surface, text, x, y, self.size, color);
+    }
+
+    pub fn draw_fit(
+        &self,
+        surface: &mut Surface,
+        text: &str,
+        x: i32,
+        y: i32,
+        width: u32,
+        color: u32,
+    ) {
+        if self.measure(text) <= width {
+            self.draw_color(surface, text, x, y, color);
+            return;
+        }
+        let dots = self.measure("...");
+        if dots > width { return; }
+        if let Some(prefix) = self.font.fitting_prefix(text, self.size, width - dots) {
+            let shortened = alloc::format!("{prefix}...");
+            self.draw_color(surface, &shortened, x, y, color);
+        }
+    }
+
     pub fn draw_labelled_onto(&self, surface: &mut Surface, text: &str, x: i32, y: i32) {
         self.draw_onto(surface, text, x + 1, y + 1, Ink::Black);
         self.draw_onto(surface, text, x, y, Ink::White);

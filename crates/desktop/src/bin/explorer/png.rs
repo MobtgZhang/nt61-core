@@ -3,7 +3,7 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Image {
     pub width: u32,
     pub height: u32,
@@ -14,6 +14,16 @@ impl Image {
     pub fn stride(&self) -> usize {
         self.width as usize * 4
     }
+}
+
+#[test]
+fn stride_matches_width() {
+    let image = Image {
+        width: 4,
+        height: 2,
+        pixels: alloc::vec![0; 4 * 2 * 4],
+    };
+    assert_eq!(image.stride(), 16);
 }
 #[derive(Default)]
 struct BitReader<'a> {
@@ -352,7 +362,7 @@ pub fn decode_png(data: &[u8]) -> Result<Image, DecodeError> {
     let (row_bytes, bpp) = match colortype {
         2 => (width * 3, 3usize),
         6 => (width * 4, 4usize),
-        3 => ((width * depth as usize + 7) / 8, 1usize),
+        3 => ((width * depth as usize).div_ceil(8), 1usize),
         _ => return Err(DecodeError::Unsupported),
     };
     let capacity = (row_bytes + 1) * height;
@@ -389,7 +399,7 @@ pub fn decode_png(data: &[u8]) -> Result<Image, DecodeError> {
         let out = &mut pixels[row * width * 4..(row + 1) * width * 4];
         match colortype {
             2 => {
-                for (x, chunk) in current.chunks_exact(3).enumerate() {
+                for (x, chunk) in current.as_chunks::<3>().0.iter().enumerate() {
                     out[x * 4..x * 4 + 4].copy_from_slice(&[chunk[0], chunk[1], chunk[2], 0xFF]);
                 }
             }
@@ -402,7 +412,7 @@ pub fn decode_png(data: &[u8]) -> Result<Image, DecodeError> {
                         _ => current[x],
                     } as usize;
                     let base = index * 3;
-                    if base + 2 >= palette.len() + 1 && base + 2 > palette.len().saturating_sub(1) {
+                    if base + 2 > palette.len() && base + 2 > palette.len().saturating_sub(1) {
                         // fall through only when palette entry missing
                     }
                     if base + 2 < palette.len() {
@@ -423,23 +433,4 @@ pub fn decode_png(data: &[u8]) -> Result<Image, DecodeError> {
         height: height as u32,
         pixels,
     })
-}
-
-#[cfg(test)]
-mod temp_tests {
-    use super::*;
-
-    #[test]
-    fn decodes_wallpaper() {
-        let image = decode_png(include_bytes!(
-            "../../../assets/windows7/wallpapers/login-1024.png"
-        ))
-        .expect("wallpaper");
-        let non_black = image
-            .pixels
-            .chunks_exact(4)
-            .filter(|pixel| pixel[0] > 8 || pixel[1] > 8 || pixel[2] > 8)
-            .count();
-        assert_eq!(non_black, image.pixels.len() / 4);
-    }
 }

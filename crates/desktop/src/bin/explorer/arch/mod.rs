@@ -39,3 +39,16 @@ pub struct DesktopMouseState {
     pub y: i32,
     pub buttons: u32,
 }
+
+pub fn shell_time() -> u64 {
+    syscall5(0x0306, 0, 0, 0, 0, 0)
+}
+pub fn shell_ticks() -> u64 {
+    syscall5(0x0307, 0, 0, 0, 0, 0)
+}
+pub fn shell_devices() -> u64 {
+    syscall5(0x0309, 0, 0, 0, 0, 0)
+}
+pub fn shell_audio(volume: u8, muted: bool) -> u64 {
+    syscall5(0x0308, volume as usize, usize::from(muted), 0, 0, 0)
+}
