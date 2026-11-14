@@ -26,6 +26,9 @@ pub use ntoskrnl::{
 
 pub mod cmd;
 pub mod cmd_extensions;
+pub mod boot_config;
+pub mod command_tools;
+pub mod guest_program;
 #[path = "../../csrss/src/csrss.rs"]
 pub mod csrss;
 pub mod libs_smoke;

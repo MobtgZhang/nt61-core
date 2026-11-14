@@ -267,6 +267,89 @@ pub fn is_reference_command(command: &str) -> bool {
     REFERENCE_COMMANDS.contains(&canonical.as_str())
 }
 
+/// Execute implemented operations with their actual status. Recognition alone is
+/// never sufficient to report successful execution.
+pub fn execute_status(command:&str,arguments:&str,cwd:&[u8])->u32{
+    match command{
+        "diskpart"=>cmd_diskpart_status(arguments,cwd),
+        "bcdedit"=>cmd_bcdedit_status(arguments,cwd),
+        "find"|"findstr"|"fc"|"sort"|"more"=>text_command_status(command,arguments,cwd),
+        "rem"=>0,
+        "net"|"sc"=>service_command_status(command,arguments),
+        "reg"=>registry_query_status(arguments),
+        "taskkill"=>{
+            let Ok(args)=super::command_tools::arguments(arguments)else{return 1;};
+            if args.len()!=2||!args[0].eq_ignore_ascii_case("/pid"){output_line("Supported syntax: TASKKILL /PID processid");return 1;}
+            let Ok(pid)=args[1].parse::<u64>()else{output_line("Invalid process ID.");return 1;};
+            match crate::ps::process_mgmt::terminate_process_by_pid(pid,true){Ok(())=>{output_line("SUCCESS: The process was terminated.");0},Err(s)=>{output_line(&format!("Cannot terminate the process (0x{:08X}).",s as u32));1}}
+        },
+        "route"=>{
+            let option=arguments.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            if option.is_empty()||option=="print"{cmd_netstat();0}
+            else if cmd_route(arguments){0}else{1}
+        },
+        "arp"=>{
+            let args:Vec<_>=arguments.split_whitespace().collect();
+            match args.as_slice(){
+                []|["-a"]=>{cmd_arp("-a");0},
+                ["-d",address]=>if let Some(a)=parse_ipv4(address){crate::netstack::arp::cache_remove(a);0}else{output_line("Invalid Internet address.");1},
+                ["-s",address,mac]=>if let(Some(a),Some(m))=(parse_ipv4(address),parse_mac(mac)){crate::netstack::arp::cache_add_static(a,&m);0}else{output_line("Invalid Internet or physical address.");1},
+                _=>{output_line("Supported syntax: ARP -a | -d address | -s address mac");1}
+            }
+        },
+        "ipconfig" if arguments.is_empty()||arguments.eq_ignore_ascii_case("/all")=>{cmd_ipconfig(arguments);0},
+        "netstat" if arguments.eq_ignore_ascii_case("-r")=>{cmd_netstat();0},
+        "tasklist" if arguments.is_empty()=>match crate::ps::process_mgmt::get_all_processes(){
+            Ok(processes)=>{output_line("Image Name                     PID   Mem Usage");for p in processes{output_line(&format!("{:<28} {:>5} {:>7} K",p.name,p.pid,p.memory_usage/1024));}0},
+            Err(_)=>{output_line("The process list is unavailable.");1}
+        },
+        "whoami" if arguments.is_empty()=>{
+            let token=crate::ps::process::get_current_thread_token();
+            let name=if token.is_null(){None}else{unsafe{crate::se::logon::name_for_sid(&(*token).user)}};
+            if let Some(name)=name{output_line(&format!("nt61\\{}",name.to_ascii_lowercase()));0}else{output_line("Unable to resolve the current security token.");1}
+        },
+        "hostname"|"ver"|"systeminfo"|"driverquery"|"getmac" if arguments.is_empty()=>{execute(command,arguments,cwd);0},
+        "shutdown" if arguments.eq_ignore_ascii_case("/s")||arguments.eq_ignore_ascii_case("/r")=>{cmd_shutdown(arguments);0},
+        "where"=>{
+            let Ok(args)=super::command_tools::arguments(arguments)else{return 1;};
+            if args.len()!=1||args[0].contains(['*','?']){output_line("WHERE currently supports one exact file name.");return 1;}
+            let name=&args[0];let mut candidates=alloc::vec![super::command_tools::path(name,cwd)];
+            if !name.contains(['\\','/',':']){for base in ["C:\\Windows\\System32","C:\\Windows"]{candidates.push(format!("{base}\\{name}"));if !name.contains('.'){candidates.push(format!("{base}\\{name}.exe"));}}}
+            let mut found=false;for path in candidates{if crate::fs::system_volume::read_at(&path,0,0).is_ok(){output_line(&path);found=true;}}
+            if found{0}else{output_line("INFO: Could not find files for the given pattern(s).");1}
+        },
+        _=>{output_line(&format!("{}: this operation is not implemented in this build (ERROR_NOT_SUPPORTED, 50).",command.to_uppercase()));50}
+    }
+}
+
+fn service_command_status(command:&str,arguments:&str)->u32{
+    let args=match super::command_tools::arguments(arguments){Ok(a)=>a,Err(e)=>{output_line(e);return 1;}};
+    let op=args.first().map(|s|s.to_ascii_lowercase()).unwrap_or_default();
+    let name=args.get(1).map(String::as_str).unwrap_or("");
+    if args.len()>2{output_line("Unsupported service command options.");return 1;}
+    if (command=="sc"&&op=="query")||(command=="net"&&op=="start"&&name.is_empty()){
+        if name.is_empty(){for(name,state)in crate::servers::services::list_services(){if command=="sc"||state==crate::servers::services::ServiceState::Running{output_line(&format!("{name:<34} {}",service_state_name(state)));}}return 0;}
+        if let Some(service)=crate::servers::services::query_service_info(name){output_line(&format!("SERVICE_NAME: {}\r\nSTATE: {}\r\nIMAGE_PATH: {}",service.name,service_state_name(service.state),service.image_path));return 0;}
+        output_line("The specified service does not exist.");return 1060;
+    }
+    if name.is_empty(){output_line("Specify a service name.");return 1;}
+    let result=match op.as_str(){
+        "start"=>crate::servers::services::start_service(name),
+        "stop"=>crate::servers::services::stop_service(name),
+        "pause"|"continue" if command=="net"=>{let Some(handle)=crate::servers::services::open_service(name)else{output_line("The specified service does not exist.");return 1060;};crate::servers::services::control_service(handle,if op=="pause"{crate::servers::services::ServiceControl::Pause}else{crate::servers::services::ServiceControl::Continue})},
+        _=>{output_line("Supported operations: QUERY (SC), START, STOP, PAUSE/CONTINUE (NET).");return 50;}
+    };
+    if result{output_line("The operation completed successfully.");0}else{output_line("The service operation failed.");1}
+}
+fn registry_query_status(arguments:&str)->u32{
+    let args=match super::command_tools::arguments(arguments){Ok(a)=>a,Err(e)=>{output_line(e);return 1;}};
+    if !(args.len()==2||args.len()==4)||!args[0].eq_ignore_ascii_case("query")||args.len()==4&&!args[2].eq_ignore_ascii_case("/v"){output_line("Supported syntax: REG QUERY key [/v value_name]");return 1;}
+    let key=&args[1];output_line(key);
+    if args.len()==4{if let Some(v)=crate::registry::cm::query_value(key,&args[3]){output_line(&format!("{}    {}    {}",args[3],format_registry_type(v.value_type),format_registry_value(&v)));0}else{output_line("The specified registry key or value was not found.");1}}
+    else if let Some(names)=crate::registry::cm::enumerate_values(key){for name in names{if let Some(v)=crate::registry::cm::query_value(key,&name){output_line(&format!("{name}    {}    {}",format_registry_type(v.value_type),format_registry_value(&v)));}}0}
+    else{output_line("The specified registry key was not found.");1}
+}
+
 /// Execute a reference command that is not owned by the legacy shell.
 pub fn execute(command: &str, arguments: &str, cwd: &[u8]) -> bool {
     match command {
@@ -303,14 +386,14 @@ pub fn execute(command: &str, arguments: &str, cwd: &[u8]) -> bool {
         "where" => cmd_where(arguments, cwd),
         "reg" => cmd_reg(arguments),
         "fsutil" => cmd_fsutil(arguments),
-        "bcdedit" => cmd_bcdedit(arguments),
+        "bcdedit" => {let _=cmd_bcdedit_status(arguments,cwd);false},
         "choice" => cmd_choice(arguments),
         "chkdsk" | "chkntfs" => cmd_chkdsk(command, arguments),
         "cipher" => cmd_cipher(arguments),
         "clip" => cmd_clip(arguments),
         "compact" => cmd_compact(arguments),
         "convert" => cmd_convert(arguments),
-        "diskpart" => cmd_diskpart(),
+        "diskpart" => {let _=cmd_diskpart_status(arguments,cwd);false},
         "doskey" => cmd_doskey(arguments),
         "format" => cmd_format(arguments),
         "fc" => cmd_fc(arguments, cwd),
@@ -487,13 +570,11 @@ pub fn execute(command: &str, arguments: &str, cwd: &[u8]) -> bool {
 fn output(text: &str) {
     for byte in text.as_bytes() {
         if *byte != b'\x1b' && *byte != b'\x00' {
-            crate::hal::serial::with_serial_unmasked(|| {
-                crate::hal::text_console::put_serial_and_console(*byte);
-            });
-            // Mirror into the SSH capture buffer so remote command
-            // submission (sc query, net start, ipconfig, ...) returns
-            // non-empty output. Matches cmd.rs::dual_print behaviour.
-            crate::servers::cmd::capture_output_byte(*byte);
+            if crate::servers::cmd::capture_output_byte(*byte) {
+                crate::hal::serial::with_serial_unmasked(|| {
+                    crate::hal::text_console::put_serial_and_console(*byte);
+                });
+            }
         }
     }
 }
@@ -1008,14 +1089,37 @@ fn format_registry_type(value_type: crate::registry::hive::ValueType) -> &'stati
 }
 
 fn format_registry_value(value: &crate::registry::hive::Value) -> String {
-    if let Some(number) = value.as_u32() {
-        return format!("0x{:x} ({})", number, number);
-    }
-    if let Some(number) = value.as_u64() {
-        return format!("0x{:x}", number);
-    }
-    if let Some(text) = value.as_utf16_string() {
-        return text;
+    use crate::registry::hive::ValueType;
+    // The type decides how bytes are interpreted. REG_SZ and REG_BINARY
+    // commonly contain four or more bytes without being DWORD values.
+    match value.value_type {
+        ValueType::DWord | ValueType::DWordBigEndian if value.data.len() == 4 => {
+            let bytes = [value.data[0], value.data[1], value.data[2], value.data[3]];
+            let number = if value.value_type == ValueType::DWordBigEndian {
+                u32::from_be_bytes(bytes)
+            } else {
+                u32::from_le_bytes(bytes)
+            };
+            return format!("0x{number:x} ({number})");
+        }
+        ValueType::QWord if value.data.len() == 8 => {
+            if let Some(number) = value.as_u64() {
+                return format!("0x{number:x}");
+            }
+        }
+        ValueType::String | ValueType::ExpandString | ValueType::Link => {
+            if let Some(text) = value.as_utf16_string() {
+                return text;
+            }
+        }
+        ValueType::MultiString if value.data.len().is_multiple_of(2) => {
+            let units: Vec<u16> = value.data.chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])).collect();
+            if let Ok(text) = String::from_utf16(&units) {
+                return text.trim_end_matches('\0').replace('\0', "\\0");
+            }
+        }
+        _ => {}
     }
     value
         .data
@@ -1393,10 +1497,22 @@ fn cmd_title(arguments: &str) -> bool {
 }
 
 fn cmd_identity(command: &str) -> bool {
+    if command == "whoami" {
+        let token = crate::ps::process::get_current_thread_token();
+        let name = if token.is_null() { None } else {
+            // SAFETY: the running thread/process owns its effective token
+            // throughout this synchronous command; no pointer escapes the call.
+            unsafe { crate::se::logon::name_for_sid(&(*token).user) }
+        };
+        match name {
+            Some(name) => output_line(&format!("nt61\\{}", name.to_ascii_lowercase())),
+            None => output_line("ERROR: Unable to resolve the current security token."),
+        }
+        return false;
+    }
     output_line(match command {
         "ver" => "Microsoft Windows [Version 6.1.7601]",
         "vol" => " Volume in drive C is NT6.1\r\n Volume Serial Number is 0A1B-2C3D",
-        "whoami" => "nt61\\user",
         _ => "",
     });
     false
@@ -1904,11 +2020,21 @@ fn cmd_schtasks(arguments: &str) -> bool {
     false
 }
 
-fn cmd_diskpart() -> bool {
-    output_line("Disk ###  Status   Size   Free");
-    output_line("--------  -------  -----  -----");
-    output_line("Disk 0    Online   32 GB  0 B");
-    false
+/// Script mode shares the exact backend with the interactive desktop console.
+fn cmd_diskpart_status(arguments:&str,cwd:&[u8])->u32{
+    let args=arguments.trim();
+    if args.eq_ignore_ascii_case("/?"){output_line("DISKPART /S script.txt  |  Interactive: open diskpart.exe from the desktop.");return 0;}
+    let Some((option,file))=args.split_once(char::is_whitespace)else{output_line("Use DISKPART /S script.txt or open the interactive diskpart.exe console.");return 1;};
+    if !option.eq_ignore_ascii_case("/s"){output_line("Invalid DiskPart option.");return 1;}
+    let file=file.trim().trim_matches('"');let directory=core::str::from_utf8(cwd).unwrap_or("C:\\");
+    let path=if file.as_bytes().get(1)==Some(&b':'){file.into()}else{format!("{}\\{}",directory.trim_end_matches('\\'),file)};
+    let bytes=match crate::fs::system_volume::read(&path){Ok(bytes)=>bytes,Err(status)=>{output_line(&format!("Cannot open DiskPart script (0x{status:08X})."));return 1;}};
+    let text=match core::str::from_utf8(&bytes){Ok(text)=>text.trim_start_matches('\u{feff}'),Err(_)=>{output_line("DiskPart scripts must be UTF-8 text.");return 1;}};
+    let mut state=crate::fs::diskpart::DiskPartState::new();
+    for line in text.lines(){let line=line.trim();if line.is_empty()||line.get(..3).is_some_and(|s|s.eq_ignore_ascii_case("rem"))&&line.as_bytes().get(3).is_none_or(u8::is_ascii_whitespace){continue;}
+        output_line(&format!("DISKPART> {line}"));
+        match crate::fs::diskpart::execute_command(line,&mut state){Ok(output)=>output_line(&output),Err(output)if output=="EXIT"=>return 0,Err(output)=>{output_line(&output);return 1;}}
+    }0
 }
 
 fn cmd_convert(arguments: &str) -> bool {
@@ -3549,4 +3675,50 @@ mod tests {
         assert!(is_reference_command("TASKLIST"));
         assert!(!is_reference_command("not-a-command"));
     }
+}
+
+fn text_command_status(command:&str,arguments:&str,cwd:&[u8])->u32 {
+    let(code,text)=super::command_tools::execute(command,arguments,|name|crate::fs::system_volume::read(&super::command_tools::path(name,cwd)));
+    output(&text);code
+}
+
+/// Edit the actual REGF store through VFS. Unsupported elements never report success.
+fn cmd_bcdedit_status(arguments:&str,cwd:&[u8])->u32 {
+    let mut args=match super::command_tools::arguments(arguments){Ok(a)=>a,Err(e)=>{output_line(e);return 1;}};
+    if args.len()==1&&args[0]=="/?"{output_line("BCDEDIT [/store file] [/enum [all|{id}] | /timeout seconds | /set {id} element value | /export file]\r\nSupported elements: description, locale, path, systemroot, loadoptions, timeout.");return 0;}
+    let mut path=String::from("C:\\Boot\\BCD");
+    let explicit_store=args.first().is_some_and(|s|s.eq_ignore_ascii_case("/store"));
+    if explicit_store {
+        if args.len()<2{output_line("The /store option requires a file name.");return 1;}
+        path=super::command_tools::path(&args[1],cwd);args.drain(..2);
+    }
+    // UEFI installs keep BCD on the ESP, outside C:'s VFS mount. Read
+    // the actual hive loaded by the boot manager; never create a shadow
+    // C:\Boot\BCD and claim it controls firmware boot.
+    let (bytes,writable)=if explicit_store {
+        match crate::fs::system_volume::read(&path){Ok(b)=>(b,true),Err(s)=>{output_line(&format!("The boot configuration store could not be opened (0x{s:08X})."));return 1;}}
+    }else if let Some(b)=crate::registry::cm::export_hive_by_id(5){(b,false)}
+    else{output_line("The active boot configuration hive is unavailable. Specify /store file.");return 1;};
+    let mut store=match super::boot_config::Store::parse(&bytes){Ok(s)=>s,Err(e)=>{output_line(e);return 1;}};
+    let action=args.first().map(|s|s.to_ascii_lowercase()).unwrap_or_else(||"/enum".into());
+    let result:Result<(),String>=(||{
+        match action.as_str(){
+            "/enum" if args.len()<=2=>{let text=store.enumerate(args.get(1).map(String::as_str)).map_err(String::from)?;output(&text);return Ok(());},
+            "/timeout" if !writable=>return Err("The active ESP store has no writable VFS mount. Export it and edit an explicit /store file.".into()),
+            "/set" if !writable=>return Err("The active ESP store has no writable VFS mount. Export it and edit an explicit /store file.".into()),
+            "/timeout" if args.len()==2=>store.set("{bootmgr}","timeout",&args[1]).map_err(String::from)?,
+            "/set" if args.len()>=4=>store.set(&args[1],&args[2],&args[3..].join(" ")).map_err(String::from)?,
+            "/export" if args.len()==2=>{
+                let dest=super::command_tools::path(&args[1],cwd);
+                if dest.eq_ignore_ascii_case(&path){return Err("The export file must differ from the active store.".into());}
+                crate::fs::system_volume::write(&dest,&bytes).map_err(|s|format!("Cannot export the store (0x{s:08X})."))?;
+                output_line("The operation completed successfully.");return Ok(());
+            },
+            _=>return Err("This BCDEdit operation is not implemented. Use /? for supported operations.".into()),
+        }
+        let updated=store.bytes().map_err(String::from)?;
+        crate::fs::system_volume::write(&path,&updated).map_err(|s|format!("Cannot save the store (0x{s:08X})."))?;
+        output_line("The operation completed successfully.");Ok(())
+    })();
+    match result{Ok(())=>0,Err(e)=>{output_line(&e);1}}
 }

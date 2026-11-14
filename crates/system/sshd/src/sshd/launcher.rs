@@ -199,16 +199,10 @@ const AF_INET: u16 = 2;
 /// channels is wired to the kernel cmd dispatcher here.
 pub fn start_listener() -> Result<u32, LauncherError> {
     child::install_command_executor(|line| {
-        crate::servers::cmd::begin_output_capture();
-        let exit_code = if crate::servers::cmd::execute_command_line(line) {
-            0
-        } else {
-            1
-        };
-        child::CommandExecution::new(
-            exit_code,
-            crate::servers::cmd::take_output_capture().unwrap_or_default(),
-        )
+        match crate::servers::cmd::execute_captured_command(line, b"C:\\") {
+            Ok(result) => child::CommandExecution::new(0, result.output),
+            Err(error) => child::CommandExecution::new(1, error.as_bytes().to_vec()),
+        }
     });
 
     let cfg = super::state_snapshot().config;
@@ -306,7 +300,7 @@ pub fn validate_config(cfg: &SshdConfig) -> Result<(), LauncherError> {
     }
     if cfg.host_key.trim().is_empty() {
         // We don't enforce this strictly — OpenSSH's default mode
-        // is "find any ssh_host_*_key in the same directory". But
+        // is "find any ssh_host_*key in the same directory". But
         // in our bare-metal world we require an explicit HostKey
         // entry so we don't have to guess.
         return Err(LauncherError::BadAddress);

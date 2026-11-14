@@ -51,38 +51,73 @@ const MAX_HISTORY: usize = 16;
 /// Command history storage
 static CMD_HISTORY: Spinlock<Vec<[u8; CMD_BUFFER_SIZE]>> = Spinlock::new(Vec::new());
 
-/// Bounded output buffer used by remote command submission (SSH).
-/// Command output continues to be mirrored to the local console while
-/// it is captured, so enabling capture never hides output.
-static OUTPUT_CAPTURE: Spinlock<Option<Vec<u8>>> = Spinlock::new(None);
-
+/// Nested sinks keep redirection from destroying a window/SSH capture.
+struct OutputCapture {
+    bytes: Vec<u8>,
+    mirror: bool,
+}
+static OUTPUT_CAPTURE: Spinlock<Vec<OutputCapture>> = Spinlock::new(Vec::new());
 const OUTPUT_CAPTURE_LIMIT: usize = 64 * 1024;
+static COMMAND_BUSY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Start capturing command output. Discards any previous capture.
-pub fn begin_output_capture() {
-    *OUTPUT_CAPTURE.lock() = Some(Vec::new());
-}
-
-/// Stop capturing and return the captured bytes.
-pub fn take_output_capture() -> Option<Vec<u8>> {
-    OUTPUT_CAPTURE.lock().take()
-}
-
-/// Append one byte to the active SSH output capture (if any). Used by
-/// the cmd_extensions module whose output helper bypasses dual_print.
-pub fn capture_output_byte(byte: u8) {
-    if let Some(capture) = OUTPUT_CAPTURE.lock().as_mut() {
-        if capture.len() < OUTPUT_CAPTURE_LIMIT {
-            capture.push(byte);
-        }
+struct CommandGuard;
+impl CommandGuard {
+    fn acquire() -> Result<Self, &'static str> {
+        COMMAND_BUSY.compare_exchange(false, true,
+            core::sync::atomic::Ordering::Acquire,
+            core::sync::atomic::Ordering::Relaxed)
+            .map(|_| Self).map_err(|_| "command service is busy")
     }
+}
+impl Drop for CommandGuard {
+    fn drop(&mut self) {
+        COMMAND_BUSY.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Begin a silent redirection sink. The outer capture resumes when it ends.
+pub fn begin_output_capture() {
+    OUTPUT_CAPTURE.lock().push(OutputCapture { bytes: Vec::new(), mirror: false });
+}
+pub fn take_output_capture() -> Option<Vec<u8>> {
+    OUTPUT_CAPTURE.lock().pop().map(|capture| capture.bytes)
+}
+
+/// Capture a byte, returning whether it should also reach the text console.
+pub fn capture_output_byte(byte: u8) -> bool {
+    let mut sinks = OUTPUT_CAPTURE.lock();
+    let Some(capture) = sinks.last_mut() else { return true; };
+    if capture.bytes.len() < OUTPUT_CAPTURE_LIMIT { capture.bytes.push(byte); }
+    capture.mirror
+}
+
+pub struct CommandOutput {
+    pub directory: Vec<u8>,
+    pub output: Vec<u8>,
+    pub exit: bool,
+}
+
+/// Execute with caller-owned cwd and a private output sink. No spinlock is held
+/// across filesystem/command execution, so interrupts remain serviceable.
+/// A second caller gets a busy error instead of stealing the active output.
+pub fn execute_captured_command(line: &str, directory: &[u8]) -> Result<CommandOutput, &'static str> {
+    let _guard = CommandGuard::acquire()?;
+    let mut cwd = Cwd::new();
+    if !directory.is_empty() { cwd.set_str(directory); }
+    begin_output_capture();
+    let exit=process_command_chain(line.trim(), &ShellMode::Ring3, &mut cwd);
+    let output = take_output_capture().unwrap_or_default();
+    Ok(CommandOutput {
+        directory: cwd.as_cstr().to_vec(), output,
+        exit,
+    })
 }
 
 /// Working directory shared by Ring-3 command submissions and the
 /// kernel fallback shell. A single shell instance is expected during
 /// bring-up, so one lock-protected instance is sufficient.
 static RING3_CWD: Spinlock<Cwd> = Spinlock::new(Cwd {
-    path: [0; 128],
+    path: [0; 1024],
     len: 0,
 });
 
@@ -134,7 +169,7 @@ impl ShellMode {
 
 /// Current working directory state
 struct Cwd {
-    path: [u8; 128],
+    path: [u8; 1024],
     len: usize,
 }
 
@@ -163,7 +198,7 @@ pub fn diagnostic_command_failure(reason: &[u8]) {
 impl Cwd {
     fn new() -> Self {
         let mut c = Self {
-            path: [0u8; 128],
+            path: [0u8; 1024],
             len: 0,
         };
         c.set_str(b"C:\\");
@@ -172,7 +207,7 @@ impl Cwd {
 
     fn set_str(&mut self, s: &[u8]) {
         self.len = 0;
-        for &c in s.iter().take(127) {
+        for &c in s.iter().take(self.path.len() - 1) {
             self.path[self.len] = c;
             self.len += 1;
         }
@@ -628,7 +663,7 @@ pub fn find_completion(input: &str) -> Option<String> {
 
 /// Process a command, returns true if shell should exit
 /// Supports command chaining: && || &
-/// Supports output redirection: > >> 2>
+/// Supports output redirection: > >> (stdout only)
 fn process_command(cmd: &[u8; CMD_BUFFER_SIZE], mode: &ShellMode, cwd: &mut Cwd) -> bool {
     // Find actual command length
     let cmd_len = cmd.iter().position(|&c| c == 0).unwrap_or(CMD_BUFFER_SIZE);
@@ -651,194 +686,154 @@ fn process_command(cmd: &[u8; CMD_BUFFER_SIZE], mode: &ShellMode, cwd: &mut Cwd)
 
 /// Process a command chain with redirection support
 fn process_command_chain(cmd_str: &str, mode: &ShellMode, cwd: &mut Cwd) -> bool {
-    // First, handle output redirection
-    let (cmd_part, redirect_file, append) = parse_redirection(cmd_str);
-
-    // handle command chaining: && || &
-    // Split by & (but not && or ||)
-    let parts = split_command_chain(cmd_part);
-
-    let mut last_result = false;
-
-    for part in parts {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-
-        let (operator, cmd_to_run) = parse_chain_operator(part);
-
-        if redirect_file.is_some() {
-            begin_output_capture();
-        }
-
-        match operator {
-            ChainOperator::And => {
-                // cmd1 && cmd2 - run cmd2 only if cmd1 succeeds
-                if last_result {
-                    last_result = execute_single_command(cmd_to_run, mode, cwd);
-                }
-            }
-            ChainOperator::Or => {
-                // cmd1 || cmd2 - run cmd2 only if cmd1 fails
-                if !last_result {
-                    last_result = execute_single_command(cmd_to_run, mode, cwd);
-                }
-            }
-            ChainOperator::None => {
-                // Regular command
-                last_result = execute_single_command(part, mode, cwd);
-            }
-        }
-
-        if let Some(path) = redirect_file {
-            let output = take_output_capture().unwrap_or_default();
-            write_command_output(path, &output, append, cwd);
-        }
-    }
-
-    last_result
-}
-
-fn write_command_output(path: &str, output: &[u8], append: bool, cwd: &Cwd) {
-    let Some(fs) = fs::ntfs::get_mounted_fs() else {
-        serial_print(b"Output redirection failed: no filesystem mounted.\r\n");
-        return;
+    let Ok(parts) = split_command_chain(cmd_str) else {
+        serial_print(b"Invalid or unsupported command chain.\r\n");
+        return false;
     };
+    let mut error_level = 0;
+    for (operator, part) in parts {
+        if matches!(operator, ChainOperator::And) && error_level != 0
+            || matches!(operator, ChainOperator::Or) && error_level == 0 { continue; }
+        let Ok((command, redirect, append)) = parse_redirection(part) else {
+            serial_print(b"Invalid or unsupported output redirection.\r\n");
+            error_level = 1;
+            continue;
+        };
+        if redirect.is_some() { begin_output_capture(); }
+        let result = execute_single_command(&command, mode, cwd);
+        error_level = result.error_level;
+        if let Some(path) = redirect {
+            let output = take_output_capture().unwrap_or_default();
+            if !write_command_output(&path, &output, append, cwd) { error_level = 1; }
+        }
+        if result.exit { return true; }
+    }
+    false
+}
 
-    let mut content = Vec::new();
-    if append {
-        let mut path_utf16 = command_path_utf16(path, cwd);
-        path_utf16.push(0);
-        if let Some(mut handle) = fs::ntfs::open_file(fs, &path_utf16, None) {
-            if !handle.is_directory && handle.file_size <= usize::MAX as u64 {
-                let mut existing = alloc::vec![0u8; handle.file_size as usize];
-                let mut offset = 0usize;
-                while offset < existing.len() {
-                    match fs::ntfs::read_file(fs, &mut handle, &mut existing[offset..]) {
-                        Ok(0) => break,
-                        Ok(read) => offset += read,
-                        Err(_) => break,
-                    }
-                }
-                content.extend_from_slice(&existing[..offset]);
+fn write_command_output(path: &str, output: &[u8], append: bool, cwd: &Cwd) -> bool {
+    let path = expand_env_vars(path);
+    // DOS device names are independent of the working directory. NUL must
+    // discard output, rather than create a misleading file in the system volume.
+    if path.eq_ignore_ascii_case("NUL") || path.eq_ignore_ascii_case("NUL:") {
+        return true;
+    }
+    let path = String::from_utf16_lossy(&command_path_utf16(&path, cwd));
+    let mut content = if append {
+        match fs::system_volume::read(&path) {
+            Ok(bytes) => bytes,
+            Err(0xC000_0034) => Vec::new(),
+            Err(status) => {
+                serial_print(format!("Output redirection failed (0x{status:08X}).\r\n").as_bytes());
+                return false;
             }
         }
+    } else { Vec::new() };
+    if content.len().saturating_add(output.len()) > 4 * 1024 * 1024 {
+        serial_print(b"Output redirection failed: file exceeds transfer limit.\r\n");
+        return false;
     }
-
     content.extend_from_slice(output);
-
-    let mut path_utf16 = command_path_utf16(path, cwd);
-    path_utf16.push(0);
-    if fs::ntfs::delete_file(fs, &path_utf16).is_err() {
-        let mut probe = command_path_utf16(path, cwd);
-        probe.push(0);
-        if fs::ntfs::open_file(fs, &probe, None).is_some() {
-            serial_print(b"Output redirection failed: cannot replace existing file.\r\n");
-            return;
-        }
+    if let Err(status) = fs::system_volume::write(&path, &content) {
+        serial_print(format!("Output redirection failed (0x{status:08X}).\r\n").as_bytes());
+        return false;
     }
-    let mut path_utf16 = command_path_utf16(path, cwd);
-    path_utf16.push(0);
-    if fs::ntfs::create_file(fs, &path_utf16, &content).is_err() {
-        serial_print(b"Output redirection failed.\r\n");
-    }
+    true
 }
 
-/// Chain operator types
+/// The shell-exit request and the command status are independent.
 #[derive(Debug, Clone, Copy)]
-enum ChainOperator {
-    None,
-    And, // &&
-    Or,  // ||
+struct CommandResult {
+    exit: bool,
+    error_level: u32,
 }
 
-/// Parse chain operator from command string
-fn parse_chain_operator(cmd: &str) -> (ChainOperator, &str) {
-    let cmd = cmd.trim();
+#[derive(Debug, Clone, Copy)]
+enum ChainOperator { None, And, Or }
 
-    // Check for &&
-    if let Some(pos) = cmd.find("&&") {
-        return (ChainOperator::And, cmd[..pos].trim());
+/// Preserve operators, quotes and caret escapes until each command is parsed.
+/// A single pipe needs a streaming input backend; reject it without running a
+/// misleading partial command. No operation executes on a malformed chain.
+fn split_command_chain(cmd: &str) -> Result<Vec<(ChainOperator, &str)>, ()> {
+    if cmd.trim().is_empty() { return Ok(Vec::new()); }
+    let bytes=cmd.as_bytes();
+    let mut parts=Vec::new();
+    let (mut start,mut index,mut quoted,mut operator)=(0,0,false,ChainOperator::None);
+    while index<bytes.len() {
+        match bytes[index] {
+            b'^' if !quoted => { if index+1==bytes.len(){return Err(());} index+=2; continue; },
+            b'"' => quoted=!quoted,
+            b'&'|b'|' if !quoted => {
+                let part=cmd[start..index].trim();
+                if part.is_empty(){return Err(());}
+                parts.push((operator,part));
+                let doubled=bytes.get(index+1)==Some(&bytes[index]);
+                operator=match (bytes[index],doubled) {
+                    (b'&',true)=>ChainOperator::And,
+                    (b'&',false)=>ChainOperator::None,
+                    (b'|',true)=>ChainOperator::Or,
+                    _=>return Err(()),
+                };
+                index+=if doubled{2}else{1};start=index;continue;
+            },
+            _=>{},
+        }
+        index+=1;
     }
-
-    // Check for ||
-    if let Some(pos) = cmd.find("||") {
-        return (ChainOperator::Or, cmd[..pos].trim());
-    }
-
-    (ChainOperator::None, cmd)
+    let tail=cmd[start..].trim();
+    if quoted||tail.is_empty(){return Err(());}
+    parts.push((operator,tail));Ok(parts)
 }
 
-/// Split command string by & operators (not && or ||)
-fn split_command_chain(cmd: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut chars = cmd.chars().peekable();
+/// Remove caret escapes only after syntax has been recognized. Carets inside
+/// double quotes remain literal, matching CMD's quoted argument behavior.
+fn unescape_command(command:&str)->String {
+    let (mut quoted,mut chars,mut output)=(false,command.chars(),String::new());
+    while let Some(ch)=chars.next() {
+        if ch=='"' {quoted=!quoted;}
+        if ch=='^'&&!quoted {if let Some(next)=chars.next(){output.push(next);}}
+        else {output.push(ch);}
+    }
+    output
+}
 
-    while let Some(c) = chars.next() {
-        if c == '&' {
-            // Check what follows
-            match chars.peek() {
-                Some('&') => {
-                    // It's && - end current part if non-empty
-                    chars.next(); // consume second &
-                    if !current.trim().is_empty() {
-                        parts.push(current.trim().to_string());
-                    }
-                    current.clear();
+/// Output redirection is scoped to one chain segment. Reject unsupported
+/// descriptors and multiple destinations instead of creating a wrongly named file.
+fn parse_redirection(cmd:&str)->Result<(String,Option<String>,bool),()> {
+    let bytes=cmd.as_bytes();let (mut index,mut quoted)=(0,false);
+    while index<bytes.len() {
+        match bytes[index] {
+            b'^' if !quoted=>{index+=2;continue;},
+            b'"'=>quoted=!quoted,
+            b'<' if !quoted=>return Err(()),
+            b'>' if !quoted=>{
+                if index>0&&bytes[index-1].is_ascii_digit(){return Err(());}
+                let append=bytes.get(index+1)==Some(&b'>');
+                let tail=cmd[index+if append{2}else{1}..].trim();
+                let mut quoted=false;let mut escaped=false;
+                for ch in tail.chars() {
+                    if escaped {escaped=false;continue;}
+                    if ch=='^'&&!quoted {escaped=true;continue;}
+                    if ch=='"' {quoted=!quoted;continue;}
+                    if !quoted&&(ch.is_whitespace()||matches!(ch,'>'|'<'|'&'|'|')){return Err(());}
                 }
-                _ => {
-                    // It's single & - treat as separator
-                    if !current.trim().is_empty() {
-                        parts.push(current.trim().to_string());
-                    }
-                    current.clear();
-                }
-            }
-        } else {
-            current.push(c);
+                if quoted||escaped||tail.is_empty(){return Err(());}
+                let path=unescape_command(tail).trim_matches('"').to_string();
+                if path.is_empty(){return Err(());}
+                return Ok((unescape_command(cmd[..index].trim()),Some(path),append));
+            },
+            _=>{},
         }
+        index+=1;
     }
-
-    // Don't forget the last part
-    if !current.trim().is_empty() {
-        parts.push(current.trim().to_string());
-    }
-
-    parts
-}
-
-/// Parse output redirection from command
-/// Returns (command, output_file, append)
-fn parse_redirection(cmd: &str) -> (&str, Option<&str>, bool) {
-    let cmd_bytes = cmd.as_bytes();
-
-    // Check for >> (append)
-    for i in (2..cmd_bytes.len()).rev() {
-        if cmd_bytes[i] == b'>' && cmd_bytes[i - 1] == b'>' {
-            let before = &cmd[..i - 1].trim();
-            let file = cmd[i + 1..].trim();
-            return (before, Some(file), true);
-        }
-    }
-
-    // Check for > (overwrite)
-    for i in (1..cmd_bytes.len()).rev() {
-        if cmd_bytes[i] == b'>' && cmd_bytes[i - 1] != b'>' {
-            let before = &cmd[..i].trim();
-            let file = cmd[i + 1..].trim();
-            return (before, Some(file), false);
-        }
-    }
-
-    (cmd, None, false)
+    Ok((unescape_command(cmd),None,false))
 }
 
 /// Execute a single command and return success/failure
-fn execute_single_command(cmd_str: &str, mode: &ShellMode, cwd: &mut Cwd) -> bool {
+fn execute_single_command(cmd_str: &str, mode: &ShellMode, cwd: &mut Cwd) -> CommandResult {
+    let mut error_level = 0;
     if cmd_str.is_empty() {
-        return false;
+        return CommandResult { exit:false, error_level:0 };
     }
 
     // Expand environment variables
@@ -853,17 +848,18 @@ fn execute_single_command(cmd_str: &str, mode: &ShellMode, cwd: &mut Cwd) -> boo
                 serial_print(b"\r\n");
             }
         }
-        return false;
+        return CommandResult { exit:false, error_level:0 };
     }
 
     // Preserve the user-visible spelling of the command name while
     // dispatching through a canonical form so `dir`, `Dir`, and `DIR`
     // select the same implementation.
     let command_name = expanded.split_whitespace().next().unwrap_or("");
-    let cmd_name = command_name.to_uppercase();
+    let canonical_name = command_name.to_uppercase();
+    let cmd_name = canonical_name.strip_suffix(".EXE").unwrap_or(&canonical_name);
 
     if cmd_name.is_empty() {
-        return false;
+        return CommandResult { exit:false, error_level:1 };
     }
 
     // Keep the Ring-0 shell small and auditable.  The full Windows 7
@@ -871,7 +867,7 @@ fn execute_single_command(cmd_str: &str, mode: &ShellMode, cwd: &mut Cwd) -> boo
     // this maintenance shell.
     if !matches!(mode, ShellMode::Ring3)
         && !matches!(
-            cmd_name.as_str(),
+            cmd_name,
             "CD" | "CHDIR"
                 | "CLS"
                 | "DIR"
@@ -886,19 +882,20 @@ fn execute_single_command(cmd_str: &str, mode: &ShellMode, cwd: &mut Cwd) -> boo
         )
     {
         serial_print(b"The command is not supported by the kernel maintenance shell.\r\n");
-        return false;
+        return CommandResult { exit:false, error_level:1 };
     }
 
     // Get arguments
-    let args = &expanded[cmd_name.len()..].trim();
+    let args = expanded[command_name.len()..].trim();
 
-    match cmd_name.as_str() {
-        "CD" | "CHDIR" => cmd_cd(args, cwd),
+    match cmd_name {
+        "CD" | "CHDIR" => error_level = cmd_cd(args, cwd),
         "PWD" => {
             serial_print(cwd.as_cstr());
             serial_print(b"\r\n");
         }
-        "DIR" | "LS" => cmd_dir(cwd, args),
+        "DIR" | "LS" => error_level = cmd_dir(cwd, args),
+        "CLS" if !OUTPUT_CAPTURE.lock().is_empty() => {},
         "CLS" => {
             crate::hal::text_console::clear();
             crate::drivers::bootvid::vid_clear_black();
@@ -907,53 +904,60 @@ fn execute_single_command(cmd_str: &str, mode: &ShellMode, cwd: &mut Cwd) -> boo
         "TYPE" | "CAT" => {
             if args.is_empty() {
                 serial_print(b"Syntax: TYPE filename\r\n");
+                error_level = 1;
             } else {
-                cmd_type(args, cwd);
+                error_level = cmd_type(args, cwd);
             }
         }
         "VER" => cmd_ver(),
         "DATE" => cmd_date(args),
         "TIME" => cmd_time(args),
         "HELP" | "?" => cmd_help(),
-        "EXIT" => return true,
+        "EXIT" => return CommandResult {exit:true,error_level:0},
         "HALT" => cmd_halt(),
         "REBOOT" => cmd_reboot(),
         "MOUNTVOL" => cmd_mountvol(),
         "VOL" => cmd_vol(),
         // File operation commands
-        "COPY" => cmd_copy(args, cwd),
-        "DEL" | "DELETE" | "ERASE" => cmd_del(args, cwd),
-        "MD" | "MKDIR" => cmd_mkdir(args, cwd),
-        "RD" | "RMDIR" => cmd_rmdir(args, cwd),
-        "MOVE" => cmd_move(args, cwd),
-        "REN" | "RENAME" => cmd_rename(args, cwd),
+        "COPY" => error_level = cmd_copy(args, cwd),
+        "DEL" | "DELETE" | "ERASE" => error_level = cmd_del(args, cwd),
+        "MD" | "MKDIR" => error_level = cmd_mkdir(args, cwd),
+        "RD" | "RMDIR" => error_level = cmd_rmdir(args, cwd),
+        "MOVE" => error_level = cmd_move(args, cwd),
+        "REN" | "RENAME" => error_level = cmd_rename(args, cwd),
         "SET" => cmd_set(args),
         // NTFS-specific commands
         "NTFS" => cmd_ntfs_info(),
-        _ if super::cmd_extensions::is_reference_command(cmd_name.as_str()) => {
-            super::cmd_extensions::execute(cmd_name.to_lowercase().as_str(), args, cwd.as_cstr());
+        _ if super::cmd_extensions::is_reference_command(cmd_name) => {
+            error_level=super::cmd_extensions::execute_status(cmd_name.to_lowercase().as_str(), args, cwd.as_cstr());
         }
         "KDBG" => {
             if matches!(mode, ShellMode::SafeModeDebug) {
                 cmd_kdbg(args);
             } else {
                 serial_print(b"'KDBG' is not recognized as an internal or external command,\r\n");
+                error_level = 9009;
             }
         }
         _ => {
             // Not a built-in command — try as a batch file (.bat/.cmd)
             // or a DOS-style executable on the FAT32 volume.
-            if try_run_batch_file(cmd_str, cwd) {
-                return false;
+            if let Some(error_level) = try_run_batch_file(cmd_str, cwd) {
+                return CommandResult { exit: false, error_level };
+            }
+            let directory = core::str::from_utf8(cwd.as_cstr()).unwrap_or("C:\\").trim_end_matches('\0');
+            if let Some(error_level) = super::guest_program::try_execute(&expanded, directory, &get_env_var("PATH"), serial_print) {
+                return CommandResult { exit: false, error_level };
             }
             serial_print(b"'");
             serial_print(command_name.as_bytes());
             serial_print(b"' is not recognized as an internal or external command,\r\n");
             serial_print(b"operable program or batch file.\r\n");
+            error_level = 9009;
         }
     }
 
-    false
+    CommandResult {exit:false,error_level}
 }
 
 // ============================================================================
@@ -1001,8 +1005,9 @@ fn expand_env_vars(s: &str) -> String {
                 continue;
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        let character = s[i..].chars().next().expect("position is a UTF-8 boundary");
+        result.push(character);
+        i += character.len_utf8();
     }
 
     result
@@ -1019,9 +1024,9 @@ fn get_env_var(name: &str) -> String {
         "SYSTEMROOT" => return String::from("C:\\Windows"),
         "WINDIR" => return String::from("C:\\Windows"),
         "HOMEDRIVE" => return String::from("C:"),
-        "HOMEPATH" => return String::from("\\Users\\Default"),
+        "HOMEPATH" => return String::from("\\Users\\Administrator"),
         "USERNAME" => return String::from("Administrator"),
-        "USERPROFILE" => return String::from("C:\\Users\\Default"),
+        "USERPROFILE" => return String::from("C:\\Users\\Administrator"),
         "TEMP" | "TMP" => return String::from("C:\\Windows\\Temp"),
         _ => {}
     }
@@ -1056,6 +1061,9 @@ fn command_path_utf16(path: &str, cwd: &Cwd) -> Vec<u16> {
     let path = path.trim().trim_matches('"');
     if path.len() >= 2 && path.as_bytes()[1] == b':' {
         path.encode_utf16().collect()
+    } else if path.starts_with(['\\', '/']) {
+        let drive = core::str::from_utf8(&cwd.as_cstr()[..2]).unwrap_or("C:");
+        format!("{drive}{path}").encode_utf16().collect()
     } else {
         let mut full_path = cwd.as_cstr().to_vec();
         if full_path.last() != Some(&b'\\') {
@@ -1164,23 +1172,23 @@ mod path_resolution_tests {
     }
 }
 
-fn cmd_cd(args: &str, cwd: &mut Cwd) {
+fn cmd_cd(args: &str, cwd: &mut Cwd) -> u32 {
     if args.is_empty() {
         // Show current directory
         serial_print(cwd.as_cstr());
         serial_print(b"\r\n");
-        return;
+        return 0;
     }
 
     let target = args.trim().trim_matches('"');
     if target.is_empty() {
-        return;
+        return 0;
     }
 
     // handle special cases
     if target == "." {
         // Stay in current directory
-        return;
+        return 0;
     }
     if target == ".." {
         // Go up one level
@@ -1188,40 +1196,20 @@ fn cmd_cd(args: &str, cwd: &mut Cwd) {
             // Don't go above C:\
             cwd.pop();
         }
-        return;
-    }
-
-    if !ntfs::is_mounted() {
-        serial_print(b"The system cannot find the path specified.\r\n");
-        return;
+        return 0;
     }
 
     let Some(full_path) = normalize_windows_path(target, cwd) else {
         serial_print(b"The system cannot find the path specified.\r\n");
-        return;
+        return 1;
     };
-    if full_path == b"C:\\" {
-        cwd.set_str(&full_path);
-        return;
+    let path = String::from_utf8_lossy(&full_path);
+    if let Err(status) = fs::system_volume::list(&path) {
+        serial_print(format!("Cannot open directory (0x{status:08X}).\r\n").as_bytes());
+        return 1;
     }
-    let path_utf16: Vec<u16> = full_path
-        .iter()
-        .map(|&byte| byte as u16)
-        .chain(core::iter::once(0))
-        .collect();
-    let directory = ntfs::open_file(ntfs::get_mounted_fs().unwrap(), &path_utf16, None);
-    if !directory.is_some_and(|handle| handle.is_directory) {
-        serial_print(b"The system cannot find the path specified.\r\n");
-        return;
-    }
-
     cwd.set_str(&full_path);
-
-    // Remove trailing backslash except for root
-    while cwd.len > 3 && cwd.path[cwd.len - 1] == b'\\' {
-        cwd.len -= 1;
-        cwd.path[cwd.len] = 0;
-    }
+    0
 }
 
 enum EchoCommand<'a> {
@@ -1402,157 +1390,34 @@ fn parse_sort_order(sort_str: &str) -> u8 {
     order
 }
 
-fn cmd_dir(cwd: &Cwd, args: &str) {
-    // Parse options
-    let (options, _path) = parse_dir_options(args);
-
-    // Brief format (/B) suppresses headers and summary
-    if !options.brief {
-        // Print header with volume info
-        serial_print(b" Volume in drive C is NT6.1\r\n");
-        if let Some(volume) = ntfs::get_mounted_fs() {
-            serial_print(
-                format!(
-                    " Volume Serial Number is {:04X}-{:04X}\r\n\r\n",
-                    ((volume.ntfs_data.volume_serial >> 32) & 0xFFFF) as u16,
-                    (volume.ntfs_data.volume_serial & 0xFFFF) as u16
-                )
-                .as_bytes(),
-            );
-        } else {
-            serial_print(b" Volume Serial Number is 0000-0000\r\n\r\n");
-        }
-
-        serial_print(b" Directory of ");
-        serial_print(cwd.as_cstr());
-        serial_print(b"\r\n\r\n");
+fn cmd_dir(cwd: &Cwd, args: &str) -> u32 {
+    let (options, target) = parse_dir_options(args);
+    if options.recursive {
+        serial_print(b"DIR /S is not supported by this console service.\r\n");
+        return 1;
     }
-
-    // Print . and ..
-    if !options.brief && !options.wide {
-        serial_print(b"01/01/1601  12:00 AM    <DIR>          .\r\n");
-        serial_print(b"01/01/1601  12:00 AM    <DIR>          ..\r\n");
-    } else if options.wide {
-        serial_print(b".\r\n");
-        serial_print(b"..\r\n");
+    let path = if target.is_empty() { String::from_utf8_lossy(cwd.as_cstr()).into_owned() }
+        else { String::from_utf16_lossy(&command_path_utf16(target, cwd)) };
+    let mut entries = match fs::system_volume::list(&path) {
+        Ok(entries) => entries,
+        Err(status) => {serial_print(format!("Cannot list directory (0x{status:08X}).\r\n").as_bytes());return 1;}
+    };
+    entries.sort_by(|a,b| match options.sort_order & 0x7f {
+        2 => a.size.cmp(&b.size),
+        _ => a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()),
+    });
+    if options.sort_order & 0x80 != 0 {entries.reverse();}
+    if !options.brief {serial_print(format!(" Directory of {path}\r\n\r\n").as_bytes());}
+    let (mut files,mut directories,mut size) = (0u32,0u32,0u64);
+    for entry in entries {
+        if options.attr_filter != 0xff && (options.attr_filter & 0x10 != 0) != entry.directory {continue;}
+        if entry.directory {directories+=1;} else {files+=1;size=size.saturating_add(entry.size);}
+        if options.brief {serial_print(format!("{}\r\n",entry.name).as_bytes());}
+        else if options.wide {serial_print(format!("{}{}  ",if entry.directory{"[DIR] "}else{""},entry.name).as_bytes());}
+        else {serial_print(format!("{:>16}  {}\r\n",if entry.directory{"<DIR>".into()}else{format!("{}",entry.size)},entry.name).as_bytes());}
     }
-
-    // Initialize counters
-    let mut file_count: u32 = 0;
-    let mut dir_count: u32 = 2; // . and ..
-    let mut total_size: u64 = 0;
-
-    // Check filesystem and list entries
-    if ntfs::is_mounted() {
-        if let Some(ntfs_fs) = ntfs::get_mounted_fs() {
-            let cwd_bytes = cwd.as_cstr();
-            let cwd_utf16: Vec<u16> = cwd_bytes.iter().map(|byte| *byte as u16).collect();
-            let directory_handle = ntfs::open_file(ntfs_fs, &cwd_utf16, None);
-            let directory_record = directory_handle
-                .map(|handle| handle.mft_record)
-                .unwrap_or(5);
-
-            for entry in ntfs::list_directory(ntfs_fs, directory_record) {
-                let name = String::from_utf16_lossy(&entry.name);
-                if entry.is_directory {
-                    dir_count += 1;
-                    if !options.brief && !options.wide {
-                        serial_print(format_dir_timestamp(entry.modification_time).as_bytes());
-                        serial_print(b"    <DIR>          ");
-                        serial_print(name.as_bytes());
-                        serial_print(b"\r\n");
-                    } else if options.wide {
-                        serial_print(b"<DIR>  ");
-                        serial_print(name.as_bytes());
-                        serial_print(b"  ");
-                    } else {
-                        serial_print(name.as_bytes());
-                        serial_print(b"\r\n");
-                    }
-                } else {
-                    file_count += 1;
-                    total_size += entry.file_size;
-                    if !options.brief && !options.wide {
-                        serial_print(format_dir_timestamp(entry.modification_time).as_bytes());
-                        serial_print(b"         ");
-                        serial_print_str(&format_size(entry.file_size as u32));
-                        serial_print(b" ");
-                        serial_print(name.as_bytes());
-                        serial_print(b"\r\n");
-                    } else if options.wide {
-                        serial_print(name.as_bytes());
-                        serial_print(b"  ");
-                    } else {
-                        serial_print(name.as_bytes());
-                        serial_print(b"\r\n");
-                    }
-                }
-            }
-        }
-    } else if fat32::is_mounted() {
-        // Try to read directory entries from FAT32
-        if let Some(fs) = fat32::get_mounted_fs() {
-            let mut entries = [fat32::FatDirEntry::new(); MAX_DIR_ENTRIES];
-            let count = fat32::list_root_directory(fs, &mut entries);
-
-            // Show real entries
-            for i in 0..count {
-                let entry = &entries[i];
-                let name_len = entry.name.iter().position(|&c| c == 0).unwrap_or(13);
-
-                if entry.is_dir {
-                    if !options.brief && !options.wide {
-                        serial_print(b"06/20/2026  12:00 PM    <DIR>          ");
-                        serial_print(&entry.name[..name_len]);
-                        serial_print(b"\r\n");
-                    } else if options.wide {
-                        serial_print(b"<DIR>  ");
-                        serial_print(&entry.name[..name_len]);
-                        serial_print(b"  ");
-                    } else {
-                        serial_print(&entry.name[..name_len]);
-                        serial_print(b"\r\n");
-                    }
-                    dir_count += 1;
-                } else {
-                    if !options.brief && !options.wide {
-                        serial_print(b"06/20/2026  12:00 PM         ");
-                        serial_print_str(&format_size(entry.size));
-                        serial_print(b" ");
-                        serial_print(&entry.name[..name_len]);
-                        serial_print(b"\r\n");
-                    } else if options.wide {
-                        serial_print(&entry.name[..name_len]);
-                        serial_print(b"  ");
-                    } else {
-                        serial_print(&entry.name[..name_len]);
-                        serial_print(b"\r\n");
-                    }
-                    file_count += 1;
-                    total_size += entry.size as u64;
-                }
-            }
-        }
-    } else {
-        // Use built-in directory listing
-        print_builtin_dir(cwd, &options);
-    }
-
-    // Print summary (unless /B)
-    if !options.brief {
-        if options.wide {
-            serial_print(b"\r\n");
-        }
-        serial_print(b"\r\n");
-        serial_print(b"               ");
-        serial_print_str(&format_number(file_count));
-        serial_print(b" File(s)      ");
-        serial_print_str(&format_size(total_size as u32));
-        serial_print(b" bytes\r\n");
-        serial_print(b"                ");
-        serial_print_str(&format_number(dir_count));
-        serial_print(b" Dir(s)       64,000,000 bytes free\r\n");
-    }
+    if !options.brief {serial_print(format!("\r\n{files} File(s) {size} bytes\r\n{directories} Dir(s)\r\n").as_bytes());}
+    0
 }
 
 /// Convert an NTFS FILETIME value to the compact date/time form used by
@@ -1676,64 +1541,11 @@ fn print_builtin_dir(cwd: &Cwd, options: &DirOptions) {
     }
 }
 
-fn cmd_type(path: &str, _cwd: &Cwd) {
-    let filename = path.trim().trim_matches('"').as_bytes();
-    if fs::ntfs::is_mounted() && try_read_ntfs_file(path, _cwd) {
-        return;
-    }
-
-    let fs_mounted = fat32::is_mounted();
-    if !fs_mounted {
-        serial_print(b"No filesystem mounted.\r\n");
-        serial_print(b"Cannot read file: ");
-        serial_print(filename);
-        serial_print(b"\r\n");
-        return;
-    }
-
-    if fat32::is_mounted() {
-        if let Some(fs) = fat32::get_mounted_fs() {
-            let mut buffer = [0u8; 512];
-
-            // Look for file in root directory
-            if let Some(entry) = find_file_in_root(fs, filename) {
-                let cluster = entry.first_cluster();
-                let size = entry.file_size();
-
-                if size > 0 {
-                    // read file content
-                    let read_size = core::cmp::min(size as usize, buffer.len());
-                    if let Ok(n) = fat32::read_file(fs, cluster, read_size as u32, &mut buffer) {
-                        // Print content as text (limit to readable ASCII)
-                        for &b in &buffer[..n] {
-                            if (0x20..0x7F).contains(&b) {
-                                dual_put_byte(b);
-                            } else if b == b'\n' {
-                                dual_put_byte(b);
-                            } else if b == b'\r' {
-                                // Skip (already handled \n)
-                            } else if b == 0 {
-                                break;
-                            } else {
-                                // Print hex for non-printable
-                                dual_put_byte(b'.');
-                            }
-                        }
-                        serial_print(b"\r\n");
-                        return;
-                    }
-                }
-            }
-
-            serial_print(b"File not found: ");
-            serial_print(filename);
-            serial_print(b"\r\n");
-            return;
-        }
-
-        serial_print(b"Failed to access filesystem.\r\n");
-    } else {
-        serial_print(b"No filesystem available.\r\n");
+fn cmd_type(path: &str, cwd: &Cwd) -> u32 {
+    let path = String::from_utf16_lossy(&command_path_utf16(path, cwd));
+    match fs::system_volume::read(&path) {
+        Ok(bytes) => {serial_print(&bytes);if !bytes.ends_with(b"\n"){serial_print(b"\r\n");}0},
+        Err(status) => {serial_print(format!("Cannot read file (0x{status:08X}).\r\n").as_bytes());1},
     }
 }
 
@@ -2026,240 +1838,80 @@ fn cmd_kdbg(args: &str) {
 
 /// COPY command - Copy files
 /// Syntax: COPY source [+source2...] dest
-fn cmd_copy(args: &str, _cwd: &Cwd) {
-    if args.is_empty() {
-        serial_print(b"Syntax: COPY source [+source2...] dest\r\n");
-        return;
-    }
-
-    // Find the last space-separated token (destination)
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    if parts.len() < 2 {
-        serial_print(b"Invalid number of arguments.\r\n");
-        serial_print(b"Syntax: COPY source dest\r\n");
-        return;
-    }
-
-    let dest = parts[parts.len() - 1];
-    let sources: Vec<&str> = parts[..parts.len() - 1].to_vec();
-
-    // Check if filesystem is available
-    if !fat32::is_mounted() {
-        serial_print(b"No filesystem mounted. Cannot copy.\r\n");
-        return;
-    }
-
-    let fs = match fat32::get_mounted_fs() {
-        Some(f) => f,
-        None => {
-            serial_print(b"No FAT32 filesystem available.\r\n");
-            return;
-        }
+fn cmd_copy(args: &str, cwd: &Cwd) -> u32 {
+    let Some(parts) = file_command_arguments(args) else {
+        serial_print(b"Unmatched quote.\r\n"); return 1;
     };
-
-    // Convert destination to 8.3 format
-    let dest_83 = fat32::name_to_83(dest);
-
-    // Check if destination already exists
-    if fat32::file_exists_in_root(fs, &dest_83) {
-        serial_print(b"Destination file already exists: ");
-        serial_print(dest.as_bytes());
-        serial_print(b"\r\n");
-        return;
+    if parts.len() != 2 || parts.iter().any(|part| part.contains(['*', '?', '+']) || part.starts_with('/')) {
+        serial_print(b"Syntax: COPY source destination (wildcards and concatenation are not supported).\r\n"); return 1;
     }
+    let source = String::from_utf16_lossy(&command_path_utf16(&parts[0], cwd));
+    let mut destination = String::from_utf16_lossy(&command_path_utf16(&parts[1], cwd));
+    if fs::system_volume::list(&destination).is_ok() {
+        destination.push('\\');
+        destination.push_str(source.rsplit(['\\', '/']).next().unwrap_or_default());
+    }
+    let result = (|| {
+        let source = fs::system_volume::normalize(&source)?;
+        let destination = fs::system_volume::normalize(&destination)?;
+        if source.eq_ignore_ascii_case(&destination) { return Err(0xC000000Du32); }
+        // Read the entire bounded source before writing; failed reads leave
+        // the destination untouched. No delete-and-recreate replacement.
+        let data = fs::system_volume::read(&source)?;
+        fs::system_volume::write(&destination, &data)
+    })();
+    match result {
+        Ok(()) => {serial_print(b"        1 file(s) copied.\r\n");0},
+        Err(status) => {serial_print(format!("Copy failed (0x{status:08X}).\r\n").as_bytes());1},
+    }
+}
 
-    let mut copied_count: u32 = 0;
-
-    for source in sources {
-        let source = source.trim_matches('"');
-
-        serial_print(b"        ");
-        serial_print(source.as_bytes());
-        serial_print(b"\r\n");
-
-        // Convert source to 8.3 format
-        let source_83 = fat32::name_to_83(source);
-
-        // Find source file
-        if let Some(source_entry) = fat32::find_file_in_root(fs, &source_83) {
-            let source_cluster = source_entry.first_cluster();
-            let source_size = source_entry.file_size();
-
-            if source_cluster == 0 || source_cluster >= fat32::FAT32_EOC {
-                serial_print(b"        Invalid source file cluster.\r\n");
-                continue;
-            }
-
-            // Allocate new cluster for destination
-            let dest_cluster = match fat32::allocate_cluster(fs, 0) {
-                Ok(c) => c,
-                Err(_) => {
-                    serial_print(b"        Failed to allocate cluster for destination.\r\n");
-                    continue;
-                }
-            };
-
-            // Copy file data cluster by cluster
-            let cluster_size = fs.base.cluster_size as usize;
-            let mut remaining = source_size as usize;
-            let mut current_source_cluster = source_cluster;
-            let mut current_dest_cluster = dest_cluster;
-
-            while remaining > 0 && (2..fat32::FAT32_EOC).contains(&current_source_cluster) {
-                let to_copy = core::cmp::min(remaining, cluster_size);
-
-                // read from source
-                if to_copy > 0 {
-                    let mut read_buf = alloc::vec![0u8; to_copy];
-                    if fat32::read_file(fs, current_source_cluster, to_copy as u32, &mut read_buf)
-                        .is_ok()
-                    {
-                        // write to destination
-                        if fat32::write_cluster(fs, current_dest_cluster, &read_buf).is_err() {
-                            serial_print(b"        Error writing to destination.\r\n");
-                            break;
-                        }
-                    }
-                }
-
-                remaining = remaining.saturating_sub(to_copy);
-
-                // Move to next source cluster
-                let next_source = fat32::read_fat_entry(fs, current_source_cluster);
-                if next_source >= fat32::FAT32_EOC || remaining == 0 {
-                    break;
-                }
-                current_source_cluster = next_source;
-
-                // Allocate next destination cluster if needed
-                if remaining > 0 {
-                    match fat32::allocate_cluster(fs, current_dest_cluster) {
-                        Ok(c) => current_dest_cluster = c,
-                        Err(_) => {
-                            serial_print(b"        Failed to allocate destination cluster.\r\n");
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // create destination file entry
-            if fat32::create_file_in_root(fs, &dest_83, dest_cluster, source_size).is_ok() {
-                serial_print(b"        1 file(s) copied.\r\n");
-                copied_count += 1;
-            } else {
-                serial_print(b"        Failed to create destination entry.\r\n");
-                // Free allocated cluster
-                let _ = fat32::free_cluster_chain(fs, dest_cluster);
-            }
-        } else {
-            serial_print(b"        Source file not found: ");
-            serial_print(source.as_bytes());
-            serial_print(b"\r\n");
+/// Whitespace separates file arguments only outside double quotes.
+fn file_command_arguments(args: &str) -> Option<Vec<String>> {
+    let mut result = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut present = false;
+    for ch in args.chars() {
+        match ch {
+            '"' => { quoted = !quoted; present = true; },
+            ch if ch.is_whitespace() && !quoted => {
+                if present { result.push(core::mem::take(&mut word)); present = false; }
+            },
+            ch => { word.push(ch); present = true; },
         }
     }
-
-    serial_print(b"       ");
-    serial_print_str(&format_number(copied_count));
-    serial_print(b" file(s) copied.\r\n");
+    if quoted { return None; }
+    if present { result.push(word); }
+    Some(result)
 }
 
 /// DEL/DELETE command - Delete files
 /// Syntax: DEL [/F] [/Q] pathname
-fn cmd_del(args: &str, _cwd: &Cwd) {
-    if args.is_empty() {
-        serial_print(b"Syntax: DEL [/F] [/Q] pathname\r\n");
-        return;
-    }
-
-    // Parse options
-    let mut force = false;
-    let mut quiet = false;
-    let mut prompt = false;
-    let mut pathname = String::new();
-
-    for part in args.split_whitespace() {
-        match part.to_uppercase().as_str() {
-            "/F" => force = true,
-            "/Q" => quiet = true,
-            "/P" => prompt = true,
-            _ => {
-                if pathname.is_empty() {
-                    pathname = part.to_string();
-                }
-            }
-        }
-    }
-
-    if pathname.is_empty() {
-        serial_print(b"Syntax: DEL pathname\r\n");
-        return;
-    }
-
-    // Check if filesystem is available
-    if !fat32::is_mounted() {
-        serial_print(b"No filesystem mounted. Cannot delete.\r\n");
-        return;
-    }
-
-    let fs = match fat32::get_mounted_fs() {
-        Some(f) => f,
-        None => {
-            serial_print(b"No FAT32 filesystem available.\r\n");
-            return;
-        }
+fn cmd_del(args: &str, cwd: &Cwd) -> u32 {
+    let Some(parts) = file_command_arguments(args) else {
+        serial_print(b"Unmatched quote.\r\n"); return 1;
     };
-
-    // Convert filename to 8.3 format
-    let name_83 = fat32::name_to_83(&pathname);
-
-    // Find the file
-    if let Some((_cluster, byte_offset)) = fat32::find_file_in_root_ex(fs, &name_83) {
-        // read entry to get cluster and size
-        let sector_size = fs.base.sector_size as usize;
-        let sector_index = byte_offset / sector_size;
-        let offset_in_sector = byte_offset % sector_size;
-
-        let mut buffer = [0u8; 512];
-        if fat32::read_cluster_sector(fs, _cluster, sector_index as u32, &mut buffer).is_err() {
-            serial_print(b"Error reading directory entry.\r\n");
-            return;
+    let mut paths = Vec::new();
+    for part in &parts {
+        if part.eq_ignore_ascii_case("/F") || part.eq_ignore_ascii_case("/Q") { continue; }
+        if part.starts_with('/') || part.contains(['*', '?']) {
+            serial_print(b"This DEL option or wildcard is not supported.\r\n"); return 1;
         }
-
-        // Get cluster from entry (offset 20-21 for high word, 26-27 for low word)
-        let high =
-            u16::from_le_bytes([buffer[offset_in_sector + 20], buffer[offset_in_sector + 21]]);
-        let low =
-            u16::from_le_bytes([buffer[offset_in_sector + 26], buffer[offset_in_sector + 27]]);
-        let file_cluster = ((high as u32) << 16) | (low as u32);
-
-        if prompt && !quiet && !confirm_delete(pathname.as_str()) {
-            serial_print(b"Skipped.\r\n");
-            return;
-        }
-
-        serial_print(b"Deleting: ");
-        serial_print(pathname.as_bytes());
-        serial_print(b"\r\n");
-
-        // Free the cluster chain
-        if file_cluster >= 2 && fat32::free_cluster_chain(fs, file_cluster).is_err() {
-            serial_print(b"Warning: Error freeing file clusters.\r\n");
-        }
-
-        // Mark directory entry as deleted
-        if fat32::delete_file_entry(fs, _cluster, byte_offset).is_ok() {
-            serial_print(b"File deleted successfully.\r\n");
-        } else {
-            serial_print(b"Error marking file as deleted.\r\n");
-        }
-
-        let _ = (force, quiet);
-    } else {
-        serial_print(b"File not found: ");
-        serial_print(pathname.as_bytes());
-        serial_print(b"\r\n");
+        paths.push(part);
     }
+    if paths.is_empty() { serial_print(b"Syntax: DEL [/F] [/Q] pathname\r\n"); return 1; }
+    let mut error_level=0;
+    for path in paths {
+        let path = String::from_utf16_lossy(&command_path_utf16(path, cwd));
+        if fs::system_volume::list(&path).is_ok() {
+            serial_print(b"DEL requires a file; use RD for empty directories.\r\n"); error_level=1;continue;
+        }
+        if let Err(status) = fs::system_volume::remove(&path) {
+            serial_print(format!("Cannot delete {path} (0x{status:08X}).\r\n").as_bytes());error_level=1;
+        }
+    }
+    error_level
 }
 
 fn confirm_delete(pathname: &str) -> bool {
@@ -2281,214 +1933,83 @@ fn confirm_delete(pathname: &str) -> bool {
 
 /// MD/MKDIR command - create directory
 /// Syntax: MD pathname or MKDIR pathname
-fn cmd_mkdir(args: &str, cwd: &Cwd) {
+fn cmd_mkdir(args: &str, cwd: &Cwd) -> u32 {
     let path = args.trim();
     if path.is_empty() {
         serial_print(b"Syntax: MD pathname\r\n");
-        return;
+        return 1;
     }
 
     // Remove quotes if present
     let path = path.trim_matches('"');
 
-    if !ntfs::is_mounted() {
-        serial_print(b"No filesystem mounted. Cannot create directory.\r\n");
-        return;
+    let path = String::from_utf16_lossy(&command_path_utf16(path, cwd));
+    if let Err(status) = fs::system_volume::mkdir(&path) {
+        serial_print(format!("Cannot create directory (0x{status:08X}).\r\n").as_bytes());return 1;
     }
-
-    let path_utf16 = command_path_utf16(path, cwd);
-    if ntfs::create_directory(ntfs::get_mounted_fs().unwrap(), &path_utf16).is_ok() {
-        serial_print(b"        1 dir(s) created.\r\n");
-    } else {
-        serial_print(b"Directory already exists or the filesystem rejected the request.\r\n");
-    }
+    0
 }
 
 /// RD/RMDIR command - Remove directory
 /// Syntax: RD [/S] [/Q] pathname
-fn cmd_rmdir(args: &str, cwd: &Cwd) {
-    if args.is_empty() {
-        serial_print(b"Syntax: RD [/S] [/Q] pathname\r\n");
-        return;
+fn cmd_rmdir(args: &str, cwd: &Cwd) -> u32 {
+    let Some(parts) = file_command_arguments(args) else {
+        serial_print(b"Unmatched quote.\r\n"); return 1;
+    };
+    let paths: Vec<_> = parts.iter().filter(|part| !part.eq_ignore_ascii_case("/Q")).collect();
+    if paths.len() != 1 || paths[0].starts_with('/') {
+        serial_print(b"Syntax: RD [/Q] pathname (recursive removal is not supported).\r\n"); return 1;
     }
-
-    // Parse options
-    let mut recursive = false;
-    let mut quiet = false;
-    let mut pathname = String::new();
-
-    for part in args.split_whitespace() {
-        match part.to_uppercase().as_str() {
-            "/S" => recursive = true,
-            "/Q" => quiet = true,
-            _ => {
-                if pathname.is_empty() {
-                    pathname = part.to_string();
-                }
+    let path = String::from_utf16_lossy(&command_path_utf16(paths[0], cwd));
+    match fs::system_volume::list(&path) {
+        Ok(entries) if entries.is_empty() => {
+            if let Err(status) = fs::system_volume::remove(&path) {
+                serial_print(format!("Cannot remove directory (0x{status:08X}).\r\n").as_bytes());return 1;
             }
-        }
-    }
-
-    if pathname.is_empty() {
-        serial_print(b"Syntax: RD pathname\r\n");
-        return;
-    }
-
-    if !ntfs::is_mounted() {
-        serial_print(b"No filesystem mounted. Cannot remove directory.\r\n");
-        return;
-    }
-
-    if recursive {
-        serial_print(b"Removing directory tree: ");
-    } else {
-        serial_print(b"Removing directory: ");
-    }
-    serial_print(pathname.as_bytes());
-    serial_print(b"\r\n");
-
-    if recursive && !quiet {
-        serial_print(b"Are you sure (Y/N)? ");
-        serial_print(b"Y\r\n");
-    }
-
-    let path_utf16 = command_path_utf16(pathname.as_str(), cwd);
-    if ntfs::delete_directory(ntfs::get_mounted_fs().unwrap(), &path_utf16).is_ok() {
-        serial_print(b"        1 dir(s) removed.\r\n");
-    } else {
-        serial_print(b"Directory not found or not empty.\r\n");
+            0
+        },
+        Ok(_) => {serial_print(b"The directory is not empty.\r\n");1},
+        Err(status) => {serial_print(format!("Cannot open directory (0x{status:08X}).\r\n").as_bytes());1},
     }
 }
 
 /// MOVE command - Move or rename files
 /// Syntax: MOVE source dest
-fn cmd_move(args: &str, _cwd: &Cwd) {
-    if args.is_empty() {
-        serial_print(b"Syntax: MOVE source dest\r\n");
-        return;
-    }
-
-    // Find the destination (last token)
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    if parts.len() < 2 {
-        serial_print(b"Invalid number of arguments.\r\n");
-        serial_print(b"Syntax: MOVE source dest\r\n");
-        return;
-    }
-
-    let source = parts[0].trim_matches('"');
-    let dest = parts[parts.len() - 1].trim_matches('"');
-
-    // Check if filesystem is available
-    if !fat32::is_mounted() {
-        serial_print(b"No filesystem mounted. Cannot move.\r\n");
-        return;
-    }
-
-    let fs = match fat32::get_mounted_fs() {
-        Some(f) => f,
-        None => {
-            serial_print(b"No FAT32 filesystem available.\r\n");
-            return;
-        }
-    };
-
-    // Convert to 8.3 format
-    let source_83 = fat32::name_to_83(source);
-    let dest_83 = fat32::name_to_83(dest);
-
-    // Check if destination already exists
-    if fat32::file_exists_in_root(fs, &dest_83) {
-        serial_print(b"Destination file already exists: ");
-        serial_print(dest.as_bytes());
-        serial_print(b"\r\n");
-        return;
-    }
-
-    // Find source file
-    if let Some((_cluster, _byte_offset)) = fat32::find_file_in_root_ex(fs, &source_83) {
-        serial_print(b"Moving: ");
-        serial_print(source.as_bytes());
-        serial_print(b"\r\n       To: ");
-        serial_print(dest.as_bytes());
-        serial_print(b"\r\n");
-
-        // Simply rename the file (in same directory)
-        if fat32::rename_file_in_root(fs, &source_83, &dest_83).is_ok() {
-            serial_print(b"        1 file(s) moved.\r\n");
-        } else {
-            serial_print(b"Failed to rename file.\r\n");
-        }
-    } else {
-        serial_print(b"Source file not found: ");
-        serial_print(source.as_bytes());
-        serial_print(b"\r\n");
-    }
+fn cmd_move(args: &str, cwd: &Cwd) -> u32 {
+    rename_command(args, cwd, false)
 }
 
-/// REN/RENAME command - Rename files
-/// Syntax: REN source dest or RENAME source dest
-fn cmd_rename(args: &str, _cwd: &Cwd) {
-    if args.is_empty() {
-        serial_print(b"Syntax: REN source dest\r\n");
-        return;
-    }
+/// REN changes the leaf name in the source directory, even when the source
+/// was given as an absolute path. Both commands use the mounted volume.
+fn cmd_rename(args: &str, cwd: &Cwd) -> u32 {
+    rename_command(args, cwd, true)
+}
 
-    // Find the new name (last token)
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    if parts.len() < 2 {
-        serial_print(b"Invalid number of arguments.\r\n");
-        serial_print(b"Syntax: REN source dest\r\n");
-        return;
-    }
-
-    let source = parts[0].trim_matches('"');
-    let dest = parts[parts.len() - 1].trim_matches('"');
-
-    // Check if filesystem is available
-    if !fat32::is_mounted() {
-        serial_print(b"No filesystem mounted. Cannot rename.\r\n");
-        return;
-    }
-
-    let fs = match fat32::get_mounted_fs() {
-        Some(f) => f,
-        None => {
-            serial_print(b"No FAT32 filesystem available.\r\n");
-            return;
-        }
+fn rename_command(args: &str, cwd: &Cwd, leaf_only: bool) -> u32 {
+    let Some(parts) = file_command_arguments(args) else {
+        serial_print(b"Unmatched quote.\r\n"); return 1;
     };
-
-    // Convert to 8.3 format
-    let source_83 = fat32::name_to_83(source);
-    let dest_83 = fat32::name_to_83(dest);
-
-    // Check if destination already exists
-    if fat32::file_exists_in_root(fs, &dest_83) {
-        serial_print(b"A file with that name already exists: ");
-        serial_print(dest.as_bytes());
-        serial_print(b"\r\n");
-        return;
+    if parts.len() != 2 || parts.iter().any(|part| part.is_empty() || part.contains(['*', '?']) || part.starts_with('/')) {
+        serial_print(b"Syntax: REN source new_name / MOVE source destination\r\n"); return 1;
     }
-
-    // Find source file
-    if fat32::find_file_in_root(fs, &source_83).is_some() {
-        serial_print(b"Renaming: ");
-        serial_print(source.as_bytes());
-        serial_print(b"\r\n        To: ");
-        serial_print(dest.as_bytes());
-        serial_print(b"\r\n");
-
-        // Rename the file
-        if fat32::rename_file_in_root(fs, &source_83, &dest_83).is_ok() {
-            serial_print(b"        1 file(s) renamed.\r\n");
+    let result = (|| {
+        let source = fs::system_volume::normalize(&String::from_utf16_lossy(&command_path_utf16(&parts[0], cwd)))?;
+        let destination = if leaf_only {
+            if parts[1].contains([':', '\\', '/']) { return Err(0xC000000Du32); }
+            let (parent, _) = source.rsplit_once('\\').ok_or(0xC000000Du32)?;
+            format!("{parent}\\{}", parts[1])
         } else {
-            serial_print(b"Failed to rename file.\r\n");
-        }
-    } else {
-        serial_print(b"File not found: ");
-        serial_print(source.as_bytes());
-        serial_print(b"\r\n");
+            let mut path = String::from_utf16_lossy(&command_path_utf16(&parts[1], cwd));
+            if fs::system_volume::list(&path).is_ok() {
+                path.push('\\');path.push_str(source.rsplit('\\').next().unwrap_or_default());
+            }
+            fs::system_volume::normalize(&path)?
+        };
+        fs::system_volume::rename(&source, &destination)
+    })();
+    match result {
+        Ok(()) => {serial_print(if leaf_only { b"        1 file(s) renamed.\r\n" } else { b"        1 file(s) moved.\r\n" });0},
+        Err(status) => {serial_print(format!("Rename/move failed (0x{status:08X}).\r\n").as_bytes());1},
     }
 }
 
@@ -2501,7 +2022,7 @@ fn cmd_set(args: &str) {
         // Display all environment variables
         serial_print(b"COMPUTERNAME=NT61\r\n");
         serial_print(b"HOMEDRIVE=C:\r\n");
-        serial_print(b"HOMEPATH=\\Users\\Default\r\n");
+        serial_print(b"HOMEPATH=\\Users\\Administrator\r\n");
         serial_print(b"OS=Windows_NT\r\n");
         serial_print(b"PATH=C:\\Windows\\System32;C:\\Windows\r\n");
         serial_print(b"PROMPT=$P$G\r\n");
@@ -2509,7 +2030,7 @@ fn cmd_set(args: &str) {
         serial_print(b"TEMP=C:\\Windows\\Temp\r\n");
         serial_print(b"TMP=C:\\Windows\\Temp\r\n");
         serial_print(b"USERNAME=Administrator\r\n");
-        serial_print(b"USERPROFILE=C:\\Users\\Default\r\n");
+        serial_print(b"USERPROFILE=C:\\Users\\Administrator\r\n");
         serial_print(b"WINDIR=C:\\Windows\r\n");
         return;
     }
@@ -2631,13 +2152,10 @@ fn dual_print(s: &[u8]) {
             continue;
         }
         if c != b'\x00' {
-            crate::hal::serial::with_serial_unmasked(|| {
-                text_console::put_serial_and_console(c);
-            });
-            if let Some(capture) = OUTPUT_CAPTURE.lock().as_mut() {
-                if capture.len() < OUTPUT_CAPTURE_LIMIT {
-                    capture.push(c);
-                }
+            if capture_output_byte(c) {
+                crate::hal::serial::with_serial_unmasked(|| {
+                    text_console::put_serial_and_console(c);
+                });
             }
         }
         i += 1;
@@ -2649,9 +2167,11 @@ fn dual_print(s: &[u8]) {
 /// mirrored immediately.
 fn dual_put_byte(c: u8) {
     if c != b'\x1b' && c != b'\x00' {
-        crate::hal::serial::with_serial_unmasked(|| {
-            text_console::put_serial_and_console(c);
-        });
+        if capture_output_byte(c) {
+            crate::hal::serial::with_serial_unmasked(|| {
+                text_console::put_serial_and_console(c);
+            });
+        }
     }
 }
 
@@ -2926,6 +2446,9 @@ impl BatchExecutor for CmdBatchExecutor {
         match fs_type {
             crate::fs::FsType::Fat32 => self.read_file_fat32(filename),
             crate::fs::FsType::Ntfs => self.read_file_ntfs(filename),
+            crate::fs::FsType::Refs => crate::fs::read_file_from_disk(filename)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .ok_or_else(|| BatError::FileNotFound(String::from(filename))),
             crate::fs::FsType::Ext2 | crate::fs::FsType::Ext3 | crate::fs::FsType::Ext4 => {
                 self.read_file_ext2(filename)
             }
@@ -2943,17 +2466,9 @@ impl BatchExecutor for CmdBatchExecutor {
         // reach the complete Windows command surface, not just the
         // restricted Safe Mode shell subset.
         let mode = ShellMode::Ring3;
-        // Drop the error level into a sentinel before dispatch —
-        // the inner command may overwrite it via SET ERRORLEVEL, but
-        // we propagate the legacy behaviour by clearing on success.
-        let saved = self.error_level;
-        let _ = execute_single_command(command, &mode, &mut self.cwd);
-        // Naive error level: 0 unless the command name starts with
-        // a known-failing token. A full implementation would have
-        // execute_single_command return the error level.
-        let _ = saved;
-        self.error_level = 0;
-        Ok(0)
+        let result = execute_single_command(command, &mode, &mut self.cwd);
+        self.error_level = result.error_level;
+        Ok(result.error_level)
     }
 
     fn echo_line(&self, line: &str) {
@@ -2964,21 +2479,21 @@ impl BatchExecutor for CmdBatchExecutor {
 
 /// Detect whether a command line refers to a batch file (.bat or
 /// .cmd) and, if so, dispatch it through the batch parser.
-/// Returns `true` if the command was handled as a batch file.
-fn try_run_batch_file(cmd_str: &str, cwd: &Cwd) -> bool {
+/// Returns the batch status, or `None` when this is not a batch filename.
+fn try_run_batch_file(cmd_str: &str, cwd: &Cwd) -> Option<u32> {
     let trimmed = cmd_str.trim();
     // Extract the first token (the command name) — strip a leading
     // call site path like ".\script" or "subdir\script".
     let first = trimmed.split_whitespace().next().unwrap_or("");
     if first.is_empty() {
-        return false;
+        return None;
     }
     // Skip if it has a directory separator and the file doesn't end
     // in .bat/.cmd. Skip if it contains characters that are
     // unambiguously an internal command.
     let lower = first.to_ascii_lowercase();
     if !lower.ends_with(".bat") && !lower.ends_with(".cmd") {
-        return false;
+        return None;
     }
     // Strip a leading ".\" or "./" so the file lookup stays at the
     // current directory.
@@ -2992,18 +2507,18 @@ fn try_run_batch_file(cmd_str: &str, cwd: &Cwd) -> bool {
     let mut parser = BatchParser::new();
     let mut executor = CmdBatchExecutor::new(cwd);
     match parser.execute(cleaned, &mut executor) {
-        Ok(()) => true,
+        Ok(()) => Some(parser.get_error_level() as u32),
         Err(BatError::FileNotFound(name)) => {
             serial_print(b"'");
             serial_print(cleaned.as_bytes());
             serial_print(b"' is not recognized as an internal or external command,\r\n");
             serial_print(b"operable program or batch file.\r\n");
             let _ = name;
-            false
+            Some(9009)
         }
-        Err(BatError::Exit(_)) => {
+        Err(BatError::Exit(status)) => {
             // EXIT /B — leave the CMD prompt alive.
-            true
+            Some(status as u32)
         }
         Err(e) => {
             serial_print(b"BAT execution error: ");
@@ -3011,7 +2526,7 @@ fn try_run_batch_file(cmd_str: &str, cwd: &Cwd) -> bool {
             let _ = core::fmt::write(&mut s, format_args!("{:?}", e));
             serial_print(s.as_bytes());
             serial_print(b"\r\n");
-            false
+            Some(1)
         }
     }
 }
@@ -3147,6 +2662,7 @@ pub fn run_batch_from_user_ptr(user_ptr: *const u8) -> Option<()> {
 /// their original case. Command matching remains case-insensitive in
 /// `execute_single_command`.
 pub fn execute_command_line(command_line: &str) -> bool {
+    let Ok(_guard) = CommandGuard::acquire() else { return false; };
     let mut cwd = RING3_CWD.lock();
     if cwd.len == 0 {
         *cwd = Cwd::new();
@@ -3173,7 +2689,5 @@ pub fn execute_command_from_user_ptr(
 pub fn execute_command_bytes(bytes: &[u8]) -> Result<bool, &'static str> {
     let line = core::str::from_utf8(bytes).map_err(|_| "command is not valid UTF-8")?;
     let line = line.trim_matches(|character: char| character == '\0' || character.is_whitespace());
-    let exit_requested = line.eq_ignore_ascii_case("exit");
-    execute_command_line(line);
-    Ok(exit_requested)
+    Ok(execute_command_line(line))
 }

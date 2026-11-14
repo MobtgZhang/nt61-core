@@ -18,10 +18,14 @@ unsafe extern "sysv64" fn syscall5_raw(
     arg4: usize,
 ) -> u64 {
     core::arch::naked_asm!(
-        "mov r10, r8",
+        "sub rsp, 16",
+        "mov [rsp + 8], r9", // fifth argument follows the return-address slot
+        "mov r9, r8",
         "mov r8, rcx",
+        "mov r10, rsi",
         "mov rax, rdi",
         "syscall",
+        "add rsp, 16",
         "ret",
     );
 }

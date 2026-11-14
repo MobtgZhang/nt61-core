@@ -14,7 +14,7 @@
 //! The editor is POLLED — it never registers an interrupt handler
 //! and works with interrupts masked or unmasked.
 
-use crate::hal::text_console;
+use super::cmd_host::putchar;
 use crate::ke::sync::Spinlock;
 use alloc::vec::Vec;
 
@@ -54,9 +54,9 @@ pub fn history_len() -> usize {
 /// Erase `count` characters from the console (backspace sequence).
 fn erase_chars(count: usize) {
     for _ in 0..count {
-        text_console::put_byte(0x08);
-        text_console::put_byte(b' ');
-        text_console::put_byte(0x08);
+        putchar(0x08);
+        putchar(b' ');
+        putchar(0x08);
     }
 }
 
@@ -68,7 +68,7 @@ fn redraw_line(buf: &mut [u8], pos: usize, entry: &[u8]) -> usize {
     let len = len.min(buf.len() - 1);
     buf[..len].copy_from_slice(&entry[..len]);
     for &byte in &buf[..len] {
-        text_console::put_byte(byte);
+        putchar(byte);
     }
     len
 }
@@ -88,8 +88,17 @@ pub fn read_line(buffer: &mut [u8], length: usize) -> usize {
     let mut escape: u8 = 0;
     let mut history_index: usize = 0;
     let history_len = HISTORY.lock().len();
+    let mut last_present = crate::hal::common::pit::get_system_time_ms().wrapping_sub(16);
 
     loop {
+        // This blocking, polled syscall can run without scheduler preemption.
+        // Drain console damage here as well as on the display thread, so the
+        // prompt and line edits reach VirtIO scanout while awaiting input.
+        let now = crate::hal::common::pit::get_system_time_ms();
+        if now.wrapping_sub(last_present) >= 16 {
+            crate::drivers::bootvid::present_desktop_frame();
+            last_present = now;
+        }
         crate::hal::keyboard_input::poll();
         let Some(byte) = crate::hal::keyboard_input::try_read_byte() else {
             core::hint::spin_loop();
@@ -98,17 +107,17 @@ pub fn read_line(buffer: &mut [u8], length: usize) -> usize {
         match byte {
             // Ctrl+C — abandon the line.
             0x03 => {
-                text_console::put_byte(b'^');
-                text_console::put_byte(b'C');
-                text_console::put_byte(b'\r');
-                text_console::put_byte(b'\n');
+                putchar(b'^');
+                putchar(b'C');
+                putchar(b'\r');
+                putchar(b'\n');
                 buffer[0] = 0;
                 return 0;
             }
             // Enter.
             b'\r' | b'\n' => {
-                text_console::put_byte(b'\r');
-                text_console::put_byte(b'\n');
+                putchar(b'\r');
+                putchar(b'\n');
                 push_history(&buf[..pos]);
                 buf[pos] = 0;
                 buffer[..pos].copy_from_slice(&buf[..pos]);
@@ -139,7 +148,7 @@ pub fn read_line(buffer: &mut [u8], length: usize) -> usize {
                         buf[word_start..new_len].copy_from_slice(completion_bytes);
                         pos = new_len;
                         for &byte in &buf[word_start..pos] {
-                            text_console::put_byte(byte);
+                            putchar(byte);
                         }
                     }
                 }
@@ -159,7 +168,7 @@ pub fn read_line(buffer: &mut [u8], length: usize) -> usize {
                             .lock()
                             .get(history_index - 1)
                             .unwrap_or(&[0u8; LINE_CAPACITY]);
-                        pos = redraw_line(&mut buf, pos, &entry);
+                        pos = redraw_line(&mut buf[..cap], pos, &entry);
                     }
                 }
             }
@@ -177,7 +186,7 @@ pub fn read_line(buffer: &mut [u8], length: usize) -> usize {
                             .lock()
                             .get(history_index - 1)
                             .unwrap_or(&[0u8; LINE_CAPACITY]);
-                        pos = redraw_line(&mut buf, pos, &entry);
+                        pos = redraw_line(&mut buf[..cap], pos, &entry);
                     }
                 }
             }
@@ -199,7 +208,7 @@ pub fn read_line(buffer: &mut [u8], length: usize) -> usize {
                 if pos < cap - 1 {
                     buf[pos] = byte;
                     pos += 1;
-                    text_console::put_byte(byte);
+                    putchar(byte);
                 }
             }
             _ => {
