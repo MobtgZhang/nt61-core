@@ -16,6 +16,7 @@ mod tests {
             op: IROp::Nop,
             guest_va: 0x1000,
             guest_len: 1,
+            ..IrInst::empty()
         }];
         let result = build_ir(&ir);
         assert_eq!(result.len(), 1);

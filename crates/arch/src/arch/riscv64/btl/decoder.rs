@@ -40,8 +40,10 @@ impl X86Inst {
 
 /// Decode a basic block using the shared decoder. Adapts the shared
 /// API to the riscv64-specific signature.
-pub fn decode_block(bytes: &[u8], base_va: u64, _mode: DecMode, out: &mut [IrInst]) -> usize {
-    crate::arch::common::btl::x86_decoder::decode_block(bytes, base_va, out)
+pub fn decode_block(bytes: &[u8], base_va: u64, mode: DecMode, out: &mut [IrInst]) -> usize {
+    crate::arch::common::btl::x86_decoder::decode_block_mode(bytes, base_va,
+        match mode { DecMode::Mode32 => crate::arch::common::btl::ir::DecodeMode::X86,
+            DecMode::Mode64 => crate::arch::common::btl::ir::DecodeMode::X64 }, out)
 }
 
 pub fn init() {}

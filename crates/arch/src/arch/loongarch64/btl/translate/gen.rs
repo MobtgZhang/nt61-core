@@ -571,7 +571,7 @@ pub fn encode_block(ir: &[IrInst], guest_start: u64) -> alloc::vec::Vec<u8> {
                 // syscall (breakpoint trap in LA64)
                 em.push(0x002B_0000); // syscall encoding
             }
-            IROp::Unsupported => {
+            IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => {
                 // break 0
                 em.push(0x002A_0000);
             }
@@ -690,7 +690,7 @@ pub fn translate(
         IROp::Call { .. } => em.emit_call(),
         IROp::Ret => em.emit_jirl(LA_ZERO, LA_RA, 0),
         IROp::Syscall => em.push(LA64_SYSCALL),
-        IROp::Unsupported => em.push(LA64_BREAK),
+        IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => em.push(LA64_BREAK),
         IROp::SimdMov { .. } | IROp::SimdStore { .. } | IROp::SimdArith { .. } => {
             em.push(LA64_BREAK)
         }
@@ -715,6 +715,9 @@ pub fn smoke_test() -> bool {
             op: IROp::Nop,
             guest_va: 0x1000,
             guest_len: 1,
+            operand_width: 8,
+            address_width: 8,
+            segment: crate::arch::common::btl::ir::Segment::Flat,
         },
         IrInst {
             op: IROp::MovImm {
@@ -723,11 +726,17 @@ pub fn smoke_test() -> bool {
             },
             guest_va: 0x1001,
             guest_len: 5,
+            operand_width: 8,
+            address_width: 8,
+            segment: crate::arch::common::btl::ir::Segment::Flat,
         },
         IrInst {
             op: IROp::Ret,
             guest_va: 0x1006,
             guest_len: 1,
+            operand_width: 8,
+            address_width: 8,
+            segment: crate::arch::common::btl::ir::Segment::Flat,
         },
     ];
     let bytes = encode_block(&ir, 0x1000);

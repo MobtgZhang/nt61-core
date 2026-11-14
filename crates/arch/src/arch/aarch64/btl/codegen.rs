@@ -578,7 +578,7 @@ pub fn encode_block(ir: &[IrInst], guest_start: u64) -> CodeBlock {
                 let word: u32 = 0xD400_0000 | 0x0020_0000;
                 em.push(word);
             }
-            IROp::Unsupported => {
+            IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => {
                 // Emit BRK #0 to signal an unsupported instruction.
                 let word: u32 = 0xD420_0000;
                 em.push(word);
@@ -608,6 +608,9 @@ pub fn smoke_test() -> bool {
             op: IROp::Nop,
             guest_va: 0x1000,
             guest_len: 1,
+            operand_width: 8,
+            address_width: 8,
+            segment: crate::arch::common::btl::ir::Segment::Flat,
         },
         IrInst {
             op: IROp::MovImm {
@@ -616,11 +619,17 @@ pub fn smoke_test() -> bool {
             },
             guest_va: 0x1001,
             guest_len: 5,
+            operand_width: 8,
+            address_width: 8,
+            segment: crate::arch::common::btl::ir::Segment::Flat,
         },
         IrInst {
             op: IROp::Ret,
             guest_va: 0x1006,
             guest_len: 1,
+            operand_width: 8,
+            address_width: 8,
+            segment: crate::arch::common::btl::ir::Segment::Flat,
         },
     ];
     let block = encode_block(&ir, 0x1000);

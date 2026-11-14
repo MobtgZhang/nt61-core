@@ -1,39 +1,13 @@
-//! BTL runtime.
-//!
-//! Provides the dispatch logic for translating and running
-//! guest x86/x86-64 basic blocks on RISC-V. The runtime is the
-//! single entry point the kernel calls into when a user-mode
-//! thread starts executing.
-//!
-//! ## Flow
-//!
-//! 1. `start_thread()` is called by the user-mode entry shim when
-//!    a WoW64-styled guest thread is scheduled. It installs the
-//!    guest descriptor (fs base, gs base, decoder mode) on the
-//!    thread's per-CPU area and sets `sstatus.PRIV = U` (i.e.
-//!    continues to run in U-mode).
-//! 2. The first time the guest executes a basic block, the page
-//!    fault handler calls into [`translate_and_dispatch`], which
-//!    goes: `decode_block → translate_block → encode_block` and
-//!    caches the resulting entrypoint in
-//!    [`crate::arch::riscv64::btl::cache`].
-//! 3. Subsequent hits on the same block simply re-enter the
-//!    cached code. Self-modifying code is handled by the watchpoint
-//!    machinery in [`crate::arch::riscv64::btl::exception`].
-//!
-//! Phase 5 implements the wiring. Phase 6 adds performance counters
-//! and watchpoint-based re-translation.
+//! Experimental RV64 emitter entry points. Executable dispatch is gated until
+//! native code preserves guest flags, exceptions and the thread ABI. Use the
+//! shared `GuestThread` / `GuestImage` resumable correctness backend instead.
 
 #![cfg(feature = "btl")]
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use super::cache::{insert as cache_insert, lookup as cache_lookup};
-use super::codegen::{encode_block, CodeBlock};
-use super::decoder::{decode_block, DecMode, MAX_BLOCK_BYTES, MAX_DECODED_INSTS};
-use super::mem::{decoder_mode, set_decoder_mode};
+use super::decoder::DecMode;
 use super::syscall_glue::{btl_syscall_dispatch, BtlSyscallResult};
-use super::translator::IrInst;
 
 /// Maximum cached guest length translated per call. The first
 /// pass over a chunk of code may translate up to this many bytes
@@ -58,62 +32,16 @@ static SYSCALLS_ROUTED: AtomicU64 = AtomicU64::new(0);
 /// tables in unit tests).
 static ENABLED_MASK: AtomicU32 = AtomicU32::new(0);
 
-/// Start a BTL guest thread on the current hart. The `pc` is the
-/// guest RIP; the runtime will lazy-translate the relevant blocks
-/// on first reference. The function returns to the caller; the
-/// actual `sret`-to-user transition is handled by the existing
-/// user-entry code (see [`crate::arch::riscv64::user_entry`]).
-pub fn start_thread(guest_pc: u64, guest_sp: u64, mode: DecMode) {
-    set_decoder_mode(mode);
-    // Hook the guest into the per-CPU area. We publish a
-    // dummy initial block so subsequent re-entries don't
-    // double-translate.
-    ENABLED_MASK.fetch_or(1, Ordering::Relaxed);
-    let _ = guest_pc;
-    let _ = guest_sp;
+/// Create resumable state for one guest thread. The caller retains it across
+/// scheduler quanta; guest instructions must not be handed directly to SRET.
+pub fn start_thread(guest_pc: u64, guest_sp: u64, mode: DecMode) -> super::GuestThread {
+    use crate::arch::common::btl::ir::DecodeMode;
+    super::GuestThread::new(match mode { DecMode::Mode32 => DecodeMode::X86,
+        DecMode::Mode64 => DecodeMode::X64 }, guest_pc, guest_sp)
 }
 
-/// Translate and dispatch one basic block starting at `guest_va`.
-/// Returns the host pointer (RV64) of the translated code entry
-/// and writes the caller's result-destination register slot.
-pub fn translate_and_dispatch(guest_va: u64) -> u64 {
-    if let Some(host) = try_cached(guest_va) {
-        return host;
-    }
-    let mut bytes = [0u8; MAX_BLOCK_BYTES];
-    let bytes_len = read_guest_bytes(guest_va, &mut bytes);
-    if bytes_len == 0 {
-        return 0;
-    }
-    let mode = decoder_mode();
-    let mut ir: [IrInst; MAX_DECODED_INSTS] = [IrInst::empty(); MAX_DECODED_INSTS];
-    let n_ir = decode_block(&bytes[..bytes_len], guest_va, mode, &mut ir);
-    if n_ir == 0 {
-        return 0;
-    }
-    let cb: CodeBlock = encode_block(&ir[..n_ir], guest_va);
-    // Materialise the code block into cache. We use a tiny static
-    // ring (Phase 4) sized for one full block.
-    let host = super::cache::materialize(&cb);
-    cache_insert(guest_va, host);
-    TRANSLATED_COUNT.fetch_add(1, Ordering::Relaxed);
-    CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-    host
-}
-
-fn try_cached(guest_va: u64) -> Option<u64> {
-    let host = cache_lookup(guest_va);
-    if host != 0 {
-        CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-        Some(host)
-    } else {
-        None
-    }
-}
-
-fn read_guest_bytes(va: u64, out: &mut [u8]) -> usize {
-    super::mem::read_virt(va, out)
-}
+/// Native entry is unavailable; never hand an experimental code pointer to SRET.
+pub fn translate_and_dispatch(_guest_va: u64) -> u64 { 0 }
 
 /// Router for the BTL guest's `syscall` instruction. Mirrors
 /// [`crate::arch::riscv64::syscall::dispatch_syscall`] but is
@@ -123,7 +51,7 @@ pub fn route_syscall(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u
     SYSCALLS_ROUTED.fetch_add(1, Ordering::Relaxed);
     match btl_syscall_dispatch(num, a0, a1, a2, a3, a4) {
         BtlSyscallResult::Handled { result } => result,
-        BtlSyscallResult::NotHandled => 0xC000_0002u64,
+        BtlSyscallResult::NotHandled => 0xC000_000Cu64,
     }
 }
 
@@ -155,7 +83,7 @@ pub fn smoke_test() -> bool {
     translate_and_dispatch(0x1000);
     let _ = route_syscall(0, 0, 0, 0, 0, 0);
     let s = stats();
-    s.translated >= 1 && s.syscalls >= 1
+    s.translated == 0 && s.syscalls >= 1
 }
 
 #[cfg(test)]

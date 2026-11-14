@@ -72,6 +72,7 @@ impl TranslationManager {
     /// per-`pc` access counters so the future hot-spot detector can
     /// decide to retranslating.
     pub fn resolve(&mut self, pc: u64) -> Option<u64> {
+        if !crate::arch::common::btl::NATIVE_EXECUTION_READY { return None; }
         if let Some(unit) = self.cache.lookup(pc) {
             self.hit_count += 1;
             unit.access_count
@@ -104,6 +105,7 @@ impl TranslationManager {
         if !super::ENABLED {
             return Err(BtlError::Disabled);
         }
+        if !crate::arch::common::btl::NATIVE_EXECUTION_READY { return Err(BtlError::Untranslatable); }
         match req.guest_arch {
             GuestArch::X86_64 => {}
             GuestArch::X86_32 | GuestArch::ARM32 => {

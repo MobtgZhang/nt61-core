@@ -1,25 +1,8 @@
-//! Binary Translation Layer (BTL) — directory layout.
+//! LoongArch64 support for portable x86/x64 guest execution.
 //!
-//! The BTL lets the LoongArch kernel run x86 (32-bit and 64-bit) binaries
-//! without leaving Ring 3. When a thread starts executing an x86 binary,
-//! `btl::dispatch` walks translation-cache entries and falls back to the
-//! decoder/emitter when a cache miss occurs.
-//!
-//! Modules:
-//!   * `common` — shared helpers (instr-table lookup, bitfield macros).
-//!   * `cpu`    — x86 CPU state, register file, flags helpers.
-//!   * `decoder`— x86 instruction decoder (32-bit and 64-bit).
-//!   * `emit`   — LoongArch instruction emitter.
-//!   * `translate` — x86→LA64 instruction translation rules.
-//!   * `cache`  — translation cache (TC) management.
-//!   * `syscall`— NT/Win32 system call bridging.
-//!   * `tests`  — unit tests for the translation rules.
-//!
-//! References:
-//!   * WoW64 internals (geoffchappell.com)
-//!   * QEMU TCG (QEMU docs/TCG.html)
-//!   * DynamoRIO / DynamoSem
-//!   * LoongArch Reference Manual
+//! GuestImage/GuestThread use the shared checked PE interpreter and NT 6.1
+//! services. Native decoder, emitter and cache modules are experimental;
+//! no native translation dispatcher or Ring 3 integration is provided here.
 
 #![cfg(any(target_arch = "loongarch64", test))]
 
@@ -48,3 +31,7 @@ pub use translate::{translate_block, translate_instruction, TranslateError};
 pub use crate::arch::common::btl::abi::{normalize_syscall_args, GuestAbi};
 pub use crate::arch::common::btl::exec::{execute_block, GuestState, SyscallHook};
 pub use crate::arch::common::btl::memory::{GuestAddressSpace, GuestMemory};
+
+/// Portable execution path; each scheduled guest owns this state.
+pub use crate::arch::common::btl::runtime::{GuestThread, RunResult, StopReason};
+pub use crate::arch::common::btl::pe::{GuestImage, ImageRunResult};

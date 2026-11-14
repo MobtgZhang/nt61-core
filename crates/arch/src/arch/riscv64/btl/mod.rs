@@ -1,48 +1,9 @@
-//! RISC-V Binary Translation Layer (BTL) — module root.
+//! RISC-V support for portable x86/x64 guest execution.
 //!
-//! Translates x86/x86-64 guest code (Windows PE/COFF or user-mode
-//! ELF) into RISC-V instructions at runtime, similar in spirit to
-//! Windows 11's WoW64 on ARM64. The translation pipeline:
-//!
-//! ```text
-//!   ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
-//!   │ Decode  │ →  │ IR /   │ →  │ Codegen │ →  │ Code   │
-//!   │ (x86)   │    │ Semantic│    │ (RV64)  │    │ Cache  │
-//!   └─────────┘    └─────────┘    └─────────┘    └─────────┘
-//!        ↑                                           │
-//!        └────────────────  patch  ─────────────────┘
-//! ```
-//!
-//! ## Architecture
-//!
-//! * Sub-modules are isolated so they can be tested independently
-//!   when QEMU emulation is not available.
-//! * Translation is *ahead-of-time* per basic block (no trace
-//!   scheduling yet); we re-translate on self-modifying code via
-//!   a 3-stage cache (hot/warm/cold).
-//! * Syscalls are routed through [`syscall_glue`] which decides
-//!   between native (rv64 kernel) and emulated NT calls based on
-//!   the guest descriptor. The NT call mapping mirrors the one used
-//!   by Windows ARM64 WoW64 (`xtajit64.dll`, `wowarm64.dll`).
-//!
-//! ## Files
-//!
-//! | File              | Purpose                                |
-//! |-------------------|----------------------------------------|
-//! | `mod.rs`          | this file                              |
-//! | `decoder.rs`      | x86 instruction decoder                |
-//! | `translator.rs`   | IR + lowering to RV64                  |
-//! | `codegen.rs`      | RV64 encoder                           |
-//! | `cache.rs`        | basic-block cache                      |
-//! | `mem.rs`          | guest memory model                     |
-//! | `exception.rs`    | fault → re-translation hooks           |
-//! | `syscall_glue.rs` | NT call dispatch from guest ECALLs     |
-//!
-//! ## Limits
-//!
-//! Phase 4 ships scaffolding only. Phase 5 wires the runtime and
-//! Phase 6 adds performance counters and self-modifying code
-//! detection.
+//! GuestImage/GuestThread use the shared checked PE interpreter and typed
+//! NT 6.1 services. Native RV64 emitters/caches remain experimental and their
+//! execution entry is disabled. This is neither ELF support nor a port of
+//! Microsoft's ARM emulation libraries.
 
 #![cfg(any(feature = "btl", test))]
 
@@ -79,3 +40,7 @@ pub fn init() {
 pub fn smoke_test() -> bool {
     true
 }
+
+/// Portable execution path; each scheduled guest owns this state.
+pub use crate::arch::common::btl::runtime::{GuestThread, RunResult, StopReason};
+pub use crate::arch::common::btl::pe::{GuestImage, ImageRunResult};

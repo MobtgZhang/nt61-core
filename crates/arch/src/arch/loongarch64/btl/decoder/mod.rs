@@ -68,6 +68,11 @@ pub fn decode_one(code: &[u8], offset: usize) -> Result<(Decoded, usize), Decode
                 IROp::Pop { .. } => 0x58,
                 IROp::Jcc { .. } => 0x74,
                 IROp::SimdMov { .. } | IROp::SimdStore { .. } | IROp::SimdArith { .. } => 0x0F,
+                IROp::RetImm { .. } => 0xC2,
+                IROp::PushImm { .. } => 0x68,
+                IROp::StoreImm { .. } => 0xC7,
+                IROp::AluStore { .. } | IROp::AluStoreImm { .. } => 0x83,
+                IROp::JumpReg { .. } | IROp::JumpMem { .. } => 0xFF,
                 IROp::Unsupported => 0x0F,
             };
             Ok((

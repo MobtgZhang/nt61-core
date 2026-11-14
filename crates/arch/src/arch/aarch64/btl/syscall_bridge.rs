@@ -1,14 +1,5 @@
-//! BTL syscall bridge.
-//!
-//! Translates Windows NT 6.1 guest (`x86_64`, `x86_32`, `AArch32`)
-//! system calls to the native API exposed by the AArch64 kernel.
-//!
-//! ## Calling-convention translation
-//!
-//! Each guest ABI has a different parameter passing convention.
-//! The bridge normalises them to the AArch64 AAPCS64 convention
-//! (X0..X7 parameter registers) before forwarding to the common
-//! NT SSDT used by the AArch64 native dispatcher.
+//! NT 6.1 guest service bridge. Guest indices are resolved independently
+//! of the host SSDT. The portable runner supplies typed process/VFS services.
 
 /// Syscall bridge result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +12,7 @@ pub struct BridgeResult {
 
 use crate::arch::common::btl::abi::GuestAbi;
 use crate::arch::common::btl::memory::{GuestMemory, NullGuestMemory};
-use crate::arch::common::btl::syscall::{dispatch_nt_syscall, BridgeOutcome};
+use crate::arch::common::btl::nt61;
 
 fn bridge_abi(
     abi: GuestAbi,
@@ -29,23 +20,15 @@ fn bridge_abi(
     args: &[u64],
     memory: &mut dyn GuestMemory,
 ) -> BridgeResult {
-    let outcome = unsafe { dispatch_nt_syscall(abi, syscall_num, args, memory) };
-    match outcome {
-        BridgeOutcome::Dispatched(status) => BridgeResult {
-            result: status as u64,
-            status: 0,
-        },
-        failure => BridgeResult {
-            result: 0,
-            status: failure.status(),
-        },
-    }
+    let status = nt61::legacy_status(abi, syscall_num, args, memory);
+    if status & 0x8000_0000 != 0 { BridgeResult { result: 0, status } }
+    else { BridgeResult { result: status as u64, status: 0 } }
 }
 
-/// Translate an x86_64 syscall into the AArch64 native kernel path.
+/// Translate an x86_64 syscall into the NT 6.1 guest service path.
 ///
 /// `args` is the guest register file indexed by `X86Reg`. Numbers not
-/// present in the NT SSDT fail closed with `STATUS_INVALID_SYSTEM_SERVICE`.
+/// present in the guest service table fail closed with `STATUS_INVALID_SYSTEM_SERVICE`.
 pub fn bridge_x86_64(syscall_num: u32, args: &[u64]) -> BridgeResult {
     let mut memory = NullGuestMemory;
     bridge_abi(GuestAbi::X86_64, syscall_num, args, &mut memory)
@@ -88,69 +71,13 @@ pub fn bridge_x86_32_memory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::common::btl::memory::{FlatPaging, GuestAddressSpace};
-    use crate::ke::ssdt_common::{register_syscall, SyscallArguments, STATUS_SUCCESS};
-    use core::sync::atomic::{AtomicU64, Ordering};
-
-    static LAST_ARG: AtomicU64 = AtomicU64::new(0);
-
-    unsafe extern "C" fn capture_handler(args: &SyscallArguments) -> u32 {
-        LAST_ARG.store(args.register_args[0] as u64, Ordering::SeqCst);
-        STATUS_SUCCESS
-    }
-
-    const TEST_SERVICE: u32 = 0x3F3;
-
     #[test]
-    fn unregistered_services_fail_closed_with_ntstatus() {
-        const UNREGISTERED: u32 = 0xFFFF;
-        let invalid = BridgeOutcome::InvalidService.status();
-        let x64 = bridge_x86_64(UNREGISTERED, &[0; 16]);
-        assert_eq!(x64.result, 0);
-        assert_eq!(x64.status, invalid);
-
-        let arm32 = bridge_arm32(UNREGISTERED, &[0; 8]);
-        assert_eq!(arm32.result, 0);
-        assert_eq!(arm32.status, invalid);
-    }
-
-    #[test]
-    fn x86_64_service_dispatches_normalised_arguments() {
-        unsafe {
-            register_syscall(TEST_SERVICE as usize, capture_handler, 1, "btl_a64").unwrap();
-        }
-        let mut args = alloc::vec![0u64; 17];
-        args[crate::arch::common::btl::ir::X86Reg::R10 as usize] = 0xBEEF;
-        let mut memory = GuestAddressSpace::new(FlatPaging {
-            base: core::ptr::null_mut(),
-            len: 0,
-        });
-        let result = bridge_x86_64_memory(TEST_SERVICE, &args, &mut memory);
-        assert_eq!(
-            result,
-            BridgeResult {
-                result: STATUS_SUCCESS as u64,
-                status: 0
-            }
-        );
-        assert_eq!(LAST_ARG.load(Ordering::SeqCst), 0xBEEF);
-    }
-
-    #[test]
-    fn x86_32_memory_fault_fails_closed() {
-        let mut args = alloc::vec![0u64; 17];
-        args[crate::arch::common::btl::ir::X86Reg::Rdx as usize] = 0x1000;
-        let mut memory = GuestAddressSpace::new(FlatPaging {
-            base: core::ptr::null_mut(),
-            len: 0,
-        });
-        let result = bridge_x86_32_memory(TEST_SERVICE, &args, &mut memory);
-        assert_eq!(
-            result,
-            BridgeResult {
-                result: 0,
-                status: BridgeOutcome::MemoryFault.status(),
-            }
-        );
+    fn guest_indices_are_not_native_indices() {
+        assert_eq!(bridge_x86_64(0x3f3, &[0; 17]).status, nt61::STATUS_INVALID_SYSTEM_SERVICE);
+        assert_eq!(bridge_x86_64(0x43, &[]).result, 0x4000_0024);
+        // x86 CreateFile must read its 11 DWORD arguments through GuestMemory.
+        let mut memory = NullGuestMemory;
+        assert_eq!(bridge_x86_32_memory(0x42, &[0; 17], &mut memory).status, nt61::STATUS_ACCESS_VIOLATION);
+        assert_eq!(bridge_arm32(0x43, &[0; 17]).status, nt61::STATUS_INVALID_SYSTEM_SERVICE);
     }
 }

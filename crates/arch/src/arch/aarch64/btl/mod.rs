@@ -1,47 +1,9 @@
-//! AArch64 Binary Translation Layer (BTL).
+//! AArch64 support for portable x86/x64 guest execution.
 //!
-//! Provides the framework for translating non-native binaries
-//! (currently x86_64, with AArch32 planned) into AArch64 code that
-//! the kernel can execute directly.
-//!
-//! ## Architecture
-//!
-//! ```text
-//!  ┌──────────────────────────────────────────────────────────────────┐
-//!  │                       AArch64 NT6.1.7601 kernel                   │
-//!  │                                                                  │
-//!  │   ┌──────────────────────────┐   ┌──────────────────────────┐   │
-//!  │   │   Translation Manager    │   │      Code Cache          │   │
-//!  │   │   - load region          │   │   - WX memory            │   │
-//!  │   │   - hot-spot detection   │   │   - hash table           │   │
-//!  │   └──────────────────────────┘   └──────────────────────────┘   │
-//!  │   ┌──────────────┐ ┌──────────────┐ ┌──────────────────────┐   │
-//!  │   │  Decoder     │→│      IR      │→│   CodeGen (AArch64)   │   │
-//!  │   │ (x86_64/A32) │ │              │ │  - reg allocate       │   │
-//!  │   └──────────────┘ └──────────────┘ └──────────────────────┘   │
-//!  │   ┌──────────────┐ ┌──────────────┐ ┌──────────────────────┐   │
-//!  │   │   State      │ │  Exceptions  │ │    Syscall bridge     │   │
-//!  │   │   (regs)     │ │  (signals)   │ │   (x86 → NT ARM64)    │   │
-//!  │   └──────────────┘ └──────────────┘ └──────────────────────┘   │
-//!  └──────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Submodule layout
-//!
-//! * `mod.rs` (this file) — public API and configuration
-//! * `translation_manager.rs` — top-level translation manager
-//! * `code_cache.rs`           — WX memory region + hash table
-//! * `decoder`                 — x86_64/AArch32 instruction decoder
-//! * `ir`                      — Intermediate Representation
-//! * `codegen`                 — AArch64 code generation
-//! * `state`                   — Translated-state management
-//! * `syscall_bridge`          — NT / Win32 syscall bridging
-//!
-//! ## Current status
-//!
-//! The shared x86_64 decoder and per-architecture code generators are fully wired.
-//! The first usable translation path (simple x86_64 arithmetic and
-//! control flow into AArch64) is gated behind `cfg(feature = "btl")`.
+//! GuestImage/GuestThread use the shared checked PE interpreter and NT 6.1
+//! services. The optional native emitters are experimental: translate/resolve
+//! remain disabled until they satisfy the interpreter's semantics. Portable
+//! console invocation is available independently of the native `btl` feature.
 
 pub mod code_cache;
 pub mod translation_manager;
@@ -75,14 +37,12 @@ pub const BTL_FEATURE_ARM32_TRANSLATION: u32 = 1 << 2;
 
 /// BTL feature flag shared with `Cargo.toml`.
 ///
-/// x86_64 translation and the shared NT syscall bridge are enabled;
-/// ARM32 translation remains off until its ABI is fully modelled.
+/// Describes the shared portable x64 execution/service interface, not JIT
+/// readiness or general Win32 compatibility. ARM32 execution is unavailable.
 pub const BTL_FEATURES: u32 = BTL_FEATURE_X86_64_TRANSLATION | BTL_FEATURE_SYSCALL_BRIDGE;
 
-/// Compile-time gate for the BTL subsystem. Set `feature = "btl"`
-/// to enable the heavy components (decoder, IR, codegen). Until
-/// then the BTL API is exposed but some entry points may return Unsupported
-/// that returns `BtlError::Disabled`.
+/// Compile-time gate for experimental native decoder/codegen modules.
+/// This does not disable the shared portable PE interpreter.
 pub const ENABLED: bool = cfg!(feature = "btl");
 
 /// BTL errors.
@@ -110,3 +70,7 @@ pub type BtlResult<T> = Result<T, BtlError>;
 pub fn smoke_test() -> bool {
     code_cache::smoke_test() && translation_manager::smoke_test()
 }
+
+/// Portable execution path; each scheduled guest owns this state.
+pub use crate::arch::common::btl::runtime::{GuestThread, RunResult, StopReason};
+pub use crate::arch::common::btl::pe::{GuestImage, ImageRunResult};
