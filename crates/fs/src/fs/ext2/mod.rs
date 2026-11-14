@@ -184,9 +184,15 @@ pub unsafe fn read_sector(device: *mut (), sector: u64, buffer: &mut [u8]) -> Re
 
     if let Some(context) = unsafe { crate::fs::mount_context_from_device(device) } {
         let base = context.base;
-        let off = (sector as usize) * 512;
+        let off = usize::try_from(sector)
+            .ok()
+            .and_then(|s| s.checked_mul(512))
+            .ok_or(STATUS_UNSUCCESSFUL)?;
         let max_size = context.size;
-        if off + 512 > max_size {
+        if off
+            .checked_add(buffer.len())
+            .is_none_or(|end| end > max_size)
+        {
             Err(STATUS_UNSUCCESSFUL)
         } else {
             // Dispatch to sys_ramdisk_read for the system partition
@@ -194,14 +200,14 @@ pub unsafe fn read_sector(device: *mut (), sector: u64, buffer: &mut [u8]) -> Re
             if Some(base) == sys_base {
                 // Use sys_ramdisk_read which has its own serial prints
                 let n = crate::fs::sys_ramdisk_read(off as u64, buffer);
-                if n >= 512 {
+                if n == buffer.len() {
                     Ok(())
                 } else {
                     Err(STATUS_UNSUCCESSFUL)
                 }
             } else {
                 let n = crate::fs::esp_ramdisk_read(off as u64, buffer);
-                if n >= 512 {
+                if n == buffer.len() {
                     Ok(())
                 } else {
                     Err(STATUS_UNSUCCESSFUL)
@@ -346,8 +352,8 @@ pub fn mount(
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// Unmount an ext2 filesystem
-pub unsafe fn unmount(_fs: *mut Ext2FileSystem) {
-    if !_fs.is_null() {
+pub unsafe fn unmount(fs: *mut Ext2FileSystem) {
+    if !fs.is_null() {
         // kprintln!("[EXT2] Filesystem unmounted");
         // In a full implementation, we would:
         // 1. Sync all buffers
@@ -472,6 +478,19 @@ pub unsafe fn read_whole_file(
     fs: &Ext2FileSystem,
     path: &str,
 ) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    // SAFETY: forwarded from this function's caller.
+    unsafe { read_whole_file_limited(fs, path, 64 * 1024 * 1024) }
+}
+
+/// Read a complete file only if its inode size fits the caller's limit.
+///
+/// # Safety
+/// The mounted filesystem and its device must remain valid during the read.
+pub unsafe fn read_whole_file_limited(
+    fs: &Ext2FileSystem,
+    path: &str,
+    limit: usize,
+) -> Result<alloc::vec::Vec<u8>, &'static str> {
     // Convert Windows path to ext2 path
     let ext2_path = win_path_to_ext2(path);
 
@@ -487,7 +506,8 @@ pub unsafe fn read_whole_file(
         None => return Err("ext2: read_inode failed"),
     };
 
-    let file_size = inode.get_size(&fs.superblock) as usize;
+    let file_size = usize::try_from(inode.get_size(&fs.superblock)).map_err(|_| "ext2: file too large")?;
+    if file_size > limit { return Err("ext2: file exceeds read limit"); }
     if file_size == 0 {
         return Ok(Vec::new());
     }
@@ -569,8 +589,12 @@ pub fn clear_mounted_fs() {
 /// Convert a Windows-style path ("C:\Windows\file") to an ext2-style
 /// path ("/Windows/file"). Strips the leading drive prefix if present.
 fn win_path_to_ext2(path: &str) -> alloc::string::String {
-    let p = path.trim_start_matches(['C', 'c']);
-    let p = p.trim_start_matches([':', '\\', '/']);
+    let p = if path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic() {
+        &path[2..]
+    } else {
+        path
+    };
+    let p = p.trim_start_matches(['\\', '/']);
     let p = p.replace('\\', "/");
     if p.is_empty() || !p.starts_with('/') {
         alloc::format!("/{}", p)

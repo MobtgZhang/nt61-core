@@ -34,14 +34,14 @@ pub fn is_mounted() -> bool {
     super::is_mounted()
 }
 
-pub fn read_file(_path: &str) -> Result<Vec<u8>, NTSTATUS> {
+pub fn read_file(path: &str) -> Result<Vec<u8>, NTSTATUS> {
     let fs = super::get_mounted_fs().ok_or(STATUS_UNSUCCESSFUL)?;
-    unsafe { super::read_whole_file(fs, _path) }.map_err(|_| STATUS_UNSUCCESSFUL)
+    unsafe { super::read_whole_file(fs, path) }.map_err(|_| STATUS_UNSUCCESSFUL)
 }
 
-pub fn list_directory(_path: &str) -> Result<Vec<ExtEntry>, NTSTATUS> {
+pub fn list_directory(path: &str) -> Result<Vec<ExtEntry>, NTSTATUS> {
     let fs = super::get_mounted_fs().ok_or(STATUS_UNSUCCESSFUL)?;
-    let path = super::win_path_to_ext2(_path);
+    let path = super::win_path_to_ext2(path);
     let inode = super::resolve_path(fs, path.as_bytes()).ok_or(STATUS_UNSUCCESSFUL)?;
     let entries = super::list_directory(fs, inode).ok_or(STATUS_UNSUCCESSFUL)?;
     Ok(entries

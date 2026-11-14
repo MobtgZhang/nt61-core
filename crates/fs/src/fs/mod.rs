@@ -12,6 +12,7 @@ pub mod ntfs;
 pub mod refs; // ReFS (Resilient File System) support
 pub mod smoke;
 pub mod vfs;
+pub mod system_volume;
 pub mod windows_paths; // Windows 7 path and directory mapping
 
 use crate::ke::sync::Spinlock;
@@ -61,7 +62,7 @@ impl DeviceSelection {
                     None
                 }
             }
-            DeviceSelection::ByType(_device_type) => {
+            DeviceSelection::ByType(_) => {
                 // Search for a device of the specified type
                 let count = crate::drivers::storage::device_count();
                 for i in 0..count {
@@ -694,15 +695,46 @@ pub fn detect_system_partition_type() -> FsType {
 /// loaders used by SMSS. It deliberately performs no image validation so
 /// callers can read configuration and text files as well as binaries.
 pub fn read_file_from_disk(path: &str) -> Option<Vec<u8>> {
+    read_file_from_disk_limited(path, MAX_SYSTEM_FILE_SIZE)
+}
+
+/// Reject oversized files before allocating their contents.
+pub fn read_file_from_disk_limited(path: &str, limit: usize) -> Option<Vec<u8>> {
+    let limit = limit.min(MAX_SYSTEM_FILE_SIZE);
     match detect_system_partition_type() {
-        FsType::Fat32 => read_file_from_fat32(path),
-        FsType::Ntfs => read_file_from_ntfs(path),
-        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => read_file_from_ext(path),
+        FsType::Fat32 => read_file_from_fat32(path, limit),
+        FsType::Ntfs => read_file_from_ntfs(path, limit),
+        FsType::Refs => read_file_from_refs_extension(path, limit),
+        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => read_file_from_ext(path, limit),
         _ => None,
     }
 }
 
-fn read_file_from_fat32(path: &str) -> Option<Vec<u8>> {
+/// Reader for the project's flat ReFS extension, not Microsoft's ReFS B-tree.
+fn read_file_from_refs_extension(path: &str, limit: usize) -> Option<Vec<u8>> {
+    let mut header = [0u8; 512];
+    if sys_ramdisk_read(0x1000, &mut header) != header.len() { return None; }
+    if u64::from_le_bytes(header[..8].try_into().ok()?) != 0x52647366 { return None; }
+    let table_size = usize::try_from(u64::from_le_bytes(header[88..96].try_into().ok()?)).ok()?;
+    if table_size < 272 || table_size > 16 * 1024 * 1024 { return None; }
+    let normalized = path.trim_start_matches("C:").trim_start_matches("c:")
+        .trim_start_matches(['/', '\\']).replace('\\', "/");
+    let mut table = vec![0; table_size];
+    if sys_ramdisk_read(0x2000, &mut table) != table_size { return None; }
+    for entry in table.chunks_exact(272) {
+        if entry[0] == 0 { break; }
+        let n = entry[..256].iter().position(|b| *b == 0).unwrap_or(256);
+        if !core::str::from_utf8(&entry[..n]).ok()?.eq_ignore_ascii_case(&normalized) { continue; }
+        let start = u64::from_le_bytes(entry[256..264].try_into().ok()?).checked_mul(512)?;
+        let len = usize::try_from(u64::from_le_bytes(entry[264..272].try_into().ok()?)).ok()?;
+        if len > limit { return None; }
+        let mut data = vec![0; len];
+        return (sys_ramdisk_read(start, &mut data) == len).then_some(data);
+    }
+    None
+}
+
+fn read_file_from_fat32(path: &str, limit: usize) -> Option<Vec<u8>> {
     if !fat32::is_mounted() {
         return None;
     }
@@ -714,7 +746,7 @@ fn read_file_from_fat32(path: &str) -> Option<Vec<u8>> {
     let result = fat32::get_mounted_fs().and_then(|filesystem| {
         let entry = fat32::find_file_at_path(filesystem, path)?;
         let file_size = entry.file_size() as usize;
-        if file_size == 0 || file_size > MAX_SYSTEM_FILE_SIZE {
+        if file_size > limit {
             return None;
         }
         let mut buffer = vec![0u8; file_size];
@@ -733,7 +765,7 @@ fn read_file_from_fat32(path: &str) -> Option<Vec<u8>> {
     result
 }
 
-fn read_file_from_ntfs(path: &str) -> Option<Vec<u8>> {
+fn read_file_from_ntfs(path: &str, limit: usize) -> Option<Vec<u8>> {
     if !ntfs::is_mounted() {
         return None;
     }
@@ -751,7 +783,7 @@ fn read_file_from_ntfs(path: &str) -> Option<Vec<u8>> {
 
         let mut handle = ntfs::open_file(filesystem, &path_utf16, None)?;
         let file_size = handle.file_size as usize;
-        if file_size == 0 || file_size > MAX_SYSTEM_FILE_SIZE {
+        if file_size > limit {
             return None;
         }
         let mut buffer = vec![0u8; file_size];
@@ -798,13 +830,13 @@ pub fn write_ntfs_file_at(path: &str, offset: u64, buffer: &[u8]) -> Option<usiz
     ntfs::write_file(filesystem, &mut handle, buffer).ok()
 }
 
-fn read_file_from_ext(path: &str) -> Option<Vec<u8>> {
+fn read_file_from_ext(path: &str, limit: usize) -> Option<Vec<u8>> {
     if !ext2::is_mounted() {
         return None;
     }
     let filesystem = ext2::get_mounted_fs()?;
-    let mut buffer = unsafe { ext2::read_whole_file(filesystem, path) }.ok()?;
-    if buffer.len() > MAX_SYSTEM_FILE_SIZE {
+    let mut buffer = unsafe { ext2::read_whole_file_limited(filesystem, path, limit) }.ok()?;
+    if buffer.len() > limit {
         return None;
     }
     buffer.truncate(buffer.len());
@@ -1312,6 +1344,7 @@ pub fn mount_sys_from_bootinfo(boot_info: &crate::boot_types::BootInfo) {
 pub enum FsType {
     Fat32,
     Ntfs,
+    Refs,
     Ext4,
     Ext3,
     Ext2,
@@ -1323,6 +1356,7 @@ impl FsType {
         match self {
             FsType::Fat32 => "FAT32",
             FsType::Ntfs => "NTFS",
+            FsType::Refs => "project ReFS extension",
             FsType::Ext4 => "ext4",
             FsType::Ext3 => "ext3",
             FsType::Ext2 => "ext2",
@@ -1360,6 +1394,7 @@ pub unsafe fn detect_fs_type(base_ptr: *const u8) -> FsType {
         if oem == b"FAT32   " || oem == b"FAT16   " || oem == b"FAT12   " || oem == b"FAT     " {
             return FsType::Fat32;
         }
+        if oem == b"ReFS    " { return FsType::Refs; }
         if oem == b"NTFS    " {
             return FsType::Ntfs;
         }
@@ -1420,7 +1455,7 @@ fn mount_partition_detected(drive_letter: u16, base_ptr: *const u8, ramdisk: Par
                 let context = MountContext::new(base_ptr, size);
                 let res = fat32::mount(core::ptr::null_mut(), &path, Some(context));
                 match res {
-                    Some(_fs) => {
+                    Some(_) => {
                         crate::boot_println!(
                             "[MOUNT] drive={}: FAT32 mounted",
                             drive_letter as u8 as char
@@ -1445,7 +1480,7 @@ fn mount_partition_detected(drive_letter: u16, base_ptr: *const u8, ramdisk: Par
                 let context = MountContext::new(base_ptr, size);
                 let res = crate::fs::ntfs::mount(core::ptr::null_mut(), &path, Some(context));
                 match res {
-                    Some(_fs) => {
+                    Some(_) => {
                         crate::boot_println!(
                             "[MOUNT] drive={}: NTFS mounted",
                             drive_letter as u8 as char
@@ -1501,7 +1536,7 @@ fn mount_partition_detected(drive_letter: u16, base_ptr: *const u8, ramdisk: Par
                 };
                 let context = MountContext::new(base_ptr, size);
                 match crate::fs::ext2::mount(core::ptr::null_mut(), 0, Some(context)) {
-                    Some(_fs) => {
+                    Some(_) => {
                         crate::boot_println!(
                             "[MOUNT] drive={}: {} mounted",
                             drive_letter as u8 as char,
@@ -1518,6 +1553,10 @@ fn mount_partition_detected(drive_letter: u16, base_ptr: *const u8, ramdisk: Par
                         false
                     }
                 }
+            }
+            FsType::Refs => {
+                crate::boot_println!("[MOUNT] project ReFS extension: read-only boot access");
+                true
             }
             FsType::Unknown => {
                 crate::boot_println!(
@@ -1573,8 +1612,8 @@ impl PartRamdisk {
 /// for that partition.
 fn mount_esp_partition() {
     let drive = b'Z' as u16;
-    let (base, _size) = match esp_mirror_address() {
-        Some(b) => (b, 0),
+    let base = match esp_mirror_address() {
+        Some(b) => b,
         None => {
             crate::boot_println!("[FS] mount_esp_partition: no ESP mirror, nothing to mount");
             return;
@@ -1589,8 +1628,8 @@ fn mount_esp_partition() {
 /// from the mirror and the right driver (FAT32/NTFS/EXT4) is picked.
 fn mount_system_partition() {
     let drive = b'C' as u16;
-    let (base, _size) = match sys_mirror_address() {
-        Some(b) => (b, 0),
+    let base = match sys_mirror_address() {
+        Some(b) => b,
         None => {
             crate::boot_println!("[FS] mount_system_partition: no System mirror, nothing to mount");
             return;

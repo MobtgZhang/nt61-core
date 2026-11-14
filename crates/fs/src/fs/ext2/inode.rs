@@ -20,7 +20,6 @@ extern crate alloc;
 
 use alloc::vec;
 
-use super::extent::Ext4ExtentHeader;
 use super::group::read_group_descriptor;
 use super::superblock::{Ext2SuperBlock, EXT2_FEATURE_RO_COMPAT_LARGE_FILE, SUPERBLOCK_OFFSET};
 
@@ -458,6 +457,11 @@ pub unsafe fn read_inode(
         }
 
         // Parse inode from buffer
+        if inode_size < core::mem::size_of::<Ext2Inode>()
+            || block_offset.checked_add(core::mem::size_of::<Ext2Inode>())? > buffer.len()
+        {
+            return None;
+        }
         let inode_ptr = buffer.as_ptr().add(block_offset) as *const Ext2Inode;
         Some(core::ptr::read_unaligned(inode_ptr))
     }
@@ -513,7 +517,7 @@ pub unsafe fn write_inode(
         core::ptr::copy_nonoverlapping(
             inode as *const Ext2Inode as *const u8,
             buffer.as_mut_ptr().add(block_offset),
-            inode_size,
+            core::mem::size_of::<Ext2Inode>(),
         );
 
         // write back
@@ -544,10 +548,9 @@ pub unsafe fn logical_to_lba(
         let block_size = sb.get_block_size();
 
         // Try extent-based lookup first (ext4)
-        if inode.has_extents() || sb.has_extents() {
-            if let Some(physical) = extent_lookup(device, sb, inode, block_num) {
-                return Some(physical * (block_size / 512) as u64);
-            }
+        if inode.has_extents() {
+            return extent_lookup(device, sb, inode, block_num)?
+                .checked_mul((block_size / 512) as u64);
         }
 
         // Fall back to traditional block pointer approach (ext2/ext3)
@@ -645,104 +648,87 @@ fn extent_lookup(
     inode: &Ext2Inode,
     logical_block: u32,
 ) -> Option<u64> {
-    unsafe {
-        let block_size = sb.get_block_size() as usize;
-
-        // In ext4, the extent header is stored in the inode's block array at index 0
-        // We need to read the first block which contains the extent header
-        let extent_block_num = inode.get_direct_block(0)?;
-
-        // read the extent header block
-        let extent_sector = extent_block_num as u64 * (block_size / 512) as u64;
-        let mut extent_data = vec![0u8; block_size];
-
-        if super::superblock::read_sector(device, extent_sector, &mut extent_data).is_err() {
-            return None;
-        }
-
-        // Parse extent header
-        let header = &*(extent_data.as_ptr() as *const Ext4ExtentHeader);
-
-        if !header.is_valid() {
-            return None;
-        }
-
-        // Walk the extent tree to find the block
-        find_in_extent_node(device, &extent_data, header.depth, logical_block)
+    // i_block is an inline 60-byte extent root, not a pointer to a root block.
+    let mut root = [0u8; 60];
+    for (i, word) in inode
+        .block
+        .iter()
+        .copied()
+        .chain([inode.i_block, inode.i_double_block, inode.i_triple_block])
+        .enumerate()
+    {
+        root[i * 4..i * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
+    let depth = u16::from_le_bytes(root[6..8].try_into().ok()?);
+    if depth > 5 {
+        return None;
+    }
+    find_in_extent_node(
+        device,
+        sb.get_block_size() as usize,
+        &root,
+        depth,
+        logical_block,
+    )
 }
 
-/// Recursively search an extent node for a logical block
-/// Returns the physical block number, or None if not found
+/// Byte decoding avoids unaligned references on AArch64, RISC-V and LoongArch.
 fn find_in_extent_node(
     device: *mut (),
+    block_size: usize,
     data: &[u8],
     depth: u16,
     logical_block: u32,
 ) -> Option<u64> {
-    unsafe {
-        let header = &*(data.as_ptr() as *const Ext4ExtentHeader);
-
-        if header.magic != Ext4ExtentHeader::new(0, 0).magic {
-            // Invalid header
+    let header = data.get(..12)?;
+    let word = |offset| u16::from_le_bytes([header[offset], header[offset + 1]]);
+    let entries = usize::from(word(2));
+    let capacity = usize::from(word(4));
+    if word(0) != 0xf30a
+        || word(6) != depth
+        || entries > capacity
+        || capacity > (data.len() - 12) / 12
+    {
+        return None;
+    }
+    let mut child = None;
+    let mut previous = None;
+    for entry in data[12..12 + entries * 12].chunks_exact(12) {
+        let logical = u32::from_le_bytes(entry[..4].try_into().ok()?);
+        if previous.is_some_and(|p| logical <= p) {
             return None;
         }
-
-        let num_entries = header.entries as usize;
-        let header_size = core::mem::size_of::<Ext4ExtentHeader>();
-        let extent_size = core::mem::size_of::<super::extent::Ext4Extent>();
-        let index_size = core::mem::size_of::<super::extent::Ext4ExtentIdx>();
-
-        for i in 0..num_entries {
-            if depth == 0 {
-                // Leaf node - extent entries
-                let entry_offset = header_size + i * extent_size;
-                if entry_offset + extent_size > data.len() {
-                    break;
-                }
-
-                let extent =
-                    &*(data.as_ptr().add(entry_offset) as *const super::extent::Ext4Extent);
-
-                if extent.covers(logical_block) {
-                    return extent.logical_to_physical(logical_block);
-                }
-            } else {
-                // Index node - extent index entries
-                let entry_offset = header_size + i * index_size;
-                if entry_offset + index_size > data.len() {
-                    break;
-                }
-
-                let index =
-                    &*(data.as_ptr().add(entry_offset) as *const super::extent::Ext4ExtentIdx);
-
-                // Check if this index covers our logical block
-                if logical_block >= index.ei_block {
-                    // We need to search this child node
-                    let child_block = index.get_child_block();
-                    let child_sector = child_block * 512; // Assuming 512-byte sectors
-
-                    let block_size = 4096; // Default block size
-                    let mut child_data = vec![0u8; block_size];
-
-                    if super::superblock::read_sector(device, child_sector, &mut child_data)
-                        .is_err()
-                    {
-                        continue;
-                    }
-
-                    if let Some(physical) =
-                        find_in_extent_node(device, &child_data, depth - 1, logical_block)
-                    {
-                        return Some(physical);
-                    }
-                }
-            }
+        previous = Some(logical);
+        if logical_block < logical {
+            break;
         }
-
-        None
+        if depth == 0 {
+            let length = u16::from_le_bytes(entry[4..6].try_into().ok()?);
+            // ee_len > 32768 denotes uninitialized extents, never executable data.
+            if length == 0 || length > 32768 {
+                continue;
+            }
+            let delta = logical_block - logical;
+            if delta < u32::from(length) {
+                let high = u16::from_le_bytes(entry[6..8].try_into().ok()?);
+                let low = u32::from_le_bytes(entry[8..12].try_into().ok()?);
+                return ((u64::from(high) << 32) | u64::from(low)).checked_add(u64::from(delta));
+            }
+        } else {
+            let low = u32::from_le_bytes(entry[4..8].try_into().ok()?);
+            let high = u16::from_le_bytes(entry[8..10].try_into().ok()?);
+            child = Some((u64::from(high) << 32) | u64::from(low));
+        }
     }
+    if depth == 0 {
+        return None;
+    }
+    let sector = child?.checked_mul((block_size / 512) as u64)?;
+    let mut buffer = vec![0; block_size];
+    unsafe {
+        super::superblock::read_sector(device, sector, &mut buffer).ok()?;
+    }
+    find_in_extent_node(device, block_size, &buffer, depth - 1, logical_block)
 }
 
 /// # Safety

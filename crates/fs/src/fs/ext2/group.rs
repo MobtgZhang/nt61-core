@@ -198,7 +198,7 @@ impl Default for Ext2GroupDescTable {
 /// Calculate the size of the group descriptor table
 pub fn calculate_gdt_size(sb: &Ext2SuperBlock) -> usize {
     let group_count = sb.get_group_count() as usize;
-    let desc_size = if sb.is_dynamic_rev() && sb.inode_size >= 255 {
+    let desc_size = if sb.has_64bit() {
         EXT2_BGDESC_SIZE_NEW
     } else {
         EXT2_BGDESC_SIZE_OLD
@@ -232,7 +232,7 @@ pub unsafe fn read_group_desc_table(
     let block_size = sb.get_block_size() as usize;
 
     // Determine descriptor size
-    let desc_size = if sb.is_dynamic_rev() && sb.inode_size >= 255 {
+    let desc_size = if sb.has_64bit() {
         EXT2_BGDESC_SIZE_NEW
     } else {
         EXT2_BGDESC_SIZE_OLD
@@ -247,7 +247,7 @@ pub unsafe fn read_group_desc_table(
     let mut buffer = vec![0u8; blocks_needed * block_size];
 
     if unsafe {
-        super::superblock::read_sectors(device, gdt_start, blocks_needed as u32, &mut buffer)
+        super::superblock::read_sector(device, gdt_start * (block_size / 512) as u64, &mut buffer)
     }
     .is_err()
     {
@@ -291,7 +291,7 @@ pub unsafe fn read_group_descriptor(
         }
 
         // Determine descriptor size
-        let desc_size = if sb.is_dynamic_rev() && sb.inode_size >= 255 {
+        let desc_size = if sb.has_64bit() {
             EXT2_BGDESC_SIZE_NEW
         } else {
             EXT2_BGDESC_SIZE_OLD

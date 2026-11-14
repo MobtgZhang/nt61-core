@@ -46,7 +46,7 @@ pub const EXT2_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004; // ext3 needs recovery
 pub const EXT2_FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0008; // Journal device
 pub const EXT2_FEATURE_INCOMPAT_META_BG: u32 = 0x0010;
 pub const EXT2_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040; // ext4 extents
-pub const EXT2_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0020; // Flexible block groups
+pub const EXT2_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200; // Flexible block groups
 pub const EXT2_FEATURE_INCOMPAT_EA_INODE: u32 = 0x0080; // Extended attributes in inode
 pub const EXT2_FEATURE_INCOMPAT_DIRDATA: u32 = 0x0100; // Data in directory entry
 pub const EXT2_FEATURE_INCOMPAT_BG_USE_META_BG: u32 = 0x0200;
@@ -252,7 +252,7 @@ impl Ext2SuperBlock {
 
     /// Check if this filesystem has 64-bit support
     pub fn has_64bit(&self) -> bool {
-        self.is_dynamic_rev() && (self.incompatible_features & 0x200) != 0
+        self.is_dynamic_rev() && (self.incompatible_features & 0x80) != 0
     }
 
     /// Check if journal is present
@@ -673,21 +673,27 @@ pub unsafe fn read_sector(device: *mut (), sector: u64, buffer: &mut [u8]) -> Re
     // and read from the system partition properly.
     if let Some(context) = unsafe { crate::fs::mount_context_from_device(device) } {
         let base = context.base;
-        let off = (sector as usize) * 512;
+        let off = usize::try_from(sector)
+            .ok()
+            .and_then(|s| s.checked_mul(512))
+            .ok_or(STATUS_UNSUCCESSFUL)?;
         let max_size = context.size;
-        if off + 512 > max_size {
+        if off
+            .checked_add(buffer.len())
+            .is_none_or(|end| end > max_size)
+        {
             return Err(STATUS_UNSUCCESSFUL);
         }
         // Dispatch to sys_ramdisk_read for the system partition
         let sys_base = crate::fs::sys_mirror_address();
         if Some(base) == sys_base {
             let n = crate::fs::sys_ramdisk_read(off as u64, buffer);
-            if n >= 512 {
+            if n == buffer.len() {
                 return Ok(());
             }
         } else {
             let n = crate::fs::esp_ramdisk_read(off as u64, buffer);
-            if n >= 512 {
+            if n == buffer.len() {
                 return Ok(());
             }
         }

@@ -60,9 +60,7 @@ pub const EXT2_DIR_ENTRY_NO_FTYPE_SIZE: usize = 8;
 // Directory Entry Structure
 // ============================================================================
 
-/// ext2 Directory Entry (variable size, minimum 8 bytes)
-/// All fields are stored in little-endian byte order.
-#[repr(C)]
+/// Owned directory entry decoded from the eight-byte on-disk header.
 pub struct Ext2DirEntry {
     /// Inode number (0 = unused entry)
     pub inode: u32,
@@ -72,10 +70,8 @@ pub struct Ext2DirEntry {
     pub name_len: u16,
     /// File type (only present if FILETYPE feature set)
     pub file_type: u8,
-    /// Reserved
-    pub reserved: u8,
     /// File name (variable length, not null-terminated)
-    pub name: [u8; 1], // Variable length, actual size is name_len
+    pub name: [u8; EXT2_NAME_LEN],
 }
 
 impl Ext2DirEntry {
@@ -104,9 +100,7 @@ impl Ext2DirEntry {
 
     /// Get the file name as a byte slice
     pub fn get_name(&self) -> &[u8] {
-        // Safety: This assumes the entry is valid and the name doesn't
-        // extend beyond the record. For normal entries, this is safe.
-        unsafe { core::slice::from_raw_parts(self.name.as_ptr(), self.name_len as usize) }
+        &self.name[..usize::from(self.name_len).min(EXT2_NAME_LEN)]
     }
 
     /// Get the file name as a null-terminated string (lossy ASCII)
@@ -256,60 +250,57 @@ unsafe fn parse_directory_entries(
     has_filetype: bool,
     entries: &mut Vec<Ext2DirEntryInfo>,
 ) {
-    let entry_size = if has_filetype {
-        EXT2_DIR_ENTRY_FTYPE_SIZE
-    } else {
-        EXT2_DIR_ENTRY_NO_FTYPE_SIZE
-    };
-
-    let mut offset = 0usize;
-
-    while offset + entry_size <= buffer.len() {
-        // read entry header
-        let inode = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
-        let rec_len = u16::from_le_bytes(buffer[offset + 4..offset + 6].try_into().unwrap());
-        let name_len = u16::from_le_bytes(buffer[offset + 6..offset + 8].try_into().unwrap());
-
-        if inode == 0 {
-            // Unused entry
-            offset += rec_len as usize;
-            continue;
-        }
-
-        if rec_len < entry_size as u16 || name_len > EXT2_NAME_LEN as u16 {
-            // Invalid entry
-            break;
-        }
-
-        // Get file type if present
-        let file_type = if has_filetype {
-            buffer[offset + 8]
-        } else {
-            // Derive type from inode (simplified)
-            EXT2_FT_UNKNOWN
-        };
-
-        // Get name
-        let name_start = offset + entry_size;
-        let name_end = name_start + name_len as usize;
-
-        if name_end > buffer.len() {
-            break;
-        }
-
-        let name = buffer[name_start..name_end].to_vec();
-        let name_str = String::from_utf8_lossy(&name).into_owned();
-
-        entries.push(Ext2DirEntryInfo::new(inode, name_str, file_type, rec_len));
-
-        // Move to next entry
-        offset += rec_len as usize;
-
-        // Sanity check
-        if rec_len == 0 {
-            break;
+    let mut offset = 0;
+    while let Some((entry, next)) = decode_directory_entry(buffer, offset, has_filetype) {
+        offset = next;
+        if entry.inode != 0 {
+            entries.push(Ext2DirEntryInfo::new(
+                entry.inode,
+                String::from_utf8_lossy(entry.get_name()).into_owned(),
+                entry.file_type,
+                entry.rec_len,
+            ));
         }
     }
+}
+
+/// Decode bytes without overlaying a variable-length record onto a Rust object.
+fn decode_directory_entry(
+    buffer: &[u8],
+    offset: usize,
+    has_filetype: bool,
+) -> Option<(Ext2DirEntry, usize)> {
+    let header = buffer.get(offset..offset.checked_add(8)?)?;
+    let inode = u32::from_le_bytes(header[..4].try_into().ok()?);
+    let rec_len = u16::from_le_bytes(header[4..6].try_into().ok()?);
+    let name_len = if has_filetype {
+        u16::from(header[6])
+    } else {
+        u16::from_le_bytes(header[6..8].try_into().ok()?)
+    };
+    let next = offset.checked_add(usize::from(rec_len))?;
+    if rec_len < 8
+        || rec_len % 4 != 0
+        || next > buffer.len()
+        || name_len as usize > EXT2_NAME_LEN
+        || name_len > rec_len - 8
+    {
+        return None;
+    }
+    let mut entry = Ext2DirEntry {
+        inode,
+        rec_len,
+        name_len,
+        file_type: if has_filetype {
+            header[7]
+        } else {
+            EXT2_FT_UNKNOWN
+        },
+        name: [0; EXT2_NAME_LEN],
+    };
+    entry.name[..name_len as usize]
+        .copy_from_slice(&buffer[offset + 8..offset + 8 + name_len as usize]);
+    Some((entry, next))
 }
 
 /// # Safety
@@ -370,71 +361,13 @@ unsafe fn find_entry_in_buffer(
     name: &[u8],
     has_filetype: bool,
 ) -> Option<Ext2DirEntry> {
-    let entry_size = if has_filetype {
-        EXT2_DIR_ENTRY_FTYPE_SIZE
-    } else {
-        EXT2_DIR_ENTRY_NO_FTYPE_SIZE
-    };
-
-    let mut offset = 0usize;
-
-    while offset + entry_size <= buffer.len() {
-        // read entry header
-        let inode = u32::from_le_bytes(buffer[offset..offset + 4].try_into().unwrap());
-        let rec_len = u16::from_le_bytes(buffer[offset + 4..offset + 6].try_into().unwrap());
-        let name_len = u16::from_le_bytes(buffer[offset + 6..offset + 8].try_into().unwrap());
-
-        if inode == 0 {
-            // Unused entry, skip
-            offset += rec_len as usize;
-            continue;
-        }
-
-        if rec_len < entry_size as u16 || name_len as usize > EXT2_NAME_LEN {
-            break;
-        }
-
-        // Get file type if present
-        let file_type = if has_filetype {
-            buffer[offset + 8]
-        } else {
-            EXT2_FT_UNKNOWN
-        };
-
-        // Compare name
-        let name_start = offset + entry_size;
-        let name_end = name_start + name_len as usize;
-
-        if name_end > buffer.len() {
-            break;
-        }
-
-        if buffer[name_start..name_end] == name[..] {
-            // Found match
-            let mut entry = Ext2DirEntry {
-                inode,
-                rec_len,
-                name_len,
-                file_type,
-                reserved: 0,
-                name: [0; 1],
-            };
-
-            // Copy name
-            entry.name[..core::cmp::min(name.len(), name_len as usize)]
-                .copy_from_slice(&name[..core::cmp::min(name.len(), name_len as usize)]);
-
+    let mut offset = 0;
+    while let Some((entry, next)) = decode_directory_entry(buffer, offset, has_filetype) {
+        offset = next;
+        if entry.inode != 0 && entry.get_name().eq_ignore_ascii_case(name) {
             return Some(entry);
         }
-
-        // Move to next entry
-        offset += rec_len as usize;
-
-        if rec_len == 0 {
-            break;
-        }
     }
-
     None
 }
 
@@ -597,14 +530,12 @@ pub fn create_dir_entry(inode_num: u32, name: &[u8], file_type: u8, has_filetype
     // rec_len
     entry.extend_from_slice(&rec_len.to_le_bytes());
 
-    // name_len
-    entry.extend_from_slice(&name_len.to_le_bytes());
-
-    // file_type (if present)
     if has_filetype {
+        entry.push(name_len as u8);
         entry.push(file_type);
+    } else {
+        entry.extend_from_slice(&name_len.to_le_bytes());
     }
-    entry.push(0); // reserved
 
     // name
     entry.extend_from_slice(name);
@@ -628,7 +559,7 @@ pub fn debug_print_directory(entries: &[Ext2DirEntryInfo]) {
     // contract remains intact.
     for entry in entries {
         let _inode_str = format!("{}", entry.inode);
-        let _name_str = entry.name.clone();
+        let name_str = entry.name.clone();
         let _type_str = match entry.file_type {
             EXT2_FT_UNKNOWN => "Unknown",
             EXT2_FT_REG_FILE => "File",
@@ -641,6 +572,6 @@ pub fn debug_print_directory(entries: &[Ext2DirEntryInfo]) {
             _ => "Unknown",
         };
         // The format strings are preserved for when debug logging is enabled.
-        let _ = (entry.rec_len, _inode_str, _name_str, _type_str);
+        let _ = (entry.rec_len, _inode_str, name_str, _type_str);
     }
 }

@@ -11,6 +11,12 @@
 //! Each file/directory has a SecurityId that indexes into these structures.
 use crate::libs::ntdll::types::NTSTATUS;
 
+#[path = "secure_stream.rs"]
+mod secure_stream;
+
+/// Shared descriptor used by newly created files, referenced by STANDARD_INFORMATION.
+pub const DEFAULT_SECURITY_ID: u32 = 256;
+
 /// Maximum number of security descriptors in the cache.
 const MAX_SECURITY_DESCRIPTORS: usize = 256;
 
@@ -138,134 +144,55 @@ pub struct NtfsSecurityDescriptor {
 impl NtfsSecurityDescriptor {
     /// create a new security descriptor with default permissions.
     pub fn new_default() -> Self {
+        let mut owner = [0u8; 64];
+        owner[..16].copy_from_slice(&[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0]);
         Self {
-            id: 0,
-            owner: [0; 64],
-            owner_size: 0,
-            group: [0; 64],
-            group_size: 0,
-            dacl: Self::default_dacl(),
-            dacl_size: Self::default_dacl().len() as u32,
-            sacl: [0; 512],
-            sacl_size: 0,
-            hash: 0,
+            id: DEFAULT_SECURITY_ID,
+            owner, owner_size: 16,
+            group: owner, group_size: 16,
+            dacl: Self::default_dacl(), dacl_size: 72,
+            sacl: [0; 512], sacl_size: 0, hash: 0,
         }
     }
 
-    /// create a security descriptor for well-known SIDs.
+    /// Create a descriptor owned by a well-known SID.
     pub fn new_well_known(id: SecurityId) -> Self {
         let mut sd = Self::new_default();
         sd.id = id;
-
-        match id {
-            well_known_sids::SYSTEM => {
-                // SYSTEM SID: S-1-5-18
-                sd.owner_size = 12;
-                sd.owner[0] = 0x01; // revision
-                sd.owner[1] = 0x02; // SubAuthorityCount
-                sd.owner[2..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x05]); // NT AUTHORITY
-                sd.owner[8] = 0x12; // SYSTEM RID
-                sd.owner[9] = 0x00;
-            }
-            well_known_sids::EVERYONE => {
-                // Everyone SID: S-1-1-0
-                sd.owner_size = 8;
-                sd.owner[0] = 0x01;
-                sd.owner[1] = 0x01;
-                sd.owner[2..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x01]);
-                // WORLD
-            }
-            well_known_sids::ADMINISTRATORS => {
-                // Administrators SID: S-1-5-32-544
-                sd.owner_size = 12;
-                sd.owner[0] = 0x01;
-                sd.owner[1] = 0x02;
-                sd.owner[2..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x05]); // NT AUTHORITY
-                sd.owner[8] = 0x20; // SubAuthority (DOMAIN_ALIAS_RID_ADMINS)
-                sd.owner[9] = 0x02;
-                sd.owner[10] = 0x00;
-                sd.owner[11] = 0x00;
-            }
-            _ => {}
-        }
+        let sid: &[u8] = match id {
+            well_known_sids::SYSTEM => &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0],
+            well_known_sids::EVERYONE => &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+            well_known_sids::ADMINISTRATORS => &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0],
+            _ => &[],
+        };
+        sd.owner.fill(0);
+        sd.owner[..sid.len()].copy_from_slice(sid);
+        sd.owner_size = sid.len() as u32;
         sd.calculate_hash();
         sd
     }
 
-    /// Default DACL that grants full access to SYSTEM and Administrators,
-    /// and read/execute to Everyone.
+    /// SYSTEM and Administrators full access; Everyone read/execute.
     fn default_dacl() -> [u8; 512] {
-        let mut dacl = [0u8; 512];
-
-        // ACL Header
-        dacl[0] = 0x05; // revision (ACL_REVISION)
-        dacl[1] = 0x02; // sbz1
-        dacl[2] = 0x14; // ACL size (little endian)
-        dacl[3] = 0x00;
-        dacl[4] = 0x02; // ACE count
-        dacl[5] = 0x00;
-        dacl[6] = 0x00; // sbz2
-        dacl[7] = 0x00;
-
-        // ACE 1: SYSTEM - full access (ACCESS_ALLOWED_ACE)
-        let ace1_offset = 8;
-        dacl[ace1_offset] = 0x00; // ACE type (ACCESS_ALLOWED_ACE_TYPE)
-        dacl[ace1_offset + 1] = 0x00; // ACE flags
-        dacl[ace1_offset + 2] = 0x18; // ACE size
-        dacl[ace1_offset + 3] = 0x00;
-        // Access mask (GENERIC_ALL | STANDARD_RIGHTS_ALL | SPECIFIC_RIGHTS_ALL)
-        dacl[ace1_offset + 4] = 0xFF; // GenericAll
-        dacl[ace1_offset + 5] = 0xFF; // Standard rights
-        dacl[ace1_offset + 6] = 0x01; // Specific rights
-        dacl[ace1_offset + 7] = 0x00;
-
-        // SID for SYSTEM (S-1-5-18)
-        let sid1_offset = ace1_offset + 8;
-        dacl[sid1_offset] = 0x01; // revision
-        dacl[sid1_offset + 1] = 0x02; // SubAuthorityCount
-                                      // IdentifierAuthority (NT AUTHORITY)
-        dacl[sid1_offset + 2] = 0x00;
-        dacl[sid1_offset + 3] = 0x00;
-        dacl[sid1_offset + 4] = 0x00;
-        dacl[sid1_offset + 5] = 0x00;
-        dacl[sid1_offset + 6] = 0x00;
-        dacl[sid1_offset + 7] = 0x05; // SECURITY_NT_AUTHORITY
-                                      // SubAuthorities
-        dacl[sid1_offset + 8] = 0x12; // SECURITY_LOCAL_SYSTEM_RID
-        dacl[sid1_offset + 9] = 0x00;
-        dacl[sid1_offset + 10] = 0x00;
-        dacl[sid1_offset + 11] = 0x00;
-
-        // ACE 2: Everyone - read/execute (ACCESS_ALLOWED_ACE)
-        let ace2_offset = ace1_offset + 20;
-        dacl[ace2_offset] = 0x00; // ACE type
-        dacl[ace2_offset + 1] = 0x00; // ACE flags (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE)
-        dacl[ace2_offset + 2] = 0x14; // ACE size
-        dacl[ace2_offset + 3] = 0x00;
-        // Access mask (FILE_READ_DATA | FILE_EXECUTE | READ_CONTROL)
-        dacl[ace2_offset + 4] = 0x20; // FILE_READ_DATA
-        dacl[ace2_offset + 5] = 0x01; // FILE_EXECUTE
-        dacl[ace2_offset + 6] = 0x00; // READ_CONTROL
-        dacl[ace2_offset + 7] = 0x00;
-
-        // SID for Everyone (S-1-1-0)
-        let sid2_offset = ace2_offset + 8;
-        dacl[sid2_offset] = 0x01; // revision
-        dacl[sid2_offset + 1] = 0x01; // SubAuthorityCount
-                                      // IdentifierAuthority (WORLD)
-        dacl[sid2_offset + 2] = 0x00;
-        dacl[sid2_offset + 3] = 0x00;
-        dacl[sid2_offset + 4] = 0x00;
-        dacl[sid2_offset + 5] = 0x00;
-        dacl[sid2_offset + 6] = 0x00;
-        dacl[sid2_offset + 7] = 0x01; // SECURITY_WORLD_SID_AUTHORITY
-                                      // SubAuthority
-        dacl[sid2_offset + 8] = 0x00; // SECURITY_NULL_SID_AUTHORITY
-        dacl[sid2_offset + 9] = 0x00;
-        dacl[sid2_offset + 10] = 0x00;
-        dacl[sid2_offset + 11] = 0x00;
-
-        dacl
+        let mut acl = [0u8; 512];
+        acl[0] = 2;
+        acl[2..4].copy_from_slice(&72u16.to_le_bytes());
+        acl[4..6].copy_from_slice(&3u16.to_le_bytes());
+        let sids: [&[u8]; 3] = [
+            &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0],
+            &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0],
+            &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+        ];
+        let mut at = 8;
+        for (i, sid) in sids.iter().enumerate() {
+            let size = 8 + sid.len();
+            acl[at + 2..at + 4].copy_from_slice(&(size as u16).to_le_bytes());
+            let mask: u32 = if i == 2 { 0x1200A9 } else { 0x1F01FF };
+            acl[at + 4..at + 8].copy_from_slice(&mask.to_le_bytes());
+            acl[at + 8..at + size].copy_from_slice(sid);
+            at += size;
+        }
+        acl
     }
 
     /// Calculate hash for quick comparison.
@@ -727,8 +654,8 @@ pub fn check_file_access(security_id: SecurityId, desired_access: u32) -> bool {
 /// 3. Parse and return the NtfsSecurityDescriptor
 ///
 /// # Arguments
-/// * `_ntfs` - NTFS filesystem data
-/// * `_security_id` - Security ID to read
+/// * `ntfs` - NTFS filesystem data
+/// * `security_id` - Security ID to read
 ///
 /// # Returns
 /// * Security descriptor if found
@@ -739,6 +666,9 @@ pub fn read_security_descriptor(
     // Read the $Secure record and locate its (non-resident) $DATA
     // attribute, which is the $SDS stream.
     let record = super::read_mft_record(ntfs, super::system_records::SECURE)?;
+    if let Some((_, _, data)) = secure_stream::stream(&record) {
+        return parse_sds_descriptor(security_id, secure_stream::descriptor(data, security_id)?);
+    }
     let attr_offset = super::find_attribute_in_record(&record, super::AttributeHeader::TYPE_DATA)?;
     if attr_offset + 0x40 > record.len() {
         return None;
@@ -832,11 +762,11 @@ pub fn read_security_descriptor(
             sds[pos + 0x12],
             sds[pos + 0x13],
         ]) as usize;
-        if length == 0 || length > 0x10000 {
+        if length < 0x14 || length > 0x10000 {
             // Corrupt entry: stop scanning rather than guessing.
             break;
         }
-        let entry_end = pos + 0x14 + length;
+        let entry_end = pos + length;
         if entry_end > filled {
             break;
         }
@@ -947,99 +877,55 @@ pub fn init() {
     // kprintln!("      Pre-populated well-known SIDs");
 }
 
-const SECURE_SDS_ATTRIBUTE_TYPE: u32 = 0x50;
-const SECURE_RECORD_NUMBER: u64 = 9;
-
-/// Serialize a self-relative Windows security descriptor for `$Secure:$SDS`.
+/// Serialize the 20-byte self-relative SECURITY_DESCRIPTOR header and components.
 pub fn serialize_sds_descriptor(descriptor: &NtfsSecurityDescriptor) -> alloc::vec::Vec<u8> {
-    let owner_size = descriptor.owner_size as usize;
-    let group_size = descriptor.group_size as usize;
-    let dacl_size = descriptor.dacl_size as usize;
-    let owner_offset = 0x20usize;
-    let group_offset = owner_offset + owner_size;
-    let dacl_offset = group_offset + group_size;
-    let descriptor_size = dacl_offset + dacl_size;
-
-    let mut bytes = alloc::vec![0u8; descriptor_size];
+    let mut bytes = alloc::vec![0u8; 20];
     bytes[0] = 1;
-    bytes[8] = descriptor.id as u8;
-    bytes[9] = (descriptor.id >> 8) as u8;
-    bytes[10] = (descriptor.id >> 16) as u8;
-    bytes[11] = (descriptor.id >> 24) as u8;
-    bytes[12] = 0x04;
-    bytes[13] = 0x80;
-    bytes[16..20].copy_from_slice(&(owner_offset as u32).to_le_bytes());
-    bytes[20..24].copy_from_slice(&(group_offset as u32).to_le_bytes());
-    bytes[24..28].copy_from_slice(&0u32.to_le_bytes());
-    bytes[28..32].copy_from_slice(&(dacl_offset as u32).to_le_bytes());
-    if owner_size > 0 {
-        bytes[owner_offset..owner_offset + owner_size]
-            .copy_from_slice(&descriptor.owner[..owner_size]);
+    let mut control = 0x8000u16;
+    for (field, component) in [
+        (4, &descriptor.owner[..(descriptor.owner_size as usize).min(descriptor.owner.len())]),
+        (8, &descriptor.group[..(descriptor.group_size as usize).min(descriptor.group.len())]),
+        (12, &descriptor.sacl[..(descriptor.sacl_size as usize).min(descriptor.sacl.len())]),
+        (16, &descriptor.dacl[..(descriptor.dacl_size as usize).min(descriptor.dacl.len())]),
+    ] {
+        if component.is_empty() { continue; }
+        if field == 12 { control |= 0x10; }
+        if field == 16 { control |= 4; }
+        let offset = bytes.len() as u32;
+        bytes[field..field + 4].copy_from_slice(&offset.to_le_bytes());
+        bytes.extend_from_slice(component);
+        while !bytes.len().is_multiple_of(4) { bytes.push(0); }
     }
-    if group_size > 0 {
-        bytes[group_offset..group_offset + group_size]
-            .copy_from_slice(&descriptor.group[..group_size]);
-    }
-    if dacl_size > 0 {
-        bytes[dacl_offset..dacl_offset + dacl_size].copy_from_slice(&descriptor.dacl[..dacl_size]);
-    }
+    bytes[2..4].copy_from_slice(&control.to_le_bytes());
     bytes
 }
 
-/// Build an `$Secure:$SDS` entry: hash pair, descriptor, and 8-byte alignment.
 pub fn build_sds_entry(security_id: SecurityId, descriptor: &[u8]) -> alloc::vec::Vec<u8> {
-    let hash = crate::fs::ntfs::security::sds_hash(descriptor);
-    let mut entry = alloc::vec![0u8; 16];
-    entry[..4].copy_from_slice(&hash.to_le_bytes());
-    entry[4..8].copy_from_slice(&hash.to_le_bytes());
-    entry[8..12].copy_from_slice(&security_id.to_le_bytes());
-    entry[12..16].copy_from_slice(&0u32.to_le_bytes());
-    entry.extend_from_slice(descriptor);
-    while !entry.len().is_multiple_of(8) {
-        entry.push(0);
-    }
-    entry
+    secure_stream::entry(security_id, 0, descriptor).unwrap_or_default()
 }
 
-fn sds_hash(descriptor: &[u8]) -> u32 {
-    let mut hash = 0x811C9DC5u32;
-    for byte in descriptor {
-        hash = (hash ^ *byte as u32).wrapping_mul(0x01000193);
-    }
-    hash
-}
-
-/// Rebuild the `$Secure` MFT record's resident `$SDS` stream and write it.
+/// Update a bounded resident named DATA stream, preserving the MFT record layout.
+/// Nonresident SDS growth and the SII/SDH indexes are not implemented yet.
 pub fn update_secure_sds(
     ntfs: &super::NtfsFileSystem,
     security_id: SecurityId,
     descriptor: &[u8],
 ) -> Result<(), NTSTATUS> {
-    let mut record: alloc::vec::Vec<u8> =
-        match super::read_mft_record(&ntfs.ntfs_data, SECURE_RECORD_NUMBER) {
-            Some(record) => record.to_vec(),
-            None => alloc::vec![0u8; 1024],
-        };
-    record[..4].copy_from_slice(b"FILE");
-    record[8..10].copy_from_slice(&1u16.to_le_bytes());
-    record[0x14..0x16].copy_from_slice(&1024u16.to_le_bytes());
-    record.resize(1024, 0);
-    let entry = build_sds_entry(security_id, descriptor);
-    let mut value = alloc::vec![0u8; 8];
-    value[4..8].copy_from_slice(&entry.len().to_le_bytes());
-    value.extend_from_slice(&entry);
-    super::append_resident_attribute(
-        &mut record,
-        SECURE_SDS_ATTRIBUTE_TYPE,
-        &value,
-        security_id as u16,
-    );
-    record.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-    super::write_mft_record(&ntfs.ntfs_data, SECURE_RECORD_NUMBER, &record)
+    if parse_sds_descriptor(security_id, descriptor).is_none() {
+
+        return Err(super::STATUS_UNSUCCESSFUL);
+    }
+    let record = match super::read_mft_record(&ntfs.ntfs_data, super::system_records::SECURE) {
+        Some(record) => record.to_vec(),
+        None => secure_stream::new_record(ntfs.ntfs_data.mft_record_size as usize)
+            .ok_or(super::STATUS_UNSUCCESSFUL)?,
+    };
+    let rebuilt = secure_stream::upsert(&record, security_id, descriptor)
+        .ok_or(super::STATUS_UNSUCCESSFUL)?;
+    if rebuilt == record { return Ok(()); }
+    super::write_mft_record(&ntfs.ntfs_data, super::system_records::SECURE, &rebuilt)
 }
 
-/// Default `$SDS` descriptor used for newly created files and directories.
 pub fn default_sds_entry(_security_id: SecurityId) -> alloc::vec::Vec<u8> {
-    let descriptor = NtfsSecurityDescriptor::new_default();
-    serialize_sds_descriptor(&descriptor)
+    serialize_sds_descriptor(&NtfsSecurityDescriptor::new_default())
 }

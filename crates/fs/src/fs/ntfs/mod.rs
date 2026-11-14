@@ -83,25 +83,25 @@ pub struct NtfsBootSector {
     pub bytes_per_sector: u16,   // 0x0B: 2 bytes
     pub sectors_per_cluster: u8, // 0x0D: 1 byte
     pub reserved_sectors: u16,   // 0x0E: 2 bytes
-    pub media_descriptor: u8,    // 0x10: 1 byte
-    pub zero: [u8; 6],           // 0x11: 6 bytes
-    pub sectors_per_track: u16,  // 0x17: 2 bytes
-    pub num_heads: u16,          // 0x19: 2 bytes
-    pub hidden_sectors: u32,     // 0x1B: 4 bytes
-    pub total_sectors_32: u32,   // 0x1F: 4 bytes
-    // Padding (0x23..0x28): four unused bytes in the NTFS BPB.
-    pub padding: [u8; 4],     // 0x23: 4 bytes
-    pub drive_descriptor: u8, // 0x27: 1 byte
+    pub zero: [u8; 5],           // 0x10..0x14
+    pub media_descriptor: u8,    // 0x15
+    pub zero_fat_sectors: u16,   // 0x16
+    pub sectors_per_track: u16,  // 0x18
+    pub num_heads: u16,          // 0x1A
+    pub hidden_sectors: u32,     // 0x1C
+    pub total_sectors_32: u32,   // 0x20
+    pub drive_descriptor: u8,    // 0x24
+    pub padding: [u8; 3],        // 0x25..0x27
     // Extended BPB
     pub total_sectors_64: u64,        // 0x28: 8 bytes
     pub mft_lcn: u64,                 // 0x30: 8 bytes
     pub mft_mirror_lcn: u64,          // 0x38: 8 bytes
     pub cluster_per_mft_record: i8,   // 0x40: 1 byte
-    pub reserved_mft: u8,             // 0x41: 1 byte
-    pub cluster_per_index_record: i8, // 0x42: 1 byte
-    pub reserved_index: u8,           // 0x43: 1 byte
-    pub volume_serial_number: u64,    // 0x44: 8 bytes
-    pub checksum: u32,                // 0x4C: 4 bytes
+    pub reserved_mft: [u8; 3],        // 0x41..0x43
+    pub cluster_per_index_record: i8, // 0x44
+    pub reserved_index: [u8; 3],      // 0x45..0x47
+    pub volume_serial_number: u64,    // 0x48
+    pub checksum: u32,                // 0x50
 }
 
 impl NtfsBootSector {
@@ -844,8 +844,8 @@ pub fn read_mft_record(ntfs: &NtfsData, record_num: u64) -> Option<MftRecordBuff
         crate::boot_debug_println!("[NTFS] read_mft_record: copy done");
     }
 
-    // Apply FixUp repair
-    apply_fixup(&mut record);
+    // Reject torn records before parsing their attributes.
+    if !apply_fixup(&mut record) { return None; }
 
     // Verify the record
     if !verify_record(&record) {
@@ -1238,66 +1238,9 @@ pub fn parse_file_name(record: &[u8]) -> Option<(u64, Vec<u16>, bool)> {
 /// * `Some(u64)` - File size
 /// * `None` - $DATA attribute not found
 pub fn get_file_size(record: &[u8], _ntfs_data: &NtfsData) -> Option<u64> {
-    let attr_offset = find_attribute_in_record(record, AttributeHeader::TYPE_DATA)?;
-
-    if attr_offset + 8 > record.len() {
-        return None;
-    }
-
-    let non_resident = record[attr_offset + 8];
-
-    if non_resident == 0 {
-        // Resident file - size is in value_length at offset 0x10 in the
-        // resident attribute header (24 bytes total).
-        if attr_offset + 0x18 > record.len() {
-            return None;
-        }
-        Some(u32::from_le_bytes([
-            record[attr_offset + 0x10],
-            record[attr_offset + 0x11],
-            record[attr_offset + 0x12],
-            record[attr_offset + 0x13],
-        ]) as u64)
-    } else {
-        // Non-resident file - file size lives in the `real_size`
-        // field of the non-resident attribute header. The
-        // `build_esp` NTFS emitter (`build_non_resident_data_attr`
-        // in `tools/src/fs/ntfs.rs`) writes it at +0x28 from the
-        // attribute start — matching the NTFS 3.1 spec layout:
-        //
-        //   +0x10: u64 starting_vcn
-        //   +0x18: u64 last_vcn
-        //   +0x20: u64 allocated_size
-        //   +0x28: u64 real_size        ← file size
-        //   +0x30: u64 initialised_size
-        //   +0x38: u16 run_list_offset
-        //   +0x3A: u16 compression_unit
-        //   +0x3C: u32 padding
-        //   +0x40: run list
-        //
-        // Earlier this routine read at +0x38, which yielded the
-        // `run_list_offset` field (a small positive integer like
-        // 0x40 → 64 bytes) instead of the real file size. That made
-        // `handle.file_size = 64` for every non-resident binary,
-        // which then capped the SMSS read loop at 64 bytes — not
-        // enough bytes to parse even the PE optional header, so
-        // `parse_pe_headers` returned InvalidPe and the SMSS layer
-        // printed `Failed to launch cmd.exe: InvalidPe` for every
-        // subsystem binary.
-        if attr_offset + 64 > record.len() {
-            return None;
-        }
-        Some(u64::from_le_bytes([
-            record[attr_offset + 0x28],
-            record[attr_offset + 0x29],
-            record[attr_offset + 0x2A],
-            record[attr_offset + 0x2B],
-            record[attr_offset + 0x2C],
-            record[attr_offset + 0x2D],
-            record[attr_offset + 0x2E],
-            record[attr_offset + 0x2F],
-        ]))
-    }
+    // The standard non-resident header stores allocated size at +0x28 and
+    // logical file length at +0x30. Reuse the attribute parser for both forms.
+    get_attribute_info(record, AttributeHeader::TYPE_DATA).map(|(_, size)| size)
 }
 
 /// Get filename from MFT record
@@ -1673,7 +1616,7 @@ pub fn read_from_run_list(
     let mut run_offset = 0u64;
 
     let mut offset_found = false;
-    for (i, &(_start_cluster, length)) in runs[..num_runs].iter().enumerate() {
+    for (i, &(_, length)) in runs[..num_runs].iter().enumerate() {
         let run_end = file_pos + (length * bytes_per_cluster);
         if offset < run_end {
             run_idx = i;
@@ -1820,7 +1763,7 @@ pub fn parse_index_entry(buffer: &[u8], offset: usize) -> Option<(DirectoryEntry
     // CRITICAL: The INDEX_ENTRY's key IS the FILE_NAME_ATTR directly — there is
     // NO separate 24-byte attribute header. The earlier code added +24 assuming an
     // attribute header existed, reading garbage fields for every entry.
-    if offset + 16 > buffer.len() {
+    if offset.checked_add(16)? > buffer.len() {
         return None;
     }
 
@@ -1833,7 +1776,7 @@ pub fn parse_index_entry(buffer: &[u8], offset: usize) -> Option<(DirectoryEntry
     }
 
     // Validate entry fits in buffer
-    if entry_size < 16 || offset + entry_size > buffer.len() {
+    if entry_size < 16 || entry_size % 8 != 0 || offset.checked_add(entry_size)? > buffer.len() {
         return None;
     }
 
@@ -1858,7 +1801,8 @@ pub fn parse_index_entry(buffer: &[u8], offset: usize) -> Option<(DirectoryEntry
 
     // key_length at offset +0x0A: verify it is >= 66 (minimum FILE_NAME_ATTR size)
     let key_len = u16::from_le_bytes([buffer[offset + 10], buffer[offset + 11]]) as usize;
-    if key_len < 66 {
+    let tail = if entry_flags & 1 != 0 { 8 } else { 0 };
+    if key_len < 66 || 16 + key_len + tail > entry_size {
         return None;
     }
 
@@ -1877,7 +1821,7 @@ pub fn parse_index_entry(buffer: &[u8], offset: usize) -> Option<(DirectoryEntry
 
     // Bounds: name starts at fn_off + 0x42
     let name_start = fn_off + 0x42;
-    if name_start + name_length * 2 > buffer.len() {
+    if 66 + name_length * 2 > key_len {
         return None;
     }
 
@@ -2375,37 +2319,35 @@ fn read_index_bytes(
     byte_offset: u64,
     len: usize,
 ) -> Option<alloc::vec::Vec<u8>> {
-    unsafe {
-        let cluster_size = (ntfs.ntfs_data.cluster_size as usize).max(512);
-        let sectors_per_cluster = (cluster_size / 512).max(1) as u64;
-        let mut out = alloc::vec![0u8; len];
-        let mut done = 0usize;
-        while done < len {
-            let absolute = byte_offset as usize + done;
-            let cluster = (absolute / cluster_size) as u64;
-            let in_cluster = absolute % cluster_size;
-            let chunk = core::cmp::min(cluster_size - in_cluster, len - done);
-            let lcn = index_vcn_to_lcn(runs, cluster)?;
-            let base_sector = ntfs.ntfs_data.hidden_sectors + lcn * sectors_per_cluster;
-            let mut cluster_buf = alloc::vec![0u8; cluster_size];
-            for i in 0..sectors_per_cluster as usize {
-                let mut sector_buf = [0u8; 512];
-                if read_sector(
-                    core::ptr::null_mut(),
-                    base_sector + i as u64,
-                    &mut sector_buf,
-                )
-                .is_err()
-                {
-                    return None;
-                }
-                cluster_buf[i * 512..(i + 1) * 512].copy_from_slice(&sector_buf);
+    let cluster_size = (ntfs.ntfs_data.cluster_size as usize).max(512);
+    let sectors_per_cluster = (cluster_size / 512).max(1) as u64;
+    let mut out = alloc::vec![0u8; len];
+    let mut done = 0usize;
+    while done < len {
+        let absolute = byte_offset as usize + done;
+        let cluster = (absolute / cluster_size) as u64;
+        let in_cluster = absolute % cluster_size;
+        let chunk = core::cmp::min(cluster_size - in_cluster, len - done);
+        let lcn = index_vcn_to_lcn(runs, cluster)?;
+        let base_sector = ntfs.ntfs_data.hidden_sectors + lcn * sectors_per_cluster;
+        let mut cluster_buf = alloc::vec![0u8; cluster_size];
+        for i in 0..sectors_per_cluster as usize {
+            let mut sector_buf = [0u8; 512];
+            if !read_mounted_sector(
+                &ntfs.ntfs_data,
+                base_sector + i as u64,
+                &mut sector_buf,
+            )
+            {
+                return None;
             }
-            out[done..done + chunk].copy_from_slice(&cluster_buf[in_cluster..in_cluster + chunk]);
-            done += chunk;
+            cluster_buf[i * 512..(i + 1) * 512].copy_from_slice(&sector_buf);
         }
-        Some(out)
+        out[done..done + chunk].copy_from_slice(&cluster_buf[in_cluster..in_cluster + chunk]);
+        done += chunk;
     }
+    Some(out)
+
 }
 
 /// Parse a non-resident $INDEX_ALLOCATION attribute header into its run
@@ -2435,23 +2377,13 @@ fn parse_index_allocation_runs(
     Some((runs, allocated_size))
 }
 
-/// Slice the entry region out of an INDX record, using the same
-/// first-entry and size fields the historical scanner read (offsets
-/// 0x24 and 0x26, matching the images this driver mounts).
+/// Entry offsets are relative to INDEX_HEADER at byte 0x18 of an INDX record.
 fn indx_entry_region(record: &[u8]) -> Option<&[u8]> {
-    if record.len() < 0x2C || &record[0..4] != b"INDX" {
-        return None;
-    }
-    let first_entry_offset = u16::from_le_bytes([record[0x24], record[0x25]]) as usize;
-    let index_size =
-        u32::from_le_bytes([record[0x26], record[0x27], record[0x28], record[0x29]]) as usize;
-    let end = first_entry_offset
-        .saturating_add(index_size)
-        .min(record.len());
-    if first_entry_offset >= end {
-        return None;
-    }
-    Some(&record[first_entry_offset..end])
+    if record.len() < 40 || &record[..4] != b"INDX" { return None; }
+    let first = u32::from_le_bytes(record[24..28].try_into().ok()?) as usize;
+    let size = u32::from_le_bytes(record[28..32].try_into().ok()?) as usize;
+    if first < 16 || first > size || size > record.len() - 24 { return None; }
+    Some(&record[24 + first..24 + size])
 }
 
 /// Read the directory $BITMAP attribute (one bit per index-record VCN).
@@ -2694,34 +2626,59 @@ fn find_in_index_allocation(
 /// # Returns
 /// * Vector of directory entries
 pub fn list_directory(ntfs: &NtfsFileSystem, dir_record: u64) -> Vec<DirectoryEntry> {
-    let mut entries: Vec<DirectoryEntry> = Vec::new();
+    list_directory_checked(ntfs, dir_record).unwrap_or_default()
+}
 
-    // read the directory's MFT record
-    let record = match read_mft_record(&ntfs.ntfs_data, dir_record) {
-        Some(r) => r,
-        None => return entries,
-    };
-
-    // Check if it's a directory
-    let flags = u16::from_le_bytes([record[0x16], record[0x17]]);
-    if flags & MftRecordHeader::IS_DIRECTORY == 0 {
-        return entries;
+/// Fallible enumeration for VFS clients: damaged or unreadable indexes must
+/// report an error, rather than masquerading as an empty directory.
+pub fn list_directory_checked(ntfs: &NtfsFileSystem, dir_record: u64) -> Result<Vec<DirectoryEntry>, NTSTATUS> {
+    let record = read_mft_record(&ntfs.ntfs_data, dir_record).ok_or(STATUS_UNSUCCESSFUL)?;
+    if record.len() < 24 || u16::from_le_bytes([record[22], record[23]]) & MftRecordHeader::IS_DIRECTORY == 0 {
+        return Err(STATUS_UNSUCCESSFUL);
     }
-
-    // Parse $INDEX_ROOT. The parser now returns a stack-only
-    // array; we materialise the `Vec` only after the parser
-    // has finished so the heap allocations happen in one
-    // contiguous region instead of interleaved with the
-    // byte-walking code.
-    if let Some(index_root) = parse_attribute(&record, AttributeHeader::TYPE_INDEX_ROOT) {
-        let (parsed, count) = parse_index_root(index_root);
-        entries.reserve(count);
-        for entry in parsed.iter().take(count) {
-            entries.push(entry.clone());
+    let root = parse_attribute(&record, AttributeHeader::TYPE_INDEX_ROOT).ok_or(STATUS_UNSUCCESSFUL)?;
+    if root.len() < 32 { return Err(STATUS_UNSUCCESSFUL); }
+    let first = u32::from_le_bytes(root[16..20].try_into().unwrap()) as usize;
+    let size = u32::from_le_bytes(root[20..24].try_into().unwrap()) as usize;
+    if first < 16 || first > size || size > root.len() - 16 { return Err(STATUS_UNSUCCESSFUL); }
+    let mut entries = Vec::new();
+    collect_directory_entries(&root[16 + first..16 + size], &mut entries)?;
+    if let Some(allocation) = parse_attribute(&record, AttributeHeader::TYPE_INDEX_ALLOCATION) {
+        let (runs, allocated) = parse_index_allocation_runs(allocation).ok_or(STATUS_UNSUCCESSFUL)?;
+        let record_size = ntfs.ntfs_data.index_record_size as usize;
+        if !(512..=65536).contains(&record_size) || allocated % record_size as u64 != 0 {
+            return Err(STATUS_UNSUCCESSFUL);
+        }
+        let bitmap = read_index_bitmap(ntfs, &record).ok_or(STATUS_UNSUCCESSFUL)?;
+        let count = allocated / record_size as u64;
+        if count > bitmap.len() as u64 * 8 { return Err(STATUS_UNSUCCESSFUL); }
+        for index in 0..count {
+            if bitmap[index as usize / 8] & (1 << (index % 8)) == 0 { continue; }
+            let mut page = read_index_bytes(ntfs, &runs, index * record_size as u64, record_size)
+                .ok_or(STATUS_UNSUCCESSFUL)?;
+            if !apply_fixup(&mut page) { return Err(STATUS_UNSUCCESSFUL); }
+            let region = indx_entry_region(&page).ok_or(STATUS_UNSUCCESSFUL)?;
+            collect_directory_entries(region, &mut entries)?;
         }
     }
+    Ok(entries)
+}
 
-    entries
+fn collect_directory_entries(region: &[u8], entries: &mut Vec<DirectoryEntry>) -> Result<(), NTSTATUS> {
+    let mut offset = 0;
+    while offset < region.len() {
+        let header = region.get(offset..offset + 16).ok_or(STATUS_UNSUCCESSFUL)?;
+        let flags = u16::from_le_bytes([header[12], header[13]]);
+        if flags & 2 != 0 { return Ok(()); }
+        let (entry, next) = parse_index_entry(region, offset).ok_or(STATUS_UNSUCCESSFUL)?;
+        // DOS aliases are separate index keys, not separate Explorer objects.
+        let namespace = region[offset + 16 + 65];
+        if namespace != 2 && !entries.iter().any(|old| old.record_number == entry.record_number && old.name == entry.name) {
+            entries.push(entry);
+        }
+        offset = next;
+    }
+    Err(STATUS_UNSUCCESSFUL)
 }
 
 /// Parse path into components, supporting both backslash and forward slash separators.
@@ -2859,8 +2816,10 @@ pub fn read_file(
                         if let Some(data_value) =
                             parse_attribute(&record, AttributeHeader::TYPE_DATA)
                         {
-                            let copy_len = data_value.len().min(buffer.len());
-                            buffer[..copy_len].copy_from_slice(&data_value[..copy_len]);
+                            let start = usize::try_from(handle.current_position)
+                                .unwrap_or(usize::MAX).min(data_value.len());
+                            let copy_len = (data_value.len() - start).min(buffer.len());
+                            buffer[..copy_len].copy_from_slice(&data_value[start..start + copy_len]);
                             handle.current_position += copy_len as u64;
                             return Ok(copy_len);
                         }
@@ -2927,7 +2886,7 @@ fn read_file_via_runlist(
     // Parse the non-resident attribute header using the standard NTFS
     // layout. The run-list offset is stored at +0x20, and the size
     // fields follow the 4-byte reserved area.
-    let allocated_size = u64::from_le_bytes([
+    let _allocated_size = u64::from_le_bytes([
         data_attr[0x28],
         data_attr[0x29],
         data_attr[0x2A],
@@ -2960,7 +2919,7 @@ fn read_file_via_runlist(
     crate::boot_debug_println!(
         "[NTFS] read_file_via_runlist: mapping_pairs_offset=0x{:x} allocated_size={} file_size={}",
         mapping_pairs_offset,
-        allocated_size,
+        0,
         file_size
     );
 
@@ -3280,7 +3239,7 @@ fn write_file_with_runs(
         }
 
         // Write the portion of the buffer that falls within this run.
-        let mut offset_in_run = handle.current_position.saturating_sub(file_pos);
+        let mut offset_in_run = (handle.current_position + bytes_written as u64).saturating_sub(file_pos);
 
         while offset_in_run < run_size && bytes_written < buffer.len() {
             let offset_in_cluster = (offset_in_run % bytes_per_cluster) as usize;
@@ -3295,8 +3254,9 @@ fn write_file_with_runs(
             let cluster = start_cluster + cluster_in_run;
             let first_sector = cluster_to_sector(cluster, ntfs.ntfs_data.cluster_size);
             let mut sector_offset = offset_in_cluster;
+            let cluster_end = offset_in_cluster + bytes_in_cluster;
 
-            while sector_offset < bytes_in_cluster && bytes_written < buffer.len() {
+            while sector_offset < cluster_end && bytes_written < buffer.len() {
                 let sector = first_sector + (sector_offset / 512) as u64;
                 let offset_in_sector = sector_offset % 512;
 
@@ -3307,7 +3267,7 @@ fn write_file_with_runs(
                 }
 
                 let copy_len = core::cmp::min(
-                    bytes_in_cluster - sector_offset,
+                    cluster_end - sector_offset,
                     core::cmp::min(512 - offset_in_sector, buffer.len() - bytes_written),
                 );
                 sector_buf[offset_in_sector..offset_in_sector + copy_len]
@@ -3409,103 +3369,46 @@ fn persist_nonresident_file_size(ntfs: &NtfsFileSystem, record_num: u64, new_siz
 /// Returns the allocated cluster number (LCN), or None if the bitmap
 /// cannot be read or the volume is full.
 pub fn allocate_cluster_ntfs(ntfs: &NtfsFileSystem) -> Option<u64> {
-    unsafe {
-        // Read the $Bitmap MFT record.
-        let bitmap_record = read_mft_record(&ntfs.ntfs_data, system_records::BITMAP)?;
-
-        // Find its $DATA attribute to get the run list.
-        let data_offset = find_attribute_in_record(&bitmap_record, AttributeHeader::TYPE_DATA)?;
-        if data_offset + 8 > bitmap_record.len() {
-            return None;
-        }
-
-        let non_resident = bitmap_record[data_offset + 8];
-        if non_resident == 0 {
-            // $Bitmap is always non-resident on a real NTFS volume.
-            return None;
-        }
-
-        let data_runs_offset = u16::from_le_bytes([
-            bitmap_record[data_offset + 0x20],
-            bitmap_record[data_offset + 0x21],
-        ]) as usize;
-        if data_runs_offset == 0 || data_offset + data_runs_offset > bitmap_record.len() {
-            return None;
-        }
-
-        let run_list = &bitmap_record[data_offset + data_runs_offset..];
-        let mut runs = [(0u64, 0u64); 64];
-        let num_runs = parse_run_list(run_list, &mut runs);
-        if num_runs == 0 {
-            return None;
-        }
-
-        let bits_per_bitmap_cluster = ntfs.ntfs_data.cluster_size as u64 * 8;
-
-        // Scan each bitmap cluster for the first free bit. The LCN of a data
-        // cluster is its position in the $Bitmap data stream (each bitmap
-        // cluster covers `cluster_size * 8` data clusters), so the index must
-        // accumulate across all runs of the $Bitmap, not reset per run.
-        let mut bitmap_cluster_index: u64 = 0;
-        for &(start_cluster, length) in runs[..num_runs].iter() {
-            for cluster_in_run in 0..length {
-                let bitmap_cluster = start_cluster + cluster_in_run;
-                let bitmap_sector = cluster_to_sector(bitmap_cluster, ntfs.ntfs_data.cluster_size);
-
-                let mut sector_buf = [0u8; 512];
-                let read_ok = if let Some(device_id) = ntfs.ntfs_data.device_id {
-                    crate::drivers::storage::block::read_block(
-                        device_id,
-                        bitmap_sector,
-                        &mut sector_buf,
-                    )
-                } else {
-                    read_sector(core::ptr::null_mut(), bitmap_sector, &mut sector_buf).is_ok()
-                };
-                if !read_ok {
-                    continue;
-                }
-
-                // Each 512-byte sector covers 4096 clusters (8 bits/byte).
-                for (byte_index, &byte) in sector_buf.iter().enumerate() {
-                    if byte == 0xFF {
-                        continue;
-                    }
-                    for bit_index in 0..8u32 {
-                        let mask = 1u8 << bit_index;
-                        if byte & mask == 0 {
-                            let bit_position = (byte_index * 8) as u64 + bit_index as u64;
-                            let allocated_lcn = bitmap_cluster_index
-                                .saturating_mul(bits_per_bitmap_cluster)
-                                + bit_position;
-
-                            // Mark the bit as used.
-                            sector_buf[byte_index] |= mask;
-                            let write_ok = if let Some(device_id) = ntfs.ntfs_data.device_id {
-                                crate::drivers::storage::block::write_block(
-                                    device_id,
-                                    bitmap_sector,
-                                    &sector_buf,
-                                )
-                            } else {
-                                write_sector(core::ptr::null_mut(), bitmap_sector, &sector_buf)
-                                    .is_ok()
-                            };
-                            if !write_ok {
-                                return None;
-                            }
-
-                            return Some(allocated_lcn);
-                        }
-                    }
-                }
-                bitmap_cluster_index += 1;
-            }
-        }
-
-        // Volume full.
-        None
+    let cluster_size = ntfs.ntfs_data.cluster_size as u64;
+    if cluster_size == 0 || !cluster_size.is_multiple_of(512) || ntfs.base.total_clusters == 0 {
+        return None;
     }
+    let record = read_mft_record(&ntfs.ntfs_data, system_records::BITMAP)?;
+    let at = find_attribute_in_record(&record, AttributeHeader::TYPE_DATA)?;
+    let header = record.get(at..at.checked_add(64)?)?;
+    if header[8] == 0 { return None; }
+    let length = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+    let run_offset = u16::from_le_bytes(header[32..34].try_into().ok()?) as usize;
+    if run_offset < 64 || run_offset >= length { return None; }
+    let run_bytes = record.get(at.checked_add(run_offset)?..at.checked_add(length)?)?;
+    let mut runs = [(0, 0); 64];
+    let count = parse_run_list(run_bytes, &mut runs);
+    let mut stream_sector = 0u64;
+    for &(lcn, clusters) in &runs[..count] {
+        let first = ntfs.ntfs_data.hidden_sectors.checked_add(lcn.checked_mul(cluster_size / 512)?)?;
+        for sector in 0..clusters.checked_mul(cluster_size / 512)? {
+            let first_bit = stream_sector.checked_mul(4096)?;
+            if first_bit >= ntfs.base.total_clusters { return None; }
+            let address = first.checked_add(sector)?;
+            let mut bytes = [0u8; 512];
+            // A failed bitmap read is an I/O error, never evidence of free space.
+            if !read_mounted_sector(&ntfs.ntfs_data, address, &mut bytes) { return None; }
+            for byte in 0..bytes.len() {
+                if bytes[byte] == 255 { continue; }
+                for bit in 0..8u32 {
+                    let cluster = first_bit + byte as u64 * 8 + bit as u64;
+                    if cluster >= ntfs.base.total_clusters { return None; }
+                    let mask = 1u8 << bit;
+                    if bytes[byte] & mask == 0 {
+                        bytes[byte] |= mask;
+                        return write_mounted_sector(&ntfs.ntfs_data, address, &bytes).then_some(cluster);
+                    }
+                }
+            }
+            stream_sector += 1;
+        }
+    }
+    None
 }
 
 /// Allocate the first unused MFT record number in the mounted mirror.
@@ -3514,7 +3417,31 @@ pub fn allocate_cluster_ntfs(ntfs: &NtfsFileSystem) -> Option<u64> {
 /// entirely unreadable/uninitialised are considered free. Records whose
 /// fixups are corrupt are treated as allocated rather than silently reused.
 fn allocate_mft_record(ntfs: &NtfsFileSystem) -> Option<u64> {
-    (32..1024u64).find(|&record_number| read_mft_record(&ntfs.ntfs_data, record_number).is_none())
+    // This project's mirror reserves a contiguous 1024-record MFT area.
+    // An unreadable or corrupt record must never be mistaken for free space.
+    for number in 32..1024 {
+        let Some(mut record)=read_mft_slot(&ntfs.ntfs_data,number) else {return None;};
+        if record.iter().all(|b|*b==0){return Some(number);}
+        if record.get(..4)==Some(b"FILE") && apply_fixup(&mut record)
+            && u16::from_le_bytes([record[22],record[23]])&1==0 {return Some(number);}
+    }
+    None
+}
+
+fn read_mft_slot(ntfs:&NtfsData,number:u64)->Option<Vec<u8>>{
+    let size=ntfs.mft_record_size as usize;
+    if !(512..=4096).contains(&size)||size%512!=0{return None;}
+    let mut bytes=vec![0;size];
+    for (i,out)in bytes.chunks_exact_mut(512).enumerate(){
+        if !read_mounted_sector(ntfs,ntfs.mft_start+number*(size/512)as u64+i as u64,out){return None;}
+    }
+    Some(bytes)
+}
+
+fn next_mft_sequence(ntfs:&NtfsData,number:u64)->u16{
+    read_mft_slot(ntfs,number).and_then(|bytes|{
+        let old=u16::from_le_bytes([bytes[16],bytes[17]]);Some(old.wrapping_add(1).max(1))
+    }).unwrap_or(1)
 }
 
 /// Append a resident attribute value to an MFT record.
@@ -3570,6 +3497,7 @@ fn build_index_entry(
 ) -> Vec<u8> {
     if is_end {
         let mut entry = alloc::vec![0u8; 16];
+        entry[8..10].copy_from_slice(&16u16.to_le_bytes());
         entry[12..14].copy_from_slice(&2u16.to_le_bytes());
         return entry;
     }
@@ -3590,13 +3518,19 @@ fn build_index_entry(
 fn build_index_root(entries: &[DirectoryEntry]) -> Vec<u8> {
     let mut entry_bytes = Vec::new();
     for entry in entries {
-        let entry_bytes_current = build_index_entry(
+        let mut entry_bytes_current = build_index_entry(
             entry.record_number,
             entry.parent_record,
             &entry.name,
             entry.is_directory,
             false,
         );
+        // The index caches FILE_NAME sizes; preserve them when another entry
+        // is inserted instead of resetting every existing file to zero bytes.
+        entry_bytes_current[16 + 0x28..16 + 0x30]
+            .copy_from_slice(&entry.file_size.to_le_bytes());
+        entry_bytes_current[16 + 0x30..16 + 0x38]
+            .copy_from_slice(&entry.file_size.to_le_bytes());
         entry_bytes.extend_from_slice(&entry_bytes_current);
     }
     entry_bytes.extend_from_slice(&build_index_entry(0, 0, &[], false, true));
@@ -3625,63 +3559,137 @@ fn build_index_root(entries: &[DirectoryEntry]) -> Vec<u8> {
     attribute
 }
 
-/// Rebuild a directory's MFT record with a new `$INDEX_ROOT`.
-fn directory_record_with_entries(
-    ntfs: &NtfsFileSystem,
-    parent_record_number: u64,
-    entries: &[DirectoryEntry],
-) -> Option<Vec<u8>> {
-    let current = read_mft_record(&ntfs.ntfs_data, parent_record_number)?;
-    let mut rebuilt = alloc::vec![0u8; current.len()];
-    rebuilt.copy_from_slice(&current);
+/// Release clusters via the mounted volume bitmap. Called only after the new
+/// directory record is committed, or when abandoning an uncommitted index.
+fn release_ntfs_runs(ntfs:&NtfsFileSystem,runs:&[(u64,u64)])->Result<(),NTSTATUS>{
+    if runs.is_empty(){return Ok(());}
+    let record=read_mft_record(&ntfs.ntfs_data,system_records::BITMAP).ok_or(STATUS_UNSUCCESSFUL)?;
+    let data=parse_attribute(&record,AttributeHeader::TYPE_DATA).ok_or(STATUS_UNSUCCESSFUL)?;
+    if data.len()<64||data[8]==0{return Err(STATUS_UNSUCCESSFUL);}
+    let offset=u16::from_le_bytes([data[32],data[33]])as usize;
+    let mut bitmap_runs=[(0,0);256];let count=parse_run_list(data.get(offset..).ok_or(STATUS_UNSUCCESSFUL)?,&mut bitmap_runs);
+    for &(first,length)in runs{for lcn in first..first.checked_add(length).ok_or(STATUS_UNSUCCESSFUL)?{
+        let byte=lcn/8;let cluster=byte/ntfs.ntfs_data.cluster_size as u64;
+        let physical=index_vcn_to_lcn(&bitmap_runs[..count],cluster).ok_or(STATUS_UNSUCCESSFUL)?;
+        let within=byte%ntfs.ntfs_data.cluster_size as u64;
+        let sector=ntfs.ntfs_data.hidden_sectors+physical*(ntfs.ntfs_data.cluster_size/512)as u64+within/512;
+        let mut bytes=[0;512];if !read_mounted_sector(&ntfs.ntfs_data,sector,&mut bytes){return Err(STATUS_UNSUCCESSFUL);}
+        bytes[(within%512)as usize]&=!(1<<(lcn%8));
+        if !write_mounted_sector(&ntfs.ntfs_data,sector,&bytes){return Err(STATUS_UNSUCCESSFUL);}
+    }}Ok(())
+}
 
-    let mut attributes = Vec::new();
-    let start = u16::from_le_bytes([current[0x14], current[0x15]]) as usize;
-    let mut offset = start;
-    let mut replaced = false;
-    while offset + 8 <= current.len() {
-        let attribute_type = u32::from_le_bytes([
-            current[offset],
-            current[offset + 1],
-            current[offset + 2],
-            current[offset + 3],
-        ]);
-        if attribute_type == 0xFFFF_FFFF {
-            break;
-        }
-        let attribute_length = u32::from_le_bytes([
-            current[offset + 4],
-            current[offset + 5],
-            current[offset + 6],
-            current[offset + 7],
-        ]) as usize;
-        if attribute_length < 8 || offset + attribute_length > current.len() {
-            return None;
-        }
-        if attribute_type == 0x90 {
-            attributes.extend_from_slice(&build_index_root(entries));
-            replaced = true;
-        } else {
-            attributes.extend_from_slice(&current[offset..offset + attribute_length]);
-        }
-        offset += attribute_length;
-    }
-    if !replaced {
-        return None;
-    }
+fn named_index_attribute(kind:u32,value:&[u8],id:u16)->Vec<u8>{
+    let length=(32+value.len()+7)&!7;let mut out=vec![0;length];
+    out[..4].copy_from_slice(&kind.to_le_bytes());out[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+    out[9]=4;out[10..12].copy_from_slice(&24u16.to_le_bytes());out[14..16].copy_from_slice(&id.to_le_bytes());
+    out[16..20].copy_from_slice(&(value.len()as u32).to_le_bytes());out[20..22].copy_from_slice(&32u16.to_le_bytes());
+    out[24..32].copy_from_slice(&[b'$',0,b'I',0,b'3',0,b'0',0]);out[32..32+value.len()].copy_from_slice(value);out
+}
+fn index_node_entry(mut key:Vec<u8>,child:u64)->Vec<u8>{
+    let flags=u16::from_le_bytes([key[12],key[13]]);
+    if flags&1==0{key.extend_from_slice(&[0;8]);}
+    let length=key.len();key[8..10].copy_from_slice(&(length as u16).to_le_bytes());
+    key[12..14].copy_from_slice(&(flags|1).to_le_bytes());key[length-8..].copy_from_slice(&child.to_le_bytes());key
+}
+fn index_end(child:Option<u64>)->Vec<u8>{
+    let end=build_index_entry(0,0,&[],false,true);
+    match child{Some(vcn)=>index_node_entry(end,vcn),None=>end}
+}
 
-    if attributes.len() + 8 > rebuilt.len() - start {
-        return None;
+/// Stage a complete NTFS directory B-tree in fresh index clusters. No live
+/// index pages are overwritten before the parent MFT record is committed.
+fn persist_directory_entries(ntfs:&NtfsFileSystem,number:u64,entries:&[DirectoryEntry])->Result<(),NTSTATUS>{
+    let current=read_mft_record(&ntfs.ntfs_data,number).ok_or(STATUS_UNSUCCESSFUL)?;
+    let start=u16::from_le_bytes([current[20],current[21]])as usize;
+    let mut other=Vec::new();let mut at=start;
+    while at+8<=current.len(){
+        let kind=u32::from_le_bytes(current[at..at+4].try_into().unwrap());if kind==u32::MAX{break;}
+        let length=u32::from_le_bytes(current[at+4..at+8].try_into().unwrap())as usize;
+        if length<24||at+length>current.len(){return Err(STATUS_UNSUCCESSFUL);}
+        if !matches!(kind,0x90|0xa0|0xb0){other.extend_from_slice(&current[at..at+length]);}at+=length;
     }
-
-    rebuilt[start..start + attributes.len()].copy_from_slice(&attributes);
-    rebuilt[start + attributes.len()..].fill(0);
-    rebuilt[start + attributes.len()..start + attributes.len() + 4]
-        .copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-    let used_size = start + attributes.len() + 8;
-    rebuilt[0x18..0x1C].copy_from_slice(&(used_size as u32).to_le_bytes());
-    rebuilt[0x28..0x2A].copy_from_slice(&0x91u16.to_le_bytes());
-    Some(rebuilt)
+    let old_runs=parse_attribute(&current,AttributeHeader::TYPE_INDEX_ALLOCATION)
+        .and_then(parse_index_allocation_runs).map(|(r,_)|r).unwrap_or_default();
+    let root_budget=current.len().checked_sub(start+other.len()+256).ok_or(STATUS_UNSUCCESSFUL)?;
+    if root_budget<64{return Err(STATUS_UNSUCCESSFUL);}
+    let mut sorted=entries.to_vec();sorted.sort_by(|a,b|a.name.iter().copied().map(utf16_ascii_upper).cmp(b.name.iter().copied().map(utf16_ascii_upper)));
+    let mut keys:Vec<Vec<u8>>=sorted.iter().map(|e|{
+        let mut key=build_index_entry(e.record_number,e.parent_record,&e.name,e.is_directory,false);
+        for (at,value)in [(24,e.creation_time),(32,e.modification_time),(56,e.file_size),(64,e.file_size)]{key[at..at+8].copy_from_slice(&value.to_le_bytes());}
+        // The upper 16 reference bits are the record's sequence number.
+        if let Some(record)=read_mft_record(&ntfs.ntfs_data,e.record_number){
+            key[6..8].copy_from_slice(&record[16..18]);
+        }key
+    }).collect();
+    let record_size=ntfs.ntfs_data.index_record_size as usize;
+    let cluster_size=ntfs.ntfs_data.cluster_size as usize;
+    if record_size!=cluster_size||!(512..=4096).contains(&record_size){return Err(STATUS_UNSUCCESSFUL);}
+    let first=(40+(record_size/512+1)*2+7)&!7;
+    let capacity=record_size-first;
+    let mut pages:Vec<Vec<u8>>=Vec::new();let mut last_child=None;
+    while keys.iter().map(Vec::len).sum::<usize>()+index_end(last_child).len()>root_budget{
+        let mut next=Vec::new();let mut leaf=Vec::new();let mut bytes=0;
+        let mut items=keys.into_iter().peekable();
+        while let Some(key)=items.next(){
+            if key.len()+24>capacity{return Err(STATUS_UNSUCCESSFUL);}
+            if bytes+key.len()+24>capacity{
+                let child=if key[12]&1!=0{Some(u64::from_le_bytes(key[key.len()-8..].try_into().unwrap()))}else{None};
+                leaf.extend_from_slice(&index_end(child));let vcn=pages.len()as u64;pages.push(leaf);
+                next.push(index_node_entry(key,vcn));leaf=Vec::new();bytes=0;
+            }else{bytes+=key.len();leaf.extend_from_slice(&key);}
+        }
+        leaf.extend_from_slice(&index_end(last_child));last_child=Some(pages.len()as u64);pages.push(leaf);
+        if next.len()>=sorted.len()&&pages.len()>1{return Err(STATUS_UNSUCCESSFUL);}
+        keys=next;
+    }
+    let mut region=Vec::new();for key in keys{region.extend_from_slice(&key);}region.extend_from_slice(&index_end(last_child));
+    let mut root=vec![0;32];root[..4].copy_from_slice(&0x30u32.to_le_bytes());root[4..8].copy_from_slice(&1u32.to_le_bytes());
+    root[8..12].copy_from_slice(&(record_size as u32).to_le_bytes());root[12]=1;root[16..20].copy_from_slice(&16u32.to_le_bytes());
+    let size=(16+region.len())as u32;root[20..24].copy_from_slice(&size.to_le_bytes());root[24..28].copy_from_slice(&size.to_le_bytes());root[28]=u8::from(!pages.is_empty());root.extend_from_slice(&region);
+    other.extend_from_slice(&named_index_attribute(0x90,&root,0x90));
+    let mut runs:Vec<(u64,u64)>=Vec::new();
+    let mut release_new=true;
+    let result=(||{
+        for _ in &pages{
+            let lcn=allocate_cluster_ntfs(ntfs).ok_or(STATUS_UNSUCCESSFUL)?;
+            if let Some(last)=runs.last_mut().filter(|r|r.0+r.1==lcn){last.1+=1;}else{runs.push((lcn,1));}
+        }
+        if !pages.is_empty(){
+            let mapping=encode_run_list(&runs);let length=(72+mapping.len()+1+7)&!7;
+            let mut allocation=vec![0;length];allocation[..4].copy_from_slice(&0xa0u32.to_le_bytes());allocation[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+            allocation[8]=1;allocation[9]=4;allocation[10..12].copy_from_slice(&64u16.to_le_bytes());allocation[14..16].copy_from_slice(&0xa0u16.to_le_bytes());
+            allocation[24..32].copy_from_slice(&(pages.len()as u64-1).to_le_bytes());allocation[32..34].copy_from_slice(&72u16.to_le_bytes());
+            for offset in [40,48,56]{allocation[offset..offset+8].copy_from_slice(&(pages.len()as u64*record_size as u64).to_le_bytes());}
+            allocation[64..72].copy_from_slice(&[b'$',0,b'I',0,b'3',0,b'0',0]);allocation[72..72+mapping.len()].copy_from_slice(&mapping);other.extend_from_slice(&allocation);
+            let mut bitmap=vec![255;pages.len().div_ceil(8)];let remaining=pages.len()%8;if remaining!=0{*bitmap.last_mut().unwrap()=(1<<remaining)-1;}
+            other.extend_from_slice(&named_index_attribute(0xb0,&bitmap,0xb0));
+        }
+        if start+other.len()+8>current.len(){return Err(STATUS_UNSUCCESSFUL);}
+        for (vcn,region)in pages.iter().enumerate(){
+            let mut page=vec![0;record_size];page[..4].copy_from_slice(b"INDX");page[4..6].copy_from_slice(&40u16.to_le_bytes());
+            page[6..8].copy_from_slice(&((record_size/512+1)as u16).to_le_bytes());page[16..24].copy_from_slice(&(vcn as u64).to_le_bytes());
+            page[24..28].copy_from_slice(&((first-24)as u32).to_le_bytes());page[28..32].copy_from_slice(&((first-24+region.len())as u32).to_le_bytes());page[32..36].copy_from_slice(&((record_size-24)as u32).to_le_bytes());
+            page[36]=u8::from(region.get(12).is_some_and(|f|f&1!=0));page[first..first+region.len()].copy_from_slice(region);
+            if !prepare_fixup_for_write(&mut page){return Err(STATUS_UNSUCCESSFUL);}
+            let lcn=index_vcn_to_lcn(&runs,vcn as u64).ok_or(STATUS_UNSUCCESSFUL)?;
+            for (i,sector)in page.chunks_exact(512).enumerate(){
+                if !write_mounted_sector(&ntfs.ntfs_data,ntfs.ntfs_data.hidden_sectors+lcn*(cluster_size/512)as u64+i as u64,sector){return Err(STATUS_UNSUCCESSFUL);}
+            }
+        }
+        let mut rebuilt=current.to_vec();rebuilt[start..].fill(0);rebuilt[start..start+other.len()].copy_from_slice(&other);
+        rebuilt[start+other.len()..start+other.len()+4].copy_from_slice(&u32::MAX.to_le_bytes());rebuilt[24..28].copy_from_slice(&((start+other.len()+8)as u32).to_le_bytes());
+        release_new=false;
+        let committed=write_mft_record(&ntfs.ntfs_data,number,&rebuilt);
+        if committed.is_err(){
+            // A sector write may have failed halfway through the MFT record.
+            // Retain the new allocation if restoring the old record also fails.
+            release_new=write_mft_record(&ntfs.ntfs_data,number,&current).is_ok();
+        }
+        committed
+    })();
+    if result.is_err(){if release_new{let _=release_ntfs_runs(ntfs,&runs);}}else{let _=release_ntfs_runs(ntfs,&old_runs);}
+    result
 }
 
 /// Normalize a Win32-style NTFS path into UTF-16 components.
@@ -3764,6 +3772,7 @@ fn parent_and_leaf(
 ) -> Result<(u64, Vec<u16>), NTSTATUS> {
     let components = ntfs_path_components(path)?;
     let leaf = components.last().ok_or(STATUS_UNSUCCESSFUL)?.clone();
+    if leaf.iter().any(|c|*c<32||matches!(*c,34|42|58|60|62|63|124))||matches!(leaf.last(),Some(32|46)){return Err(0xc000000du32 as NTSTATUS);}
     let parent = directory_record_for_components(
         ntfs,
         &components[..components.len() - 1],
@@ -3778,7 +3787,7 @@ fn create_directory_in_parent(
     name: &[u16],
 ) -> Result<NtfsHandle, NTSTATUS> {
     if find_file_in_directory(ntfs, parent_record, name).is_some() {
-        return Err(STATUS_UNSUCCESSFUL);
+        return Err(0xc0000035u32 as NTSTATUS);
     }
 
     let record_number = allocate_mft_record(ntfs).ok_or(STATUS_UNSUCCESSFUL)?;
@@ -3797,7 +3806,7 @@ fn create_directory_in_parent(
     record[MftRecordHeader::OFFSET_UPDATE_SEQUENCE_COUNT
         ..MftRecordHeader::OFFSET_UPDATE_SEQUENCE_COUNT + 2]
         .copy_from_slice(&((sectors_per_record + 1) as u16).to_le_bytes());
-    record[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+    record[0x10..0x12].copy_from_slice(&next_mft_sequence(&ntfs.ntfs_data,record_number).to_le_bytes());
     record[0x12..0x14].copy_from_slice(&1u16.to_le_bytes());
     record[0x14..0x16].copy_from_slice(&(attribute_offset as u16).to_le_bytes());
     record[0x16..0x18].copy_from_slice(&(0x0001u16 | 0x0002u16).to_le_bytes());
@@ -3805,6 +3814,7 @@ fn create_directory_in_parent(
     record[0x28..0x2A].copy_from_slice(&0x91u16.to_le_bytes());
     record[0x2C..0x30].copy_from_slice(&(record_number as u32).to_le_bytes());
 
+    append_resident_attribute(&mut record, 0x10, &build_standard_information_value(), 0);
     let file_name = build_file_name_value(parent_record, name, true);
     append_resident_attribute(&mut record, 0x30, &file_name, 1);
     append_resident_attribute(&mut record, 0x90, &build_index_root(&[])[24..], 2);
@@ -3820,13 +3830,13 @@ fn create_directory_in_parent(
         return Err(STATUS_UNSUCCESSFUL);
     }
 
-    let security_id = record_number as crate::fs::ntfs::security::SecurityId;
+    let security_id = security::DEFAULT_SECURITY_ID;
     let descriptor = crate::fs::ntfs::security::serialize_sds_descriptor(
         &crate::fs::ntfs::security::NtfsSecurityDescriptor::new_default(),
     );
     crate::fs::ntfs::security::update_secure_sds(ntfs, security_id, &descriptor)?;
 
-    let current_entries = list_directory(ntfs, parent_record);
+    let current_entries = list_directory_checked(ntfs, parent_record)?;
     let mut entries = current_entries;
     let mut directory_entry = DirectoryEntry::new();
     directory_entry.record_number = record_number;
@@ -3834,29 +3844,27 @@ fn create_directory_in_parent(
     directory_entry.name = name.to_vec();
     directory_entry.is_directory = true;
     entries.push(directory_entry);
-    let parent =
-        directory_record_with_entries(ntfs, parent_record, &entries).ok_or(STATUS_UNSUCCESSFUL)?;
-    if write_mft_record(&ntfs.ntfs_data, parent_record, &parent).is_err() {
-        return Err(STATUS_UNSUCCESSFUL);
-    }
+    persist_directory_entries(ntfs, parent_record, &entries)?;
 
     Ok(NtfsHandle::new(record_number, true, 0, name))
 }
 
 /// Create a directory at a full Win32-style path.
 pub fn create_directory(ntfs: &NtfsFileSystem, path: &[u16]) -> Result<NtfsHandle, NTSTATUS> {
-    let (parent_record, name) = parent_and_leaf(ntfs, path, true)?;
+    let (parent_record, name) = parent_and_leaf(ntfs, path, false)?;
     create_directory_in_parent(ntfs, parent_record, &name)
 }
 
 /// Build a $STANDARD_INFORMATION resident value.
 fn build_standard_information_value() -> Vec<u8> {
-    alloc::vec![0u8; STANDARD_INFORMATION_VALUE_SIZE]
+    let mut value = alloc::vec![0u8; STANDARD_INFORMATION_VALUE_SIZE];
+    value[52..56].copy_from_slice(&security::DEFAULT_SECURITY_ID.to_le_bytes());
+    value
 }
 
 /// Size of the on-disk `$STANDARD_INFORMATION` value (Windows NT 6.1,
 /// version 1.0 layout: four 8-byte timestamps, flags, version, class id).
-const STANDARD_INFORMATION_VALUE_SIZE: usize = 48;
+const STANDARD_INFORMATION_VALUE_SIZE: usize = 72;
 
 /// Physical sector size of an NTFS volume (Windows NT 6.1 standard layout).
 const SECTOR_SIZE: usize = 512;
@@ -3876,7 +3884,7 @@ fn create_file_in_parent(
     initial_data: &[u8],
 ) -> Result<NtfsHandle, NTSTATUS> {
     if find_file_in_directory(ntfs, parent_record, name).is_some() {
-        return Err(STATUS_UNSUCCESSFUL);
+        return Err(0xc0000035u32 as NTSTATUS);
     }
 
     let record_number = allocate_mft_record(ntfs).ok_or(STATUS_UNSUCCESSFUL)?;
@@ -3894,7 +3902,7 @@ fn create_file_in_parent(
     record[4..6].copy_from_slice(&0x30u16.to_le_bytes());
     record[6..8].copy_from_slice(&((record_size / 512 + 1) as u16).to_le_bytes());
     record[MftRecordHeader::OFFSET_SEQUENCE_NUMBER..MftRecordHeader::OFFSET_SEQUENCE_NUMBER + 2]
-        .copy_from_slice(&1u16.to_le_bytes());
+        .copy_from_slice(&next_mft_sequence(&ntfs.ntfs_data,record_number).to_le_bytes());
     record[MftRecordHeader::OFFSET_LINK_COUNT..MftRecordHeader::OFFSET_LINK_COUNT + 2]
         .copy_from_slice(&1u16.to_le_bytes());
     record
@@ -3936,7 +3944,7 @@ fn create_file_in_parent(
         return Err(STATUS_UNSUCCESSFUL);
     }
 
-    let security_id = record_number as crate::fs::ntfs::security::SecurityId;
+    let security_id = security::DEFAULT_SECURITY_ID;
     let descriptor = crate::fs::ntfs::security::serialize_sds_descriptor(
         &crate::fs::ntfs::security::NtfsSecurityDescriptor::new_default(),
     );
@@ -3962,6 +3970,71 @@ pub fn create_file(
     create_file_in_parent(ntfs, parent_record, &name, initial_data)
 }
 
+/// Replace the unnamed data stream using fresh clusters. A failed data write
+/// leaves the previous stream intact. This is not an NTFS journal transaction.
+pub fn replace_file_contents(ntfs: &mut NtfsFileSystem, path: &[u16], data: &[u8]) -> Result<(), NTSTATUS> {
+    let (parent,leaf)=parent_and_leaf(ntfs,path,false)?;
+    let number=match find_file_in_directory(ntfs,parent,&leaf){
+        Some(number)=>number,
+        None=>create_file(ntfs,path,&[])?.mft_record,
+    };
+    let original=read_mft_record(&ntfs.ntfs_data,number).ok_or(STATUS_UNSUCCESSFUL)?;
+    if original[22]&2!=0{return Err(0xc000000du32 as NTSTATUS);}
+    let offset=find_attribute_in_record(&original,AttributeHeader::TYPE_DATA).ok_or(STATUS_UNSUCCESSFUL)?;
+    let id=u16::from_le_bytes([original[offset+14],original[offset+15]]);
+    let old_runs=if original[offset+8]!=0 {
+        let length=u32::from_le_bytes(original[offset+4..offset+8].try_into().unwrap())as usize;
+        let run=u16::from_le_bytes(original[offset+32..offset+34].try_into().unwrap())as usize;
+        let mut parsed=[(0,0);256];
+        let count=parse_run_list(original.get(offset+run..offset+length).ok_or(STATUS_UNSUCCESSFUL)?,&mut parsed);
+        if count==0{return Err(STATUS_UNSUCCESSFUL);}parsed[..count].to_vec()
+    }else{Vec::new()};
+    let mut replacement=Vec::new();append_resident_attribute(&mut replacement,AttributeHeader::TYPE_DATA,data,id);
+    let resident=rebuild_record_replacing_data(&original,&replacement);
+    let mut runs:Vec<(u64,u64)>=Vec::new();
+    let mut release_new=true;
+    let result=(||{
+        let mut record=if let Some(record)=resident{record}else{
+            let cluster=ntfs.ntfs_data.cluster_size as usize;
+            if cluster==0||cluster%512!=0{return Err(STATUS_UNSUCCESSFUL);}
+            for _ in 0..data.len().div_ceil(cluster){
+                let lcn=allocate_cluster_ntfs(ntfs).ok_or(STATUS_UNSUCCESSFUL)?;
+                if let Some(last)=runs.last_mut().filter(|r|r.0+r.1==lcn){last.1+=1;}else{runs.push((lcn,1));}
+            }
+            for (vcn,input)in data.chunks(cluster).enumerate(){
+                let lcn=index_vcn_to_lcn(&runs,vcn as u64).ok_or(STATUS_UNSUCCESSFUL)?;
+                for index in 0..cluster/512{
+                    let mut sector=[0;512];let start=index*512;
+                    if start<input.len(){let n=(input.len()-start).min(512);sector[..n].copy_from_slice(&input[start..start+n]);}
+                    let address=ntfs.ntfs_data.hidden_sectors+lcn*(cluster/512)as u64+index as u64;
+                    if !write_mounted_sector(&ntfs.ntfs_data,address,&sector){return Err(STATUS_UNSUCCESSFUL);}
+                }
+            }
+            let attribute=build_nonresident_data_attribute(id,&runs,data.len().div_ceil(cluster)as u64,cluster as u32,data.len()as u64,data.len()as u64);
+            rebuild_record_replacing_data(&original,&attribute).ok_or(STATUS_UNSUCCESSFUL)?
+        };
+        let allocated=if runs.is_empty(){data.len()as u64}else{runs.iter().map(|r|r.1).sum::<u64>()*ntfs.ntfs_data.cluster_size as u64};
+        if let Some(at)=find_attribute_in_record(&record,AttributeHeader::TYPE_FILE_NAME){
+            let value=u16::from_le_bytes([record[at+20],record[at+21]])as usize+at;
+            record.get_mut(value+40..value+48).ok_or(STATUS_UNSUCCESSFUL)?.copy_from_slice(&allocated.to_le_bytes());
+            record.get_mut(value+48..value+56).ok_or(STATUS_UNSUCCESSFUL)?.copy_from_slice(&(data.len()as u64).to_le_bytes());
+        }
+        let mut entries=list_directory_checked(ntfs,parent)?;
+        entries.iter_mut().find(|e|e.record_number==number).ok_or(STATUS_UNSUCCESSFUL)?.file_size=data.len()as u64;
+        release_new=false;
+        if let Err(error)=write_mft_record(&ntfs.ntfs_data,number,&record){
+            release_new=write_mft_record(&ntfs.ntfs_data,number,&original).is_ok();
+            return Err(error);
+        }
+        if let Err(error)=persist_directory_entries(ntfs,parent,&entries){
+            release_new=write_mft_record(&ntfs.ntfs_data,number,&original).is_ok();return Err(error);
+        }
+        Ok(())
+    })();
+    if result.is_err(){if release_new{let _=release_ntfs_runs(ntfs,&runs);}}else{let _=release_ntfs_runs(ntfs,&old_runs);}
+    result
+}
+
 /// Insert a directory entry into a directory's $INDEX_ROOT.
 pub fn insert_directory_entry(
     ntfs: &NtfsFileSystem,
@@ -3970,7 +4043,7 @@ pub fn insert_directory_entry(
     name: &[u16],
     is_directory: bool,
 ) -> Result<(), NTSTATUS> {
-    let current_entries = list_directory(ntfs, parent_record);
+    let current_entries = list_directory_checked(ntfs, parent_record)?;
     let mut entries = current_entries;
     let mut directory_entry = DirectoryEntry::new();
     directory_entry.record_number = record_number;
@@ -3979,9 +4052,7 @@ pub fn insert_directory_entry(
     directory_entry.is_directory = is_directory;
     entries.push(directory_entry);
 
-    let parent =
-        directory_record_with_entries(ntfs, parent_record, &entries).ok_or(STATUS_UNSUCCESSFUL)?;
-    write_mft_record(&ntfs.ntfs_data, parent_record, &parent)
+    persist_directory_entries(ntfs, parent_record, &entries)
 }
 
 /// Extend a file to at least `new_size` bytes.
@@ -4133,7 +4204,7 @@ fn build_nonresident_data_attribute(
     let mut run_bytes = encode_run_list(runs);
     run_bytes.push(0); // run-list terminator (length size 0)
 
-    let mut attr = alloc::vec![0u8; 0x40 + run_bytes.len() + 4];
+    let mut attr = alloc::vec![0u8; (0x40 + run_bytes.len() + 7) & !7];
     let attr_len = attr.len() as u32;
     attr[0..4].copy_from_slice(&AttributeHeader::TYPE_DATA.to_le_bytes());
     attr[4..8].copy_from_slice(&attr_len.to_le_bytes());
@@ -4146,8 +4217,6 @@ fn build_nonresident_data_attribute(
     attr[48..56].copy_from_slice(&real_size.to_le_bytes());
     attr[56..64].copy_from_slice(&initialized_size.to_le_bytes());
     attr[0x40..0x40 + run_bytes.len()].copy_from_slice(&run_bytes);
-    let tail = attr.len() - 4;
-    attr[tail..].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
     attr
 }
 
@@ -4207,9 +4276,11 @@ fn rebuild_record_replacing_data(record: &[u8], replacement: &[u8]) -> Option<al
         return None;
     }
     out.extend_from_slice(replacement);
-    if out.len() > record.len() {
+    if out.len() + 8 > record.len() {
         return None;
     }
+    out.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    out.extend_from_slice(&[0;4]);
     let used = out.len();
     out.resize(record.len(), 0);
     out[0x18..0x1C].copy_from_slice(&(used as u32).to_le_bytes());
@@ -4352,86 +4423,86 @@ fn read_volume_label(ntfs: &NtfsFileSystem, out: &mut [u16; 64]) -> bool {
     true
 }
 
-/// Delete an empty directory identified by a full Win32-style path.
-pub fn delete_directory(ntfs: &NtfsFileSystem, path: &[u16]) -> Result<(), NTSTATUS> {
-    let (parent_record, name) = parent_and_leaf(ntfs, path, false)?;
-    let record_number = match find_file_in_directory(ntfs, parent_record, &name) {
-        Some(value) => value,
-        None => return Err(STATUS_UNSUCCESSFUL),
-    };
-    let current = match read_mft_record(&ntfs.ntfs_data, record_number) {
-        Some(value) => value,
-        None => return Err(STATUS_UNSUCCESSFUL),
-    };
-    let flags = u16::from_le_bytes([current[0x16], current[0x17]]);
-    if flags & 0x0002 == 0 {
-        return Err(STATUS_UNSUCCESSFUL);
+/// Rename one link in its existing parent, retaining the MFT identity and
+/// directory children. Moving across parents requires a volume transaction.
+pub fn rename(ntfs:&NtfsFileSystem,source:&[u16],destination:&[u16])->Result<(),NTSTATUS>{
+    let (parent,old_name)=parent_and_leaf(ntfs,source,false)?;
+    let (new_parent,new_name)=parent_and_leaf(ntfs,destination,false)?;
+    if parent!=new_parent{return Err(0xc00000bbu32 as NTSTATUS);}
+    if new_name.is_empty()||new_name.len()>255||new_name.iter().any(|c|matches!(*c,0|34|42|47|58|60|62|63|92|124))||matches!(new_name.last(),Some(32|46)){return Err(0xc000000du32 as NTSTATUS);}
+    let mut entries=list_directory_checked(ntfs,parent)?;
+    let selected=entries.iter().position(|e|e.name.iter().copied().map(utf16_ascii_upper).eq(old_name.iter().copied().map(utf16_ascii_upper))).ok_or(STATUS_UNSUCCESSFUL)?;
+    if entries.iter().enumerate().any(|(i,e)|i!=selected&&e.name.iter().copied().map(utf16_ascii_upper).eq(new_name.iter().copied().map(utf16_ascii_upper))){return Err(0xc0000035u32 as NTSTATUS);}
+    let number=entries[selected].record_number;
+    if number<32{return Err(0xc0000022u32 as NTSTATUS);}
+    let original=read_mft_record(&ntfs.ntfs_data,number).ok_or(STATUS_UNSUCCESSFUL)?;
+    if u16::from_le_bytes([original[18],original[19]])!=1{return Err(0xc00000bbu32 as NTSTATUS);}
+    let start=u16::from_le_bytes([original[20],original[21]])as usize;
+    let mut rebuilt=original[..start].to_vec();let mut at=start;let mut found=false;
+    while at+8<=original.len(){
+        let kind=u32::from_le_bytes(original[at..at+4].try_into().unwrap());if kind==u32::MAX{break;}
+        let length=u32::from_le_bytes(original[at+4..at+8].try_into().unwrap())as usize;
+        if length<24||at+length>original.len(){return Err(STATUS_UNSUCCESSFUL);}
+        if kind==AttributeHeader::TYPE_FILE_NAME{
+            if found{return Err(0xc00000bbu32 as NTSTATUS);}
+            let value=parse_attribute(&original,kind).ok_or(STATUS_UNSUCCESSFUL)?;
+            if value.len()<66{return Err(STATUS_UNSUCCESSFUL);}
+            let mut name=value[..66].to_vec();name[64]=new_name.len()as u8;name[65]=1;
+            for c in &new_name{name.extend_from_slice(&c.to_le_bytes());}
+            let id=u16::from_le_bytes([original[at+14],original[at+15]]);
+            append_resident_attribute(&mut rebuilt,kind,&name,id);found=true;
+        }else{rebuilt.extend_from_slice(&original[at..at+length]);}at+=length;
     }
-
-    let child_entries = list_directory(ntfs, record_number);
-    if !child_entries.is_empty() {
-        return Err(STATUS_UNSUCCESSFUL);
+    if !found||rebuilt.len()+8>original.len(){return Err(STATUS_UNSUCCESSFUL);}
+    let used=rebuilt.len()+8;rebuilt.extend_from_slice(&u32::MAX.to_le_bytes());rebuilt.resize(original.len(),0);rebuilt[24..28].copy_from_slice(&(used as u32).to_le_bytes());
+    entries[selected].name=new_name;
+    write_mft_record(&ntfs.ntfs_data,number,&rebuilt)?;
+    if let Err(error)=persist_directory_entries(ntfs,parent,&entries){
+        write_mft_record(&ntfs.ntfs_data,number,&original)?;return Err(error);
     }
-
-    let entries: Vec<DirectoryEntry> = list_directory(ntfs, parent_record)
-        .into_iter()
-        .filter(|entry| entry.record_number != record_number)
-        .collect();
-    let parent = match directory_record_with_entries(ntfs, parent_record, &entries) {
-        Some(value) => value,
-        None => return Err(STATUS_UNSUCCESSFUL),
-    };
-    if write_mft_record(&ntfs.ntfs_data, parent_record, &parent).is_err() {
-        return Err(STATUS_UNSUCCESSFUL);
-    }
-
-    let mut deleted = alloc::vec![0u8; current.len()];
-    deleted.copy_from_slice(&current);
-    deleted[..4].copy_from_slice(&[0, 0, 0, 0]);
-    deleted[0x16..0x18].copy_from_slice(&0u16.to_le_bytes());
-    write_mft_record(&ntfs.ntfs_data, record_number, &deleted)
+    Ok(())
 }
 
-/// Delete a file (non-directory entry) from the NTFS filesystem.
-///
-/// Marks the file's MFT record as deleted and removes its index
-/// entry from the parent directory, mirroring the approach used by
-/// `delete_directory` but without the "is directory" check.
-pub fn delete_file(ntfs: &NtfsFileSystem, path: &[u16]) -> Result<(), NTSTATUS> {
-    let (parent_record, name) = parent_and_leaf(ntfs, path, false)?;
-    let record_number = match find_file_in_directory(ntfs, parent_record, &name) {
-        Some(value) => value,
-        None => return Err(STATUS_UNSUCCESSFUL),
-    };
-    let current = match read_mft_record(&ntfs.ntfs_data, record_number) {
-        Some(value) => value,
-        None => return Err(STATUS_UNSUCCESSFUL),
-    };
-    // Reject directories — callers should use delete_directory for those.
-    let flags = u16::from_le_bytes([current[0x16], current[0x17]]);
-    if flags & 0x0002 != 0 {
-        return Err(STATUS_UNSUCCESSFUL);
-    }
+/// Delete an empty directory; nonempty deletion requires explicit traversal by
+/// the caller, so a failed enumeration can never accidentally erase children.
+pub fn delete_directory(ntfs:&NtfsFileSystem,path:&[u16])->Result<(),NTSTATUS>{
+    delete_entry(ntfs,path,true)
+}
 
-    // Remove the entry from the parent directory's index.
-    let entries: Vec<DirectoryEntry> = list_directory(ntfs, parent_record)
-        .into_iter()
-        .filter(|entry| entry.record_number != record_number)
-        .collect();
-    let parent = match directory_record_with_entries(ntfs, parent_record, &entries) {
-        Some(value) => value,
-        None => return Err(STATUS_UNSUCCESSFUL),
-    };
-    if write_mft_record(&ntfs.ntfs_data, parent_record, &parent).is_err() {
-        return Err(STATUS_UNSUCCESSFUL);
-    }
+pub fn delete_file(ntfs:&NtfsFileSystem,path:&[u16])->Result<(),NTSTATUS>{
+    delete_entry(ntfs,path,false)
+}
 
-    // Zero the MFT record header to mark it as free.
-    let mut deleted = alloc::vec![0u8; current.len()];
-    deleted.copy_from_slice(&current);
-    deleted[..4].copy_from_slice(&[0, 0, 0, 0]);
-    deleted[0x16..0x18].copy_from_slice(&0u16.to_le_bytes());
-    write_mft_record(&ntfs.ntfs_data, record_number, &deleted)
+fn delete_entry(ntfs:&NtfsFileSystem,path:&[u16],directory:bool)->Result<(),NTSTATUS>{
+    let (parent,name)=parent_and_leaf(ntfs,path,false)?;
+    let number=find_file_in_directory(ntfs,parent,&name).ok_or(STATUS_UNSUCCESSFUL)?;
+    if number<32{return Err(0xc0000022u32 as NTSTATUS);}
+    let original=read_mft_record(&ntfs.ntfs_data,number).ok_or(STATUS_UNSUCCESSFUL)?;
+    if (original[22]&2!=0)!=directory{return Err(STATUS_UNSUCCESSFUL);}
+    if u16::from_le_bytes([original[18],original[19]])!=1{return Err(0xc00000bbu32 as NTSTATUS);}
+    if directory&&!list_directory_checked(ntfs,number)?.is_empty(){return Err(0xc0000101u32 as NTSTATUS);}
+    let entries:Vec<_>=list_directory_checked(ntfs,parent)?.into_iter().filter(|e|e.record_number!=number).collect();
+    let mut deleted=original.to_vec();deleted[22..24].copy_from_slice(&0u16.to_le_bytes());deleted[18..20].copy_from_slice(&0u16.to_le_bytes());
+    write_mft_record(&ntfs.ntfs_data,number,&deleted)?;
+    if let Err(error)=persist_directory_entries(ntfs,parent,&entries){
+        write_mft_record(&ntfs.ntfs_data,number,&original)?;return Err(error);
+    }
+    // Retain the FILE signature and sequence number for safe record reuse.
+    // Free data and index streams only after the name has been unlinked.
+    let mut at=u16::from_le_bytes([original[20],original[21]])as usize;
+    while at+64<=original.len(){
+        let kind=u32::from_le_bytes(original[at..at+4].try_into().unwrap());if kind==u32::MAX{break;}
+        let length=u32::from_le_bytes(original[at+4..at+8].try_into().unwrap())as usize;
+        if length<24||at+length>original.len(){break;}
+        if matches!(kind,0x80|0xa0|0xb0)&&original[at+8]!=0{
+            let offset=u16::from_le_bytes([original[at+32],original[at+33]])as usize;
+            if offset>=64&&offset<length{
+                let mut runs=[(0,0);256];let count=parse_run_list(&original[at+offset..at+length],&mut runs);
+                let _=release_ntfs_runs(ntfs,&runs[..count]);
+            }
+        }at+=length;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4533,7 +4604,7 @@ pub fn mount(
         //                  < 0  ->  2^|n| bytes (typical: -10 means 1024)
         //                  = 0  ->  undefined; assume 1024
         //                  > 0  ->  n * cluster_size bytes
-        //   0x41         clusters_per_index_record (i8)  (same encoding)
+        //   0x44         clusters_per_index_record (i8)  (same encoding)
         //   0x48..0x4F   volume_serial_number (u64 LE)
         //
         // We read these by hand from the raw buffer instead of casting
@@ -4622,7 +4693,7 @@ pub fn mount(
                 // Calculate MFT record size
                 // Default to 1024 bytes (standard) if not specified
                 let cluster_per_mft_record = buffer[0x40] as i8; // Try offset 0x40 first
-                let cluster_per_index_record = buffer[0x41] as i8;
+                let cluster_per_index_record = buffer[0x44] as i8;
 
                 let mft_record_size: u32 = if cluster_per_mft_record < 0 {
                     // Negative means power of 2 divisor of sectors_per_cluster
@@ -5399,11 +5470,11 @@ mod index_search_tests {
     fn indx_entry_region_bounds_entry_walk() {
         let mut record = alloc::vec![0u8; 512];
         record[0..4].copy_from_slice(b"INDX");
-        record[0x24] = 0x28;
+        record[24..28].copy_from_slice(&16u32.to_le_bytes());
         let entry = build_index_entry(42, 5, &utf16_name("alpha"), false, false);
         record[0x28..0x28 + entry.len()].copy_from_slice(&entry);
         let index_size = entry.len() as u32;
-        record[0x26..0x2A].copy_from_slice(&index_size.to_le_bytes());
+        record[28..32].copy_from_slice(&(16 + index_size).to_le_bytes());
         let region = indx_entry_region(&record).unwrap();
         assert_eq!(region.len(), entry.len());
 

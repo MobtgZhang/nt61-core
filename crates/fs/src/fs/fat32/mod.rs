@@ -22,8 +22,7 @@
 //! # Mounting
 //! We expose two entry points: `mount` reads the boot sector and
 //! registers a `Fat32FileSystem`; `Fat32FileSystem::read_file` reads
-//! the bytes of a file by walking the cluster chain. write support is
-//! out of scope for the bootstrap.
+//! the bytes of a file by walking the cluster chain. mutations are shared by the system-volume VFS.
 use crate::libs::ntdll::{
     status::{STATUS_IO_DEVICE_ERROR, STATUS_UNSUCCESSFUL},
     types::NTSTATUS,
@@ -95,6 +94,7 @@ impl Fat32BootSector {
 
 /// FAT32 directory entry - 32 bytes, packed.
 #[repr(C, packed)]
+#[derive(Clone, Copy)]
 pub struct FatDirectoryEntry {
     pub name: [u8; 11],
     pub attributes: u8,
@@ -355,12 +355,12 @@ pub unsafe fn read_sector(device: *mut (), sector: u64, buffer: &mut [u8]) -> Re
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// write a sector to the backing device.
-pub unsafe fn write_sector(_device: *mut (), sector: u64, buffer: &[u8]) -> Result<(), NTSTATUS> {
+pub unsafe fn write_sector(device: *mut (), sector: u64, buffer: &[u8]) -> Result<(), NTSTATUS> {
     if buffer.len() < 512 {
         return Err(STATUS_UNSUCCESSFUL);
     }
 
-    if let Some(context) = unsafe { crate::fs::mount_context_from_device(_device) } {
+    if let Some(context) = unsafe { crate::fs::mount_context_from_device(device) } {
         let offset = sector as usize * 512;
         if offset + 512 > context.size {
             return Err(STATUS_UNSUCCESSFUL);
@@ -453,15 +453,10 @@ pub fn update_fat_entry(fs: &Fat32FileSystem, cluster: u32, value: u32) -> Resul
             return Err(STATUS_UNSUCCESSFUL);
         }
 
-        // Mirror to backup FAT if there are multiple FATs
-        let num_fats = fs.fat_data.boot_sector.num_fats as u64;
-        if num_fats > 1 {
-            let backup_fat_sector =
-                fat_sector + (fs.fat_data.boot_sector.sectors_per_fat_32 as u64);
-            if write_sector(fs.base.device, backup_fat_sector, &sector_buf).is_err() {
-                // kprintln!("[FAT32] update_fat_entry: failed to write backup FAT sector");
-                // Continue anyway - primary FAT update succeeded
-            }
+        // A mirror failure is an I/O failure, even if the primary was written.
+        for copy in 1..fs.fat_data.boot_sector.num_fats as u64 {
+            let backup = fat_sector + copy * fs.fat_data.boot_sector.sectors_per_fat_32 as u64;
+            write_sector(fs.base.device, backup, &sector_buf)?;
         }
 
         Ok(())
@@ -477,8 +472,8 @@ pub fn allocate_cluster(fs: &Fat32FileSystem, current_cluster: u32) -> Result<u3
     }
 
     // Scan FAT to find a free cluster
-    for cluster in 2..total_clusters {
-        let entry = read_fat_entry(fs, cluster);
+    for cluster in 2..total_clusters.saturating_add(2) {
+        let entry = read_fat_entry_checked(fs, cluster)?;
         if entry == FAT32_FREE {
             // Mark new cluster as end of chain
             if update_fat_entry(fs, cluster, FAT32_EOC).is_err() {
@@ -502,152 +497,57 @@ pub fn allocate_cluster(fs: &Fat32FileSystem, current_cluster: u32) -> Result<u3
 
 /// Free an entire cluster chain starting from the given cluster.
 pub fn free_cluster_chain(fs: &Fat32FileSystem, start_cluster: u32) -> Result<(), NTSTATUS> {
-    if start_cluster < 2 {
-        return Ok(()); // Nothing to free
+    if start_cluster<2{return Ok(());}
+    let mut chain=Vec::new();let mut current=start_cluster;
+    while (2..0x0fff_fff8).contains(&current){
+        if chain.len()>=fs.base.total_clusters as usize || chain.contains(&current){return Err(STATUS_UNSUCCESSFUL);}
+        chain.push(current);current=read_fat_entry_checked(fs,current)?;
     }
-
-    let mut current = start_cluster;
-    let mut iterations = 0;
-    let max_iterations = fs.base.total_clusters as usize;
-
-    while (2..FAT32_EOC).contains(&current) && iterations < max_iterations {
-        let next = read_fat_entry(fs, current);
-
-        // Mark cluster as free
-        if update_fat_entry(fs, current, FAT32_FREE).is_err() {
-            // kprintln!("[FAT32] free_cluster_chain: failed to free cluster {}", current);
-            return Err(STATUS_UNSUCCESSFUL);
-        }
-
-        current = next;
-        iterations += 1;
-
-        // Check for FAT corruption (loop detection)
-        if next == current {
-            // kprintln!("[FAT32] free_cluster_chain: FAT corruption detected at cluster {}", current);
-            break;
-        }
-    }
-
+    if current<0x0fff_fff8{return Err(STATUS_UNSUCCESSFUL);}
+    for cluster in chain{update_fat_entry(fs,cluster,FAT32_FREE)?;}
     Ok(())
 }
 
 /// write data to a file given its starting cluster.
 /// This handles cluster allocation and FAT table updates.
 pub fn write_file(
-    fs: &Fat32FileSystem,
-    start_cluster: u32,
-    offset: u32,
-    data: &[u8],
+    fs: &Fat32FileSystem, start_cluster: u32, offset: u32, data: &[u8],
 ) -> Result<usize, NTSTATUS> {
-    unsafe {
-        let cluster_size = fs.base.cluster_size as usize;
-        let sectors_per_cluster = fs.base.cluster_size / fs.base.sector_size;
-
-        // Calculate which cluster contains the offset
-        let cluster_offset = offset / cluster_size as u32;
-        let byte_offset_in_cluster = offset % cluster_size as u32;
-
-        // Find or allocate the target cluster
-        let mut current_cluster = start_cluster;
-        let mut c = 0u32;
-
-        while c < cluster_offset {
-            let next = read_fat_entry(fs, current_cluster);
-            if next >= FAT32_EOC {
-                // Need to allocate a new cluster
-                match allocate_cluster(fs, current_cluster) {
-                    Ok(new_cluster) => {
-                        current_cluster = new_cluster;
-                    }
-                    Err(_) => {
-                        if c == 0 {
-                            return Err(STATUS_UNSUCCESSFUL);
-                        }
-                        break;
-                    }
-                }
-            } else {
-                current_cluster = next;
+    let cluster_size=fs.base.cluster_size as usize;
+    if cluster_size==0||cluster_size%512!=0||start_cluster<2{return Err(STATUS_UNSUCCESSFUL);}
+    if data.is_empty(){return Ok(0);}
+    let mut current=start_cluster;
+    let mut visited=Vec::new();
+    let mut remaining_skip=offset as usize/cluster_size;
+    let mut within=offset as usize%cluster_size;
+    let mut written=0;
+    loop {
+        if current<2||current as u64>=fs.base.total_clusters.saturating_add(2)||visited.contains(&current){return Err(STATUS_UNSUCCESSFUL);}
+        visited.push(current);
+        if remaining_skip==0 {
+            while within<cluster_size&&written<data.len(){
+                let mut sector=[0;512];
+                let sector_index=(within/512)as u32;
+                let position=within%512;
+                let count=(512-position).min(data.len()-written);
+                if position!=0||count!=512{read_cluster_sector(fs,current,sector_index,&mut sector)?;}
+                sector[position..position+count].copy_from_slice(&data[written..written+count]);
+                write_cluster_sector(fs,current,sector_index,&sector)?;
+                written+=count;within+=count;
             }
-            c += 1;
-
-            // Loop detection
-            if c > 1000 {
-                // kprintln!("[FAT32] write_file: cluster chain too long");
-                return Err(STATUS_UNSUCCESSFUL);
-            }
-        }
-
-        // Calculate the starting sector for this cluster
-        let first_sector = fs.fat_data.data_start_sector
-            + ((current_cluster - 2) as u64) * (sectors_per_cluster as u64);
-
-        // If writing at the start of a cluster and data fits, write entire cluster
-        if byte_offset_in_cluster == 0 && data.len() >= cluster_size {
-            // write full cluster(s)
-            let mut bytes_written = 0;
-            let mut current = current_cluster;
-            let mut clusters_needed = data.len().div_ceil(cluster_size);
-
-            while clusters_needed > 0 && bytes_written < data.len() {
-                // write one cluster
-                for s in 0..sectors_per_cluster {
-                    let mut sector_buf = [0u8; 512];
-                    let src_offset = bytes_written + (s as usize) * 512;
-                    let copy_len = core::cmp::min(512, data.len() - src_offset);
-                    if copy_len > 0 {
-                        sector_buf[..copy_len]
-                            .copy_from_slice(&data[src_offset..src_offset + copy_len]);
-                    }
-                    if write_sector(fs.base.device, first_sector + (s as u64), &sector_buf).is_err()
-                    {
-                        return Err(STATUS_UNSUCCESSFUL);
-                    }
-                }
-                bytes_written += cluster_size;
-                clusters_needed -= 1;
-
-                // Move to next cluster if more data to write
-                if clusters_needed > 0 && bytes_written < data.len() {
-                    let next = read_fat_entry(fs, current);
-                    if next >= FAT32_EOC {
-                        match allocate_cluster(fs, current) {
-                            Ok(new_cluster) => {
-                                current = new_cluster;
-                            }
-                            Err(_) => break,
-                        }
-                    } else {
-                        current = next;
-                    }
-                }
-            }
-
-            Ok(bytes_written)
-        } else {
-            // Partial cluster write - need to read-modify-write
-            let mut sector_buf = [0u8; 512];
-            let sector_in_cluster = (byte_offset_in_cluster / 512) as usize;
-            let sector_offset = (byte_offset_in_cluster % 512) as usize;
-
-            // read existing sector
-            let sector_num = first_sector + sector_in_cluster as u64;
-            if { read_sector(fs.base.device, sector_num, &mut sector_buf) }.is_err() {
-                return Err(STATUS_UNSUCCESSFUL);
-            }
-
-            // Modify the sector
-            let copy_len = core::cmp::min(data.len(), 512 - sector_offset);
-            sector_buf[sector_offset..sector_offset + copy_len].copy_from_slice(&data[..copy_len]);
-
-            // write sector back
-            if write_sector(fs.base.device, sector_num, &sector_buf).is_err() {
-                return Err(STATUS_UNSUCCESSFUL);
-            }
-
-            Ok(copy_len)
-        }
+            if written==data.len(){return Ok(written);}
+        }else{remaining_skip-=1;}
+        within=0;
+        let next=read_fat_entry_checked(fs,current)?;
+        current=if next>=0x0fff_fff8 {
+            // Initialize before linking, so gaps and reused clusters never
+            // expose bytes from a previously deleted file.
+            let new=allocate_cluster(fs,0)?;
+            let zero=alloc::vec![0;cluster_size];
+            if let Err(error)=write_cluster(fs,new,&zero){let _=update_fat_entry(fs,new,FAT32_FREE);return Err(error);}
+            if let Err(error)=update_fat_entry(fs,current,new){let _=update_fat_entry(fs,new,FAT32_FREE);return Err(error);}
+            new
+        }else{next};
     }
 }
 
@@ -710,6 +610,12 @@ pub fn mount(
         let sector_sz = boot.sector_size();
         let cluster_sz = boot.cluster_size();
         let root_clu = boot.root_cluster;
+        let total_sectors = if boot.total_sectors_16 != 0 { boot.total_sectors_16 as u64 } else { boot.total_sectors_32 as u64 };
+        if sector_sz != 512 || boot.sectors_per_cluster == 0 || !boot.sectors_per_cluster.is_power_of_two()
+            || fats == 0 || fat_size == 0 || total_sectors <= data_start { return None; }
+        let total_clusters = (total_sectors - data_start) / boot.sectors_per_cluster as u64;
+        if total_clusters == 0 || total_clusters + 2 > fat_size * sector_sz as u64 / 4
+            || total_clusters + 2 > 0x0fff_fff0 || root_clu < 2 || root_clu as u64 >= total_clusters + 2 { return None; }
         // kprintln!("[FAT32] Mounting volume:");
         // kprintln!("      Bytes/sector:  {}", boot.bytes_per_sector);
         // kprintln!("      Sectors/cluster: {}", boot.sectors_per_cluster);
@@ -739,6 +645,7 @@ pub fn mount(
         (*fs_ptr).base.device = device;
         (*fs_ptr).base.sector_size = sector_sz;
         (*fs_ptr).base.cluster_size = cluster_sz;
+        (*fs_ptr).base.total_clusters = total_clusters;
         (*fs_ptr).fat_data.boot_sector = boot;
         (*fs_ptr).fat_data.fat_start_sector = fat_start;
         (*fs_ptr).fat_data.data_start_sector = data_start;
@@ -858,6 +765,30 @@ fn unmount_fs(fs: *mut FileSystem) {
 /// read a file's bytes by walking its cluster chain. The file is
 /// identified by its starting cluster (taken from a directory entry
 /// search) and its size.
+/// Read a byte range without allocating or reading the preceding file data.
+pub fn read_file_at(fs:&Fat32FileSystem,start:u32,size:u64,offset:u64,out:&mut[u8])->Result<usize,NTSTATUS>{
+    if offset>=size || out.is_empty(){return Ok(0);}
+    let cluster_size=fs.base.cluster_size as usize;
+    if cluster_size==0 || cluster_size%512!=0{return Err(STATUS_IO_DEVICE_ERROR);}
+    let mut cluster=start;
+    let skip=offset/cluster_size as u64;
+    if skip>=fs.base.total_clusters{return Err(STATUS_IO_DEVICE_ERROR);}
+    for _ in 0..skip {if !(2..0x0fff_fff8).contains(&cluster){return Err(STATUS_IO_DEVICE_ERROR);}cluster=read_fat_entry_checked(fs,cluster)?;}
+    let length=out.len().min((size-offset)as usize);let mut copied=0;let mut within=(offset%cluster_size as u64)as usize;
+    while copied<length{
+        if !(2..0x0fff_fff8).contains(&cluster){return Err(STATUS_IO_DEVICE_ERROR);}
+        let first=fs.fat_data.data_start_sector+(cluster-2)as u64*(cluster_size/512)as u64;
+        while within<cluster_size && copied<length{
+            let mut sector=[0;512];
+            unsafe{read_sector(fs.base.device,first+(within/512)as u64,&mut sector)}?;
+            let n=(512-within%512).min(length-copied);
+            out[copied..copied+n].copy_from_slice(&sector[within%512..within%512+n]);copied+=n;within+=n;
+        }
+        within=0;if copied<length{cluster=read_fat_entry_checked(fs,cluster)?;}
+    }
+    Ok(copied)
+}
+
 pub fn read_file(
     fs: &Fat32FileSystem,
     start_cluster: u32,
@@ -877,7 +808,7 @@ pub fn read_file(
     let mut iterations = 0u32;
     let max_iterations = (file_size / cluster_size as u32 + 1).min(65536);
 
-    while (2..FAT32_EOC).contains(&current)
+    while (2..0x0fff_fff8).contains(&current)
         && written < file_size as usize
         && iterations < max_iterations
     {
@@ -1049,7 +980,7 @@ pub fn list_directory_cluster(
     let mut long_name_buffer: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
 
     // Follow the FAT chain
-    while (2..FAT32_EOC).contains(&current_cluster) {
+    while (2..0x0fff_fff8).contains(&current_cluster) {
         // read this cluster
         match read_cluster_data(fs, current_cluster, &mut buffer) {
             Ok(_) => {
@@ -1152,37 +1083,15 @@ pub fn read_cluster_sector(
 /// read a FAT entry for a given cluster number.
 /// Returns the next cluster in the chain, or FAT32_EOC if end of chain or error.
 pub fn read_fat_entry(fs: &Fat32FileSystem, cluster: u32) -> u32 {
-    {
-        let fat_start = fs.fat_data.fat_start_sector;
-        let sector_size = fs.base.sector_size as u64;
-        let bytes_per_sector = sector_size as usize;
+    read_fat_entry_checked(fs,cluster).unwrap_or(FAT32_EOC)
+}
 
-        // Each FAT entry is 4 bytes (32-bit for FAT32)
-        let entry_offset = (cluster as u64) * 4;
-        let fat_sector = fat_start + (entry_offset / sector_size);
-        let offset_in_sector = (entry_offset % sector_size) as usize;
-
-        let mut sector_buf = [0u8; 512];
-        if unsafe { read_sector(fs.base.device, fat_sector, &mut sector_buf) }.is_err() {
-            // kprintln!("[FAT32] read_fat_entry: failed to read FAT sector {}", fat_sector);
-            return FAT32_EOC;
-        }
-
-        if offset_in_sector + 4 > bytes_per_sector {
-            // Entry spans sector boundary - unlikely but handle it
-            // kprintln!("[FAT32] read_fat_entry: entry spans sector boundary at cluster {}", cluster);
-            return FAT32_EOC;
-        }
-
-        let value = u32::from_le_bytes([
-            sector_buf[offset_in_sector],
-            sector_buf[offset_in_sector + 1],
-            sector_buf[offset_in_sector + 2],
-            sector_buf[offset_in_sector + 3],
-        ]);
-
-        decode_fat_entry(value)
-    }
+/// Checked FAT lookup for callers that must distinguish I/O failure from EOF.
+fn read_fat_entry_checked(fs:&Fat32FileSystem,cluster:u32)->Result<u32,NTSTATUS>{
+    if fs.base.sector_size!=512||cluster as u64>=fs.base.total_clusters.saturating_add(2){return Err(STATUS_IO_DEVICE_ERROR);}
+    let mut sector=[0;512];let offset=cluster as usize*4;
+    unsafe{read_sector(fs.base.device,fs.fat_data.fat_start_sector+(offset/512)as u64,&mut sector)}?;
+    Ok(decode_fat_entry(u32::from_le_bytes(sector[offset%512..offset%512+4].try_into().map_err(|_|STATUS_IO_DEVICE_ERROR)?)))
 }
 
 /// read an entire cluster's worth of data.
@@ -1572,7 +1481,7 @@ pub fn find_free_dir_slot_in(fs: &Fat32FileSystem, dir_cluster: u32) -> Option<(
     let mut current_cluster = dir_cluster;
     let mut visited = 0u32;
 
-    while (2..FAT32_EOC).contains(&current_cluster) && visited < 0x0FFF_FFFF {
+    while (2..0x0fff_fff8).contains(&current_cluster) && visited < 0x0FFF_FFFF {
         let first_sector = fs.fat_data.data_start_sector
             + ((current_cluster - 2) as u64) * (sectors_per_cluster as u64);
         for s in 0..sectors_per_cluster {
@@ -1598,7 +1507,7 @@ pub fn find_free_dir_slot_in(fs: &Fat32FileSystem, dir_cluster: u32) -> Option<(
         }
 
         let next = read_fat_entry(fs, current_cluster);
-        if next == current_cluster || next >= FAT32_EOC {
+        if next == current_cluster || next >= 0x0fff_fff8 {
             {
                 break;
             }
@@ -1624,7 +1533,7 @@ pub fn find_dir_entry_location(
     let mut current_cluster = dir_cluster;
     let mut visited = 0u32;
 
-    while (2..FAT32_EOC).contains(&current_cluster) && visited < 0x0FFF_FFFF {
+    while (2..0x0fff_fff8).contains(&current_cluster) && visited < 0x0FFF_FFFF {
         let first_sector = fs.fat_data.data_start_sector
             + ((current_cluster - 2) as u64) * (sectors_per_cluster as u64);
         for s in 0..sectors_per_cluster {
@@ -1653,7 +1562,7 @@ pub fn find_dir_entry_location(
         }
 
         let next = read_fat_entry(fs, current_cluster);
-        if next == current_cluster || next >= FAT32_EOC {
+        if next == current_cluster || next >= 0x0fff_fff8 {
             break;
         }
         current_cluster = next;
@@ -1781,226 +1690,115 @@ fn lfn_name_utf16(long_name: &[u8]) -> alloc::vec::Vec<u16> {
         .collect()
 }
 
-fn short_name_for_long(long_name: &[u8], index: u8) -> [u8; 11] {
-    let mut name = [b' '; 11];
-    let dot = long_name.iter().rposition(|byte| *byte == b'.');
-    let count = if index >= 100 {
-        3
-    } else if index >= 10 {
-        2
-    } else {
-        1
-    };
-    let stem_end = dot.unwrap_or(long_name.len());
-    let stem = &long_name[..stem_end.min(8 - count)];
-    let extension = dot
-        .and_then(|dot| long_name.get(dot + 1..))
-        .unwrap_or(&[])
-        .iter()
-        .take(3);
-    name[..stem.len()].copy_from_slice(stem);
-    for (index, byte) in extension.enumerate() {
-        name[8 + index] = *byte;
+fn short_name_for_long(long_name:&[u8],index:u8)->[u8;11]{
+    let mut name=[b' ';11];
+    let text=core::str::from_utf8(long_name).unwrap_or("");
+    let (stem,extension)=text.rsplit_once('.').unwrap_or((text,""));
+    let suffix=alloc::format!("~{index}");let limit=8-suffix.len();
+    let mut count=0;
+    for c in stem.chars(){
+        if c==' '||c=='.'{continue;}
+        if count==limit{break;}
+        name[count]=if c.is_ascii_alphanumeric()||matches!(c,'_'|'-'|'$'|'!'){c.to_ascii_uppercase()as u8}else{b'_'};count+=1;
     }
-    name.make_ascii_uppercase();
-    if index > 0 {
-        name[8 - count] = b'~';
-        let mut value = index;
-        for position in (8 - count + 1)..8 {
-            name[position] = b'0' + value % 10;
-            value /= 10;
-        }
-    }
+    if count==0{name[0]=b'_';count=1;}
+    name[count..count+suffix.len()].copy_from_slice(suffix.as_bytes());
+    for(i,c)in extension.chars().take(3).enumerate(){name[8+i]=if c.is_ascii_alphanumeric(){c.to_ascii_uppercase()as u8}else{b'_'};}
     name
 }
 
-fn lfn_entry(sequence: u8, checksum: u8, utf16_name: &[u16], start: usize) -> FatDirectoryEntry {
-    let mut name = [0xFFFFu16; 13];
-    for (index, slot) in name.iter_mut().enumerate() {
-        let position = start + index;
-        if position < utf16_name.len() {
-            *slot = utf16_name[position];
-        } else if position == utf16_name.len() {
-            *slot = 0;
-        }
+fn lfn_entry(sequence:u8,checksum:u8,name:&[u16],start:usize)->FatDirectoryEntry{
+    let mut bytes=[0xff;32];bytes[0]=sequence;bytes[11]=ATTR_LONG_NAME;bytes[12]=0;bytes[13]=checksum;bytes[26]=0;bytes[27]=0;
+    for (i,offset)in [1,3,5,7,9,14,16,18,20,22,24,28,30].into_iter().enumerate(){
+        let unit=if start+i<name.len(){name[start+i]}else if start+i==name.len(){0}else{0xffff};
+        bytes[offset..offset+2].copy_from_slice(&unit.to_le_bytes());
     }
-    FatDirectoryEntry {
-        name: [0; 11],
-        attributes: 0x0F,
-        reserved: 0,
-        creation_time_tenth: checksum,
-        creation_time: name[0],
-        creation_date: name[1],
-        last_access_date: name[2],
-        first_cluster_high: name[3],
-        modification_time: name[4],
-        modification_date: name[5],
-        first_cluster_low: 0,
-        file_size: (sequence as u32) << 24 | (name[6] as u32) << 12 | (name[7] as u32) << 8,
+    // SAFETY: the buffer is exactly one packed integer-only FAT directory record.
+    unsafe{core::ptr::read_unaligned(bytes.as_ptr()as *const FatDirectoryEntry)}
+}
+
+fn find_contiguous_free_dir_slots(fs:&Fat32FileSystem,parent:u32,count:usize)->Result<Vec<(u32,usize)>,NTSTATUS>{
+    if count==0||count>21||fs.base.cluster_size==0||fs.base.cluster_size%512!=0{return Err(STATUS_UNSUCCESSFUL);}
+    let mut cluster=parent;let mut visited=Vec::new();let mut slots=Vec::new();let mut end=false;
+    let mut buffer=alloc::vec![0;fs.base.cluster_size as usize];
+    loop{
+        if cluster<2||cluster as u64>=fs.base.total_clusters.saturating_add(2)||visited.contains(&cluster){return Err(STATUS_UNSUCCESSFUL);}
+        visited.push(cluster);read_cluster_data(fs,cluster,&mut buffer)?;
+        for offset in (0..buffer.len()).step_by(32){
+            if buffer[offset]==0&&!end{
+                end=true;buffer[offset..].fill(0);write_cluster(fs,cluster,&buffer)?;
+            }
+            if end||buffer[offset]==0xe5{slots.push((cluster,offset));if slots.len()==count{return Ok(slots);}}
+            else{slots.clear();}
+        }
+        let next=read_fat_entry_checked(fs,cluster)?;
+        if next>=0x0fff_fff8{
+            let new=allocate_cluster(fs,0)?;buffer.fill(0);
+            if let Err(error)=write_cluster(fs,new,&buffer){let _=update_fat_entry(fs,new,FAT32_FREE);return Err(error);}
+            if let Err(error)=update_fat_entry(fs,cluster,new){let _=update_fat_entry(fs,new,FAT32_FREE);return Err(error);}
+            cluster=new;
+        }else{cluster=next;}
+        if end{
+            // All records after the first 0 marker are unused. Clear stale
+            // bytes in following clusters before publishing any new entry.
+            buffer.fill(0);write_cluster(fs,cluster,&buffer)?;
+        }
     }
 }
 
-fn find_contiguous_free_dir_slots(
-    fs: &Fat32FileSystem,
-    dir_cluster: u32,
-    count: usize,
-) -> Option<(u32, usize)> {
-    let sector_size = fs.base.sector_size as usize;
-    let entries_per_sector = sector_size / 32;
-    let sectors_per_cluster = fs.base.cluster_size / fs.base.sector_size;
-    let mut current_cluster = dir_cluster;
-    let mut visited = 0u32;
 
-    while (2..FAT32_EOC).contains(&current_cluster) && visited < 0x0FFF_FFFF {
-        for sector_index in 0..sectors_per_cluster {
-            let mut buffer = [0u8; 512];
-            if read_cluster_sector(fs, current_cluster, sector_index, &mut buffer).is_err() {
-                continue;
-            }
-            for entry_index in 0..entries_per_sector.saturating_sub(count - 1) {
-                let base = entry_index * 32;
-                let all_free = (0..count).all(|run| {
-                    let first = buffer[base + run * 32];
-                    first == 0 || first == 0xE5
-                });
-                if all_free {
-                    let offset = sector_index as usize * sector_size + base;
-                    return Some((current_cluster, offset));
+
+/// Remove a validated LFN chain, including records crossing cluster boundaries.
+fn unlink_named_entry(fs:&Fat32FileSystem,parent:u32,entry:&NamedDirectoryEntry)->Result<(),NTSTATUS>{
+    let mut cluster=parent;let mut visited=Vec::new();let mut pending:Vec<(u32,usize)>=Vec::new();
+    let mut buffer=alloc::vec![0;fs.base.cluster_size as usize];
+    while (2..0x0fff_fff8).contains(&cluster){
+        if visited.contains(&cluster)||visited.len()>=fs.base.total_clusters as usize{return Err(STATUS_UNSUCCESSFUL);}
+        visited.push(cluster);read_cluster_data(fs,cluster,&mut buffer)?;
+        for (i,raw)in buffer.chunks_exact(32).enumerate(){
+            if cluster==entry.directory_cluster&&i*32==entry.byte_offset{
+                // Unlink the live short entry first. A failed cleanup leaves
+                // orphan LFN records rather than a live entry with a freed chain.
+                delete_file_entry_without_freeing_chain(fs,cluster,i*32)?;
+                if pending.iter().all(|(c,o)|{
+                    let mut sector=[0;512];read_cluster_sector(fs,*c,(*o/512)as u32,&mut sector).is_ok()
+                        && sector[*o%512+13]==calc_long_name_checksum(&entry.raw.name)
+                }){
+                    for (c,o)in pending{delete_file_entry_without_freeing_chain(fs,c,o)?;}
                 }
-            }
-        }
-        let next = read_fat_entry(fs, current_cluster);
-        if next == current_cluster || next >= FAT32_EOC {
-            break;
-        }
-        current_cluster = next;
-        visited += 1;
-    }
-    None
-}
-
-fn write_lfn_entries(
-    fs: &Fat32FileSystem,
-    dir_cluster: u32,
-    long_name: &[u8],
-    short_name: &[u8; 11],
-) -> Result<u32, NTSTATUS> {
-    if long_name.len() <= 11 {
-        return Ok(0);
-    }
-    let utf16_name = lfn_name_utf16(long_name);
-    if utf16_name.len() > 255 {
-        return Err(STATUS_UNSUCCESSFUL);
-    }
-    let lfn_count = utf16_name.len().div_ceil(13);
-    let (cluster, offset) = find_contiguous_free_dir_slots(fs, dir_cluster, lfn_count + 1)
-        .ok_or(STATUS_UNSUCCESSFUL)?;
-    let checksum = calc_long_name_checksum(short_name);
-    for ordinal in 0..lfn_count {
-        let sequence = ((lfn_count - ordinal) as u8) | 0x40;
-        let start = (lfn_count - ordinal - 1) * 13;
-        let entry = lfn_entry(sequence, checksum, &utf16_name, start);
-        update_dir_entry(fs, cluster, offset + ordinal * 32, &entry)?;
-    }
-    Ok(cluster)
-}
-
-fn delete_lfn_entries(
-    fs: &Fat32FileSystem,
-    dir_cluster: u32,
-    main_offset: usize,
-    short_name: &[u8; 11],
-) -> Result<(), NTSTATUS> {
-    let checksum = calc_long_name_checksum(short_name);
-    let sector_size = fs.base.sector_size as usize;
-    let sector_index = main_offset / sector_size;
-    let main_index = (main_offset % sector_size) / 32;
-
-    // Scan backwards across sector boundaries within the same directory
-    // cluster to find and delete all LFN entries that precede the main
-    // (short-name) entry. Previously this only scanned within the same
-    // sector, so LFN entries in the previous sector survived deletion.
-    let mut current_sector = sector_index as u32;
-    let mut current_index = main_index;
-    let mut buffer = [0u8; 512];
-    if read_cluster_sector(fs, dir_cluster, current_sector, &mut buffer).is_err() {
-        return Err(STATUS_UNSUCCESSFUL);
-    }
-
-    loop {
-        if current_index == 0 {
-            // Reached the start of this sector; move to the previous
-            // sector within the same cluster.
-            if current_sector == 0 {
-                // Reached the start of the cluster chain; no more LFN
-                // entries to scan backwards (we cannot follow the FAT
-                // chain backwards without a full traversal).
                 return Ok(());
             }
-            current_sector -= 1;
-            current_index = sector_size / 32;
-            // Load the new sector
-            if read_cluster_sector(fs, dir_cluster, current_sector, &mut buffer).is_err() {
-                return Err(STATUS_UNSUCCESSFUL);
-            }
+            if raw[0]==0{return Err(STATUS_UNSUCCESSFUL);}
+            if raw[0]!=0xe5&&raw[11]==ATTR_LONG_NAME{
+                if raw[0]&0x40!=0{pending.clear();}pending.push((cluster,i*32));
+                if pending.len()>20{return Err(STATUS_UNSUCCESSFUL);}
+            }else{pending.clear();}
         }
-        current_index -= 1;
-        let offset = current_index * 32;
-        if buffer[offset + 11] != 0x0F || buffer[offset + 13] != checksum {
-            // Not an LFN entry or wrong checksum; stop scanning.
-            // Write back the current (possibly modified) sector.
-            break;
-        }
-        // Mark this LFN entry as deleted.
-        buffer[offset] = 0xE5;
-        let end = offset + 32;
-        buffer[offset + 1..end].fill(0);
+        cluster=read_fat_entry_checked(fs,cluster)?;
     }
-
-    write_cluster_sector(fs, dir_cluster, current_sector, &buffer)
+    Err(STATUS_UNSUCCESSFUL)
 }
 
-pub fn create_entry_long(
-    fs: &Fat32FileSystem,
-    dir_cluster: u32,
-    long_name: &[u8],
-    start_cluster: u32,
-    size: u32,
-    attributes: u8,
-) -> Result<(), NTSTATUS> {
-    if long_name.len() <= 11 {
-        let mut short_name = [b' '; 11];
-        short_name[..long_name.len()].copy_from_slice(long_name);
-        short_name.make_ascii_uppercase();
-        return create_dir_entry_in_dir(
-            fs,
-            dir_cluster,
-            &short_name,
-            start_cluster,
-            size,
-            attributes,
-        );
-    }
+pub fn create_entry_long(fs:&Fat32FileSystem,parent:u32,name:&[u8],start:u32,size:u32,attributes:u8)->Result<(),NTSTATUS>{
+    create_entry_long_impl(fs,parent,name,start,size,attributes,None)
+}
 
-    let mut index = 1u8;
-    loop {
-        let short_name = short_name_for_long(long_name, index);
-        if find_dir_entry_location(fs, dir_cluster, &short_name).is_none() {
-            write_lfn_entries(fs, dir_cluster, long_name, &short_name)?;
-            return create_dir_entry_in_dir(
-                fs,
-                dir_cluster,
-                &short_name,
-                start_cluster,
-                size,
-                attributes,
-            );
-        }
-        index += 1;
-        if index == 0 {
-            return Err(STATUS_UNSUCCESSFUL);
-        }
+fn create_entry_long_impl(fs:&Fat32FileSystem,parent:u32,name:&[u8],start:u32,size:u32,attributes:u8,exclude:Option<(u32,usize)>)->Result<(),NTSTATUS>{
+    let text=core::str::from_utf8(name).map_err(|_|STATUS_UNSUCCESSFUL)?;
+    if text.is_empty()||text.ends_with([' ','.'])||text.chars().any(|c|c<' '||matches!(c,'\\'|'/'|':'|'*'|'?'|'"'|'<'|'>'|'|')){return Err(STATUS_UNSUCCESSFUL);}
+    let units:Vec<_>=text.encode_utf16().collect();if units.len()>255{return Err(STATUS_UNSUCCESSFUL);}
+    let entries=directory_entries(fs,parent)?;
+    if entries.iter().any(|e|Some((e.directory_cluster,e.byte_offset))!=exclude&&e.name.eq_ignore_ascii_case(text)){return Err(0xc0000035u32 as NTSTATUS);}
+    let short=(1..=255).map(|i|short_name_for_long(name,i)).find(|short|!entries.iter().any(|e|e.raw.name==*short)).ok_or(STATUS_UNSUCCESSFUL)?;
+    let count=units.len().div_ceil(13);let slots=find_contiguous_free_dir_slots(fs,parent,count+1)?;
+    for (ordinal,&(cluster,offset))in slots[..count].iter().enumerate(){
+        let number=count-ordinal;let sequence=number as u8|if ordinal==0{0x40}else{0};
+        update_dir_entry(fs,cluster,offset,&lfn_entry(sequence,calc_long_name_checksum(&short),&units,(number-1)*13))?;
     }
+    // SAFETY: packed integer fields permit zero initialization.
+    let mut raw:FatDirectoryEntry=unsafe{core::mem::zeroed()};
+    raw.name=short;raw.attributes=attributes;raw.first_cluster_high=(start>>16)as u16;raw.first_cluster_low=start as u16;raw.file_size=size;
+    let (cluster,offset)=slots[count];update_dir_entry(fs,cluster,offset,&raw)
 }
 
 pub fn create_file_in_dir_long(
@@ -2022,69 +1820,32 @@ pub fn create_dir_in_dir_long(
     create_entry_long(fs, dir_cluster, long_name, start_cluster, 0, 0x10)
 }
 
-pub fn delete_file_in_dir_long(
-    fs: &Fat32FileSystem,
-    dir_cluster: u32,
-    long_name: &[u8],
-) -> Result<(), NTSTATUS> {
-    let short_name = if long_name.len() <= 11 {
-        let mut name = [b' '; 11];
-        name[..long_name.len()].copy_from_slice(long_name);
-        name
-    } else {
-        short_name_for_long(long_name, 1)
-    };
-    let (cluster, offset, _entry) =
-        find_dir_entry_location(fs, dir_cluster, &short_name).ok_or(STATUS_UNSUCCESSFUL)?;
-    delete_lfn_entries(fs, cluster, offset, &short_name)?;
-    delete_file_entry(fs, cluster, offset)?;
-    Ok(())
+/// Delete a file or empty directory using its resolved LFN, never a guessed alias.
+pub fn delete_file_in_dir_long(fs:&Fat32FileSystem,parent:u32,name:&[u8])->Result<(),NTSTATUS>{
+    let name=core::str::from_utf8(name).map_err(|_|STATUS_UNSUCCESSFUL)?;
+    if matches!(name,"."|".."){return Err(STATUS_UNSUCCESSFUL);}
+    let entry=directory_entries(fs,parent)?.into_iter().find(|e|e.name.eq_ignore_ascii_case(name)).ok_or(STATUS_UNSUCCESSFUL)?;
+    if entry.raw.is_directory()&&directory_entries(fs,entry.raw.first_cluster())?.iter().any(|e|!matches!(e.name.as_str(),"."|"..")){
+        return Err(0xc0000101u32 as NTSTATUS);
+    }
+    unlink_named_entry(fs,parent,&entry)?;
+    free_cluster_chain(fs,entry.raw.first_cluster())
 }
 
-pub fn rename_file_in_dir_long(
-    fs: &Fat32FileSystem,
-    dir_cluster: u32,
-    old_long_name: &[u8],
-    new_long_name: &[u8],
-) -> Result<(), NTSTATUS> {
-    let old_short_name = if old_long_name.len() <= 11 {
-        let mut name = [b' '; 11];
-        name[..old_long_name.len()].copy_from_slice(old_long_name);
-        name
-    } else {
-        short_name_for_long(old_long_name, 1)
-    };
-    let (cluster, offset, entry) =
-        find_dir_entry_location(fs, dir_cluster, &old_short_name).ok_or(STATUS_UNSUCCESSFUL)?;
-    if new_long_name.len() <= 11 {
-        let mut new_short_name = [b' '; 11];
-        new_short_name[..new_long_name.len()].copy_from_slice(new_long_name);
-        delete_lfn_entries(fs, cluster, offset, &old_short_name)?;
-        return rename_entry_at(fs, cluster, offset, &new_short_name);
-    }
-
-    let mut index = 1u8;
-    loop {
-        let new_short_name = short_name_for_long(new_long_name, index);
-        if find_dir_entry_location(fs, dir_cluster, &new_short_name).is_none() {
-            write_lfn_entries(fs, dir_cluster, new_long_name, &new_short_name)?;
-            create_dir_entry_in_dir(
-                fs,
-                dir_cluster,
-                &new_short_name,
-                ((entry.first_cluster_high as u32) << 16) | entry.first_cluster_low as u32,
-                entry.file_size,
-                entry.attributes,
-            )?;
-            delete_lfn_entries(fs, cluster, offset, &old_short_name)?;
-            delete_file_entry_without_freeing_chain(fs, cluster, offset)?;
-            return Ok(());
-        }
-        index += 1;
-        if index == 0 {
-            return Err(STATUS_UNSUCCESSFUL);
-        }
-    }
+/// Create the replacement name before unlinking the original, retaining the
+/// data chain, timestamps and attributes. Same-parent rename only.
+pub fn rename_file_in_dir_long(fs:&Fat32FileSystem,parent:u32,old:&[u8],new:&[u8])->Result<(),NTSTATUS>{
+    let old=core::str::from_utf8(old).map_err(|_|STATUS_UNSUCCESSFUL)?;
+    let new_text=core::str::from_utf8(new).map_err(|_|STATUS_UNSUCCESSFUL)?;
+    let entries=directory_entries(fs,parent)?;
+    let entry=entries.iter().find(|e|e.name.eq_ignore_ascii_case(old)).ok_or(STATUS_UNSUCCESSFUL)?;
+    if old==new_text{return Ok(());}
+    if entries.iter().any(|e|e.name.eq_ignore_ascii_case(new_text)&&(e.directory_cluster,e.byte_offset)!=(entry.directory_cluster,entry.byte_offset)){return Err(0xc0000035u32 as NTSTATUS);}
+    create_entry_long_impl(fs,parent,new,entry.raw.first_cluster(),entry.raw.file_size(),entry.raw.attributes,Some((entry.directory_cluster,entry.byte_offset)))?;
+    let replacement=directory_entries(fs,parent)?.into_iter().find(|e|e.name==new_text).ok_or(STATUS_UNSUCCESSFUL)?;
+    let mut raw=entry.raw;raw.name=replacement.raw.name;
+    update_dir_entry(fs,replacement.directory_cluster,replacement.byte_offset,&raw)?;
+    unlink_named_entry(fs,parent,entry)
 }
 
 /// Mark a short-name entry deleted without freeing its cluster chain.
@@ -2342,7 +2103,7 @@ fn find_in_dir_by_short(
     // Walk the FAT chain so multi-cluster directories are supported.
     let mut visited: u32 = 0;
     let mut iter_count: u32 = 0;
-    while (2..FAT32_EOC).contains(&current_cluster) && visited < 0x0FFF_FFFF {
+    while (2..0x0fff_fff8).contains(&current_cluster) && visited < 0x0FFF_FFFF {
         let first_sector = fs.fat_data.data_start_sector
             + ((current_cluster - 2) as u64) * (sectors_per_cluster as u64);
         for s in 0..sectors_per_cluster {
@@ -2399,7 +2160,7 @@ fn find_in_dir_by_short(
             }
         }
         let next = read_fat_entry(fs, current_cluster);
-        if next == current_cluster || next >= FAT32_EOC {
+        if next == current_cluster || next >= 0x0fff_fff8 {
             break;
         }
         current_cluster = next;
@@ -2422,71 +2183,81 @@ fn find_in_dir_by_short(
 /// returns `None` rather than descending into the root, so a
 /// halfway-mounted system partition never silently runs a stale
 /// script from `C:\autoexec.bat`.
+/// Complete UTF-8 names and on-disk locations for VFS consumers.
+/// Unlike the legacy FatDirEntry this does not truncate LFNs to 12 bytes.
+pub struct NamedDirectoryEntry {
+    pub name: alloc::string::String,
+    pub raw: FatDirectoryEntry,
+    pub directory_cluster: u32,
+    pub byte_offset: usize,
+}
+
+pub fn directory_entries(fs: &Fat32FileSystem, start: u32) -> Result<Vec<NamedDirectoryEntry>, NTSTATUS> {
+    let cluster_size = fs.base.cluster_size as usize;
+    if start < 2 || cluster_size == 0 || cluster_size > 65536 { return Err(STATUS_UNSUCCESSFUL); }
+    let mut buffer = alloc::vec![0; cluster_size];
+    let mut entries = Vec::new();
+    let mut visited = Vec::new();
+    let mut cluster = start;
+    let mut lfn = Vec::new();
+    while (2..0x0fff_fff8).contains(&cluster) {
+        if visited.len() >= 4096 || visited.contains(&cluster) { return Err(STATUS_UNSUCCESSFUL); }
+        visited.push(cluster);
+        read_cluster_data(fs, cluster, &mut buffer)?;
+        for (index, bytes) in buffer.chunks_exact(32).enumerate() {
+            if bytes[0] == 0 { return Ok(entries); }
+            if bytes[0] == 0xE5 { lfn.clear(); continue; }
+            if bytes[11] == ATTR_LONG_NAME {
+                if bytes[0] & 0x40 != 0 { lfn.clear(); }
+                if lfn.len() < 20 * 32 { lfn.extend_from_slice(bytes); }
+                continue;
+            }
+            // SAFETY: bytes contains a full packed directory record, read by value.
+            let raw = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const FatDirectoryEntry) };
+            if raw.is_volume_id() { lfn.clear(); continue; }
+            let mut units = Vec::new();
+            let count = lfn.len() / 32;
+            let valid = count != 0 && lfn.chunks_exact(32).enumerate().all(|(i, rec)|
+                usize::from(rec[0] & 0x1F) == count-i && rec[13] == calc_long_name_checksum(&raw.name));
+            if valid {
+                'name: for record in lfn.chunks_exact(32).rev() {
+                    for offset in [1,3,5,7,9,14,16,18,20,22,24,28,30] {
+                        let unit = u16::from_le_bytes([record[offset], record[offset+1]]);
+                        if unit == 0 || unit == 0xFFFF { break 'name; }
+                        units.push(unit);
+                    }
+                }
+            }
+            let name = if units.is_empty() {
+                let short = convert_83_name(&raw.name, raw.is_directory());
+                let length = short.iter().position(|b| *b==0).unwrap_or(short.len());
+                alloc::string::String::from_utf8_lossy(&short[..length]).into_owned()
+            } else { alloc::string::String::from_utf16_lossy(&units) };
+            lfn.clear();
+            entries.push(NamedDirectoryEntry { name, raw, directory_cluster: cluster, byte_offset:index*32 });
+            if entries.len() >= 8192 { return Err(STATUS_UNSUCCESSFUL); }
+        }
+        cluster = read_fat_entry_checked(fs, cluster)?;
+    }
+    if cluster < 0x0fff_fff8 { return Err(STATUS_IO_DEVICE_ERROR); }
+    Ok(entries)
+}
+
 pub fn find_file_at_path(fs: &Fat32FileSystem, path: &str) -> Option<FatDirectoryEntry> {
-    // Skip drive letters and leading slashes
-    let mut pos = 0;
-    for (i, c) in path.char_indices() {
-        match c {
-            'C' | 'c' | ':' => {
-                pos = i + 1;
-            }
-            '\\' | '/' => {
-                pos = i + 1;
-            }
-            _ => {
-                break;
-            }
-        }
-    }
-    let cleaned = &path[pos..];
-    if cleaned.is_empty() {
-        return None;
-    }
-
-    // Split path into segments using a fixed-size stack array
-    let mut segments: [&str; 4] = ["", "", "", ""];
-    let mut seg_count = 0usize;
-    for seg in cleaned.split(['\\', '/']) {
-        if seg.is_empty() || seg_count >= 4 {
-            continue;
-        }
-        segments[seg_count] = seg;
-        seg_count += 1;
-    }
-    if seg_count == 0 {
-        return None;
-    }
-
-    // Start at root directory
-    let mut dir_cluster = fs.fat_data.root_cluster;
-    boot_println!(
-        "[FAT32] find_file_at_path: root_cluster={} seg_count={}",
-        dir_cluster,
-        seg_count
-    );
-
-    for i in 0..seg_count {
-        let short_name = name_to_83(segments[i]);
-        boot_println!(
-            "[FAT32] find_file_at_path: seg[{}]='{}' short={:?} dir_cluster={}",
-            i,
-            segments[i],
-            short_name,
-            dir_cluster
-        );
-        let entry = find_in_dir_by_short(fs, dir_cluster, &short_name)?;
-
-        if i + 1 == seg_count {
-            return Some(entry);
-        }
-
-        if !entry.is_directory() {
-            return None;
-        }
-        dir_cluster = entry.first_cluster();
-        if dir_cluster < 2 {
-            return None;
-        }
+    let path = path.strip_prefix("C:").or_else(||path.strip_prefix("c:")).unwrap_or(path);
+    let mut segments = path.split(['\\','/']).filter(|s| !s.is_empty()).peekable();
+    let mut cluster = fs.fat_data.root_cluster;
+    while let Some(segment) = segments.next() {
+        if segment == "." || segment == ".." { return None; }
+        let entry = directory_entries(fs, cluster).ok()?.into_iter()
+            .find(|entry| {
+                let short = convert_83_name(&entry.raw.name, entry.raw.is_directory());
+                let n = short.iter().position(|b|*b==0).unwrap_or(short.len());
+                entry.name.eq_ignore_ascii_case(segment) || short[..n].eq_ignore_ascii_case(segment.as_bytes())
+            })?;
+        if segments.peek().is_none() { return Some(entry.raw); }
+        if !entry.raw.is_directory() { return None; }
+        cluster = entry.raw.first_cluster();
     }
     None
 }
