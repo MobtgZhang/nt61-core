@@ -52,7 +52,7 @@ pub struct LoadedHive {
     /// Size in bytes.
     pub len: u32,
     /// Reserved for future use (flags, hive class, ...).
-    pub _reserved: u32,
+    pub reserved: u32,
 }
 
 impl LoadedHive {
@@ -62,7 +62,7 @@ impl LoadedHive {
             name_len: 0,
             ptr: 0,
             len: 0,
-            _reserved: 0,
+            reserved: 0,
         }
     }
 
@@ -135,15 +135,19 @@ pub fn init(boot_info: &BootInfo) {
             return;
         }
 
-        // The hives pointer is a *physical* address that was
-        // written by the UEFI loader. The kernel copied UEFI's
-        // PML4 verbatim, so the low 512 GiB of physical memory
-        // remains identity-mapped (VA == PA). We can therefore
-        // read the records array and the hive bytes directly
-        // through the physical address — no extra mapping is
-        // required. This is much simpler (and more reliable)
-        // than the system PTE pool, which is not yet wired up
-        // for the page-table chain at this point in boot.
+        // Establish these mappings before process address spaces copy the
+        // system page tables. Firmware mappings alone are not a kernel
+        // lifetime guarantee, especially for the ESP BCD buffer on RISC-V.
+        let records_bytes = count * core::mem::size_of::<LoadedHive>();
+        if !crate::arch::identity_map_region(boot_info.hives, records_bytes as u64) {
+            kprintln!(subsystem: "CM", "    [CM] cannot map hive records");
+            INITIALIZED = true;
+            return;
+        }
+
+        // The loader publishes physical addresses. The explicit identity
+        // mappings above and below make them valid kernel pointers on every
+        // architecture, independent of the firmware's sparse mappings.
         let records_pa = boot_info.hives;
 
         // Sanity check: the first 6 bytes of the first record
@@ -179,9 +183,8 @@ pub fn init(boot_info: &BootInfo) {
                 i + 1,
                 count
             );
-            // SAFETY: we just mapped `records_va` from `records_pa`
-            // for `records_pages` pages, so reading one record per
-            // slot (52 bytes) is in-bounds.
+            // SAFETY: the mapped records array contains count C-layout
+            // LoadedHive records, each with its ABI alignment and padding.
             let lh = &*base.add(i);
             kprintln!(
                 subsystem: "CM",
@@ -194,9 +197,11 @@ pub fn init(boot_info: &BootInfo) {
                 kprintln!(subsystem: "CM", "    [CM]   skipped (empty)");
                 continue;
             }
-            // The hive bytes are at a different PA. Since the
-            // kernel identity-maps the low 512 GiB, we can read
-            // them directly through the physical address.
+            if !crate::arch::identity_map_region(lh.ptr, lh.len as u64) {
+                kprintln!(subsystem: "CM", "    [CM] cannot map hive {}", lh.name_str());
+                continue;
+            }
+            // Each hive has its own physical buffer and mapping.
             kprintln!(
                 subsystem: "CM",
                 "    [CM]   hive bytes PA=0x{:x} len={}",
@@ -207,8 +212,7 @@ pub fn init(boot_info: &BootInfo) {
             // for the entire kernel lifetime (it placed them
             // in memory that survives ExitBootServices and is
             // not reused by the kernel's allocator). The kernel
-            // identity-maps this physical address, so the VA==
-            // PA mapping lets us read them as a borrowed slice.
+            // explicitly identity-mapped this physical range above.
             let bytes: &'static [u8] =
                 core::slice::from_raw_parts(lh.ptr as *const u8, lh.len as usize);
             kprintln!(
@@ -249,8 +253,29 @@ pub fn init(boot_info: &BootInfo) {
         }
 
         INITIALIZED = true;
+        select_control_set(nt61_boot_types::boot_options::BootOptions(boot_info.boot_flags).has(nt61_boot_types::boot_options::BootOptions::LAST_GOOD));
         load_sam_runtime_users();
         kprintln!(subsystem: "CM", "    [CM] configuration manager initialized");
+    }
+}
+
+static ACTIVE_CONTROL_SET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// Resolve CurrentControlSet using SYSTEM\Select, including F8 LastKnownGood.
+fn resolve_control_set(mut path: ParsedPath) -> ParsedPath {
+    if path.hive == HiveId::System && path.subkeys.first().map(|s| s.eq_ignore_ascii_case("CurrentControlSet")).unwrap_or(false) {
+        path.subkeys[0] = alloc::format!("ControlSet{:03}", ACTIVE_CONTROL_SET.load(core::sync::atomic::Ordering::Acquire));
+    }
+    path
+}
+fn select_control_set(last_good: bool) {
+    let name = if last_good { "LastKnownGood" } else { "Current" };
+    let selected = query_dword("System\\Select", name).unwrap_or(1);
+    if selected > 0 && selected <= 999 {
+        let control_set = alloc::format!("ControlSet{:03}", selected);
+        if mounted(HiveId::System).and_then(|m| m.hive.open_path(&[control_set.as_str()]).ok().flatten()).is_some() {
+            ACTIVE_CONTROL_SET.store(selected, core::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -284,6 +309,7 @@ pub fn query_value(path: &str, name: &str) -> Option<Value> {
         parsed.hive,
         parsed.subkeys
     );
+    let parsed = resolve_control_set(parsed);
     let m = mounted(parsed.hive)?;
     let path_strs: Vec<&str> = parsed.subkeys.iter().map(|s| s.as_str()).collect();
     let node = m.hive.open_path(&path_strs).ok().flatten()?;
@@ -491,6 +517,7 @@ pub fn enumerate_subkeys(path: &str) -> Option<Vec<String>> {
         path
     );
     let parsed = ParsedPath::parse(path).ok()?;
+    let parsed = resolve_control_set(parsed);
     let m = mounted(parsed.hive)?;
     let path_strs: Vec<&str> = parsed.subkeys.iter().map(|s| s.as_str()).collect();
     let node = m.hive.open_path(&path_strs).ok()??;
@@ -508,6 +535,7 @@ pub fn enumerate_subkeys(path: &str) -> Option<Vec<String>> {
 pub fn enumerate_values(path: &str) -> Option<Vec<String>> {
     kprintln!(subsystem: "CM", "    [CM] enumerate_values: path='{}'", path);
     let parsed = ParsedPath::parse(path).ok()?;
+    let parsed = resolve_control_set(parsed);
     let m = mounted(parsed.hive)?;
     let path_strs: Vec<&str> = parsed.subkeys.iter().map(|s| s.as_str()).collect();
     let node = m.hive.open_path(&path_strs).ok()??;

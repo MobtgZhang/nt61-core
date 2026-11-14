@@ -338,10 +338,6 @@ pub fn load_pe(image: &[u8]) -> Option<LoaderResult> {
         return None;
     }
 
-    let _file_header = unsafe {
-        core::ptr::read_unaligned(image.as_ptr().add(file_header_offset) as *const FileHeader)
-    };
-
     // Check optional header magic
     let optional_header_offset = file_header_offset + 20;
     if optional_header_offset + 2 > image.len() {
@@ -820,14 +816,14 @@ pub fn load_image_full(
         size_of_headers.min(bytes.len()).min(img.len())
     };
     img[..header_copy_len].copy_from_slice(&bytes[..header_copy_len]);
-    let source_head = if bytes.len() >= 8 {
+    let _source_head = if bytes.len() >= 8 {
         let mut value = [0u8; 8];
         value.copy_from_slice(&bytes[0..8]);
         u64::from_le_bytes(value)
     } else {
         0
     };
-    let image_head = if img.len() >= 8 {
+    let _image_head = if img.len() >= 8 {
         let mut value = [0u8; 8];
         value.copy_from_slice(&img[0..8]);
         u64::from_le_bytes(value)
@@ -1385,11 +1381,11 @@ fn parse_exports(image: &LoadedImage, raw_pe: &[u8]) -> Vec<DbEntry> {
     // We need the export directory RVA, which we get by re-parsing
     // the raw PE bytes. (The in-memory `image.bytes` does not
     // contain the data directories as written.)
-    let (file_hdr, _opt_size, _magic, opt_off) = match parse_headers(raw_pe) {
+    let (file_hdr, _opt_size, magic, opt_off) = match parse_headers(raw_pe) {
         Some(p) => p,
         None => return Vec::new(),
     };
-    let (export_rva, _export_size) = if _magic == 0x10B {
+    let (export_rva, _export_size) = if magic == 0x10B {
         read_data_directory_pe32(raw_pe, opt_off, 0)
     } else {
         read_data_directory_pe32plus(raw_pe, opt_off, 0)
@@ -1874,7 +1870,7 @@ pub const DLL_THREAD_DETACH: u32 = 3;
 /// BOOL DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved);
 /// ```
 ///
-/// This function looks up `_DllMainCRTStartup`, `DllMainCRTStartup`,
+/// This function looks up `DllMainCRTStartup`, `DllMainCRTStartup`,
 /// or `DllMain` in the loaded image's export table and calls the
 /// entry point with the DllMain convention:
 ///   arg0 = image_base  (HINSTANCE)
@@ -1885,7 +1881,7 @@ pub const DLL_THREAD_DETACH: u32 = 3;
 /// When no DllMain export exists the loader reports success (1 = TRUE),
 /// matching the PE/COFF specification for DLLs without entry points.
 pub fn call_dll_main(image: &LoadedImage, reason: u32, reserved: u64) -> i32 {
-    let entry_names = ["_DllMainCRTStartup", "DllMainCRTStartup", "DllMain"];
+    let entry_names = ["DllMainCRTStartup", "DllMainCRTStartup", "DllMain"];
     for name in &entry_names {
         if let Some(addr) = image.find_export(name) {
             let rva = (addr - image.image_base) as usize;
@@ -2056,17 +2052,18 @@ fn load_raw_image_into_user_address_space(
         return None;
     }
 
-    // Sv39 user VA is limited to the low 256 GiB. PE preferred bases
-    // generated for other architectures can be far above that limit, so
-    // RISC-V uses its own architecture-specific user image base and
-    // must be relocated there. This mirrors the ARM64 loader policy
-    // rather than inheriting x86_64 canonical addresses.
-    #[cfg(target_arch = "riscv64")]
+    // Keep a valid preferred base: statically linked ELF-to-PE desktop
+    // images contain absolute pointers and do not carry PE relocations.
+    // Only images outside Sv39's low 256-GiB user range need rebasing.
     let preferred_base = preferred_image_base;
     #[cfg(target_arch = "riscv64")]
-    let image_base = ntoskrnl::mm::vas::DEFAULT_USER_IMAGE_BASE;
-    #[cfg(not(target_arch = "riscv64"))]
-    let preferred_base = preferred_image_base;
+    let image_base = if preferred_base != 0
+        && preferred_base.checked_add(size_of_image as u64)? <= (1u64 << 38)
+    {
+        preferred_base
+    } else {
+        ntoskrnl::mm::vas::DEFAULT_USER_IMAGE_BASE
+    };
     #[cfg(not(target_arch = "riscv64"))]
     let image_base = preferred_image_base;
     // The base delta the relocations must absorb. On x86_64 this is
@@ -2132,7 +2129,34 @@ fn load_raw_image_into_user_address_space(
     //     baked into .data/.rdata and RIP-relative displacements are
     //     all stored relative to the preferred ImageBase and must be
     //     fixed by the same delta the mapping moved by.
-    let mut rva_image: alloc::vec::Vec<u8> = alloc::vec![0; size_of_image as usize];
+    // Physical image pages are already zeroed. Only initialized bytes need
+    // staging for relocation; desktop binaries include a 64-MiB .bss heap,
+    // which must not be duplicated in the 32-MiB kernel heap.
+    let mut initialized_extent = (u32::from_le_bytes([
+        image[opt_off + 0x3C],
+        image[opt_off + 0x3D],
+        image[opt_off + 0x3E],
+        image[opt_off + 0x3F],
+    ]) as usize).min(size_of_image as usize);
+    for i in 0..file_hdr.number_of_sections as usize {
+        let sh_off = sect_off.checked_add(i.checked_mul(40)?)?;
+        if sh_off.checked_add(40)? > image.len() {
+            return None;
+        }
+        let sh: SectionHeader = unsafe {
+            core::ptr::read_unaligned(image.as_ptr().add(sh_off) as *const SectionHeader)
+        };
+        if sh.size_of_raw_data == 0 {
+            continue;
+        }
+        let start = sh.virtual_address as usize;
+        let end = start.checked_add(sh.size_of_raw_data as usize)?;
+        if end > size_of_image as usize {
+            return None;
+        }
+        initialized_extent = initialized_extent.max(end);
+    }
+    let mut rva_image: alloc::vec::Vec<u8> = alloc::vec![0; initialized_extent];
     let header_len = (u32::from_le_bytes([
         image[opt_off + 0x3C],
         image[opt_off + 0x3D],
@@ -2222,60 +2246,23 @@ fn load_raw_image_into_user_address_space(
     // (e.g. on the very first attach), we read CR3 itself as the
     // best-effort fallback.
     let saved_cr3 = ntoskrnl::arch::switch_to_system_address_space();
-    for i in 0..file_hdr.number_of_sections as usize {
-        let sh_off = sect_off + i * 40;
-        let sh: SectionHeader = if sh_off + 40 <= image.len() {
-            unsafe { core::ptr::read_unaligned(image.as_ptr().add(sh_off) as *const SectionHeader) }
-        } else {
-            continue;
-        };
-        if sh.virtual_size == 0 {
-            continue;
-        }
-        let dst_va = image_base + sh.virtual_address as u64;
-        let size = core::cmp::min(sh.virtual_size, sh.size_of_raw_data) as usize;
-        if size == 0 {
-            continue;
-        }
-        if sh.virtual_address as usize + size > rva_image.len() {
-            continue;
-        }
-        if sh.virtual_address as u64 + size as u64 > size_of_image as u64 {
-            continue;
-        }
-
-        // Copy from the source PE buffer to the right user page.
-        for off in (0..size).step_by(0x1000) {
-            let chunk = core::cmp::min(0x1000, size - off);
-            let page_va = dst_va + off as u64;
-            let page_idx = ((page_va - image_base) / 0x1000) as usize;
-            if page_idx >= phys_pages.len() {
-                break;
-            }
-            let dst_phys = phys_pages[page_idx] + (page_va & 0xFFF);
-            // Zero-fill the destination page first to avoid any
-            // carry-over from the demand-zero handler. Use
-            // write_volatile on a u64 stride to avoid memcpy hangs.
+    // Copy by destination page rather than section. Section RVAs need not
+    // be page-aligned, and consecutive virtual pages need not have adjacent
+    // physical frames. A section-sized copy can otherwise corrupt a different
+    // allocation when it crosses a physical page boundary.
+    for (page_index, bytes) in rva_image.chunks(0x1000).enumerate() {
+        let dst = phys_pages[page_index] as *mut u8;
+        for (word_index, chunk) in bytes.chunks(8).enumerate() {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            // SAFETY: each destination is a zeroed, identity-mapped image
+            // frame. Page-aligned chunks keep this write within that frame;
+            // padding the last word preserves the zero-filled image tail.
             unsafe {
-                let dst = dst_phys as *mut u8;
-                for off8 in (0..chunk).step_by(8) {
-                    let rem = chunk - off8;
-
-                    let src_p = rva_image
-                        .as_ptr()
-                        .add(sh.virtual_address as usize + off + off8);
-                    let raw: u64 = if rem >= 8 {
-                        core::ptr::read_unaligned(src_p as *const u64)
-                    } else {
-                        let mut tmp = [0u8; 8];
-                        for j in 0..rem {
-                            tmp[j] = *src_p.add(j);
-                        }
-                        u64::from_le_bytes(tmp)
-                    };
-                    // write 8 bytes (one u64) to destination.
-                    core::ptr::write_volatile(dst.add(off8) as *mut u64, raw);
-                }
+                core::ptr::write_volatile(
+                    dst.add(word_index * 8) as *mut u64,
+                    u64::from_le_bytes(word),
+                );
             }
         }
     }

@@ -75,7 +75,7 @@ impl AllocationHeader {
 }
 
 /// NT-style kernel heap control block. The fields mirror what
-/// `nt!_HEAP` looks like in 7-era NT, but the actual layout is far
+/// `nt!HEAP` looks like in 7-era NT, but the actual layout is far
 /// larger in NT. We only keep the parts that are useful for
 /// diagnostics here.
 #[repr(C)]
@@ -264,17 +264,21 @@ impl KernelHeap {
         Some((base, size))
     }
 
-    pub unsafe fn debug_free_list(&self) {
+    pub unsafe fn debug_free_list(&self) -> (usize, usize) {
         let lock_ref = &*self.heap_lock.get();
         let _guard = lock_ref.lock();
         let mut cur = *self.free_list_head.get();
         let mut index = 0;
+        let mut total_size = 0usize;
         while !cur.is_null() && index < 32 {
             let address = cur as usize;
             let size = (*cur).size;
             cur = (*cur).next;
             index += 1;
+            let _ = address;
+            total_size = total_size.saturating_add(size);
         }
+        (index, total_size)
     }
 
     /// Check if a pointer and size fall within the heap range.
@@ -294,8 +298,6 @@ impl KernelHeap {
     /// when possible, otherwise prepend the new block.
     unsafe fn add_to_free_list(&self, block_ptr: *mut FreeBlock, size: usize) {
         let block_addr = block_ptr as usize;
-        let _base = self.base.load(Ordering::Relaxed);
-
         let head_ref: &mut *mut FreeBlock = &mut *self.free_list_head.get();
         let mut merged_addr = block_addr;
         let mut merged_size = size;

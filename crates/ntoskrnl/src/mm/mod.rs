@@ -439,7 +439,10 @@ pub fn init(boot_info: &BootInfo) {
     if chosen_size > FRAME_COVERAGE_BYTES {
         chosen_size = FRAME_COVERAGE_BYTES;
     }
-    const BOOTSTRAP_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+    // Explorer and LogonUI each carry a 64-MiB user heap and coexist
+    // during logon. Track the full capacity of FRAME_TABLE so their
+    // images, stacks and page tables fit alongside kernel allocations.
+    const BOOTSTRAP_LIMIT_BYTES: u64 = FRAME_COVERAGE_BYTES;
     if chosen_size > BOOTSTRAP_LIMIT_BYTES {
         chosen_size = BOOTSTRAP_LIMIT_BYTES;
     }
@@ -447,29 +450,9 @@ pub fn init(boot_info: &BootInfo) {
         chosen_size = MAX_RAM_BYTES;
     }
 
-    // Widen the PFN DB so it covers the live CR3 PML4. OVMF
-    // often places its reserved page-table pages just past the
-    // largest `EfiConventionalMemory` region (e.g. q35 `-m 8G`
-    // lands the PML4 at `0x7f801000`), outside the 64 MiB
-    // bootstrap window. `frame::init` will clamp `num_frames`
-    // to FRAME_TABLE_ENTRIES (128 MiB) and emit `AI0_CLAMP`;
-    // PFN DB storage is allocated out of the buddy separately.
-    if let Some(cr3_phys) = crate::arch::kernel_page_root() {
-        let cr3_pfn_end = (cr3_phys >> 12) + 1;
-        let chosen_end_pfn = (chosen_base / 4096) + (chosen_size / 4096);
-        if cr3_pfn_end > chosen_end_pfn {
-            const MAX_PFN_DB_COVERAGE: u64 = 192 * 1024 * 1024 * 1024;
-            let base_pfn = chosen_base / 4096;
-            let new_size = (cr3_pfn_end - base_pfn) * 4096;
-            let aligned = (new_size + 0xFFF) & !0xFFF;
-            chosen_size = if aligned > MAX_PFN_DB_COVERAGE {
-                MAX_PFN_DB_COVERAGE
-            } else {
-                aligned
-            };
-            crate::hal::serial::write_string("[mm] extended PFN DB to cover CR3 PML4\r\n");
-        }
-    }
+    // Firmware page tables outside the managed bank remain reserved firmware
+    // allocations. They do not need PFN entries; extending the bank to their
+    // address would seed free pages beyond the buddy allocator's capacity.
 
     {
         // Print the chosen region. The hex formatting and decimal
@@ -522,6 +505,9 @@ pub fn init(boot_info: &BootInfo) {
         (boot_info.ntoskrnl_image_base, boot_info.ntoskrnl_image_size),
         (boot_info.hal_image_base, boot_info.hal_image_size),
         (boot_info.bootvid_image_base, boot_info.bootvid_image_size),
+        // A BLT-only firmware GPU uses a RAM framebuffer until the kernel
+        // display driver takes over. It is live memory, never a free page.
+        (boot_info.framebuffer_base, boot_info.framebuffer_size),
     ] {
         if image_base != 0 && image_size != 0 {
             crate::hal::serial::write_string_always("[mm] loader image reserve base=0x");
@@ -531,6 +517,20 @@ pub fn init(boot_info: &BootInfo) {
             crate::hal::serial::write_string_always("\r\n");
             crate::mm::frame::reserve_range(image_base, image_size);
         }
+    }
+    if cfg!(target_arch = "aarch64")
+        && boot_info.kernel_physical_base != 0
+        && boot_info.kernel_size != 0
+    {
+        crate::arch::set_kernel_image_range(
+            boot_info.kernel_physical_base,
+            boot_info.kernel_size,
+        );
+    } else if boot_info.ntoskrnl_image_base != 0 && boot_info.ntoskrnl_image_size != 0 {
+        crate::arch::set_kernel_image_range(
+            boot_info.ntoskrnl_image_base,
+            boot_info.ntoskrnl_image_size,
+        );
     }
 
     // The FDT can describe a broad RAM bank, while UEFI exposes reserved,

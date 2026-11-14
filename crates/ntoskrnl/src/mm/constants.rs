@@ -65,10 +65,6 @@ pub const KERNEL_IMAGE_BASE: u64 = 0xFFFF_8000_0000_0000;
 
 /// User space base. Low 64KB is left unused for NULL pointer
 /// compatibility and DOS compatibility.
-#[cfg(target_arch = "riscv64")]
-pub const USER_BASE: u64 = 0x0000_0000_1000_0000;
-
-#[cfg(not(target_arch = "riscv64"))]
 pub const USER_BASE: u64 = 0x0000_0000_0001_0000;
 
 /// User space upper limit (canonical form, Windows 7 x64 default).

@@ -399,6 +399,38 @@ pub fn create_user_address_space() -> Option<u64> {
     result
 }
 
+/// Copy the native page-table tree; leaf frames retain their kernel mappings.
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn copy_native_tables(src: *const u64, dst: *mut u64, levels: u8) -> bool {
+    for index in 0..PT_ENTRIES {
+        let entry = core::ptr::read_volatile(src.add(index));
+        #[cfg(target_arch = "aarch64")]
+        let table = levels > 1 && entry & 3 == 3;
+        #[cfg(target_arch = "riscv64")]
+        let table = levels > 1 && entry & 1 != 0 && entry & 0xe == 0;
+        #[cfg(target_arch = "loongarch64")]
+        let table = levels > 1 && entry != 0;
+        if table {
+            #[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
+            let address = entry & 0x0000_ffff_ffff_f000;
+            #[cfg(target_arch = "riscv64")]
+            let address = ((entry & 0x003f_ffff_ffff_fc00) >> 10) << 12;
+            let Some(copy) = alloc_zeroed_page() else { return false; };
+            if !copy_native_tables(address as *const u64, copy as *mut u64, levels - 1) {
+                return false;
+            }
+            #[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
+            let descriptor = (entry & !0x0000_ffff_ffff_f000) | copy;
+            #[cfg(target_arch = "riscv64")]
+            let descriptor = (entry & !0x003f_ffff_ffff_fc00) | ((copy >> 12) << 10);
+            core::ptr::write_volatile(dst.add(index), descriptor);
+        } else {
+            core::ptr::write_volatile(dst.add(index), entry);
+        }
+    }
+    true
+}
+
 fn create_user_address_space_inner() -> Option<u64> {
     let pfn = pfn::allocate_pfn()?;
     // The root page is handed out by the PFN allocator. On non-x86
@@ -437,11 +469,18 @@ fn create_user_address_space_inner() -> Option<u64> {
     }
     #[cfg(not(target_arch = "x86_64"))]
     unsafe {
-        for i in 0..PT_ENTRIES {
-            let src_entry = *system.add(i);
-            *dst.add(i) = MMPTE {
-                u_long: src_entry.raw(),
-            };
+        // User images occupy the same virtual addresses in every process.
+        // A shallow root copy shares leaf tables and lets LogonUI overwrite
+        // Explorer's code. Copy native intermediate tables, preserving leaves.
+        #[cfg(target_arch = "aarch64")]
+        const LEVELS: u8 = 4;
+        #[cfg(target_arch = "riscv64")]
+        const LEVELS: u8 = 3;
+        #[cfg(target_arch = "loongarch64")]
+        const LEVELS: u8 = 5;
+        if !copy_native_tables(system as *const u64, dst as *mut u64, LEVELS) {
+            pfn::free_pfn(pfn);
+            return None;
         }
     }
 
@@ -608,6 +647,9 @@ pub fn refresh_kernel_mappings(pml4_phys: u64) {
 pub fn attach_process(pml4_phys: u64) -> u64 {
     let prev = current_root();
     let root_pfn = pml4_phys >> 12;
+    crate::hal::serial::write_string_always("[VAS] attach begin\r\n");
+    crate::hal::serial::write_hex_u64_always(pml4_phys);
+    crate::hal::serial::write_string_always("\r\n");
     // The previous implementation traced the first PML4 entries of
     // the new root here by reading `pml4_phys` as a pointer. That
     // dereference silently relied on a 1:1 identity map of the root
@@ -619,8 +661,11 @@ pub fn attach_process(pml4_phys: u64) -> u64 {
     unsafe {
         crate::arch::load_page_root(root_pfn);
     }
+    crate::hal::serial::write_string_always("[VAS] attach load done\r\n");
     set_current_root(pml4_phys);
+    crate::hal::serial::write_string_always("[VAS] attach root stored\r\n");
     crate::arch::common::percpu::set_address_space_roots(prev, pml4_phys);
+    crate::hal::serial::write_string_always("[VAS] attach percpu done\r\n");
     prev
 }
 
@@ -1415,8 +1460,73 @@ pub fn map_user_phys_range(
     MmStatus::Ok
 }
 
-/// Unmap a user range and free the backing physical pages. PT/PD/PDPT
-/// pages that become empty are also freed back to the PFN database.
+/// Unmap a user range and free the backing physical pages.
+/// Intermediate tables remain owned by the process address space.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn unmap_user_pages(root_phys: u64, va: u64, size: u64) -> MmStatus {
+    if size == 0 {
+        return MmStatus::Ok;
+    }
+    let Some(end) = va.checked_add(size).and_then(|end| end.checked_add(0xFFF)) else {
+        return MmStatus::InvalidAddress;
+    };
+    // Native descriptors are not x86 PTEs: Sv39 has three levels and
+    // shifted PPNs, ARM has four levels, and LoongArch has five levels.
+    // Walk the specified root without switching away from the system root.
+    #[cfg(target_arch = "riscv64")]
+    const SHIFTS: &[u32] = &[30, 21, 12];
+    #[cfg(target_arch = "aarch64")]
+    const SHIFTS: &[u32] = &[39, 30, 21, 12];
+    #[cfg(target_arch = "loongarch64")]
+    const SHIFTS: &[u32] = &[48, 39, 30, 21, 12];
+    let mut cur = va & !0xFFF;
+    while cur < (end & !0xFFF) {
+        let mut table = root_phys;
+        for (level, &shift) in SHIFTS.iter().enumerate() {
+            // SAFETY: Address-space tables reside in identity-mapped RAM.
+            // The caller owns this process's private user mapping chain.
+            let slot = unsafe { (table as *mut u64).add(((cur >> shift) & 0x1FF) as usize) };
+            let entry = unsafe { core::ptr::read_volatile(slot) };
+            #[cfg(target_arch = "riscv64")]
+            let (present, pa, leaf, user) = (
+                entry & 1 != 0,
+                ((entry & 0x003F_FFFF_FFFF_FC00) >> 10) << 12,
+                entry & 0xE != 0,
+                entry & 0x10 != 0,
+            );
+            #[cfg(target_arch = "aarch64")]
+            let (present, pa, leaf, user) = (
+                entry & 3 == 3, entry & 0x0000_FFFF_FFFF_F000,
+                level + 1 == SHIFTS.len(), entry & (1 << 6) != 0,
+            );
+            #[cfg(target_arch = "loongarch64")]
+            let (present, pa, leaf, user) = (
+                entry != 0, entry & 0x000F_FFFF_FFFF_F000,
+                level + 1 == SHIFTS.len(), entry & 0xC == 0xC,
+            );
+            if !present {
+                break;
+            }
+            if level + 1 == SHIFTS.len() {
+                if leaf && user {
+                    unsafe { core::ptr::write_volatile(slot, 0) };
+                    invalidate_tlb(cur);
+                    pfn::free_pfn(pa >> 12);
+                }
+                break;
+            }
+            if leaf || pa == 0 {
+                break;
+            }
+            table = pa;
+        }
+        cur += 0x1000;
+    }
+    MmStatus::Ok
+}
+
+/// Unmap x86 user pages using x86 descriptors.
+#[cfg(target_arch = "x86_64")]
 pub fn unmap_user_pages(pml4_phys: u64, va: u64, size: u64) -> MmStatus {
     if size == 0 {
         return MmStatus::Ok;
@@ -2169,6 +2279,17 @@ pub fn init() {
     // LoongArch64 MMIO (UART, EXTIOI, PCI ECAM).
     #[cfg(target_arch = "loongarch64")]
     {
+        // PFN allocation and the framebuffer both use VA == PA. QEMU's
+        // high RAM bank is outside the low bootstrap window, so establish
+        // its mapping while direct-address mode still lets us initialize
+        // the page tables allocated from that same bank.
+        let (ram_base, ram_end) = {
+            let db = crate::mm::pfn::PFN_DB.lock();
+            (db.lowest_pfn << 12, db.highest_pfn << 12)
+        };
+        if ram_end > ram_base {
+            ensure_identity_or_log(ram_base, ram_end - ram_base, "LoongArch64 tracked RAM range");
+        }
         ensure_identity_or_log(0x1FE0_0000, 0x20_0000, "LoongArch64 MMIO (UART/EXTIOI)");
         ensure_identity_or_log(0x2000_0000, 0x1000_0000, "LoongArch64 MMIO (ECAM)");
 
@@ -2213,7 +2334,7 @@ pub fn init() {
             if db.initialized && db.highest_pfn > db.lowest_pfn {
                 (db.lowest_pfn << 12, db.highest_pfn << 12)
             } else {
-                (0x8000_0000u64, 0x2800_0000u64)
+                (0x8000_0000u64, 0x2_8000_0000u64)
             }
         };
         // Map in 2 MiB superpage chunks. `identity_map_region` handles

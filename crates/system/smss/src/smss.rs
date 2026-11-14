@@ -898,7 +898,7 @@ pub fn init_teb_peb_for_boot_processes() {
 
             // Initialize PEB if not already set.
             if (*process).peb.is_null() {
-                let _peb = init_peb(process);
+                let _ = init_peb(process);
             }
             true
         });
@@ -1042,7 +1042,7 @@ pub fn create_session_1() {
 fn start_csrss(session_id: u32) {
     // Just call and discard; the actual full sequence runs via arch::boot::try_launch_cmd_exe_arch
     boot_println!("[SMSS] start_csrss({}) enter", session_id);
-    let _result = load_and_create_process(
+    let result_pid = load_and_create_process(
         "C:\\Windows\\System32\\csrss.exe",
         "csrss.exe",
         session_id,
@@ -1052,8 +1052,9 @@ fn start_csrss(session_id: u32) {
     // process termination notifications from user-mode clients.
     crate::servers::csrss::start_server_thread();
     boot_println!(
-        "[SMSS] start_csrss({}) load_and_create_process returned",
-        session_id
+        "[SMSS] start_csrss({}) load_and_create_process returned ok={}",
+        session_id,
+        result_pid.is_ok()
     );
 }
 
@@ -1484,9 +1485,9 @@ pub fn load_and_create_process(
         crate::hal::serial::write_string_always(" process=");
         crate::hal::serial::write_hex_u64_always(process as u64);
         crate::hal::serial::write_string_always(" page_table=");
-        crate::hal::serial::write_hex_u64_always({ (*process).page_table_pml4 });
+        crate::hal::serial::write_hex_u64_always((*process).page_table_pml4);
         crate::hal::serial::write_string_always(" alias=");
-        crate::hal::serial::write_hex_u64_always({ (*process).pml4_phys });
+        crate::hal::serial::write_hex_u64_always((*process).pml4_phys);
         crate::hal::serial::write_string_always("\r\n");
         let peb = init_peb(process);
         crate::hal::serial::write_string_always("[SMSS] init_peb end\r\n");
@@ -1495,14 +1496,14 @@ pub fn load_and_create_process(
             return Err(ExeLoadError::LoadFailed);
         }
 
-        let _r = SystemExeLoadResult {
+        let r = SystemExeLoadResult {
             pid,
             entry_point: mapping.entry_point,
             image_base: mapping.image_base,
         };
         crate::hal::serial::write_string_always("[SMSS] load_and_create_process done\r\n");
         boot_println!("[SMSS] Returning Ok result");
-        Ok(_r)
+        Ok(r)
     }
 }
 
@@ -1608,6 +1609,10 @@ pub fn read_pe_from_disk(path: &str) -> Option<core::mem::ManuallyDrop<Vec<u8>>>
     let fs_type = crate::fs::detect_system_partition_type();
     // Probe the system partition to pick the right FS driver.
     match fs_type {
+        crate::fs::FsType::Refs => {
+            let data = crate::fs::read_file_from_disk(path)?;
+            if data.starts_with(b"MZ") { return Some(core::mem::ManuallyDrop::new(data)); }
+        }
         crate::fs::FsType::Fat32 => {
             if let Some(data) = read_pe_from_fat32(path) {
                 return Some(data);
@@ -2353,6 +2358,10 @@ pub fn start_boot_sequence() {
     // Phase 6: Launch CMD
     boot_println!("[BOOT] Phase 6: Launching CMD Shell...");
     *BOOT_COMPLETE.lock() = true;
+    // Release the display only after the boot animation's final frame.
+    // Otherwise its system thread overwrites the prompt after CMD starts.
+    crate::arch::boot::mark_boot_animation_complete();
+    crate::arch::boot::wait_boot_animation_finished();
     launch_cmd_shell();
 }
 
@@ -2635,6 +2644,7 @@ pub fn launch_cmd_shell() -> ! {
                         user_rip,
                         user_rsp
                     );
+                        crate::drivers::bootvid::set_gui_console_active(false);
                         crate::hal::serial::write_string_always("[CMD] clear console\r\n");
                         {
                             // Give cmd.exe a clean canvas: wipe both the text
@@ -2698,7 +2708,7 @@ pub fn launch_logonui_then_explorer() -> ! {
         // (pml4, rip, rsp) is parked in the kernel logon-handoff slot
         // and `process_exit` will enter Ring 3 for it once LogonUI exits.
         let explorer_result = load_and_create_process(
-            "C:\\Windows\\System32\\explorer.exe",
+            "C:\\Windows\\explorer.exe",
             "explorer.exe",
             SESSION_1,
             PID_EXPLORER,
@@ -2794,9 +2804,8 @@ pub fn launch_logonui_then_explorer() -> ! {
                     "[BOOT]   WARNING: Failed to launch logonui.exe: {:?}",
                     error
                 );
-                boot_println!("[BOOT]   Falling back to direct explorer dispatch");
                 crate::ps::process::clear_logon_handoff();
-                launch_explorer_shell();
+                crate::ke::bugcheck::bugcheck(crate::ke::bugcheck::BugCheckCode::ProcessInitializationFailed);
             }
         }
     }
@@ -2811,7 +2820,7 @@ pub fn launch_explorer_shell() -> ! {
         crate::hal::serial::write_string_always("[EXPLORER] enter\r\n");
         boot_println!("[BOOT]   Loading explorer.exe from disk...");
 
-        let disk_path = "C:\\Windows\\System32\\explorer.exe";
+        let disk_path = "C:\\Windows\\explorer.exe";
         let process_name = "explorer.exe";
         let base_pid = PID_EXPLORER;
 

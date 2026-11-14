@@ -196,35 +196,13 @@ impl BuddyAllocator {
             core::ptr::write_bytes(self.frame_infos, 0, self.num_frames as usize);
             core::ptr::write_bytes(self.buddy_nodes, 0, self.num_frames as usize);
         }
-        // Add every frame to order-0 free list, then bottom-up
-        // coalesce adjacent pairs into the highest possible
-        // order. Without the coalesce, a request for 16 MiB
-        // (order 14) against a 1 GiB pool would OOM because every
-        // frame is pinned at order 0.
-        let total = self.num_frames as u32;
-        // kprintln bypassed — use the unified serial facade.
-        crate::hal::serial::write_string("AI0_SEED\r\n");
-        {
-            let mut lock = self.free_lists[0].lock();
-            unsafe {
-                for i in 0..total {
-                    let node = self.buddy_nodes.add(i as usize);
-                    (*node).next = i.wrapping_add(1);
-                    (*node).prev = if i == 0 {
-                        FREE_LIST_END
-                    } else {
-                        i.wrapping_sub(1)
-                    };
-                    (*node).on_list = 1;
-                }
-                let last = total.wrapping_sub(1);
-                let head_node = self.buddy_nodes;
-                (*head_node).prev = FREE_LIST_END;
-                let tail_node = self.buddy_nodes.add(last as usize);
-                (*tail_node).next = FREE_LIST_END;
-            }
-            lock.head = 0;
-            lock.count = total;
+        // Each free block belongs to exactly one order. Leaving every
+        // frame on order zero as well aliases the large blocks and lets
+        // later small allocations overwrite live heap/page-table storage.
+        for list in &self.free_lists {
+            let mut list = list.lock();
+            list.head = FREE_LIST_END;
+            list.count = 0;
         }
         // Seed each order with the blocks that remain after maximal
         // coalescing. For N frames, the block count at order k is
@@ -244,6 +222,7 @@ impl BuddyAllocator {
             let mut lock = self.free_lists[k].lock();
             for block_index in 0..block_count {
                 let frame = first_block + block_index * shift;
+                (*self.frame_infos.add(frame as usize)).order = k as u8;
                 push_head(&mut lock, frame as u32, self.buddy_nodes);
             }
         }
@@ -275,7 +254,10 @@ impl BuddyAllocator {
         if !self.initialised || count == 0 {
             return None;
         }
-        let order = order_of(count).min(MAX_BUDDY_ORDER - 1);
+        let order = order_of(count);
+        if order >= MAX_BUDDY_ORDER || (1u64 << order) > self.num_frames {
+            return None;
+        }
 
         for current_order in order..MAX_BUDDY_ORDER {
             // Take the first block whose pages are all allocatable.
@@ -298,6 +280,7 @@ impl BuddyAllocator {
                 cur_order -= 1;
                 let buddy = cur_frame ^ (1u32 << cur_order);
                 let mut sub_lock = self.free_lists[cur_order].lock();
+                unsafe { (*self.frame_infos.add(buddy as usize)).order = cur_order as u8; }
                 push_head(&mut sub_lock, buddy, self.buddy_nodes);
             }
             // Mark the block as used.
@@ -391,7 +374,7 @@ impl BuddyAllocator {
                 let _lock = self.free_lists[cur_order].lock();
                 unsafe { (*self.buddy_nodes.add(buddy as usize)).on_list }
             };
-            if on_list == 0 {
+            if on_list == 0 || unsafe { (*self.frame_infos.add(buddy as usize)).order } as usize != cur_order {
                 break;
             }
             // Remove buddy from the free list and merge.
@@ -402,11 +385,47 @@ impl BuddyAllocator {
             cur_order += 1;
             cur_frame = core::cmp::min(cur_frame, buddy);
         }
+        unsafe { (*self.frame_infos.add(cur_frame as usize)).order = cur_order as u8; }
         let mut lock = self.free_lists[cur_order].lock();
         push_head(&mut lock, cur_frame, self.buddy_nodes);
         drop(lock);
 
         self.free_frames.fetch_add(1u64 << order, Ordering::SeqCst);
+    }
+
+    /// Rebuild disjoint free blocks after carving firmware reservations.
+    fn rebuild_free_lists(&mut self) {
+        for list in &self.free_lists {
+            let mut list = list.lock();
+            list.head = FREE_LIST_END;
+            list.count = 0;
+        }
+        unsafe { core::ptr::write_bytes(self.buddy_nodes, 0, self.num_frames as usize); }
+        let mut frame = 0u64;
+        let mut free = 0u64;
+        while frame < self.num_frames {
+            if unsafe { (*self.frame_infos.add(frame as usize)).flags } != FRAME_FREE {
+                frame += 1;
+                continue;
+            }
+            let mut order = 0;
+            while order + 1 < MAX_BUDDY_ORDER {
+                let pages = 1u64 << (order + 1);
+                if frame % pages != 0 || frame + pages > self.num_frames {
+                    break;
+                }
+                if (frame..frame + pages).any(|i| unsafe {
+                    (*self.frame_infos.add(i as usize)).flags != FRAME_FREE
+                }) { break; }
+                order += 1;
+            }
+            let pages = 1u64 << order;
+            unsafe { (*self.frame_infos.add(frame as usize)).order = order as u8; }
+            push_head(&mut self.free_lists[order].lock(), frame as u32, self.buddy_nodes);
+            frame += pages;
+            free += pages;
+        }
+        self.free_frames.store(free, Ordering::SeqCst);
     }
 
     /// Number of free frames.
@@ -591,7 +610,7 @@ pub fn reserve_range(base: u64, size: u64) {
     let aligned_end = (base + size + 0xFFF) & !0xFFF;
     let start_frame = aligned_base / 4096;
     let end_frame = aligned_end / 4096;
-    let alloc = BUDDY_ALLOCATOR.lock();
+    let mut alloc = BUDDY_ALLOCATOR.lock();
     if alloc.frame_infos.is_null() || alloc.num_frames == 0 {
         return;
     }
@@ -609,6 +628,8 @@ pub fn reserve_range(base: u64, size: u64) {
             (*alloc.frame_infos.add(idx)).flags = FRAME_RESERVED;
         }
     }
+    alloc.rebuild_free_lists();
+    FREE_PAGES.store(alloc.free_count(), Ordering::SeqCst);
 }
 
 /// Allocate `count` contiguous physical frames.
@@ -628,7 +649,7 @@ pub fn allocate_pages(count: u64) -> Option<u64> {
         // page tables or the PFN database itself (PFN_LIST_CORRUPT).
         if crate::mm::pfn::frame_sync_is_initialized() {
             let pfn_base = addr / 4096;
-            for offset in 0..count {
+            for offset in 0..allocation_pages {
                 crate::mm::pfn::frame_sync_reserve(pfn_base + offset);
             }
         }

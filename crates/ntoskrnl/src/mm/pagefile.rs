@@ -243,7 +243,12 @@ pub fn init() {
         init_paging_file(&mut state.files[i], PAGES_PER_FILE);
     }
     init_bitmap(&mut state, 0, PAGES_PER_FILE);
-    let base_pfn = match crate::mm::frame::allocate_pages(PAGES_PER_FILE) {
+    let available = crate::mm::frame::get_free_physical() / 4096;
+    let base_pfn = match if PAGES_PER_FILE <= available / 4 {
+        crate::mm::frame::allocate_pages(PAGES_PER_FILE)
+    } else {
+        None
+    } {
         Some(p) => p / 4096,
         None => {
             // [DISABLED] // // kprintln!("    [mm] pagefile: dynamic alloc failed, pagefile disabled");

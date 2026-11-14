@@ -57,7 +57,15 @@ fn test_pfn_database() -> bool {
     crate::boot_println!("    PFN count: {}, free: {}", pfn_count, free_pfns);
 
     // Get performance stats (verifies perf counters are accessible)
-    let _stats = get_pfn_stats();
+    let stats = get_pfn_stats();
+    crate::boot_println!(
+        "    PFN stats: allocations={}, frees={}, failures={}, zeroed_used={}, free_used={}",
+        stats.alloc_count,
+        stats.free_count,
+        stats.failures,
+        stats.zeroed_used,
+        stats.free_used
+    );
 
     true
 }

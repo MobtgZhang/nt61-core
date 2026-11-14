@@ -1,6 +1,6 @@
 //! PFN (Page Frame Number) database
 //
-//! `_MMPFN` is a metadata record for every physical 4 KiB page frame in
+//! `MMPFN` is a metadata record for every physical 4 KiB page frame in
 //! the system. The fields mirror the structure used by Windows 7
 //! (around 0x30 bytes per entry) but compressed to the subset that
 //! the kernel actually inspects on the hot path:
@@ -19,7 +19,7 @@
 //! * `share_count` — number of PTEs that share the page (mapping count
 //!   beyond the owning PTE).
 //! * `pfn_database_index` — index back into this database (used to
-//!   recover the PFN from a pointer to an `_MMPFN`).
+//!   recover the PFN from a pointer to an `MMPFN`).
 //
 //!   Pages are bucketed into state lists:
 //
@@ -126,7 +126,7 @@ pub struct LIST_ENTRY {
     pub blink: PfnNumber,
 }
 
-/// `_MMPFN` — one per physical 4 KiB page.
+/// `MMPFN` — one per physical 4 KiB page.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct MMPFN {
@@ -906,12 +906,7 @@ pub fn init(base_pfn: PfnNumber, pfn_count: PfnNumber) {
         PFN_BASE = base_pfn;
         // Try to allocate the full-size storage from the buddy.
         let pages = bytes_needed.div_ceil(4096);
-        if cfg!(target_arch = "loongarch64") {
-            crate::hal::serial::write_string("[mm] pfn::init: using bootstrap storage\r\n");
-            PFN_STORAGE_PTR = (*core::ptr::addr_of_mut!(PFN_STORAGE_BOOTSTRAP)).as_mut_ptr();
-            PFN_STORAGE_USED = (*core::ptr::addr_of!(PFN_STORAGE_BOOTSTRAP)).len();
-            PFN_STORAGE_CAPACITY = (*core::ptr::addr_of!(PFN_STORAGE_BOOTSTRAP)).len();
-        } else if let Some(phys) = crate::mm::frame::allocate_pages(pages as u64) {
+        if let Some(phys) = crate::mm::frame::allocate_pages(pages as u64) {
             crate::hal::serial::write_string_always("[mm] pfn storage: phys=0x");
             crate::hal::serial::write_hex_u64_always(phys);
             crate::hal::serial::write_string_always(" pages=");
