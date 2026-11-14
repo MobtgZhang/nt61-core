@@ -1,0 +1,103 @@
+{
+  "repository": "https://github.com/google/material-design-icons",
+  "revision": "10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7",
+  "license": "Apache-2.0",
+  "icons": [
+    {
+      "name": "calculator",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/content/calculate/materialicons/24px.svg",
+      "sha256": "e169e65fa9d60d5712c4fcf5c6455bae69f36b698def5816765c1614425977a4",
+      "png_sha256": "93b8be31798d84e148091308294390354e73f95e08bac2320df55da8b2d670df"
+    },
+    {
+      "name": "paint",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/image/palette/materialicons/24px.svg",
+      "sha256": "2b63469be9cdae9b250d533d25be336ac79f8d43d700463d071a0d30593a76c3",
+      "png_sha256": "92c3d8d767e47e42406e80aa2b5adaf5668619639e4e617b068dc67ef706fcfe"
+    },
+    {
+      "name": "notes",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/sticky_note_2/materialicons/24px.svg",
+      "sha256": "86fdf41499c0d8ee5567c71a355e040dc5fa251a36e5198a016bb0484b6e3004",
+      "png_sha256": "b38056ee03ea00752eb3c1c59fef0d054083d284b27d08b4d28c31d07366add8"
+    },
+    {
+      "name": "editor",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/description/materialicons/24px.svg",
+      "sha256": "ffe4041194ad06a93b1dd035c807578c85aa64262ba9e9892001d518a4f6521b",
+      "png_sha256": "2cc1b0d72bfa4715ca07645e9b7b02b0080168a3f0206dd71ef786bf4cbb22c0"
+    },
+    {
+      "name": "characters",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/editor/text_fields/materialicons/24px.svg",
+      "sha256": "67f06b2e1ca0f7b398c238e62342577122889e5e1ff4aa6d5e7ff7ed88f72361",
+      "png_sha256": "8b97ce28ef7d75d7275cd12865d802d604b31607d517f9be5292d34cf65c1034"
+    },
+    {
+      "name": "information",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/info/materialicons/24px.svg",
+      "sha256": "5e3fe070eee9ca124d7591296c8052943d43d412aa25193284e7fde535180aa7",
+      "png_sha256": "21ddc67b7078396ca74481174f34d55b6669c89ecda887f452045156c064b65c"
+    },
+    {
+      "name": "tasks",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/assessment/materialicons/24px.svg",
+      "sha256": "818e0c78c0b1468f1c26f15f9b800c9aca8ddc6c7e9e13ad4145735e479b15bf",
+      "png_sha256": "5ec1b55bde99c32bab784d267a2d9d9cc7d7532127060f94902d4d42b1479717"
+    },
+    {
+      "name": "run",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/av/play_arrow/materialicons/24px.svg",
+      "sha256": "39d601c1d4199c5cadddf5f96a1f57157147d1eedc7a147cdadc29805c6d5fea",
+      "png_sha256": "fa41a0075b8f06205901694603925cab79443d092ef31fec4ba206ba9d60e5f5"
+    },
+    {
+      "name": "keyboard",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/hardware/keyboard/materialicons/24px.svg",
+      "sha256": "22ad5a5d2fb0c78566cd6fa022544c5cdb6c8d71fefaef82dcd9c7918b57802b",
+      "png_sha256": "617e3c9c55f9e003d106c13176323765c5d6dc2ec88730397bcd3000b1a15b88"
+    },
+    {
+      "name": "magnifier",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/search/materialicons/24px.svg",
+      "sha256": "c25d4cdca9972ef7ed9f8e9f32553d0444afd6a7cf8cc6ca9eebf5b4073ef308",
+      "png_sha256": "11dcfa10aa0c353d1ec5e950f6531e886af8c5d6ae3bb39d894ad87664e9cce5"
+    },
+    {
+      "name": "screenshot",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/image/crop/materialicons/24px.svg",
+      "sha256": "7c855aaf5c6e16c665e7d9f5310d12e3bc552096e99850d4f4321338bce4a59d",
+      "png_sha256": "83788fa8c377e0839d1b515ba2bc85be1bf71674289d6e8a8404a92b98f4c695"
+    },
+    {
+      "name": "mines",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/maps/pest_control/materialicons/24px.svg",
+      "sha256": "07e1f43ebc6c819a53626f28164e269178e69411de81383647174aff1ffe7810",
+      "png_sha256": "1af2e78ef180fb18302613f21877349f95c7c3b6bd9ec10facb9b4fc532fac7b"
+    },
+    {
+      "name": "help",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/help/materialicons/24px.svg",
+      "sha256": "130d5d3eaa72de2905720c0aeedac65f688eb224188b04134f2ae998dd85d0e6",
+      "png_sha256": "0b31ae48107ff53283b2fabc5e71d2690fa7ce5372c8772188ec34ef2fcc4270"
+    },
+    {
+      "name": "settings",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/settings/materialicons/24px.svg",
+      "sha256": "86a35d4b8dd844c6a89f6b195b1600367cb52b8465847a0e7bbc8b3365c3983d",
+      "png_sha256": "2678b2ba066da0324aaa6ccf5cb6c1b5368c6239c37f3460591afadbd2c2a1e3"
+    },
+    {
+      "name": "games",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/extension/materialicons/24px.svg",
+      "sha256": "ad6f33eb7c2f179557cb2177feb5d58d3cc1018cb6111055e1c05b4c8e6761dc",
+      "png_sha256": "a1f4f7f20a4cba265ad503fb6bcec2b1369da7948c824748dd805a9412f204a2"
+    },
+    {
+      "name": "folder",
+      "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/file/folder/materialicons/24px.svg",
+      "sha256": "f287ca4017ccbe8ff3c562acdd036a3ae88acb8637fb713f0c65b1b2f9a35b61",
+      "png_sha256": "c70ba9e710b96da1a6d5b8c5aedfaa26c68fd4ccb3ce61b65f4d15d2ca5febd4"
+    }
+  ]
+}
