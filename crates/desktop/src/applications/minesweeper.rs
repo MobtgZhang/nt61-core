@@ -1,0 +1,11 @@
+use alloc::{vec, vec::Vec};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum Outcome { Playing, Won, Lost }
+#[derive(Clone, Debug, PartialEq, Eq)] pub struct Minesweeper {pub mines:[bool;81],pub revealed:[bool;81],pub flags:[bool;81],pub outcome:Outcome,placed:bool,seed:u64}
+impl Minesweeper {
+    pub fn new(seed:u64)->Self {Self{mines:[false;81],revealed:[false;81],flags:[false;81],outcome:Outcome::Playing,placed:false,seed:seed.max(1)}}
+    fn neighbors(i:usize)->Vec<usize>{let(x,y)=((i%9)as i32,(i/9)as i32);let mut out=Vec::new();for dy in -1..=1{for dx in -1..=1{if (dx!=0||dy!=0)&&(0..9).contains(&(x+dx))&&(0..9).contains(&(y+dy)){out.push(((y+dy)*9+x+dx)as usize);}}}out}
+    pub fn adjacent(&self,i:usize)->usize{Self::neighbors(i).iter().filter(|j|self.mines[**j]).count()}
+    pub fn flag(&mut self,i:usize){if i<81&&!self.revealed[i]&&self.outcome==Outcome::Playing{self.flags[i]=!self.flags[i];}}
+    pub fn reveal(&mut self,i:usize){if i>=81||self.flags[i]||self.outcome!=Outcome::Playing{return;}if !self.placed{let mut count=0;while count<10{self.seed^=self.seed<<13;self.seed^=self.seed>>7;self.seed^=self.seed<<17;let j=self.seed as usize%81;if j!=i&&!Self::neighbors(i).contains(&j)&&!self.mines[j]{self.mines[j]=true;count+=1;}}self.placed=true;}if self.mines[i]{self.revealed[i]=true;self.outcome=Outcome::Lost;return;}let mut stack=vec![i];while let Some(j)=stack.pop(){if self.revealed[j]||self.flags[j]{continue;}self.revealed[j]=true;if self.adjacent(j)==0{for k in Self::neighbors(j){if !self.mines[k]&&!self.revealed[k]{stack.push(k);}}}}if (0..81).all(|j|self.mines[j]||self.revealed[j]){self.outcome=Outcome::Won;}}
+}
+#[cfg(test)]mod tests{use super::*;#[test]fn first_click_is_safe_and_game_can_be_won(){let mut g=Minesweeper::new(42);g.reveal(40);assert_eq!(g.adjacent(40),0);assert_eq!(g.mines.iter().filter(|m|**m).count(),10);for i in 0..81{if !g.mines[i]{g.reveal(i);}}assert_eq!(g.outcome,Outcome::Won);}#[test]fn flagged_cells_cannot_be_opened_and_mines_lose(){let mut g=Minesweeper::new(1);g.flag(0);g.reveal(0);assert!(!g.revealed[0]);g.flag(0);g.reveal(0);let i=g.mines.iter().position(|m|*m).unwrap();g.reveal(i);assert_eq!(g.outcome,Outcome::Lost);}}

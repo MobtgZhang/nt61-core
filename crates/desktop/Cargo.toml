@@ -33,4 +33,22 @@ path = "src/bin/notepad/main.rs"
 test = false
 
 [dependencies]
+nt61-abi = { path = "../abi" }
 nt61-fonts = { path = "../fonts" }
+
+[[bin]]
+name = "application-host"
+path = "src/applications/native/main.rs"
+test = false
+
+[[bin]]
+name = "application-preview"
+path = "src/applications/preview.rs"
+test = false
+required-features = ["resource-gen"]
+
+[[bin]]
+name = "explorer-preview"
+path = "src/bin/explorer-preview.rs"
+test = false
+required-features = ["resource-gen"]

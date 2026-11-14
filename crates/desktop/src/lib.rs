@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+pub mod applications;
 pub mod arch;
 pub mod bmp;
 pub mod boot;
@@ -22,6 +23,7 @@ pub mod platform;
 pub mod resource_generator;
 pub mod resources;
 pub mod shell;
+pub mod shell_resources;
 pub mod theme;
 pub mod user_account_pictures;
 pub mod user_allocator;
