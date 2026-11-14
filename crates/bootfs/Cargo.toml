@@ -5,4 +5,3 @@ edition = "2021"
 description = "Filesystem boot readers shared by the NT6.1 boot manager and winload"
 
 [dependencies]
-nt61-boot-types = { path = "../boot-types" }

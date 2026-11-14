@@ -123,8 +123,8 @@ fn find_refs_partition_start_lba(
 
     // Microsoft basic-data GUID (same for NTFS and ReFS)
     const BASIC_DATA_GUID: [u8; 16] = [
-        0xA0, 0x88, 0x2D, 0x83, 0xEB, 0xD1, 0xCD, 0x41, 0xB7, 0x96, 0x21, 0xE3, 0x66, 0x65, 0xFF,
-        0xCC,
+        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99,
+        0xC7,
     ];
 
     for i in 0..partition_entry_count {
@@ -153,13 +153,17 @@ fn find_refs_partition_start_lba(
 }
 
 /// Read a file using the directory index.
-fn read_refs_file(
+pub(crate) fn read_refs_file(
     block: &uefi::proto::media::block::BlockIO,
     media_id: u32,
     path: &str,
     partition_start_lba: u64,
 ) -> Option<Vec<u8>> {
-    let mut index = alloc::vec![0u8; 4096];
+    let mut superblock = [0u8; 512];
+    block.read_blocks(media_id, partition_start_lba + 8, &mut superblock).ok()?;
+    let table_bytes = u64::from_le_bytes(superblock[88..96].try_into().ok()?) as usize;
+    if table_bytes < ENTRY_SIZE || table_bytes > 16 * 1024 * 1024 { return None; }
+    let mut index = alloc::vec![0u8; table_bytes.div_ceil(512) * 512];
     block
         .read_blocks(media_id, partition_start_lba + REFS_INDEX_LBA, &mut index)
         .ok()?;
@@ -168,8 +172,8 @@ fn read_refs_file(
     let norm = path
         .trim_start_matches('\\')
         .trim_start_matches('/')
-        .trim_start_matches(|c| c == 'C' || c == 'c')
-        .trim_start_matches(':')
+        .trim_start_matches("C:")
+        .trim_start_matches("c:")
         .trim_start_matches('\\')
         .trim_start_matches('/')
         .replace('\\', "/");
@@ -214,7 +218,8 @@ fn read_file_data(
     base_lba: u64,
     file_len: u64,
 ) -> Option<Vec<u8>> {
-    let mut data = alloc::vec![0u8; file_len as usize];
+    if file_len > 256 * 1024 * 1024 { return None; }
+    let mut data = alloc::vec![0u8; file_len.div_ceil(512) as usize * 512];
     let total_sectors = file_len.div_ceil(512);
     let mut sector_off = 0u64;
     while sector_off < total_sectors {
@@ -233,5 +238,6 @@ fn read_file_data(
         }
         sector_off += count;
     }
+    data.truncate(file_len as usize);
     Some(data)
 }

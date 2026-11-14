@@ -2,6 +2,8 @@
 
 extern crate alloc;
 
+pub mod ntfs;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -71,7 +73,7 @@ fn find_gpt_fat32_partition(reader: &dyn SectorReader) -> Option<u64> {
     } else {
         entries_per_sector
     };
-    let entry_sectors = (entry_count as usize + entries_per_sector - 1) / entries_per_sector;
+    let entry_sectors = (entry_count as usize).div_ceil(entries_per_sector);
     if entries_per_sector == 0 || entry_sectors == 0 {
         return None;
     }
@@ -243,7 +245,7 @@ fn read_directory_chain(
     let mut cluster = first_cluster;
     for _ in 0..0x10000 {
         let sector_data = read_cluster(reader, partition_start_lba, geometry, cluster)?;
-        for entry_bytes in sector_data.chunks_exact(32) {
+        for entry_bytes in sector_data.as_chunks::<32>().0 {
             if entry_bytes[0] == 0 {
                 return Some(entries);
             }
@@ -287,7 +289,7 @@ fn read_directory_chain(
             });
         }
         cluster = next_cluster(reader, partition_start_lba, geometry, cluster)?;
-        if cluster >= 0x0FFF_FFF8 || cluster < 2 {
+        if !(2..0x0FFF_FFF8).contains(&cluster) {
             break;
         }
     }
@@ -416,7 +418,7 @@ fn read_file_data(
             break;
         }
         cluster = next_cluster(reader, partition_start_lba, geometry, cluster)?;
-        if cluster >= 0x0FFF_FFF8 || cluster < 2 {
+        if !(2..0x0FFF_FFF8).contains(&cluster) {
             break;
         }
     }
@@ -449,6 +451,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "integration test: run make build ARCH=x86_64 FORMAT=fat32 first"]
     fn reads_fat32_system_file_from_built_image() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),

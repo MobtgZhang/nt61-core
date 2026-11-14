@@ -99,6 +99,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 mod arch;
+mod block_read;
 mod ext4_boot;
 mod fat32_boot;
 mod fat_lfn;
@@ -123,7 +124,7 @@ struct HybridAllocHeader {
     base_size: usize,
     base_align: usize,
     base_ptr: *mut u8,
-    _reserved: [u8; 24],
+    reserved: [u8; 24],
 }
 
 struct HybridAllocator;
@@ -252,23 +253,20 @@ const EXTENDED_MEMORY_MAP_SIZE: usize = 256;
 // Boot drivers must match the on-disk .sys filenames. The order
 // here mirrors the storage-stack load order on real NT 6.1:
 // class drivers first (disk), then partition manager, then volume
-// manager, then the bus class drivers (storahci / iastor / stornvme),
-// then system infrastructure (pci / acpi / intelppm / mssmbios / hpet).
-const MAX_BOOT_DRIVERS: usize = 13;
+// manager, then the AHCI miniport (msahci),
+// then system infrastructure (pci / acpi / intelppm / mssmbios).
+const MAX_BOOT_DRIVERS: usize = 10;
 
 const BOOT_DRIVER_PATHS: [&str; MAX_BOOT_DRIVERS] = [
     "\\Windows\\System32\\drivers\\disk.sys",
     "\\Windows\\System32\\drivers\\classpnp.sys",
     "\\Windows\\System32\\drivers\\partmgr.sys",
     "\\Windows\\System32\\drivers\\volmgr.sys",
-    "\\Windows\\System32\\drivers\\storahci.sys",
-    "\\Windows\\System32\\drivers\\iastor.sys",
-    "\\Windows\\System32\\drivers\\stornvme.sys",
+    "\\Windows\\System32\\drivers\\msahci.sys",
     "\\Windows\\System32\\drivers\\pci.sys",
     "\\Windows\\System32\\drivers\\acpi.sys",
     "\\Windows\\System32\\drivers\\intelppm.sys",
     "\\Windows\\System32\\drivers\\mssmbios.sys",
-    "\\Windows\\System32\\drivers\\hpet.sys",
     // BOOTVID.DLL is a BOOT_START_IMAGE (not a SYS driver): it
     // has no DriverEntry but exports VidInitialize/InbvDisplayString.
     // We load it through the same `load_boot_drivers` codepath
@@ -441,14 +439,7 @@ impl HiveInfo {
     }
 }
 
-#[derive(Default, Copy, Clone)]
-#[repr(C)]
-struct DriverLoadRecord {
-    name: [u8; 32],
-    loaded: bool,
-    base: u64,
-    size: u64,
-}
+use nt61_boot_types::boot_types::BootDriverLoadRecord as DriverLoadRecord;
 
 struct PersistentBootData {
     /// Extended memory map buffer - supports up to 256 entries
@@ -479,22 +470,11 @@ struct PersistentBootData {
     esp_partition_lba: u64,
     /// Total number of LBA blocks in the ESP partition.
     esp_partition_sectors: u64,
-    /// UEFI media_id of the ESP BlockIO protocol. `capture_system_partition`
-    /// uses this to exclude the ESP handle when picking the system partition
-    /// (the previous FAT-family exclusion heuristic broke the FAT32-only
-    /// layout where system and ESP are both FAT32 and indistinguishable
-    /// by their OEM ID alone).
+    /// Firmware media ID retained for boot diagnostics.
     esp_media_id: u32,
-    /// Fingerprint of the ESP partition — its last_block + 1 (total
-    /// LBA count). On QEMU/OVMF the BlockIO `media_id` is 0 for
-    /// every partition, so it can't be used as a unique
-    /// discriminator. The partition size is unique as long as the
-    /// disk layout is unique (which is true on a normal install —
-    /// the ESP and the system partition are different sizes).
+    /// Total number of blocks in the captured ESP.
     esp_partition_blocks: u64,
-    /// Physical address of the System partition mirror (set by
-    /// `capture_system_partition`). Same semantics as
-    /// `esp_image_base` but for the second FAT32 partition.
+    /// Physical address of the complete system volume snapshot.
     sys_image_base: u64,
     /// Total size of the System partition mirror in bytes.
     sys_image_size: u64,
@@ -502,9 +482,8 @@ struct PersistentBootData {
     sys_block_size: u32,
     /// Pad to keep the struct aligned.
     _reserved5: u32,
-    /// Physical address of the ISO boot RAM disk (the `nt61.img`
-    /// FAT32 image embedded in the ISO). Populated by
-    /// `capture_iso_ramdisk()`. Zero for disk-booted configurations.
+    /// Physical address of the complete El Torito FAT boot volume.
+    /// Optical boot shares this snapshot with the system volume.
     ramdisk_image_base: u64,
     /// Total size of the ISO RAM disk image in bytes.
     ramdisk_image_size: u64,
@@ -531,86 +510,12 @@ impl PersistentBootData {
             smp_cpu_count: SMP_CPU_COUNT,
             acpi_rsdp: 0,
             system_hive: HiveInfo::zeroed(),
-            boot_drivers: [
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-                DriverLoadRecord {
-                    name: [0u8; 32],
-                    loaded: false,
-                    base: 0,
-                    size: 0,
-                },
-            ],
+            boot_drivers: [DriverLoadRecord {
+                name: [0u8; 128],
+                loaded: false,
+                base: 0,
+                size: 0,
+            }; MAX_BOOT_DRIVERS],
             memory_map_size_bytes: 0,
             descriptor_size: 0,
             // UEFI `map_key` returned by `GetMemoryMap` — must be
@@ -667,7 +572,7 @@ struct EfiSystemTable {
     header: [u8; 24],
     firmware_vendor: *const u16,
     firmware_revision: u32,
-    _reserved: u32,
+    reserved: u32,
     console_in_handle: usize,
     console_in: *const core::ffi::c_void,
     console_out_handle: usize,
@@ -682,6 +587,10 @@ struct EfiSystemTable {
 
 const EFI_DTB_TABLE_GUID: EfiGuid = EfiGuid([
     0xd5, 0x21, 0xb6, 0xb1, 0x9c, 0xf1, 0xa5, 0x41, 0x83, 0x0b, 0xd9, 0x15, 0x2c, 0x69, 0xaa, 0xe0,
+]);
+
+const EFI_BCD_MAILBOX_TABLE_GUID: EfiGuid = EfiGuid([
+    0x8b, 0xc9, 0xc6, 0xa0, 0x5b, 0x47, 0x4d, 0xca, 0x8e, 0x40, 0xdb, 0x22, 0xca, 0x1d, 0x5a, 0x6b,
 ]);
 
 const EFI_FB_MAILBOX_TABLE_GUID: EfiGuid = EfiGuid([
@@ -857,60 +766,6 @@ fn capture_device_tree_hardware() -> DeviceTreeHardware {
     hardware
 }
 
-fn capture_device_tree_base() -> Option<u64> {
-    let handle = uefi::boot::get_handle_for_protocol::<FdtClientProtocol>().ok()?;
-    let client = unsafe {
-        uefi::boot::open_protocol::<FdtClientProtocol>(
-            uefi::boot::OpenProtocolParams {
-                handle,
-                agent: uefi::boot::image_handle(),
-                controller: None,
-            },
-            uefi::boot::OpenProtocolAttributes::GetProtocol,
-        )
-        .ok()?
-    };
-    for compatible in [
-        b"memory\0".as_slice(),
-        b"memory@40000000\0".as_slice(),
-        b"\0".as_slice(),
-        b"arm,dummy-virt\0".as_slice(),
-    ] {
-        if let Some(range) = query_fdt_client_reg(&client, compatible) {
-            if range.size != 0 {
-                return Some(range.base);
-            }
-        }
-    }
-    // EDK2's FdtClientDxe knows the DTB address but does not publish it
-    // through a configuration table on this firmware. The protocol object is
-    // embedded in a private context that contains the DTB pointer; dump a
-    // small window around it for the kernel bootstrap.
-    let client_addr = &client as *const _ as u64;
-    let mut found = None;
-    for offset in (-8192i64..=8192i64).step_by(8) {
-        let probe = (client_addr as i64).wrapping_add(offset) as *const u64;
-        let candidate = unsafe { probe.read_volatile() };
-        if !(0x40000000..0x48000000).contains(&candidate) {
-            continue;
-        }
-        let bytes = candidate as *const u8;
-        if unsafe { bytes.read_volatile() } == 0xd0
-            && unsafe { bytes.add(1).read_volatile() } == 0x0d
-            && unsafe { bytes.add(2).read_volatile() } == 0xfe
-            && unsafe { bytes.add(3).read_volatile() } == 0xed
-        {
-            found = Some(candidate);
-            break;
-        }
-    }
-    uefi::println!(
-        "[WINLOAD] FDT protocol scan found=0x{:x}",
-        found.unwrap_or(0)
-    );
-    found
-}
-
 /// Locate the UEFI DTB table, copy it into runtime-surviving memory, and
 /// record its exact address/size for `BootInfo`. The firmware-owned DTB is
 /// not guaranteed to remain valid after `ExitBootServices`, so winload owns
@@ -934,73 +789,12 @@ fn capture_device_tree() {
         .iter()
         .find(|entry| entry.vendor_guid == EFI_DTB_TABLE_GUID)
     else {
-        let system_table = unsafe { &*(system_table.as_ptr() as *const EfiSystemTable) };
-        let entries = unsafe {
-            core::slice::from_raw_parts(
-                system_table.configuration_table,
-                system_table.number_of_table_entries,
-            )
-        };
-        for (index, entry) in entries.iter().enumerate() {
-            let guid = entry.vendor_guid.0;
-            uefi::println!(
-                "[WINLOAD] config-table[{}] guid={:02x?} table=0x{:x}",
-                index,
-                guid,
-                entry.vendor_table as u64
-            );
-        }
-        if hardware.uart.is_none() {
-            debug_println!("[LOADER] DTB capture unavailable: no FDT client or DTB table");
-        }
-        let source = capture_device_tree_base();
-        if let Some(source) = source {
-            let source = source as *const u8;
-            let magic = u32::from_be_bytes(unsafe {
-                [
-                    source.read_volatile(),
-                    source.add(1).read_volatile(),
-                    source.add(2).read_volatile(),
-                    source.add(3).read_volatile(),
-                ]
-            });
-            if magic == 0xd00d_feed {
-                let total_size = u32::from_be_bytes(unsafe {
-                    [
-                        source.add(4).read_volatile(),
-                        source.add(5).read_volatile(),
-                        source.add(6).read_volatile(),
-                        source.add(7).read_volatile(),
-                    ]
-                });
-                if total_size > 0 && total_size <= 8 * 1024 * 1024 {
-                    let page_count = (total_size as usize + 0xfff) / 0x1000;
-                    let Ok(mut destination) = uefi::boot::allocate_pages(
-                        uefi::boot::AllocateType::AnyPages,
-                        uefi::boot::MemoryType::RUNTIME_SERVICES_DATA,
-                        page_count,
-                    ) else {
-                        debug_println!("[LOADER] [WARN] DTB capture allocation failed");
-                        return;
-                    };
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(
-                            source,
-                            destination.as_mut(),
-                            total_size as usize,
-                        );
-                    }
-                    let persistent = unsafe { &mut *core::ptr::addr_of_mut!(PERSISTENT) };
-                    persistent.device_tree_base = destination.as_ptr() as u64;
-                    persistent.device_tree_size = total_size;
-                    uefi::println!(
-                        "[WINLOAD] DTB captured from protocol: base=0x{:x} size={}",
-                        persistent.device_tree_base,
-                        persistent.device_tree_size
-                    );
-                }
-            }
-        }
+        // The FDT client exposes parsed hardware properties, not the DTB
+        // buffer. Never scan private protocol storage or dereference a
+        // memory node's reg base: it may be unmapped (LoongArch) or MMIO.
+        // Keep the parsed properties above and let ACPI/platform discovery
+        // fill in anything the firmware did not publish.
+        debug_println!("[LOADER] DTB table unavailable; using firmware hardware properties");
         return;
     };
     let source = entry.vendor_table as *const u8;
@@ -1105,7 +899,8 @@ static mut KERNEL_BOOT_INFO: BootInfo = BootInfo {
     esp_disk_start: 0,
     esp_disk_sectors: 0,
     boot_driver_count: 0,
-    _reserved2: 0,
+    boot_flags: 0,
+    boot_driver_records: 0, boot_driver_records_count: 0, _reserved_boot_records: 0,
     esp_image_base: 0,
     esp_image_size: 0,
     esp_block_size: 0,
@@ -2381,7 +2176,7 @@ fn load_kernel_images() -> (u64, u64, u64, u64, u64) {
 /// Look up the BOOTVID.DLL slot from `PERSISTENT.boot_drivers[]` and
 /// publish its base/size into `BootInfo.bootvid_image_*`. The driver
 /// itself was already loaded by `load_boot_drivers()` (BOOTVID.DLL is
-/// the 13th entry in `BOOT_DRIVER_PATHS`); this helper just copies
+/// the final entry in `BOOT_DRIVER_PATHS`); this helper just copies
 /// the result into the canonical BootInfo fields the kernel reads.
 fn publish_bootvid_into_boot_info() {
     unsafe {
@@ -2434,6 +2229,9 @@ fn load_boot_drivers() {
             break;
         }
 
+        let name_bytes = path.as_bytes();
+        let name_len = name_bytes.len().min(pd.boot_drivers[i].name.len() - 1);
+        pd.boot_drivers[i].name[..name_len].copy_from_slice(&name_bytes[..name_len]);
         uefi::println!(
             "[WINLOAD] load driver {}/{}: {}",
             i + 1,
@@ -2845,30 +2643,13 @@ struct FramebufferInfo {
 // ESP partition capture
 // =====================================================================
 //
-// Background: The kernel does not yet have a working block-device
-// driver (no AHCI, no virtio-blk, no ATA PIO). After
-// `ExitBootServices` the firmware is no longer available, so the
-// kernel has no way to read a block device on its own. To let the
-// Safe-Mode CMD `DIR` and `TYPE` commands access the real boot
-// volume, we snapshot the entire ESP into a contiguous physical
-// memory buffer *before* `ExitBootServices` and pass a pointer
-// to it in `BootInfo`. The kernel's FAT32 driver treats this
-// buffer as a RAM disk.
-//
-// We use the UEFI `BlockIO` protocol on the same handle that
-// hosts the `SimpleFileSystem` we have already cached for the
-// ESP. The ESP's first handle from `find_handles::<SimpleFileSystem>()`
-// is the one from which we have been reading files, so its
-// `BlockIO` instance points at the ESP partition itself.
-//
-// Buffer size policy: a typical ESP is 100–500 MiB. We reserve
-// 32 MiB (`ESP_MIRROR_BYTES`) which is enough for the BCD,
-// fonts, our own binaries, and a few log files. If the
-// partition is larger than the mirror, we only snapshot the
-// first `ESP_MIRROR_BYTES`; the FAT32 driver will only see
-// truncated data and will fail gracefully on any cluster
-// outside the captured range.
-const ESP_MIRROR_BYTES: usize = 32 * 1024 * 1024;
+// Preserve boot volumes before ExitBootServices so every architecture can
+// mount the same filesystems before its native storage driver becomes usable.
+// The ESP is selected by the cached SimpleFileSystem handle. Capture complete
+// volumes because filesystem metadata can reference clusters anywhere in them.
+// The host packager enforces the same 2 GiB per-volume boot memory budget.
+const MAX_BOOT_VOLUME_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+static mut ESP_CAPTURE_HANDLE: usize = 0;
 const ESP_BLOCKS_PER_CHUNK: usize = 64; // 64 * 512 = 32 KiB per read
 
 /// Snapshot the ESP partition into a contiguous physical buffer.
@@ -2908,7 +2689,10 @@ fn capture_esp_partition() {
         let _ = open_esp_file_into_fallback("\\EFI\\Boot\\bootx64.efi", &mut fallback_buf);
         return;
     }
-    let esp_handle = handles[0];
+    let cached = unsafe { CACHED_SFS_PTR };
+    let esp_handle = handles.iter().copied().find(|h| h.as_ptr() as usize == cached)
+        .unwrap_or(handles[0]);
+    unsafe { ESP_CAPTURE_HANDLE = esp_handle.as_ptr() as usize; }
 
     // Open BlockIO on the same handle.
     debug_println!("[LOADER] ESP capture: open_protocol<BlockIO>");
@@ -2944,7 +2728,11 @@ fn capture_esp_partition() {
     let media_id = media.media_id();
     let total_blocks = (last_block as u64) + 1;
     let partition_bytes = total_blocks.saturating_mul(block_size as u64);
-    let mirror_bytes = core::cmp::min(ESP_MIRROR_BYTES as u64, partition_bytes) as usize;
+    if partition_bytes == 0 || partition_bytes > MAX_BOOT_VOLUME_BYTES {
+        debug_println!("[LOADER] ESP volume exceeds boot memory budget: {}", partition_bytes);
+        return;
+    }
+    let mirror_bytes = partition_bytes as usize;
     let blocks_to_read = mirror_bytes / block_size;
 
     debug_println!(
@@ -3022,7 +2810,7 @@ fn capture_esp_partition() {
 
     // Publish the result in PERSISTENT so `build_boot_info` can
     // copy it into BootInfo.
-    pd.esp_image_base = if total_ok == 0 { 0 } else { buffer_ptr as u64 };
+    pd.esp_image_base = if total_ok == total_blocks { buffer_ptr as u64 } else { 0 };
     pd.esp_image_size = total_ok.saturating_mul(block_size as u64);
     pd.esp_block_size = block_size as u32;
     pd.esp_partition_lba = 0; // partition-relative LBA; full ESP starts at 0
@@ -3031,15 +2819,9 @@ fn capture_esp_partition() {
     } else {
         total_blocks
     };
-    // Save the BlockIO media_id so capture_system_partition can
-    // recognise the ESP handle and pick a different partition as
-    // the system partition (works even when system is FAT32 too).
+    // Retain firmware geometry for boot diagnostics. Partition selection uses
+    // the exact handle, since firmware media IDs and partition sizes can repeat.
     pd.esp_media_id = media_id;
-    // Also save the partition block count. QEMU/OVMF reports
-    // media_id == 0 for every partition, so it can't be used as a
-    // unique discriminator; partition size is unique as long as the
-    // ESP and the system partition have different sizes (which is
-    // true on every standard install we test).
     pd.esp_partition_blocks = total_blocks;
     debug_println!(
         "[LOADER] ESP capture: media_id=0x{:x} blocks={}",
@@ -3054,31 +2836,11 @@ fn capture_esp_partition() {
 }
 
 // =====================================================================
-// System partition capture (second FAT32 partition on the disk)
+// System volume capture (FAT32, NTFS, ext4, or the project's refs extension)
 // =====================================================================
-//
-// Mirrors `capture_esp_partition` but targets the second
-// `SimpleFileSystem` handle (the Windows system partition). The
-// captured buffer is exposed to the kernel via BootInfo's
-// `sys_image_*` fields, where it is registered as a second
-// FAT32 ramdisk so user-mode code can read files like
-// `C:\tests\autoexec.bat` that live on the system partition.
 
-/// Same per-chunk chunking policy as the ESP capture. The system
-/// partition is 256 MiB on our reference disk and the mirror must
-/// cover the *whole* partition: the NTFS build tool allocates
-/// non-resident file data in clusters starting ~1 MiB into the
-/// volume and keeps going for every user file, so a truncated
-/// mirror makes any file whose clusters land past the cap fail
-/// reads with an out-of-bounds error in the kernel-side NTFS
-/// driver (observed as a silent failure to load cmd.exe).
-const SYS_MIRROR_BYTES: usize = 256 * 1024 * 1024;
-
-/// Snapshot the system partition into a contiguous physical
-/// buffer. Same lifecycle as `capture_esp_partition`: the buffer
-/// is allocated in `EfiBootServicesData` so it survives
-/// `ExitBootServices`, and the address/size/block_size fields
-/// end up in PERSISTENT -> BootInfo.
+/// Snapshot the complete system volume before ExitBootServices and publish it
+/// through PERSISTENT -> BootInfo. Optical boot reuses the captured FAT volume.
 fn capture_system_partition() {
     use uefi::boot::OpenProtocolAttributes;
     use uefi::boot::OpenProtocolParams;
@@ -3086,11 +2848,7 @@ fn capture_system_partition() {
 
     let pd = unsafe { &mut *core::ptr::addr_of_mut!(PERSISTENT) };
 
-    // Find the system partition handle. With the new layout (ESP=FAT32,
-    // System=NTFS), EFI's SimpleFileSystem only enumerates FAT volumes, so
-    // there is exactly one SFS handle (the ESP). The system partition is
-    // a NTFS volume, so we have to walk all block device handles looking
-    // for one whose first sector has the "NTFS    " OEM ID at offset 3.
+    // Non-FAT filesystems do not expose SimpleFileSystem, so enumerate BlockIO.
     let block_handles = match uefi::boot::find_handles::<BlockIO>() {
         Ok(h) => h,
         Err(e) => {
@@ -3098,27 +2856,9 @@ fn capture_system_partition() {
             return;
         }
     };
-    // Pick the block device whose first sector is NOT the EFI
-    // System Partition (FAT-family boot sector) — that's the
-    // Windows System partition regardless of whether it's
-    // formatted as FAT32, NTFS, or ext2/3/4. This matches the
-    // Windows 7 boot manager, which simply enumerates every
-    // partition on the system disk and asks the kernel to mount
-    // each one according to its own filesystem type.
-    // Identify the system partition. The previous heuristic was
-    // "ignore FAT-family partitions" — that worked for the
-    // (ESP=FAT32, sys=NTFS) layout but broke the (ESP=FAT32,
-    // sys=FAT32) layout because both partitions had FAT OEM IDs
-    // and the loop never picked a sys_handle. Now we match by ESP
-    // BlockIO media_id (recorded by capture_esp_partition) and
-    // pick the first logical partition with a different
-    // media_id. The "is_logical_partition" / 512-byte block-size
-    // filters are kept so we still exclude the whole-disk BlockIO
-    // handle and any CD/DVD.
-    let esp_media_id = pd.esp_media_id;
-    let esp_partition_blocks = pd.esp_partition_blocks;
+    // Skip the ESP by handle identity, including when both volumes are FAT32.
+    // Whole-disk and optical BlockIO handles cannot be system partitions.
     let mut sys_handle: Option<uefi::Handle> = None;
-    let mut sys_oem: [u8; 8] = [0; 8];
     for &h in &block_handles {
         let sp = unsafe {
             uefi::boot::open_protocol::<BlockIO>(
@@ -3151,18 +2891,9 @@ fn capture_system_partition() {
             core::mem::forget(block_io);
             continue;
         }
-        // Exclude the ESP itself — distinguishes system from ESP even
-        // when both are FAT32. media_id is unreliable on
-        // QEMU/OVMF (it is 0 for every partition), so we also
-        // compare the partition block count. Two partitions with
-        // identical size AND identical media_id would defeat
-        // this; in that pathological case we still get a
-        // non-ESP candidate because the block-count test fails
-        // first.
+        // Media IDs and volume sizes need not be unique.
         let this_media_id = media.media_id();
-        let this_blocks = (media.last_block() as u64) + 1;
-        let is_esp = (this_media_id == esp_media_id && esp_media_id != 0)
-            || (this_blocks == esp_partition_blocks && esp_partition_blocks != 0);
+        let is_esp = h.as_ptr() as usize == unsafe { ESP_CAPTURE_HANDLE };
         if is_esp {
             core::mem::forget(block_io);
             continue;
@@ -3184,10 +2915,30 @@ fn capture_system_partition() {
         // the signature requirement; the kernel-side
         // `detect_fs_type` will refuse to mount anything that
         // doesn't look like a real filesystem.
-        let oem = &buf[3..11];
-        sys_oem.copy_from_slice(oem);
         sys_handle = Some(h);
         break;
+    }
+
+    if sys_handle.is_none() {
+        // Optical boot exposes one FAT El Torito image containing both EFI and
+        // Windows. Its system filesystem is the loaded-image device itself.
+        let cached = unsafe { core::ptr::addr_of!(CACHED_SYSTEM_SFS_PTR).read_volatile() };
+        if let Some(handle) = unsafe { uefi::Handle::from_ptr(cached as *mut core::ffi::c_void) } {
+            if open_system_file_data("\\Windows\\System32\\ntoskrnl.exe").is_some() {
+                if handle.as_ptr() as usize == unsafe { ESP_CAPTURE_HANDLE } && pd.esp_image_base != 0 {
+                    // A single El Torito FAT volume holds EFI and Windows.
+                    // Publish the same complete snapshot without duplicate allocations.
+                    pd.sys_image_base = pd.esp_image_base;
+                    pd.sys_image_size = pd.esp_image_size;
+                    pd.sys_block_size = pd.esp_block_size;
+                    pd.ramdisk_image_base = pd.esp_image_base;
+                    pd.ramdisk_image_size = pd.esp_image_size;
+                    pd.ramdisk_block_size = pd.esp_block_size;
+                    return;
+                }
+                sys_handle = Some(handle);
+            }
+        }
     }
 
     let sys_handle = match sys_handle {
@@ -3236,7 +2987,11 @@ fn capture_system_partition() {
     let media_id = media.media_id();
     let total_blocks = (last_block as u64) + 1;
     let partition_bytes = total_blocks.saturating_mul(block_size as u64);
-    let mirror_bytes = core::cmp::min(SYS_MIRROR_BYTES as u64, partition_bytes) as usize;
+    if partition_bytes == 0 || partition_bytes > MAX_BOOT_VOLUME_BYTES {
+        debug_println!("[LOADER] SYS volume exceeds boot memory budget: {}", partition_bytes);
+        return;
+    }
+    let mirror_bytes = partition_bytes as usize;
     let blocks_to_read = mirror_bytes / block_size;
 
     debug_println!(
@@ -3299,229 +3054,11 @@ fn capture_system_partition() {
         first_err,
     );
 
-    pd.sys_image_base = if total_ok == 0 { 0 } else { buffer_ptr as u64 };
+    pd.sys_image_base = if total_ok == total_blocks { buffer_ptr as u64 } else { 0 };
     pd.sys_image_size = total_ok.saturating_mul(block_size as u64);
     pd.sys_block_size = block_size as u32;
 
     drop(block_io);
-}
-
-// =====================================================================
-// ISO boot RAM disk capture
-// =====================================================================
-//
-// For ISO boot, the disk is a single ISO-9660 volume with a combined
-// FAT32 image embedded at `EFI/Microsoft/Boot/nt61.img`. This function:
-//   1. Reads `nt61.img` from the ISO via SimpleFileSystem
-//   2. Copies the first 64 MB into a new buffer (ESP region)
-//   3. Copies the remaining 256 MB into another new buffer (System region)
-//   4. Publishes both buffers via PERSISTENT ramdisk_image fields
-//
-// The ESP and System regions in the combined image are identical to the
-// dual-partition layout: ESP occupies the first 64 MB, System occupies
-// the next 256 MB. Winload splits them here so the kernel sees the same
-// RAM disk layout regardless of whether it was booted from disk or ISO.
-
-/// Size of the ESP region within the combined FAT32 image (64 MB).
-const ISO_ESP_SIZE: usize = 64 * 1024 * 1024;
-/// Size of the System region within the combined FAT32 image (256 MB).
-const ISO_SYS_SIZE: usize = 256 * 1024 * 1024;
-
-/// Read `nt61.img` from the ISO's SimpleFileSystem and split it into
-/// ESP and System RAM disk buffers. Publishes via PERSISTENT.
-fn capture_iso_ramdisk() {
-    let pd = unsafe { &mut *core::ptr::addr_of_mut!(PERSISTENT) };
-
-    // The combined FAT32 image (ESP + System) is at most 320 MB.
-    let cached_ptr = unsafe { core::ptr::addr_of!(CACHED_SFS_PTR).read_volatile() };
-    if cached_ptr == 0 {
-        debug_println!("[LOADER] ISO ramdisk: no SFS handle cached — not available");
-        return;
-    }
-
-    // Open the volume and probe for \EFI\Microsoft\Boot\nt61.img BEFORE
-    // allocating 320 MB of boot-time memory. On a plain disk boot (no
-    // ISO), the file is absent and we must not allocate anything.
-    use uefi::boot::open_protocol_exclusive;
-    use uefi::proto::media::fs::SimpleFileSystem;
-    use uefi::Handle;
-    let handle = match unsafe { Handle::from_ptr(cached_ptr as *mut core::ffi::c_void) } {
-        Some(h) => h,
-        None => {
-            debug_println!("[LOADER] ISO ramdisk: invalid handle — ignored");
-            return;
-        }
-    };
-    let mut sfs = match open_protocol_exclusive::<SimpleFileSystem>(handle) {
-        Ok(s) => s,
-        Err(e) => {
-            debug_println!(
-                "[LOADER] ISO ramdisk: open_protocol failed: {:?} — ignored",
-                e
-            );
-            return;
-        }
-    };
-    let mut root = match sfs.open_volume() {
-        Ok(v) => v,
-        Err(_) => {
-            debug_println!("[LOADER] ISO ramdisk: open_volume failed — ignored");
-            return;
-        }
-    };
-    // Probe for the file by walking the path. If the probe finds it, we
-    // know this is an ISO boot and can proceed.
-    let img_path = "\\EFI\\Microsoft\\Boot\\nt61.img";
-    let img_path_cstr = match uefi::CString16::try_from(img_path) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let probe_handle = match root.open(
-        &img_path_cstr,
-        uefi::proto::media::file::FileMode::Read,
-        uefi::proto::media::file::FileAttribute::empty(),
-    ) {
-        Ok(h) => h,
-        Err(_) => {
-            debug_println!("[LOADER] ISO ramdisk: nt61.img not present — absent (disk boot)");
-            return;
-        }
-    };
-    let mut probe_file = match probe_handle.into_regular_file() {
-        Some(f) => f,
-        None => {
-            debug_println!("[LOADER] ISO ramdisk: nt61.img is not a regular file — ignored");
-            return;
-        }
-    };
-    debug_println!(
-        "[LOADER] ISO ramdisk: nt61.img present ({} MiB allocation follows)",
-        (ISO_ESP_SIZE + ISO_SYS_SIZE) / (1024 * 1024)
-    );
-
-    // The combined FAT32 image (ESP + System) is at most 320 MB.
-    let total_combined_size = ISO_ESP_SIZE + ISO_SYS_SIZE;
-    let combined_pages = (total_combined_size + 0xFFF) / 0x1000;
-
-    // Allocate a contiguous buffer for reading the combined image from the ISO.
-    let combined_buf = match uefi::boot::allocate_pages(
-        uefi::boot::AllocateType::AnyPages,
-        uefi::boot::MemoryType::BOOT_SERVICES_DATA,
-        combined_pages,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            debug_println!(
-                "[LOADER] [WARN] ISO ramdisk: combined image allocate_pages failed: {:?}",
-                e
-            );
-            return;
-        }
-    };
-    let combined_ptr = combined_buf.as_ptr() as *mut u8;
-
-    // Read the file we already probed (probe_file). It holds an open
-    // reference to \EFI\Microsoft\Boot\nt61.img. We don't need to
-    // navigate the directory tree again — the probe already did it.
-    let n = match probe_file
-        .read(unsafe { core::slice::from_raw_parts_mut(combined_ptr, total_combined_size) })
-    {
-        Ok(n) => n,
-        Err(e) => {
-            debug_println!("[LOADER] [WARN] ISO ramdisk: read failed: {:?}", e);
-            return;
-        }
-    };
-    debug_println!("[LOADER] ISO ramdisk: read {} bytes from nt61.img", n);
-
-    // 2. Allocate ESP buffer and copy the first 64 MB.
-    let esp_pages = (ISO_ESP_SIZE + 0xFFF) / 0x1000;
-    let esp_buf = match uefi::boot::allocate_pages(
-        uefi::boot::AllocateType::AnyPages,
-        uefi::boot::MemoryType::BOOT_SERVICES_DATA,
-        esp_pages,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            debug_println!(
-                "[LOADER] [WARN] ISO ramdisk: ESP allocate_pages failed: {:?}",
-                e
-            );
-            return;
-        }
-    };
-    let esp_ptr = esp_buf.as_ptr() as *mut u8;
-    unsafe {
-        core::ptr::copy_nonoverlapping(combined_ptr, esp_ptr, ISO_ESP_SIZE);
-    }
-    pd.esp_image_base = esp_ptr as u64;
-    pd.esp_image_size = ISO_ESP_SIZE as u64;
-    pd.esp_block_size = 512;
-    debug_println!(
-        "[LOADER] ISO ramdisk: ESP {} MB @ 0x{:x}",
-        ISO_ESP_SIZE / (1024 * 1024),
-        esp_ptr as u64
-    );
-
-    // 3. Allocate System buffer and copy the next 256 MB.
-    let sys_pages = (ISO_SYS_SIZE + 0xFFF) / 0x1000;
-    let sys_buf = match uefi::boot::allocate_pages(
-        uefi::boot::AllocateType::AnyPages,
-        uefi::boot::MemoryType::BOOT_SERVICES_DATA,
-        sys_pages,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            debug_println!(
-                "[LOADER] [WARN] ISO ramdisk: SYS allocate_pages failed: {:?}",
-                e
-            );
-            return;
-        }
-    };
-    let sys_ptr = sys_buf.as_ptr() as *mut u8;
-    unsafe {
-        core::ptr::copy_nonoverlapping(combined_ptr.add(ISO_ESP_SIZE), sys_ptr, ISO_SYS_SIZE);
-    }
-    pd.sys_image_base = sys_ptr as u64;
-    pd.sys_image_size = ISO_SYS_SIZE as u64;
-    pd.sys_block_size = 512;
-    debug_println!(
-        "[LOADER] ISO ramdisk: SYS {} MB @ 0x{:x}",
-        ISO_SYS_SIZE / (1024 * 1024),
-        sys_ptr as u64
-    );
-
-    // 4. Publish the combined image as `ramdisk_image` so the kernel can
-    //    expose it as the X: drive.
-    let ramdisk_size = core::cmp::min(n, total_combined_size);
-    let ramdisk_pages = (ramdisk_size + 0xFFF) / 0x1000;
-    let ramdisk_buf = match uefi::boot::allocate_pages(
-        uefi::boot::AllocateType::AnyPages,
-        uefi::boot::MemoryType::BOOT_SERVICES_DATA,
-        ramdisk_pages,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            debug_println!(
-                "[LOADER] [WARN] ISO ramdisk: ramdisk allocate_pages failed: {:?}",
-                e
-            );
-            return;
-        }
-    };
-    let ramdisk_ptr = ramdisk_buf.as_ptr() as *mut u8;
-    unsafe {
-        core::ptr::copy_nonoverlapping(combined_ptr, ramdisk_ptr, ramdisk_size);
-    }
-    pd.ramdisk_image_base = ramdisk_ptr as u64;
-    pd.ramdisk_image_size = ramdisk_size as u64;
-    pd.ramdisk_block_size = 512;
-    debug_println!(
-        "[LOADER] ISO ramdisk: combined {} bytes @ 0x{:x} (X: drive)",
-        ramdisk_size,
-        ramdisk_ptr as u64
-    );
 }
 
 /// Vendor GUID for the framebuffer hand-off variable. It must match
@@ -3632,6 +3169,7 @@ fn read_bcd_mailbox_from_config_table() -> Option<[u8; 16]> {
     // as the framebuffer mailbox on non-x86_64 architectures.
     // We scan for a table entry whose payload starts with "BCDE".
     for entry in entries {
+        if entry.vendor_guid != EFI_BCD_MAILBOX_TABLE_GUID { continue; }
         let mailbox = entry.vendor_table as *const u8;
         if mailbox.is_null() {
             continue;
@@ -3665,6 +3203,7 @@ fn read_bcd_boot_options() -> Option<alloc::string::String> {
             core::slice::from_raw_parts(table.configuration_table, table.number_of_table_entries)
         };
         for entry in entries {
+            if entry.vendor_guid != EFI_BCD_MAILBOX_TABLE_GUID { continue; }
             let mailbox = entry.vendor_table as *const u8;
             if mailbox.is_null() {
                 continue;
@@ -3715,23 +3254,7 @@ fn bcd_guid_to_boot_mode(
     guid: &[u8; 16],
     boot_options: Option<&str>,
 ) -> nt61_boot_types::boot_types::BootMode {
-    // Windows 7 safe modes are primarily selected by OsLoadOptions. Honor
-    // those flags before falling back to the NT61 test GUID mapping.
-    if let Some(options) = boot_options {
-        if options.contains("/safeboot:") {
-            return nt61_boot_types::boot_types::BootMode::SafeMode;
-        }
-        if options.contains("/debug") {
-            return nt61_boot_types::boot_types::BootMode::DebugCmd;
-        }
-    }
-    // Match on the first 4 bytes — the well-known GUID prefixes.
-    match &guid[0..4] {
-        [0xB2, 0x72, 0x1D, 0x66] => nt61_boot_types::boot_types::BootMode::Cmd,
-        [0x51, 0x89, 0xB2, 0x5C] => nt61_boot_types::boot_types::BootMode::DebugCmd,
-        [0xA3, 0x4C, 0x8E, 0xD1] => nt61_boot_types::boot_types::BootMode::SafeMode,
-        _ => nt61_boot_types::boot_types::BootMode::Desktop,
-    }
+    nt61_boot_types::boot_options::BootOptions::parse(boot_options.unwrap_or("")).mode(guid)
 }
 
 /// Read the framebuffer hand-off through the UEFI Configuration Table.
@@ -3822,7 +3345,8 @@ fn build_boot_info(kernel_pa: u64, kernel_size: u64) -> BootInfo {
         esp_disk_start: pd.esp_partition_lba,
         esp_disk_sectors: pd.esp_partition_sectors,
         boot_driver_count,
-        _reserved2: 0,
+        boot_flags: 0,
+    boot_driver_records: 0, boot_driver_records_count: 0, _reserved_boot_records: 0,
         esp_image_base: pd.esp_image_base,
         esp_image_size: pd.esp_image_size,
         esp_block_size: pd.esp_block_size,
@@ -3893,6 +3417,7 @@ const HIVE_PATHS: &[(&str, &str)] = &[
     ("Security", r"\Windows\System32\config\SECURITY"),
     ("SAM", r"\Windows\System32\config\SAM"),
     ("Default", r"\Windows\System32\config\DEFAULT"),
+    ("BCD", r"\EFI\Microsoft\Boot\BCD"),
 ];
 
 /// Allocate a single contiguous `BOOT_SERVICES_DATA` region for
@@ -3975,7 +3500,7 @@ fn allocate_hive_region() {
 ///   _pad         : u32        =  4   (offset 36..40)  (aligns ptr to 8)
 ///   ptr          : u64        =  8   (offset 40..48)
 ///   len          : u32        =  4   (offset 48..52)
-///   _reserved    : u32        =  4   (offset 52..56)
+///   reserved    : u32        =  4   (offset 52..56)
 /// ```
 ///
 /// Total = 56 bytes per record. The padding after `name_len` is
@@ -4058,7 +3583,8 @@ fn build_loaded_hive_list() -> (u64, u32) {
             // offset 32) and `ptr` (u64 at offset 40) so the
             // u64 is 8-byte aligned. We mirror that layout
             // here so the offsets line up exactly.
-            let rec_ptr = unsafe { (records_ptr as *mut u8).add(i * RECORD_STRUCT_BYTES) };
+            // Missing hives must not leave holes in the published record list.
+            let rec_ptr = unsafe { (records_ptr as *mut u8).add(count * RECORD_STRUCT_BYTES) };
             debug_println!(
                 "  [HIVE] slot {} rec_ptr=0x{:x} slot_base=0x{:x}",
                 i,
@@ -4167,10 +3693,10 @@ fn gop_panel_init() {
         });
         uefi::println!("[WINLOAD] gop fill done");
         let mode = gop.current_mode_info();
-        let (_w, _h) = mode.resolution();
+        let (_w, h) = mode.resolution();
         gop_display::draw_text_centered_global(
             "Windows is loading...",
-            (_h as u32) / 2 - 16,
+            (h as u32) / 2 - 16,
             0xFF,
             0xFF,
             0xFF,
@@ -4189,10 +3715,17 @@ fn mark_winload_phase(phase: u32) {
 }
 
 /// OS Loader main — marked #[inline(never)] to prevent LTO from optimizing away the call.
+static BOOT_FLAGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+fn active_boot_options() -> nt61_boot_types::boot_options::BootOptions {
+    nt61_boot_types::boot_options::BootOptions(BOOT_FLAGS.load(core::sync::atomic::Ordering::Relaxed))
+}
+
 #[inline(never)]
 fn os_loader_run() -> ! {
     uefi::println!("[WINLOAD] os_loader_run pre-header");
     boot_loader_header!();
+    let options = nt61_boot_types::boot_options::BootOptions::parse(read_bcd_boot_options().as_deref().unwrap_or(""));
+    BOOT_FLAGS.store(options.0, core::sync::atomic::Ordering::Relaxed);
     gop_panel_init();
     uefi::println!("[WINLOAD] os_loader_run entered");
 
@@ -4244,12 +3777,8 @@ fn os_loader_run() -> ! {
     // and is exactly what the FAT32 / NTFS drivers in
     // `fs::init()` expect to find populated in `BootInfo`.
     //
-    // On ISO boot, the same two buffers come from
-    // `capture_iso_ramdisk()` instead, which slices the combined
-    // `nt61.img` FAT32 image into ESP / System halves. The capture
-    // helpers are safe to call on every boot — when the underlying
-    // handle is missing (e.g. disk-less QEMU for capture_iso_ramdisk)
-    // they log a WARN and return without populating their fields.
+    // Optical boot uses the FAT El Torito volume for both EFI and Windows;
+    // capture_system_partition reuses its snapshot as the system RAM disk.
     //
     // Each capture helper prints its own progress line so the
     // bring-up log shows exactly how far the loader got before
@@ -4273,14 +3802,6 @@ fn os_loader_run() -> ! {
         "[LOADER] capture: SYS done (sys_image_base=0x{:x}, size={})",
         unsafe { (*core::ptr::addr_of!(PERSISTENT)).sys_image_base },
         unsafe { (*core::ptr::addr_of!(PERSISTENT)).sys_image_size }
-    );
-    uefi::println!("[WINLOAD] capture ISO begin");
-    capture_iso_ramdisk();
-    uefi::println!("[WINLOAD] capture ISO end");
-    debug_println!(
-        "[LOADER] capture: ISO done (ramdisk_image_base=0x{:x}, size={})",
-        unsafe { (*core::ptr::addr_of!(PERSISTENT)).ramdisk_image_base },
-        unsafe { (*core::ptr::addr_of!(PERSISTENT)).ramdisk_image_size }
     );
 
     // Phase 1/2/3 are scaffolded by helpers below (collect_memory_map,
@@ -4350,7 +3871,8 @@ fn os_loader_run() -> ! {
     // because they live in the kernel-maintained struct rather than
     // `PERSISTENT`. We restore them right after the assignment so the
     // GPU mailbox survives the copy.
-    let bi_value = build_boot_info(0, 0);
+    let (winload_image_base, winload_image_size) = winload_image_range().unwrap_or((0, 0));
+    let bi_value = build_boot_info(winload_image_base, winload_image_size);
     let bootvid_capture: (u64, u64) = unsafe {
         let pd = &*core::ptr::addr_of!(PERSISTENT);
         let last = MAX_BOOT_DRIVERS - 1;
@@ -4376,6 +3898,8 @@ fn os_loader_run() -> ! {
         };
         debug_println!("[LOAD] boot mode from BCD mailbox: {:?}", selected_mode);
         bi.boot_mode = selected_mode as u32;
+        bi.boot_flags = active_boot_options().0;
+        uefi::println!("[BOOT-POLICY] mode={} flags=0x{:x}", bi.boot_mode, bi.boot_flags);
 
         // Re-apply the framebuffer mailbox captured above. This must
         // come *after* `*bi = bi_value` or those fields would have
@@ -4417,7 +3941,10 @@ fn os_loader_run() -> ! {
     let (hive_ptr, hive_count) = build_loaded_hive_list();
     unsafe {
         let bi = &mut *core::ptr::addr_of_mut!(KERNEL_BOOT_INFO);
-        bi.boot_driver_count = MAX_BOOT_DRIVERS as u32;
+        let pd = &*core::ptr::addr_of!(PERSISTENT);
+        bi.boot_driver_count = pd.boot_drivers.iter().filter(|r| r.loaded).count() as u32;
+        bi.boot_driver_records = pd.boot_drivers.as_ptr() as u64;
+        bi.boot_driver_records_count = MAX_BOOT_DRIVERS as u32;
         bi.hive_count = hive_count;
         bi.hives = hive_ptr;
     }
@@ -4680,6 +4207,20 @@ fn os_loader_run() -> ! {
         }
     }
 
+    // The persistent array now contains the final map, including allocations
+    // made while loading drivers and building the handoff. BootInfo was copied
+    // before that refresh: publish the matching count and compact stride too,
+    // otherwise the kernel sees only a prefix and can miss most usable RAM.
+    unsafe {
+        let pd = &*core::ptr::addr_of!(PERSISTENT);
+        let boot_info = &mut *(bi_ptr as *mut BootInfo);
+        boot_info.memory_map = pd.memory_map.as_ptr() as u64;
+        boot_info.memory_map_entries = pd.memory_map_count as u64;
+        boot_info.memory_descriptor_size = core::mem::size_of::<MemoryMapEntry>() as u32;
+        boot_info.memory_map_size_bytes =
+            (pd.memory_map_count * core::mem::size_of::<MemoryMapEntry>()) as u64;
+    }
+
     // =====================================================================
     // Phase L11 — jmp ntoskrnl!KiSystemStartup
     // =====================================================================
@@ -4826,6 +4367,39 @@ fn chain_loaded_device_handle() -> Option<uefi::Handle> {
     device
 }
 
+/// Return the runtime base and size of the relocated `winload.efi` PE image.
+///
+/// This is the image that actually contains the executing kernel on AArch64.
+/// Process roots need these exact bounds after switching TTBRs; using the
+/// separate on-disk `ntoskrnl.exe` buffer leaves the live kernel unmapped.
+fn winload_image_range() -> Option<(u64, u64)> {
+    let raw = unsafe { WINLOAD_IMAGE_HANDLE };
+    if raw == 0 {
+        return None;
+    }
+    let image = unsafe { uefi::Handle::from_ptr(raw as *mut core::ffi::c_void)? };
+    use uefi::boot::OpenProtocolAttributes;
+    use uefi::boot::OpenProtocolParams;
+    use uefi::proto::loaded_image::LoadedImage;
+    let loaded = unsafe {
+        uefi::boot::open_protocol::<LoadedImage>(
+            OpenProtocolParams {
+                handle: image,
+                agent: image,
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .ok()?;
+    let (base, size) = loaded.get().map(|img| img.info())?;
+    drop(loaded);
+    if base as u64 == 0 || size == 0 {
+        return None;
+    }
+    Some((base as u64, size))
+}
+
 /// True when `handle` exposes the SimpleFileSystem protocol.
 fn device_has_simple_filesystem(handle: uefi::Handle) -> bool {
     use uefi::boot::OpenProtocolAttributes;
@@ -4852,20 +4426,20 @@ fn device_has_simple_filesystem(handle: uefi::Handle) -> bool {
 
 #[link_section = ".text.efi_main"]
 #[no_mangle]
-extern "efiapi" fn efi_main(_image: uefi::Handle, _st: *const core::ffi::c_void) -> uefi::Status {
+extern "efiapi" fn efi_main(image: uefi::Handle, st: *const core::ffi::c_void) -> uefi::Status {
     crate::arch::current::write_com1_marker(b"[WINLOAD] entered\r\n");
 
     // Capture the firmware image handle for LoadedImage-based device
     // discovery before anything else touches it.
     unsafe {
-        WINLOAD_IMAGE_HANDLE = _image.as_ptr() as u64;
+        WINLOAD_IMAGE_HANDLE = image.as_ptr() as u64;
     }
 
     // Set up UEFI globals — this MUST be done before calling any uefi crate functions.
     // SAFETY: image_handle and system_table are valid per UEFI calling convention.
     unsafe {
-        uefi::boot::set_image_handle(_image);
-        uefi::table::set_system_table(_st.cast());
+        uefi::boot::set_image_handle(image);
+        uefi::table::set_system_table(st.cast());
     }
 
     arch::current::write_debug_marker(b"WINL>\r\n");

@@ -181,7 +181,12 @@ pub fn verify_image(path: &str, image: &[u8]) -> Result<(), &'static str> {
         }
     }
 
-    if let Some(sig) = read_sidecar(path, ".sig") {
+    let driver = path.to_ascii_lowercase().ends_with(".sys");
+    let skip_signature = driver && crate::active_boot_options().has(nt61_boot_types::boot_options::BootOptions::NO_SIGNATURE);
+    if skip_signature {
+        debug_println!("[VERIFY] {} driver RSA signature enforcement disabled for this boot", path);
+    }
+    if let Some(sig) = if skip_signature { None } else { read_sidecar(path, ".sig") } {
         match load_trust_anchor() {
             Some(anchor) => {
                 if !anchor.key.verify_pkcs1v15(&digest, &sig) {
