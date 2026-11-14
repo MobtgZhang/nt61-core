@@ -102,7 +102,6 @@ pub unsafe fn dispatch_service(service_number: ULONG32, args: *const u32) -> ULO
         service_numbers::NT_QUEUE_APC_THREAD => nt_queue_apc_thread_thunk(args),
 
         service_numbers::NT_RAISE_EXCEPTION => nt_raise_exception_thunk(args),
-        service_numbers::NT_DISPATCH_EXCEPTION => nt_dispatch_exception_thunk(args),
 
         _ => {
             crate::wow64_klog!("Unhandled service 0x{:03x}", service_number);
@@ -887,7 +886,6 @@ fn register_service_thunks() {
     ssd_mod::update_service_handler(svc::NT_QUEUE_APC_THREAD, nt_queue_apc_thread_thunk);
 
     ssd_mod::update_service_handler(svc::NT_RAISE_EXCEPTION, nt_raise_exception_thunk);
-    ssd_mod::update_service_handler(svc::NT_DISPATCH_EXCEPTION, nt_dispatch_exception_thunk);
 
     crate::wow64_klog!("Service thunks registered");
 }

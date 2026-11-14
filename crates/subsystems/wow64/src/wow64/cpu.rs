@@ -440,20 +440,15 @@ pub fn emulate_far_call(
         return Err(CpuError::InvalidSegmentSelector);
     }
 
-    // Push old EIP first, then old CS.  The resulting stack layout is
-    // [ESP]=CS, [ESP+4]=EIP, matching an x86 far-call return frame.
-    let esp = cpu_state.context32.esp;
-    if crate::mm::user_copy::write_user_object(esp.wrapping_sub(4) as u64, &cpu_state.context32.eip)
-        .is_err()
-    {
-        return Err(CpuError::ProtectionFault);
-    }
-    if crate::mm::user_copy::write_user_object(esp.wrapping_sub(8) as u64, &cpu_state.context32.cs)
-        .is_err()
-    {
-        return Err(CpuError::ProtectionFault);
-    }
-    cpu_state.context32.esp = esp.wrapping_sub(8);
+    // A far return pops EIP followed by a four-byte CS slot.
+    // Publish the whole frame through one checked user copy before changing ESP.
+    let esp = cpu_state.context32.esp.checked_sub(8).ok_or(CpuError::ProtectionFault)?;
+    let mut frame = [0u8; 8];
+    frame[..4].copy_from_slice(&cpu_state.context32.eip.to_le_bytes());
+    frame[4..].copy_from_slice(&cpu_state.context32.cs.to_le_bytes());
+    crate::mm::user_copy::copy_to_user(esp as u64, &frame)
+        .map_err(|_| CpuError::ProtectionFault)?;
+    cpu_state.context32.esp = esp;
 
     // Update CS and EIP
     cpu_state.context32.cs = target_cs as u32;

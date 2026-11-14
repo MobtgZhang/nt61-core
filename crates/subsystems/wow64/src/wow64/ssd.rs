@@ -20,7 +20,7 @@ use crate::libs::wow64::types::*;
 // returned from `extern "C"` thunks whose ABI is unsigned 32-bit
 // (`ULONG32` / `NTSTATUS32`).
 pub const STATUS_SUCCESS_32: ULONG32 = 0x00000000;
-const STATUS_INVALID_SYSTEM_SERVICE_32: ULONG32 = 0xC000001C;
+const STATUS_INVALID_SYSTEM_SERVICE_32: ULONG32 = 0xC000000C;
 const STATUS_INVALID_PARAMETER_32: ULONG32 = 0xC000000D;
 pub const STATUS_NO_MEMORY_32: ULONG32 = 0xC0000017;
 pub const STATUS_INVALID_HANDLE_32: ULONG32 = 0xC0000008;
@@ -32,90 +32,86 @@ pub const STATUS_ACCESS_DENIED_32: ULONG32 = 0xC0000022;
 // =============================================================================
 
 /// System service numbers used by 32-bit ntdll.dll.
-/// These are the Wow64 service table indices.
+/// Windows 7 SP1 x86 indices, verified against j00ru/windows-syscalls.
+/// Kernel-internal service IDs and x64 indices must never be used here.
 pub mod service_numbers {
     use super::ULONG32;
 
     // Memory Management Services
-    pub const NT_ALLOCATE_VIRTUAL_MEMORY: ULONG32 = 0x0011;
-    pub const NT_FREE_VIRTUAL_MEMORY: ULONG32 = 0x0012;
-    pub const NT_QUERY_VIRTUAL_MEMORY: ULONG32 = 0x0023;
-    pub const NT_PROTECT_VIRTUAL_MEMORY: ULONG32 = 0x0047;
-    pub const NT_READ_PROCESS_MEMORY: ULONG32 = 0x0050;
-    pub const NT_WRITE_PROCESS_MEMORY: ULONG32 = 0x0051;
-    pub const NT_QUERY_SECURITY_DOMAIN: ULONG32 = 0x0053;
+    pub const NT_ALLOCATE_VIRTUAL_MEMORY: ULONG32 = 0x0013;
+    pub const NT_FREE_VIRTUAL_MEMORY: ULONG32 = 0x0083;
+    pub const NT_QUERY_VIRTUAL_MEMORY: ULONG32 = 0x010B;
+    pub const NT_PROTECT_VIRTUAL_MEMORY: ULONG32 = 0x00D7;
+    pub const NT_READ_PROCESS_MEMORY: ULONG32 = 0x0115;
+    pub const NT_WRITE_PROCESS_MEMORY: ULONG32 = 0x018F;
 
     // Process Services
-    pub const NT_CREATE_PROCESS: ULONG32 = 0x0030;
-    pub const NT_OPEN_PROCESS: ULONG32 = 0x0024;
-    pub const NT_TERMINATE_PROCESS: ULONG32 = 0x0029;
-    pub const NT_QUERY_INFORMATION_PROCESS: ULONG32 = 0x0019;
-    pub const NT_SET_INFORMATION_PROCESS: ULONG32 = 0x0015;
-    pub const NT_QUERY_DEFAULT_LOCALE: ULONG32 = 0x1005;
+    pub const NT_CREATE_PROCESS: ULONG32 = 0x004F;
+    pub const NT_OPEN_PROCESS: ULONG32 = 0x00BE;
+    pub const NT_TERMINATE_PROCESS: ULONG32 = 0x0172;
+    pub const NT_QUERY_INFORMATION_PROCESS: ULONG32 = 0x00EA;
+    pub const NT_SET_INFORMATION_PROCESS: ULONG32 = 0x014D;
+    pub const NT_QUERY_DEFAULT_LOCALE: ULONG32 = 0x00DD;
 
     // Thread Services
-    pub const NT_CREATE_THREAD: ULONG32 = 0x0031;
-    pub const NT_OPEN_THREAD: ULONG32 = 0x003F;
-    pub const NT_TERMINATE_THREAD: ULONG32 = 0x002D;
-    pub const NT_GET_CONTEXT_THREAD: ULONG32 = 0x0013;
-    pub const NT_SET_CONTEXT_THREAD: ULONG32 = 0x0014;
-    pub const NT_QUERY_INFORMATION_THREAD: ULONG32 = 0x0026;
-    pub const NT_SET_INFORMATION_THREAD: ULONG32 = 0x0010;
-    pub const NT_SUSPEND_THREAD: ULONG32 = 0x0041;
-    pub const NT_RESUME_THREAD: ULONG32 = 0x0042;
-    pub const NT_QUEUE_APC_THREAD: ULONG32 = 0x001C;
+    pub const NT_CREATE_THREAD: ULONG32 = 0x0057;
+    pub const NT_OPEN_THREAD: ULONG32 = 0x00C6;
+    pub const NT_TERMINATE_THREAD: ULONG32 = 0x0173;
+    pub const NT_GET_CONTEXT_THREAD: ULONG32 = 0x0087;
+    pub const NT_SET_CONTEXT_THREAD: ULONG32 = 0x013C;
+    pub const NT_QUERY_INFORMATION_THREAD: ULONG32 = 0x00EC;
+    pub const NT_SET_INFORMATION_THREAD: ULONG32 = 0x014F;
+    pub const NT_SUSPEND_THREAD: ULONG32 = 0x016F;
+    pub const NT_RESUME_THREAD: ULONG32 = 0x0130;
+    pub const NT_QUEUE_APC_THREAD: ULONG32 = 0x010D;
 
     // Object Services
-    pub const NT_OPEN_PROCESS_TOKEN: ULONG32 = 0x003A;
-    pub const NT_OPEN_THREAD_TOKEN: ULONG32 = 0x003B;
-    pub const NT_DUPLICATE_OBJECT: ULONG32 = 0x002A;
-    pub const NT_CLOSE: ULONG32 = 0x0030;
-    pub const NT_QUERY_OBJECT: ULONG32 = 0x0018;
+    pub const NT_OPEN_PROCESS_TOKEN: ULONG32 = 0x00BF;
+    pub const NT_OPEN_THREAD_TOKEN: ULONG32 = 0x00C7;
+    pub const NT_DUPLICATE_OBJECT: ULONG32 = 0x006F;
+    pub const NT_CLOSE: ULONG32 = 0x0032;
+    pub const NT_QUERY_OBJECT: ULONG32 = 0x00F8;
 
     // Section/Memory Object Services
-    pub const NT_CREATE_SECTION: ULONG32 = 0x0038;
-    pub const NT_MAP_VIEW_OF_SECTION: ULONG32 = 0x002E;
-    pub const NT_UNMAP_VIEW_OF_SECTION: ULONG32 = 0x002F;
-    pub const NT_SHARE_OBJECT: ULONG32 = 0x003D;
+    pub const NT_CREATE_SECTION: ULONG32 = 0x0054;
+    pub const NT_MAP_VIEW_OF_SECTION: ULONG32 = 0x00A8;
+    pub const NT_UNMAP_VIEW_OF_SECTION: ULONG32 = 0x0181;
 
     // Synchronization
-    pub const NT_WAIT_FOR_SINGLE_OBJECT: ULONG32 = 0x0024;
-    pub const NT_SET_EVENT: ULONG32 = 0x0025;
-    pub const NT_CLEAR_EVENT: ULONG32 = 0x0026;
-    pub const NT_CREATE_MUTANT: ULONG32 = 0x0027;
-    pub const NT_RELEASE_MUTANT: ULONG32 = 0x0028;
+    pub const NT_WAIT_FOR_SINGLE_OBJECT: ULONG32 = 0x0187;
+    pub const NT_SET_EVENT: ULONG32 = 0x0143;
+    pub const NT_CLEAR_EVENT: ULONG32 = 0x0031;
+    pub const NT_CREATE_MUTANT: ULONG32 = 0x004A;
+    pub const NT_RELEASE_MUTANT: ULONG32 = 0x011C;
 
     // Time Services
-    pub const NT_QUERY_SYSTEM_TIME: ULONG32 = 0x0037;
-    pub const NT_SET_SYSTEM_TIME: ULONG32 = 0x0038;
-    pub const NT_QUERY_PERFORMANCE_COUNTER: ULONG32 = 0x0040;
+    pub const NT_QUERY_SYSTEM_TIME: ULONG32 = 0x0107;
+    pub const NT_SET_SYSTEM_TIME: ULONG32 = 0x0160;
+    pub const NT_QUERY_PERFORMANCE_COUNTER: ULONG32 = 0x00FB;
 
     // Exception/APC Services
-    pub const NT_RAISE_EXCEPTION: ULONG32 = 0x004D;
-    pub const NT_DISPATCH_EXCEPTION: ULONG32 = 0x004E;
-    pub const NT_ADD_VECTORED_EXCEPTION_HANDLER: ULONG32 = 0x004B;
+    pub const NT_RAISE_EXCEPTION: ULONG32 = 0x010F;
 
     // Debug Services
-    pub const NT_DEBUG_ACTIVE_PROCESS: ULONG32 = 0x0038;
-    pub const NT_DEBUG_PROCESS: ULONG32 = 0x0039;
-    pub const NT_REMOVE_PROCESS_DEBUG: ULONG32 = 0x003A;
+    pub const NT_DEBUG_ACTIVE_PROCESS: ULONG32 = 0x0060;
+    pub const NT_REMOVE_PROCESS_DEBUG: ULONG32 = 0x0121;
 
     // Info Services
-    pub const NT_QUERY_INFORMATION_FILE: ULONG32 = 0x0020;
-    pub const NT_SET_INFORMATION_FILE: ULONG32 = 0x0021;
-    pub const NT_FLUSH_BUFFERS_FILE: ULONG32 = 0x0022;
+    pub const NT_QUERY_INFORMATION_FILE: ULONG32 = 0x00E7;
+    pub const NT_SET_INFORMATION_FILE: ULONG32 = 0x0149;
+    pub const NT_FLUSH_BUFFERS_FILE: ULONG32 = 0x007B;
 
     // ALPC Services
-    pub const NT_CREATE_PORT: ULONG32 = 0x005A;
-    pub const NT_CONNECT_PORT: ULONG32 = 0x005B;
+    pub const NT_CREATE_PORT: ULONG32 = 0x004D;
+    pub const NT_CONNECT_PORT: ULONG32 = 0x003B;
 
     // Registry Services
-    pub const NT_OPEN_KEY: ULONG32 = 0x0035;
-    pub const NT_QUERY_KEY: ULONG32 = 0x0036;
-    pub const NT_ENUMERATE_KEY: ULONG32 = 0x0037;
-    pub const NT_SET_VALUE_KEY: ULONG32 = 0x0038;
-    pub const NT_QUERY_VALUE_KEY: ULONG32 = 0x0039;
-    pub const NT_DELETE_KEY: ULONG32 = 0x003A;
+    pub const NT_OPEN_KEY: ULONG32 = 0x00B6;
+    pub const NT_QUERY_KEY: ULONG32 = 0x00F4;
+    pub const NT_ENUMERATE_KEY: ULONG32 = 0x0074;
+    pub const NT_SET_VALUE_KEY: ULONG32 = 0x0166;
+    pub const NT_QUERY_VALUE_KEY: ULONG32 = 0x010A;
+    pub const NT_DELETE_KEY: ULONG32 = 0x0067;
 
     // Maximum service number in the base table
     pub const MAX_BASE_SERVICE: ULONG32 = 0x0FFF;
@@ -276,6 +272,7 @@ pub unsafe fn get_argument_32(args: *const u32, index: u32, size: u32) -> u64 {
 
 /// Get argument size from the service table entry.
 pub fn get_argument_size(service_number: ULONG32) -> u8 {
+    if service_number > 0x1fff { return 0; }
     let table_idx = get_table_index(service_number);
     let svc_idx = get_service_index(service_number) as usize;
 
@@ -307,6 +304,7 @@ const SHADOW_SERVICE_TABLE_SIZE: usize = 2048;
 /// * `Some(handler)` on success
 /// * `None` if service not found
 pub fn lookup_service(service_number: ULONG32) -> Option<ServiceHandler> {
+    if service_number > 0x1fff { return None; }
     let table_idx = get_table_index(service_number);
     let svc_idx = get_service_index(service_number);
 
@@ -441,11 +439,6 @@ pub fn init_service_table() {
         stub_handler,
         16, // 4 args * 4 bytes
     );
-    register_base_service(
-        service_numbers::NT_DISPATCH_EXCEPTION,
-        stub_handler,
-        12, // 3 args * 4 bytes
-    );
 }
 
 /// Register a base (ntdll) service.
@@ -473,12 +466,20 @@ fn register_shadow_service(service_number: ULONG32, handler: ServiceHandler, arg
 /// This allows external modules (like syscall_thunk) to replace
 /// stub handlers with real implementations after init.
 pub fn update_service_handler(service_number: ULONG32, handler: ServiceHandler) {
-    register_base_service(service_number, handler, 0);
+    let idx = get_service_index(service_number) as usize;
+    if get_table_index(service_number) == 0 && service_number <= 0x0fff && idx < BASE_SERVICE_TABLE_SIZE {
+        // SAFETY: service handlers are installed during serial subsystem init.
+        unsafe { BASE_SERVICE_TABLE[idx].handler = Some(handler); }
+    }
 }
 
 /// Update an existing shadow service handler.
 pub fn update_shadow_service_handler(service_number: ULONG32, handler: ServiceHandler) {
-    register_shadow_service(service_number, handler, 0);
+    let idx = get_service_index(service_number) as usize;
+    if service_number <= 0x1fff && is_shadow_service(service_number) && idx < SHADOW_SERVICE_TABLE_SIZE {
+        // SAFETY: service handlers are installed during serial subsystem init.
+        unsafe { SHADOW_SERVICE_TABLE[idx].handler = Some(handler); }
+    }
 }
 
 /// # Safety

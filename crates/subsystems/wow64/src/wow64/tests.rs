@@ -234,9 +234,8 @@ fn test_object_attributes_conversion() {
     let oa32_ptr = 0x0012_FF00;
     let oa64 = convert_object_attributes_32_to_64(oa32_ptr);
 
-    assert!(oa64.is_some());
-    let oa = oa64.unwrap();
-    assert_eq!(oa.length, 0x18);
+    // An unmapped address cannot produce fabricated object attributes.
+    assert!(oa64.is_none());
 }
 
 // =============================================================================
@@ -320,7 +319,7 @@ fn test_complete_wow64_flow() {
 // =============================================================================
 //
 // These exercise the dispatch_nt_allocate_virtual_memory / _free /
-// _read / _write entry points (defined in `syscall.rs`) with real
+// read / _write entry points (defined in `syscall.rs`) with real
 // 32-bit argument shapes. The current implementations return
 // STATUS_NOT_IMPLEMENTED — the tests therefore check that the
 // input validation runs *before* the not-implemented bail-out, and

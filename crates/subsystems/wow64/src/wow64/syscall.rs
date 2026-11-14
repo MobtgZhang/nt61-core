@@ -155,6 +155,8 @@ pub fn convert_client_id_32_to_64(cid32: &ClientId32) -> (u64, u64) {
 }
 
 /// Convert OBJECT_ATTRIBUTES32 to 64-bit representation.
+/// Nested addresses remain guest addresses, not native structure pointers.
+#[repr(C)]
 pub struct ObjectAttributes64 {
     pub length: u32,
     pub root_directory: u64,
@@ -165,24 +167,18 @@ pub struct ObjectAttributes64 {
 }
 
 pub fn convert_object_attributes_32_to_64(oa32_ptr: ULONG32) -> Option<ObjectAttributes64> {
-    if oa32_ptr == 0 {
+    if oa32_ptr == 0 || !validate_wow64_pointer(oa32_ptr) {
         return None;
     }
-
-    // In a real implementation, we would:
-    // 1. Validate the pointer
-    // 2. read the 32-bit structure from user space
-    // 3. Convert each field
-    // 4. handle the nested UnicodeString pointer
-
-    // For now, return a placeholder
+    let fields = crate::mm::user_copy::read_user_object::<[u32; 6]>(oa32_ptr as u64).ok()?;
+    if fields[0] != 24 { return None; }
     Some(ObjectAttributes64 {
-        length: 0x18,
-        root_directory: 0,
-        object_name: 0,
-        attributes: 0,
-        security_descriptor: 0,
-        security_quality_of_service: 0,
+        length: 48,
+        root_directory: convert_handle_32_to_64(fields[1]),
+        object_name: fields[2] as u64,
+        attributes: fields[3],
+        security_descriptor: fields[4] as u64,
+        security_quality_of_service: fields[5] as u64,
     })
 }
 
@@ -201,22 +197,21 @@ pub fn convert_memory_basic_info_64_to_32(
 
     // Convert 64-bit structure to 32-bit
     let mbi32 = MemoryBasicInformation32 {
-        base_address: (mbi64.base_address & 0xFFFF_FFFF) as u32,
-        allocation_base: (mbi64.allocation_base & 0xFFFF_FFFF) as u32,
+        base_address: match u32::try_from(mbi64.base_address) { Ok(v) => v, Err(_) => return false },
+        allocation_base: match u32::try_from(mbi64.allocation_base) { Ok(v) => v, Err(_) => return false },
         allocation_protect: mbi64.allocation_protect,
-        region_size: (mbi64.region_size & 0xFFFF_FFFF) as u32,
+        region_size: match u32::try_from(mbi64.region_size) { Ok(v) => v, Err(_) => return false },
         state: mbi64.state,
         protect: mbi64.protect,
         type_: mbi64.type_,
     };
 
-    // In a real implementation, write to user space
-    let _ = mbi32;
-    true
+    crate::mm::user_copy::write_user_object(mbi32_ptr as u64, &mbi32).is_ok()
 }
 
 /// MEMORY_BASIC_INFORMATION32 structure.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct MemoryBasicInformation32 {
     pub base_address: u32,
     pub allocation_base: u32,

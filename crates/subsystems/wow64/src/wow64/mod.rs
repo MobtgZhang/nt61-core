@@ -1,11 +1,9 @@
-//! wow64 — Windows-on-Windows 64 stub
-//
-//! WoW64 is the emulation layer that lets 32-bit programs run
-//! on a 64-bit kernel. This kernel is x64 only and never
-//! hosts 32-bit user-mode code, so the WoW64 DLL is a thin
-//! stub whose only purpose is to advertise the WoW64 API
-//! surface and verify the loader can find it.
-//
+//! WOW64 ABI conversion and x86 process-environment support.
+//!
+//! Native x86 compatibility-mode execution and portable instruction emulation
+//! are separate backends. These modules do not imply complete Win32 support;
+//! non-x86 guests use the checked common BTL service boundary.
+//!
 //! References:
 //!   * MSDN Library "Windows 7" — wow64.dll
 //!   * geoffchappell.com — WoW64 architecture
@@ -42,13 +40,12 @@ pub mod thunk;
 pub mod types;
 pub mod wow64vas;
 
-/// WoW64 service table. The stub uses this to verify the
-/// service dispatch table is reachable.
+/// WoW64 service export discovery table.
 pub static WOW64_SERVICES: Spinlock<Vec<(&'static str, u64)>> = Spinlock::new(Vec::new());
 
-/// Initialise the wow64 stub.
+/// Initialise the WOW64 ABI modules.
 pub fn init() {
-    crate::wow64_klog!("init (stubbed)");
+    crate::wow64_klog!("init ABI modules");
     // Defer to the per-subsystem init so that the SSD and
     // thunk layers also get a chance to publish themselves.
     ssd::init_service_table();
