@@ -6,12 +6,17 @@
 use crate::hal::common::pci;
 use crate::mm::pool::{self, PoolType};
 use core::sync::atomic::{
-    AtomicBool, AtomicI16, AtomicPtr, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering,
+    AtomicBool, AtomicI16, AtomicI32, AtomicPtr, AtomicU16, AtomicU32, AtomicU8, AtomicUsize,
+    Ordering,
 };
+
+#[path = "pointer_queue.rs"]
+mod pointer_queue;
 
 const VENDOR_VIRTIO: u16 = 0x1AF4;
 const DEVICE_INPUT_MODERN: u16 = 0x1040 + 18;
 const DEVICE_INPUT_LEGACY: u16 = 0x1000 + 18;
+const MOUSE_ABS_RANGE: i32 = 0x7FFF;
 
 // Modern virtio-pci common-configuration offsets
 // (VirtIO 1.x spec, "Common configuration structure layout";
@@ -70,6 +75,7 @@ const CAP_DEVICE_CFG: u8 = 4;
 const DESC_F_WRITE: u16 = 2;
 const EVENT_TYPE_KEY: u16 = 1;
 const EVENT_TYPE_REL: u16 = 2;
+const EVENT_TYPE_ABS: u16 = 3;
 const KEY_VALUE_RELEASE: i32 = 0;
 const INPUT_CFG_ID_NAME: u8 = 0x01;
 const BTN_LEFT: u16 = 0x110;
@@ -145,6 +151,7 @@ struct Device {
 enum InputDeviceKind {
     Keyboard,
     Mouse,
+    AbsoluteMouse,
 }
 
 impl Queue {
@@ -235,6 +242,19 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
     let event_type = u16::from_le_bytes([event[0], event[1]]);
     let code = u16::from_le_bytes([event[2], event[3]]);
     let value = i32::from_le_bytes([event[4], event[5], event[6], event[7]]);
+    // EV_SYN / SYN_REPORT closes one atomic pointer report. Reading only the
+    // final device state after draining the ring loses a complete click when
+    // both button edges arrived during a software-rendered frame.
+    if event_type == 0 && code == 0 {
+        let events = MOUSE_EVENTS.load(Ordering::Acquire);
+        if events != MOUSE_QUEUED_EVENTS.load(Ordering::Relaxed) {
+            let (x, y, buttons) = get_mouse_state();
+            if MOUSE_REPORTS.push(x, y, buttons) {
+                MOUSE_QUEUED_EVENTS.store(events, Ordering::Relaxed);
+            }
+        }
+        return;
+    }
     if event_type == EVENT_TYPE_REL {
         MOUSE_EVENTS.fetch_add(1, Ordering::AcqRel);
         let delta = i16::try_from(value).unwrap_or(0);
@@ -244,6 +264,18 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         } else if code == 1 {
             let y = MOUSE_Y.load(Ordering::Relaxed);
             MOUSE_Y.store(y.saturating_add(delta).max(0), Ordering::Relaxed);
+        }
+        return;
+    }
+    if event_type == EVENT_TYPE_ABS {
+        if code == 0 {
+            MOUSE_ABS_X.store(value, Ordering::Relaxed);
+            MOUSE_ABSOLUTE.store(true, Ordering::Release);
+            MOUSE_EVENTS.fetch_add(1, Ordering::AcqRel);
+        } else if code == 1 {
+            MOUSE_ABS_Y.store(value, Ordering::Relaxed);
+            MOUSE_ABSOLUTE.store(true, Ordering::Release);
+            MOUSE_EVENTS.fetch_add(1, Ordering::AcqRel);
         }
         return;
     }
@@ -259,6 +291,13 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         } else if value != 0 {
             MOUSE_BUTTONS.store(buttons | bit, Ordering::Relaxed);
         }
+        return;
+    }
+    // Control keys produce ASCII control bytes for the shared desktop ABI.
+    if code == 29 || code == 97 {
+        let bit = if code == 29 { 1 } else { 2 };
+        if value == KEY_VALUE_RELEASE { CONTROL_KEYS.fetch_and(!bit, Ordering::Relaxed); }
+        else { CONTROL_KEYS.fetch_or(bit, Ordering::Relaxed); }
         return;
     }
     // Shift releases must clear the modifier state; every other
@@ -292,13 +331,26 @@ pub fn set_mouse_screen_bounds(width: u32, height: u32) {
 }
 
 pub fn get_mouse_state() -> (i16, i16, u8) {
-    let x = MOUSE_X
-        .load(Ordering::Relaxed)
-        .min(MOUSE_SCREEN_WIDTH.load(Ordering::Relaxed));
-    let y = MOUSE_Y
-        .load(Ordering::Relaxed)
-        .min(MOUSE_SCREEN_HEIGHT.load(Ordering::Relaxed));
-    (x, y, MOUSE_BUTTONS.load(Ordering::Relaxed))
+    if MOUSE_ABSOLUTE.load(Ordering::Acquire) {
+        let x = (MOUSE_ABS_X.load(Ordering::Relaxed).max(0)
+            * i32::from(MOUSE_SCREEN_WIDTH.load(Ordering::Relaxed))
+            / MOUSE_ABS_RANGE)
+            .clamp(0, i32::from(MOUSE_SCREEN_WIDTH.load(Ordering::Relaxed))) as i16;
+        let y = (MOUSE_ABS_Y.load(Ordering::Relaxed).max(0)
+            * i32::from(MOUSE_SCREEN_HEIGHT.load(Ordering::Relaxed))
+            / MOUSE_ABS_RANGE)
+            .clamp(0, i32::from(MOUSE_SCREEN_HEIGHT.load(Ordering::Relaxed)))
+            as i16;
+        (x, y, MOUSE_BUTTONS.load(Ordering::Relaxed))
+    } else {
+        let x = MOUSE_X
+            .load(Ordering::Relaxed)
+            .min(MOUSE_SCREEN_WIDTH.load(Ordering::Relaxed));
+        let y = MOUSE_Y
+            .load(Ordering::Relaxed)
+            .min(MOUSE_SCREEN_HEIGHT.load(Ordering::Relaxed));
+        (x, y, MOUSE_BUTTONS.load(Ordering::Relaxed))
+    }
 }
 
 /// Report whether the pointer changed since the previous desktop poll.
@@ -309,23 +361,41 @@ pub fn has_mouse_update() -> bool {
     events != polled
 }
 
+pub fn pop_mouse_report() -> Option<(i16, i16, u8)> {
+    MOUSE_REPORTS
+        .pop()
+        .or_else(|| has_mouse_update().then(get_mouse_state))
+}
+
 fn translate_key(code: u16) -> &'static [u8] {
+    if control_state() {
+        let control: u8 = match code {
+            30=>1,48=>2,46=>3,32=>4,18=>5,33=>6,34=>7,35=>8,23=>9,
+            36=>10,37=>11,38=>12,50=>13,49=>14,24=>15,25=>16,16=>17,
+            19=>18,31=>19,20=>20,22=>21,47=>22,17=>23,45=>24,21=>25,44=>26,
+            _=>0,
+        };
+        if control != 0 {
+            const BYTES: [u8;26] = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26];
+            return &BYTES[usize::from(control-1)..usize::from(control)];
+        }
+    }
     let shift = shift_state();
     let caps = caps_lock();
     let letter_upper = shift != caps;
     let use_shift = shift;
     match code {
         1 => b"\x1b",
-        2 => b"1",
-        3 => b"2",
-        4 => b"3",
-        5 => b"4",
-        6 => b"5",
-        7 => b"6",
-        8 => b"7",
-        9 => b"8",
-        10 => b"9",
-        11 => b"0",
+        2 => if use_shift { b"!" } else { b"1" },
+        3 => if use_shift { b"@" } else { b"2" },
+        4 => if use_shift { b"#" } else { b"3" },
+        5 => if use_shift { b"$" } else { b"4" },
+        6 => if use_shift { b"%" } else { b"5" },
+        7 => if use_shift { b"^" } else { b"6" },
+        8 => if use_shift { b"&" } else { b"7" },
+        9 => if use_shift { b"*" } else { b"8" },
+        10 => if use_shift { b"(" } else { b"9" },
+        11 => if use_shift { b")" } else { b"0" },
         12 => {
             if use_shift {
                 b"_"
@@ -499,7 +569,7 @@ fn translate_key(code: u16) -> &'static [u8] {
         }
         40 => {
             if use_shift {
-                b"'"
+                b"\""
             } else {
                 b"'"
             }
@@ -589,6 +659,13 @@ fn translate_key(code: u16) -> &'static [u8] {
             }
         }
         57 => b" ",
+        60 => b"\x1bOQ", // F2
+        63 => b"\x1b[15~", // F5
+        102 => b"\x1b[H", // Home
+        107 => b"\x1b[F", // End
+        104 => b"\x1b[5~", // Page Up
+        109 => b"\x1b[6~", // Page Down
+        111 => b"\x1b[3~", // Delete
         103 => b"\x1b[A",
         105 => b"\x1b[D",
         106 => b"\x1b[C",
@@ -617,6 +694,10 @@ fn set_caps_lock(value: bool) {
     if let Some(device) = unsafe { DEVICE.load(Ordering::Acquire).as_mut() } {
         device.caps_lock = value;
     }
+}
+
+fn control_state() -> bool {
+    CONTROL_KEYS.load(Ordering::Relaxed) != 0
 }
 
 fn shift_state() -> bool {
@@ -669,8 +750,10 @@ fn translate(virtual_address: u64) -> Option<u64> {
     Some(crate::arch::translate_virt(virtual_address).unwrap_or(virtual_address))
 }
 
+static CONTROL_KEYS: AtomicU8 = AtomicU8::new(0);
 static DEVICE: AtomicPtr<Device> = AtomicPtr::new(core::ptr::null_mut());
 static MOUSE_DEVICE: AtomicPtr<Device> = AtomicPtr::new(core::ptr::null_mut());
+static MOUSE_DEVICE_ABSOLUTE: AtomicBool = AtomicBool::new(false);
 static INITIALISED: AtomicBool = AtomicBool::new(false);
 static FIRST_EVENT_SEEN: AtomicUsize = AtomicUsize::new(0);
 static RING_HEAD: AtomicUsize = AtomicUsize::new(0);
@@ -678,11 +761,17 @@ static RING_TAIL: AtomicUsize = AtomicUsize::new(0);
 static RING: [AtomicU8; RING_SIZE] = [const { AtomicU8::new(0) }; RING_SIZE];
 static MOUSE_X: AtomicI16 = AtomicI16::new(0);
 static MOUSE_Y: AtomicI16 = AtomicI16::new(0);
+static MOUSE_ABS_X: AtomicI32 = AtomicI32::new(0);
+static MOUSE_ABS_Y: AtomicI32 = AtomicI32::new(0);
+static MOUSE_ABSOLUTE: AtomicBool = AtomicBool::new(false);
 static MOUSE_BUTTONS: AtomicU8 = AtomicU8::new(0);
 static MOUSE_SCREEN_WIDTH: AtomicI16 = AtomicI16::new(i16::MAX);
 static MOUSE_SCREEN_HEIGHT: AtomicI16 = AtomicI16::new(i16::MAX);
 static MOUSE_EVENTS: AtomicU32 = AtomicU32::new(0);
 static MOUSE_POLLED_EVENTS: AtomicU32 = AtomicU32::new(0);
+static MOUSE_QUEUED_EVENTS: AtomicU32 = AtomicU32::new(0);
+static MOUSE_REPORTS: pointer_queue::PointerQueue = pointer_queue::PointerQueue::new();
+static POLLING: AtomicBool = AtomicBool::new(false);
 
 /// One decoded virtio-pci capability region (BAR-relative).
 struct CapRegion {
@@ -861,14 +950,29 @@ pub fn init() {
                 trace("virtio-input: device alloc FAILED\r\n");
                 continue;
             };
-            if input_device_kind(device_config) == InputDeviceKind::Mouse {
-                if MOUSE_DEVICE.load(Ordering::Acquire).is_null() {
-                    MOUSE_DEVICE.store(device, Ordering::Release);
-                    trace("virtio-input: mouse ATTACHED\r\n");
+            match input_device_kind(device_config) {
+                InputDeviceKind::Mouse | InputDeviceKind::AbsoluteMouse => {
+                    let absolute =
+                        input_device_kind(device_config) == InputDeviceKind::AbsoluteMouse;
+                    let current = MOUSE_DEVICE.load(Ordering::Acquire);
+                    let replace_relative = absolute
+                        && !current.is_null()
+                        && !MOUSE_DEVICE_ABSOLUTE.load(Ordering::Acquire);
+                    if current.is_null() || replace_relative {
+                        MOUSE_DEVICE_ABSOLUTE.store(absolute, Ordering::Release);
+                        MOUSE_DEVICE.store(device, Ordering::Release);
+                        if absolute {
+                            trace("virtio-input: absolute mouse ATTACHED\r\n");
+                        } else {
+                            trace("virtio-input: mouse ATTACHED\r\n");
+                        }
+                    }
                 }
-            } else if DEVICE.load(Ordering::Acquire).is_null() {
-                DEVICE.store(device, Ordering::Release);
-                trace("virtio-input: keyboard ATTACHED\r\n");
+                InputDeviceKind::Keyboard if DEVICE.load(Ordering::Acquire).is_null() => {
+                    DEVICE.store(device, Ordering::Release);
+                    trace("virtio-input: keyboard ATTACHED\r\n");
+                }
+                InputDeviceKind::Keyboard => {}
             }
         }
         if attempt + 1 < 4 {
@@ -909,6 +1013,12 @@ pub fn is_present() -> bool {
 }
 
 pub fn poll() {
+    if POLLING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
     let keyboard = DEVICE.load(Ordering::Acquire);
     if !keyboard.is_null() {
         unsafe { poll_device(keyboard) };
@@ -917,6 +1027,7 @@ pub fn poll() {
     if !mouse.is_null() {
         unsafe { poll_device(mouse) };
     }
+    POLLING.store(false, Ordering::Release);
 }
 
 unsafe fn poll_device(device: *mut Device) {
@@ -1121,7 +1232,7 @@ fn contains_ignore_ascii_case(bytes: &[u8], needle: &[u8]) -> bool {
         if window
             .iter()
             .zip(needle)
-            .all(|(left, right)| left.to_ascii_lowercase() == right.to_ascii_lowercase())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
         {
             return true;
         }
@@ -1133,19 +1244,25 @@ fn input_device_kind(device_config: Option<*mut u8>) -> InputDeviceKind {
     let Some(config) = device_config else {
         return InputDeviceKind::Keyboard;
     };
-    unsafe {
-        write_u8(config, 0, INPUT_CFG_ID_NAME);
-        write_u8(config, 1, 0);
-        let length = usize::from(read_u8(config, 2)).min(128);
-        let mut name = [0u8; 128];
-        for (index, byte) in name.iter_mut().enumerate().take(length) {
-            *byte = read_u8(config, 8 + index as u64);
-        }
-        if contains_ignore_ascii_case(&name, b"mouse") {
-            InputDeviceKind::Mouse
+    write_u8(config, 0, INPUT_CFG_ID_NAME);
+    write_u8(config, 1, 0);
+    let length = usize::from(read_u8(config, 2)).min(128);
+    let mut name = [0u8; 128];
+    for (index, byte) in name.iter_mut().enumerate().take(length) {
+        *byte = read_u8(config, 8 + index as u64);
+    }
+    if contains_ignore_ascii_case(&name, b"mouse")
+        || contains_ignore_ascii_case(&name, b"tablet")
+    {
+        if contains_ignore_ascii_case(&name, b"tablet")
+            || contains_ignore_ascii_case(&name, b"absolute")
+        {
+            InputDeviceKind::AbsoluteMouse
         } else {
-            InputDeviceKind::Keyboard
+            InputDeviceKind::Mouse
         }
+    } else {
+        InputDeviceKind::Keyboard
     }
 }
 
