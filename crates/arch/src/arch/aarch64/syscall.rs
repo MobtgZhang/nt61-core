@@ -124,6 +124,7 @@ pub unsafe extern "C" fn syscall_dispatch_with_tf(syscall_num: u64, tf: *mut Tra
             }
         }
         host::SYS_PRINT_PROMPT => host::print_prompt(),
+        0x030A => unsafe { crate::arch::common::desktop_service::dispatch(tf_ref.x0) },
         desktop::SYS_DESKTOP_INFO => unsafe { desktop::info(tf_ref.x0 as *mut _) },
         desktop::SYS_DESKTOP_FILL_RECT => desktop::fill_rect(
             tf_ref.x0 as u32,
@@ -155,6 +156,10 @@ pub unsafe extern "C" fn syscall_dispatch_with_tf(syscall_num: u64, tf: *mut Tra
             )
         },
         desktop::SYS_DESKTOP_POLL_KEY => unsafe { desktop::poll_key(tf_ref.x0 as *mut u8) },
+        desktop::SYS_DESKTOP_TIME => desktop::shell_time(),
+        desktop::SYS_DESKTOP_TICKS => desktop::shell_ticks(),
+        desktop::SYS_DESKTOP_AUDIO => desktop::shell_audio(tf_ref.x0, tf_ref.x1),
+        desktop::SYS_DESKTOP_DEVICES => desktop::shell_devices(),
         desktop::SYS_DESKTOP_POLL_MOUSE => unsafe { desktop::poll_mouse(tf_ref.x0 as *mut _) },
         _ => STATUS_INVALID_SYSTEM_SERVICE,
     }

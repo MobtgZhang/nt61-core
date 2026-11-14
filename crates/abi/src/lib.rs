@@ -22,6 +22,7 @@
 #![allow(non_upper_case_globals)]
 
 pub mod constants;
+pub mod desktop_bridge;
 pub mod error;
 pub mod gdi;
 pub mod structs;

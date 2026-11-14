@@ -182,12 +182,7 @@ pub unsafe extern "C" fn dispatch_syscall(frame: *mut TrapFrame) {
     // Return value goes back in $a0 of the saved frame.
     (*frame).a[0] = result;
     // Advance ERA past the `syscall` instruction (4 bytes on LA64).
-    let era = crate::arch::loongarch64::trap::read_era();
-    asm!(
-        "csrwr {era}, 0x6",
-        era = in(reg) era + 4,
-        options(nostack),
-    );
+    (*frame).era = (*frame).era.wrapping_add(4);
 }
 
 /// Top-level handler. Phase 1 dispatches the subset of NT calls
@@ -236,6 +231,7 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
             }
         }
         SYS_PRINT_PROMPT => crate::arch::common::cmd_host::print_prompt(),
+        0x030A => unsafe { crate::arch::common::desktop_service::dispatch(a0 as u64) },
         n if n == crate::arch::common::desktop_host::SYS_DESKTOP_INFO as u64 => unsafe {
             crate::arch::common::desktop_host::info(a0 as *mut _)
         },
@@ -269,6 +265,10 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         n if n == crate::arch::common::desktop_host::SYS_DESKTOP_POLL_KEY as u64 => unsafe {
             crate::arch::common::desktop_host::poll_key(a0 as *mut u8)
         },
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_TIME as u64 => crate::arch::common::desktop_host::shell_time(),
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_TICKS as u64 => crate::arch::common::desktop_host::shell_ticks(),
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_AUDIO as u64 => crate::arch::common::desktop_host::shell_audio(a0 as u64, a1 as u64),
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_DEVICES as u64 => crate::arch::common::desktop_host::shell_devices(),
         n if n == crate::arch::common::desktop_host::SYS_DESKTOP_POLL_MOUSE as u64 => unsafe {
             crate::arch::common::desktop_host::poll_mouse(a0 as *mut _)
         },

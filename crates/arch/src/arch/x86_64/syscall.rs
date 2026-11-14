@@ -1360,55 +1360,11 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
         // `make run_x86_64` configuration: QEMU `-vga std`,
         // `-vga none`, or no-VGA at all.
         nums::SYS_PUTCHAR => {
-            // Extract the byte to print. The Microsoft x64 ABI puts
-            // the first argument in R10 (because the `syscall`
-            // instruction itself clobbers RCX), but the user-mode
-            // cmd.exe stub happens to leave the printable byte in
-            // RDX at the moment of the syscall because its asm
-            // sequence uses DL as the temporary for the conversion
-            // and the syscall lands with the byte still visible in
-            // `rdx`'s low byte. Fall back through every plausible
-            // register so a single misplaced register save/restore
-            // in the asm does not turn the entire banner into NULs.
-            let mut ch: u8 = 0;
-            for &candidate in &[
-                arg0(tf), // r10 — Microsoft x64 ABI arg0
-                tf.rdx,   // rdx — where the cmd.exe stub leaves the byte
-                tf.rdi,   // rdi — sometimes clobbered by `mov eax, imm`
-                tf.rsi,   // rsi — printable source ptr low byte
-                tf.r8,    // r8  — preserved across syscalls
-                tf.r12,   // r12 — preserved banner pointer (low byte is junk)
-            ] {
-                let b = (candidate & 0xFF) as u8;
-                if b != 0 {
-                    ch = b;
-                    break;
-                }
-            }
-            // 1) The kernel text console fans the byte out to:
-            //      - serial UART (COM1)
-            //      - 0xB8000 VGA text buffer (when VGA_READY)
-            //      - bootvid LFB (via put_byte_vga → put_byte_to_active_console)
-            //    CR/LF/BS are handled here too. This is the only
-            //    path that writes to the LFB on a normal boot.
-            crate::hal::common::serial_disable::with_serial_unmasked(|| {
-                crate::hal::x86_64::serial::write_char(ch);
-            });
-            if !crate::drivers::bootvid::gui_console_active() {
-                crate::hal::x86_64::text_console::put_byte(ch);
-                // Safety net for the no-VGA fallback: when the
-                // kernel skipped `text_console::init()` (or ran it
-                // without a real controller behind the I/O ports),
-                // `VGA_READY` is still false and the byte above
-                // never made it to the LFB. Push it directly so
-                // the QEMU GUI still shows the cmd.exe banner.
-                // `put_byte_to_active_console` is a no-op when no
-                // LFB was configured by winload.
-                if !crate::hal::x86_64::text_console::is_ready() {
-                    crate::drivers::bootvid::put_byte_to_active_console(ch);
-                }
-            }
-            0
+            // All shipped syscall thunks use the same ABI: arg0 is R10.
+            // Guessing from unrelated registers printed syscall number 0x02
+            // when a broken caller passed zero, and made NUL unprintable.
+            let ch = arg0(tf) as u8;
+            crate::arch::common::cmd_host::putchar(ch) as i64
         }
 
         // SYS_CLEARSCREEN (0x0205) - wipe the visible LFB and home
@@ -1614,6 +1570,7 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
         // NT61 desktop-shell framebuffer bridge. These private calls are
         // deliberately outside the NT native range until win32k's real
         // USER/GDI object ABI is complete.
+        0x030A => unsafe { crate::arch::common::desktop_service::dispatch(arg0(tf) as u64) as i64 },
         crate::arch::common::desktop_host::SYS_DESKTOP_INFO => unsafe {
             crate::arch::common::desktop_host::info(arg0(tf) as *mut _) as i64
         },
@@ -1653,6 +1610,10 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
         crate::arch::common::desktop_host::SYS_DESKTOP_POLL_KEY => unsafe {
             crate::arch::common::desktop_host::poll_key(arg0(tf) as *mut u8) as i64
         },
+        crate::arch::common::desktop_host::SYS_DESKTOP_TIME => crate::arch::common::desktop_host::shell_time() as i64,
+        crate::arch::common::desktop_host::SYS_DESKTOP_TICKS => crate::arch::common::desktop_host::shell_ticks() as i64,
+        crate::arch::common::desktop_host::SYS_DESKTOP_AUDIO => crate::arch::common::desktop_host::shell_audio(arg0(tf) as u64, arg1(tf) as u64) as i64,
+        crate::arch::common::desktop_host::SYS_DESKTOP_DEVICES => crate::arch::common::desktop_host::shell_devices() as i64,
         crate::arch::common::desktop_host::SYS_DESKTOP_POLL_MOUSE => unsafe {
             crate::arch::common::desktop_host::poll_mouse(arg0(tf) as *mut _) as i64
         },
