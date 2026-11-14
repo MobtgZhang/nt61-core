@@ -96,7 +96,7 @@ pub unsafe extern "C" fn memmove(
     // Forward copying corrupts the destination when the regions overlap and
     // `dst` is after `src`: each byte written overwrites a byte still to be
     // read. Copy backwards in that case.
-    if n == 0 || (dst as usize) == (src as usize) {
+    if n == 0 || core::ptr::eq(dst, src) {
         return dst as *mut core::ffi::c_void;
     }
     if (dst as usize) < (src as usize) {

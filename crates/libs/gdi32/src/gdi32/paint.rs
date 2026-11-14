@@ -119,7 +119,7 @@ pub extern "C" fn pat_blt(dc: HDC, x: i32, y: i32, w: i32, h: i32, rop: u32) -> 
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `fill_rect` — fill the rectangle with the brush
-/// referenced by `_brush`. If the brush is a real
+/// referenced by `brush`. If the brush is a real
 /// gdi32 brush we recover its colour from the table;
 /// otherwise we fall back to the DC background colour.
 pub unsafe extern "C" fn fill_rect(dc: HDC, rect: *const Rect, brush: HBRUSH) -> i32 {

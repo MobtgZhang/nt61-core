@@ -133,15 +133,6 @@ pub extern "C" fn toupper(c: CInt) -> CInt {
     }
 }
 
-#[cfg_attr(all(not(test), not(target_os = "linux")), no_mangle)]
-pub extern "C" fn _tolower(c: CInt) -> CInt {
-    tolower(c)
-}
-
-#[cfg_attr(all(not(test), not(target_os = "linux")), no_mangle)]
-pub extern "C" fn _toupper(c: CInt) -> CInt {
-    toupper(c)
-}
 
 /// # Safety
 ///
@@ -569,11 +560,6 @@ pub unsafe extern "C" fn itoa(value: CInt, str: *mut CChar, base: CInt) -> *mut 
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-#[cfg_attr(all(not(test), not(target_os = "linux")), no_mangle)]
-pub unsafe extern "C" fn _itoa(value: CInt, str: *mut CChar, base: CInt) -> *mut CChar {
-    itoa(value, str, base)
-}
-
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.

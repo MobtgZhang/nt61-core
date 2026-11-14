@@ -318,20 +318,20 @@ fn write_return_length(return_length: *mut u32, length: usize) -> Result<(), i32
 /// Windows 7 behaviour for unrecognised info classes.
 pub unsafe extern "C" fn nt_set_information_process(
     _process_handle: HANDLE,
-    _process_information_class: u32,
-    _process_information: PVOID,
-    _process_information_length: u32,
+    process_information_class: u32,
+    process_information: PVOID,
+    process_information_length: u32,
 ) -> NTSTATUS {
-    if _process_information.is_null() {
+    if process_information.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     let mut value = [0u8; 4];
-    if copy_from_user(&mut value, _process_information as u64).is_err() {
+    if copy_from_user(&mut value, process_information as u64).is_err() {
         return super::status::STATUS_ACCESS_VIOLATION;
     }
-    let _ = _process_information_length;
+    let _ = process_information_length;
     const PROCESS_BREAK_ON_TERMINATION: u32 = 14;
-    match _process_information_class {
+    match process_information_class {
         PROCESS_BREAK_ON_TERMINATION => {
             // The process manager tracks this in the Eprocess; for
             // now we accept the write and succeed (matching the

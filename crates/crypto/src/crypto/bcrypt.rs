@@ -426,8 +426,8 @@ pub unsafe extern "C" fn bcrypt_encrypt(
     input: *const u8,
     input_len: u32,
     _padding_info: *const core::ffi::c_void,
-    _iv: *mut u8,
-    _iv_len: u32,
+    iv: *mut u8,
+    iv_len: u32,
     output: *mut u8,
     output_len: u32,
     result_len: *mut u32,
@@ -448,16 +448,21 @@ pub unsafe extern "C" fn bcrypt_encrypt(
     }
     let output_slice = core::slice::from_raw_parts_mut(output, output_len as usize);
     if is_3des {
-        let Ok(_key) = <[u8; 24]>::try_from(context.key_data.as_slice()) else {
+        let key_result = <[u8; 24]>::try_from(context.key_data.as_slice());
+        if key_result.is_err() {
             return STATUS_INVALID_PARAMETER;
-        };
-        let mut iv = [0u8; 8];
-        if !_iv.is_null() && _iv_len as usize >= 8 {
-            iv.copy_from_slice(core::slice::from_raw_parts(_iv, 8));
+        }
+        let mut iv_bytes = [0u8; 8];
+        if !iv.is_null() && iv_len as usize >= 8 {
+            iv_bytes.copy_from_slice(core::slice::from_raw_parts(iv, 8));
         }
         #[cfg(feature = "crypto_libs")]
         {
-            let Ok(ciphertext) = crate::crypto::cipher::tdes_cbc_encrypt(&_key, &iv, input_data)
+            let key = match key_result {
+                Ok(key) => key,
+                Err(_) => return STATUS_INVALID_PARAMETER,
+            };
+            let Ok(ciphertext) = crate::crypto::cipher::tdes_cbc_encrypt(&key, &iv_bytes, input_data)
             else {
                 return STATUS_INVALID_PARAMETER;
             };
@@ -468,11 +473,11 @@ pub unsafe extern "C" fn bcrypt_encrypt(
         #[cfg(not(feature = "crypto_libs"))]
         return STATUS_NOT_SUPPORTED;
     }
-    let mut iv = [0u8; 16];
-    if !_iv.is_null() && _iv_len as usize >= 16 {
-        iv.copy_from_slice(core::slice::from_raw_parts(_iv, 16));
+    let mut iv_bytes = [0u8; 16];
+    if !iv.is_null() && iv_len as usize >= 16 {
+        iv_bytes.copy_from_slice(core::slice::from_raw_parts(iv, 16));
     }
-    if !aes_cbc_encrypt(&context.key_data, &iv, input_data, output_slice) {
+    if !aes_cbc_encrypt(&context.key_data, &iv_bytes, input_data, output_slice) {
         return STATUS_NOT_SUPPORTED;
     }
     *result_len = input_len;
@@ -487,8 +492,8 @@ pub unsafe extern "C" fn bcrypt_decrypt(
     input: *const u8,
     input_len: u32,
     _padding_info: *const core::ffi::c_void,
-    _iv: *mut u8,
-    _iv_len: u32,
+    iv: *mut u8,
+    iv_len: u32,
     output: *mut u8,
     output_len: u32,
     result_len: *mut u32,
@@ -509,16 +514,21 @@ pub unsafe extern "C" fn bcrypt_decrypt(
     }
     let output_slice = core::slice::from_raw_parts_mut(output, output_len as usize);
     if is_3des {
-        let Ok(_key) = <[u8; 24]>::try_from(context.key_data.as_slice()) else {
+        let key_result = <[u8; 24]>::try_from(context.key_data.as_slice());
+        if key_result.is_err() {
             return STATUS_INVALID_PARAMETER;
-        };
-        let mut iv = [0u8; 8];
-        if !_iv.is_null() && _iv_len as usize >= 8 {
-            iv.copy_from_slice(core::slice::from_raw_parts(_iv, 8));
+        }
+        let mut iv_bytes = [0u8; 8];
+        if !iv.is_null() && iv_len as usize >= 8 {
+            iv_bytes.copy_from_slice(core::slice::from_raw_parts(iv, 8));
         }
         #[cfg(feature = "crypto_libs")]
         {
-            let Ok(plaintext) = crate::crypto::cipher::tdes_cbc_decrypt(&_key, &iv, input_data)
+            let key = match key_result {
+                Ok(key) => key,
+                Err(_) => return STATUS_INVALID_PARAMETER,
+            };
+            let Ok(plaintext) = crate::crypto::cipher::tdes_cbc_decrypt(&key, &iv_bytes, input_data)
             else {
                 return STATUS_INVALID_PARAMETER;
             };
@@ -529,11 +539,11 @@ pub unsafe extern "C" fn bcrypt_decrypt(
         #[cfg(not(feature = "crypto_libs"))]
         return STATUS_NOT_SUPPORTED;
     }
-    let mut iv = [0u8; 16];
-    if !_iv.is_null() && _iv_len as usize >= 16 {
-        iv.copy_from_slice(core::slice::from_raw_parts(_iv, 16));
+    let mut iv_bytes = [0u8; 16];
+    if !iv.is_null() && iv_len as usize >= 16 {
+        iv_bytes.copy_from_slice(core::slice::from_raw_parts(iv, 16));
     }
-    if !aes_cbc_decrypt(&context.key_data, &iv, input_data, output_slice) {
+    if !aes_cbc_decrypt(&context.key_data, &iv_bytes, input_data, output_slice) {
         return STATUS_NOT_SUPPORTED;
     }
     *result_len = input_len;

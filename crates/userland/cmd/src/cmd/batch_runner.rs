@@ -156,7 +156,7 @@ where
         Self { dispatch_fn }
     }
 
-    pub fn run<O: Output>(&mut self, _output: &mut O, filename: &[u8]) -> bool {
-        run_batch_file(filename, _output, |cmd| (self.dispatch_fn)(cmd))
+    pub fn run<O: Output>(&mut self, output: &mut O, filename: &[u8]) -> bool {
+        run_batch_file(filename, output, |cmd| (self.dispatch_fn)(cmd))
     }
 }

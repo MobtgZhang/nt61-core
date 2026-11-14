@@ -284,7 +284,7 @@ fn is_icmp_error(payload: &[u8]) -> bool {
 }
 
 /// Deliver a complete datagram to the upper-layer protocol.
-fn dispatch_datagram(header: &Ipv4Header, payload: &[u8], _nic_type: NicType, _nic_index: usize) {
+fn dispatch_datagram(header: &Ipv4Header, payload: &[u8], _nic_type: NicType, nic_index: usize) {
     if !crate::netstack::ipsec::check_inbound_policy(header.src_ip, header.dst_ip, false) {
         return;
     }
@@ -329,7 +329,7 @@ fn dispatch_datagram(header: &Ipv4Header, payload: &[u8], _nic_type: NicType, _n
         src_port,
         dst_port,
         header.protocol,
-        _nic_index as u32,
+        nic_index as u32,
     );
     if !matches!(
         action,

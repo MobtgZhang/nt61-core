@@ -119,7 +119,7 @@ pub unsafe extern "C" fn create_process_w(
         set_last_error(87);
         return FALSE;
     }
-    let _name = match wide_to_string(name_ptr) {
+    let display_name = match wide_to_string(name_ptr) {
         Some(s) => s,
         None => {
             set_last_error(123);
@@ -128,7 +128,7 @@ pub unsafe extern "C" fn create_process_w(
     };
     let _ = (inherit_handles, creation_flags, startup_info);
     let mut h: HANDLE = ptr::null_mut();
-    let name_units = _name.encode_utf16().count() + 1;
+    let name_units = display_name.encode_utf16().count() + 1;
     let name_size = name_units * core::mem::size_of::<u16>();
     let storage_size = core::mem::size_of::<ObjectAttributes>()
         + core::mem::size_of::<crate::libs::ntdll::types::UnicodeString>()
@@ -146,7 +146,7 @@ pub unsafe extern "C" fn create_process_w(
         .add(core::mem::size_of::<crate::libs::ntdll::types::UnicodeString>())
         as *mut u16;
     let mut units = alloc::vec::Vec::with_capacity(name_units);
-    units.extend(_name.encode_utf16());
+    units.extend(display_name.encode_utf16());
     units.push(0);
     unsafe {
         core::ptr::write_bytes(storage, 0, storage_size);

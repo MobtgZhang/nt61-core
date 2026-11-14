@@ -64,5 +64,5 @@ fn trim_line(line: &[u8]) -> &[u8] {
 }
 
 pub fn run() -> ! {
-    Shell::default().run()
+    Shell.run()
 }

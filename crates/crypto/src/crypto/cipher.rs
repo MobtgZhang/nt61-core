@@ -219,8 +219,8 @@ impl Aes256 {
                 words[i][byte_index] = words[i - 8][byte_index] ^ temp[byte_index];
             }
         }
-        for (round_key, group) in words.chunks_exact(4).enumerate() {
-            for (destination, word) in round_keys[round_key].chunks_exact_mut(4).zip(group) {
+        for (round_key, group) in words.as_chunks::<4>().0.iter().enumerate() {
+            for (destination, word) in round_keys[round_key].as_chunks_mut::<4>().0.iter_mut().zip(group) {
                 destination.copy_from_slice(word);
             }
         }

@@ -726,11 +726,11 @@ fn copy_formatted(target: *mut CChar, size: usize, output: &[u8]) -> CInt {
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 #[cfg_attr(all(not(test), not(target_os = "linux")), no_mangle)]
-pub unsafe extern "C" fn sprintf(s: *mut CChar, format: *const CChar, _args: ...) -> CInt {
+pub unsafe extern "C" fn sprintf(s: *mut CChar, format: *const CChar, args: ...) -> CInt {
     if s.is_null() || format.is_null() {
         return -1;
     }
-    let output = format_va_list(format, _args);
+    let output = format_va_list(format, args);
     copy_formatted(s, usize::MAX, &output)
 }
 
@@ -784,11 +784,11 @@ pub unsafe extern "C" fn vsnprintf(
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 #[cfg_attr(all(not(test), not(target_os = "linux")), no_mangle)]
-pub unsafe extern "C" fn printf(format: *const CChar, _args: ...) -> CInt {
+pub unsafe extern "C" fn printf(format: *const CChar, args: ...) -> CInt {
     if format.is_null() {
         return -1;
     }
-    let output = format_va_list(format, _args);
+    let output = format_va_list(format, args);
     write_kprint_bytes(&output);
     output.len() as CInt
 }
@@ -797,11 +797,11 @@ pub unsafe extern "C" fn printf(format: *const CChar, _args: ...) -> CInt {
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 #[cfg_attr(all(not(test), not(target_os = "linux")), no_mangle)]
-pub unsafe extern "C" fn fprintf(stream: *mut FILE, format: *const CChar, _args: ...) -> CInt {
+pub unsafe extern "C" fn fprintf(stream: *mut FILE, format: *const CChar, args: ...) -> CInt {
     if stream.is_null() || format.is_null() {
         return -1;
     }
-    let output = format_va_list(format, _args);
+    let output = format_va_list(format, args);
     let mut written = 0usize;
     for byte in output {
         if fputc(byte as CInt, stream) == EOF {

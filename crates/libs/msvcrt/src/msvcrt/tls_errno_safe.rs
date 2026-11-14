@@ -235,7 +235,7 @@ pub unsafe extern "C" fn strerror(errnum: CInt) -> *const CChar {
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 #[cfg_attr(all(not(test), not(target_os = "linux")), no_mangle)]
-pub unsafe extern "C" fn _errno() -> *mut CInt {
+pub unsafe extern "C" fn errno() -> *mut CInt {
     __errno_location()
 }
 
@@ -295,7 +295,7 @@ pub unsafe extern "C" fn strerror_s(
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 #[cfg_attr(all(not(test), not(target_os = "linux")), no_mangle)]
 pub unsafe extern "C" fn perror(s: *const CChar) {
-    let errnum = *_errno();
+    let errnum = *errno();
     let stderr = super::stdio_safe::__get_stderr();
 
     if !s.is_null() && *s != 0 {

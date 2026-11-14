@@ -272,7 +272,7 @@ pub unsafe extern "C" fn crypt_hash_data(
 pub unsafe extern "C" fn crypt_get_hash_param(
     hash: usize,
     _param: u32,
-    _data: *mut u8,
+    data: *mut u8,
     data_len: *mut u32,
     _flags: u32,
 ) -> i32 {
@@ -296,7 +296,7 @@ pub unsafe extern "C" fn crypt_get_hash_param(
             HashState::Sha384(_) => 48,
             HashState::Sha512(_) => 64,
         };
-        if _data.is_null() {
+        if data.is_null() {
             *data_len = 4;
             return 1;
         }
@@ -304,8 +304,8 @@ pub unsafe extern "C" fn crypt_get_hash_param(
             *data_len = 4;
             return 0;
         }
-        core::ptr::write_bytes(_data, 0, 4);
-        _data.copy_from(size.to_le_bytes().as_ptr(), 4);
+        core::ptr::write_bytes(data, 0, 4);
+        data.copy_from(size.to_le_bytes().as_ptr(), 4);
         *data_len = 4;
         return 1;
     }
@@ -326,10 +326,10 @@ pub unsafe extern "C" fn crypt_get_hash_param(
         *data_len = digest.len() as u32;
         return 0;
     }
-    if _data.is_null() {
+    if data.is_null() {
         return 0;
     }
-    let output = core::slice::from_raw_parts_mut(_data, digest.len());
+    let output = core::slice::from_raw_parts_mut(data, digest.len());
     output.copy_from_slice(&digest);
     *data_len = digest.len() as u32;
     1

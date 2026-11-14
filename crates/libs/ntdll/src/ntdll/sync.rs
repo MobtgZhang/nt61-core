@@ -561,7 +561,7 @@ pub fn nt_wait_for_multiple_objects_kernel(
 ///
 /// On success, returns `STATUS_SUCCESS`. If the alertable flag is set,
 /// the wait can be interrupted by an APC.
-pub extern "C" fn nt_delay_execution(_alertable: u8, interval: *mut i64) -> NTSTATUS {
+pub extern "C" fn nt_delay_execution(alertable: u8, interval: *mut i64) -> NTSTATUS {
     if interval.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -571,7 +571,7 @@ pub extern "C" fn nt_delay_execution(_alertable: u8, interval: *mut i64) -> NTST
         Err(status) => return status,
     };
 
-    nt_delay_execution_kernel(_alertable, raw)
+    nt_delay_execution_kernel(alertable, raw)
 }
 
 /// Trusted-kernel entry point for `nt_delay_execution`.

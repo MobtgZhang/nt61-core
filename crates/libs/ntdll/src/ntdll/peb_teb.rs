@@ -162,15 +162,15 @@ pub unsafe extern "C" fn rtl_get_thread_error_mode() -> u32 {
 /// # Safety
 ///
 /// Caller must ensure `old_mode`, when non-null, points to writable memory.
-pub unsafe extern "C" fn rtl_set_thread_error_mode(_mode: u32, _old_mode: *mut u32) -> i32 {
-    if _mode & !VALID_THREAD_ERROR_MODE != 0 {
+pub unsafe extern "C" fn rtl_set_thread_error_mode(mode: u32, old_mode: *mut u32) -> i32 {
+    if mode & !VALID_THREAD_ERROR_MODE != 0 {
         return super::status::STATUS_INVALID_PARAMETER;
     }
 
     let thread_id = current_thread_id();
     let mut modes = THREAD_ERROR_MODES.lock();
-    if !_old_mode.is_null() {
-        *_old_mode = modes
+    if !old_mode.is_null() {
+        *old_mode = modes
             .iter()
             .find(|entry| entry.thread_id == thread_id)
             .map(|entry| entry.mode)
@@ -178,11 +178,11 @@ pub unsafe extern "C" fn rtl_set_thread_error_mode(_mode: u32, _old_mode: *mut u
     }
 
     if let Some(entry) = modes.iter_mut().find(|entry| entry.thread_id == thread_id) {
-        entry.mode = _mode;
+        entry.mode = mode;
     } else {
         modes.push(ThreadErrorMode {
             thread_id,
-            mode: _mode,
+            mode: mode,
         });
     }
     super::status::STATUS_SUCCESS

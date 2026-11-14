@@ -11,7 +11,7 @@ extern crate alloc;
 use alloc::alloc::{alloc, alloc_zeroed, dealloc, realloc as alloc_realloc};
 
 fn set_errno(value: ErrnoT) {
-    unsafe { super::tls_errno_safe::_set_errno(value) };
+    unsafe { super::tls_errno_safe::_set_errno(value as CInt) };
 }
 
 #[repr(C)]

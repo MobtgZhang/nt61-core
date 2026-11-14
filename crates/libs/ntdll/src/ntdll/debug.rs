@@ -305,13 +305,13 @@ pub unsafe extern "C" fn dbg_print_ex(component: u32, level: u32, format: PVOID)
 /// string as a placeholder. Returns 0.
 pub unsafe extern "C" fn v_dbg_print_ex(
     _component: u32,
-    _level: u32,
+    level: u32,
     format: PVOID,
-    _args: PVOID,
+    args: PVOID,
 ) -> u32 {
     // Suppress the warning about unused args
-    let _ = _args;
-    let _ = _level;
+    let _ = args;
+    let _ = level;
 
     let msg = match read_c_string(format as *const u8) {
         Some(s) => s,

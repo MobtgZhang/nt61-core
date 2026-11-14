@@ -76,21 +76,27 @@ pub fn init_user_heap(pml4: u64) -> u64 {
         return 0;
     }
 
+    crate::ntoskrnl::hal::serial::write_string_always("[HEAP] map begin\r\n");
     let status = vas::map_user_pages(pml4, HEAP_BASE, HEAP_PAGE_BUDGET, pte::PTE_RW | pte::PTE_US);
+    crate::ntoskrnl::hal::serial::write_string_always("[HEAP] map done\r\n");
     if status != vas::MmStatus::Ok {
         return 0;
     }
 
     // Page-table setup must happen on the system root. Attach only after
     // all user pages exist, so the heap can be initialized through user VAs.
+    crate::ntoskrnl::hal::serial::write_string_always("[HEAP] refresh begin\r\n");
     vas::refresh_kernel_mappings(pml4);
+    crate::ntoskrnl::hal::serial::write_string_always("[HEAP] refresh done\r\n");
     let previous_root = vas::attach_process(pml4);
+    crate::ntoskrnl::hal::serial::write_string_always("[HEAP] attach done\r\n");
 
     let base = HEAP_BASE;
     let first_block = (base + HEADER_SIZE as u64) as *mut BlockHeader;
     let first_size = HEAP_PAGE_BUDGET as usize - HEADER_SIZE;
     unsafe {
         core::ptr::write_bytes(base as *mut u8, 0, HEAP_PAGE_BUDGET as usize);
+        crate::ntoskrnl::hal::serial::write_string_always("[HEAP] zero done\r\n");
         ptr::write(
             first_block,
             BlockHeader {
@@ -101,7 +107,9 @@ pub fn init_user_heap(pml4: u64) -> u64 {
             },
         );
     }
+    crate::ntoskrnl::hal::serial::write_string_always("[HEAP] block done\r\n");
     vas::detach_process(previous_root);
+    crate::ntoskrnl::hal::serial::write_string_always("[HEAP] detach done\r\n");
 
     // Insert the heap only after returning to the system root. `Vec::push`
     // can allocate, and kernel allocations may touch PFN metadata by
