@@ -27,10 +27,17 @@
 //!     a bump to `BootInfo::MAGIC` — that gives the loader a chance to
 //!     reject kernels compiled against an older contract.
 
-/// Boot mode selected by `bootmgr` and forwarded to the kernel via
-/// `BootInfo.boot_mode`. The kernel uses this to gate certain
-/// init-time behaviour (e.g. suppress all boot log output, show
-/// the Windows 7 boot animation, or enable the debug logger).
+/// Image mapping outcomes reported by winload, including unsuccessful loads.
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct BootDriverLoadRecord {
+    pub name: [u8; 128],
+    pub loaded: bool,
+    pub base: u64,
+    pub size: u64,
+}
+
+/// Selected boot environment passed from bootmgr through winload.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootMode {
@@ -161,8 +168,8 @@ pub struct BootInfo {
     pub esp_disk_sectors: u64,
     /// Number of boot drivers loaded by winload
     pub boot_driver_count: u32,
-    /// Reserved for alignment
-    pub _reserved2: u32,
+    /// Bitset from boot_options::BootOptions, effective for this boot only.
+    pub boot_flags: u32,
 
     // =====================================================================
     // ESP in-memory mirror (added 2026-07-01)
@@ -302,6 +309,9 @@ pub struct BootInfo {
     /// flattened device tree or the EDK2 FDT client protocol when the
     /// firmware does not install the Linux EFI DTB configuration table.
     pub device_tree_hardware: DeviceTreeHardware,
+    pub boot_driver_records: u64,
+    pub boot_driver_records_count: u32,
+    pub _reserved_boot_records: u32,
 }
 
 impl BootInfo {
@@ -309,7 +319,7 @@ impl BootInfo {
     pub const MAGIC: u64 = 0x4E543631_424F4F54;
     /// Current contract version. Bumped whenever a field is added
     /// or removed. Match this against the loader's build constant.
-    pub const VERSION: u64 = 8;
+    pub const VERSION: u64 = 10;
 
     pub fn is_valid(&self) -> bool {
         self.magic == Self::MAGIC && self.version == Self::VERSION
@@ -339,7 +349,7 @@ impl BootInfo {
             esp_disk_start: 0,
             esp_disk_sectors: 0,
             boot_driver_count: 0,
-            _reserved2: 0,
+            boot_flags: 0,
             esp_image_base: 0,
             esp_image_size: 0,
             esp_block_size: 512,
@@ -373,6 +383,7 @@ impl BootInfo {
             device_tree_base: 0,
             device_tree_size: 0,
             device_tree_hardware: DeviceTreeHardware::default(),
+            boot_driver_records: 0, boot_driver_records_count: 0, _reserved_boot_records: 0,
         }
     }
 
@@ -399,7 +410,7 @@ impl BootInfo {
             esp_disk_start: 0,
             esp_disk_sectors: 0,
             boot_driver_count: 0,
-            _reserved2: 0,
+            boot_flags: 0,
             esp_image_base: 0,
             esp_image_size: 0,
             esp_block_size: 0,
@@ -433,6 +444,7 @@ impl BootInfo {
             device_tree_base: 0,
             device_tree_size: 0,
             device_tree_hardware: DeviceTreeHardware::default(),
+            boot_driver_records: 0, boot_driver_records_count: 0, _reserved_boot_records: 0,
         }
     }
 }
