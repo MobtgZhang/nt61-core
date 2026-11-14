@@ -114,6 +114,14 @@ impl ParsedPath {
 
         // Step 2: 去除前导反斜杠并收集剩余部分
         let trimmed = path.trim_start_matches('\\');
+        // REG and Win32 callers use predefined machine-root aliases, whereas
+        // native callers use \Registry\Machine. Strip the complete component
+        // only; similarly prefixed names must still fail as unknown hives.
+        let trimmed = match trimmed.split_once('\\') {
+            Some((root, rest)) if root.eq_ignore_ascii_case("HKLM")
+                || root.eq_ignore_ascii_case("HKEY_LOCAL_MACHINE") => rest,
+            _ => trimmed,
+        };
 
         // Step 3: 解析路径，确定 hive 和子键
         // 支持以下格式:
@@ -245,5 +253,15 @@ mod tests {
             parsed.subkeys,
             alloc::vec![String::from("CurrentControlSet")]
         );
+    }
+
+    #[test]
+    fn machine_root_aliases_accept_mixed_case_without_prefix_aliasing() {
+        for root in ["hklm", "HKLM", "hKeY_lOcAl_MaChInE"] {
+            let parsed = ParsedPath::parse(&alloc::format!("{root}\\software\\Microsoft")).unwrap();
+            assert_eq!(parsed.hive, Hive::Software);
+            assert_eq!(parsed.subkeys, alloc::vec![String::from("Microsoft")]);
+        }
+        assert!(ParsedPath::parse("HKLMother\\Software").is_err());
     }
 }

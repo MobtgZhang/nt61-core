@@ -67,7 +67,16 @@ const SYSTEM_STRUCTURE: &[(&str, bool)] = &[
     ("Program Files (x86)", true),
     ("ProgramData", true),
     ("Users", true),
-    ("tests", true),
+    ("Users/Administrator", true),
+    ("Users/Administrator/Desktop", true),
+    ("Users/Administrator/Documents", true),
+    ("Users/Administrator/Downloads", true),
+    ("Users/Administrator/Pictures", true),
+    ("Users/Administrator/Music", true),
+    ("Users/Administrator/Videos", true),
+    ("Users/Administrator/AppData", true),
+    ("Users/Administrator/AppData/Local", true),
+    ("Users/Administrator/AppData/Roaming", true),
 ];
 
 // =====================================================================
@@ -249,32 +258,16 @@ impl SystemBuilder {
         Ok(())
     }
 
-    /// Generate the placeholder registry hives that ship on a fresh
-    /// NT6.1 install under `Windows\System32\config\`. These are the
-    /// files loaded by the kernel's configuration manager at Phase 1b.
+    /// Generate REGF registry hives for the configuration manager, together
+    /// with the network configuration files maintained by the hive generator.
     pub fn write_registry_hives(&self) -> Result<()> {
+        crate::hive_gen::generate_all(&self.output_dir)?;
         let cfg = self.output_dir.join("Windows/System32/config");
-        crate::fs::dir::create_dir_all(&cfg)?;
         for hive in &["SYSTEM", "SOFTWARE", "SAM", "SECURITY", "DEFAULT"] {
             let p = cfg.join(hive);
-            std::fs::write(&p, Self::hive_placeholder())?;
             log::info(&format!("Registry hive written: {}", p.display()));
         }
         Ok(())
-    }
-
-    /// Placeholder hive content. The real file is a registry-format
-    /// binary; we emit the documented 32-byte `regf`/`hbin` header so
-    /// the configuration manager has something to validate.
-    fn hive_placeholder() -> Vec<u8> {
-        let mut data = Vec::new();
-        // HIVE signature ("regf"-style) plus a small body so the file
-        // is non-empty and loadable by smoke tests.
-        data.extend_from_slice(b"HIVE");
-        data.extend_from_slice(&0x00000003u32.to_le_bytes()); // major version
-        data.extend_from_slice(&0x00000000u32.to_le_bytes()); // minor version
-        data.extend_from_slice(&[0u8; 20]); // reserved
-        data
     }
 
     /// Build the full system-partition tree on disk.

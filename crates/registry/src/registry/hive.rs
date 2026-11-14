@@ -492,7 +492,7 @@ impl<'a> Hive<'a> {
 
     pub fn find_subkey(&self, node: &KeyNode, name: &str) -> Result<Option<KeyNode>, HiveError> {
         for k in self.subkeys(node)? {
-            if k.name == name {
+            if k.name.eq_ignore_ascii_case(name) {
                 return Ok(Some(k));
             }
         }
@@ -501,7 +501,7 @@ impl<'a> Hive<'a> {
 
     pub fn find_value(&self, node: &KeyNode, name: &str) -> Result<Option<Value>, HiveError> {
         for v in self.values(node)? {
-            if v.name == name {
+            if v.name.eq_ignore_ascii_case(name) {
                 return Ok(Some(v));
             }
         }
@@ -769,5 +769,16 @@ mod tests {
         let node = hive.open_path(&["SUBKEY"]).unwrap().unwrap();
         let v = hive.find_value(&node, "Nonexistent").unwrap();
         assert!(v.is_none());
+    }
+
+    #[test]
+    fn key_and_value_lookup_ignore_ascii_case_and_keep_stored_spelling() {
+        let data = build_test_hive();
+        let hive = Hive::parse(&data).unwrap();
+        let node = hive.open_path(&["sUbKeY"]).unwrap().unwrap();
+        assert_eq!(node.name, "SUBKEY");
+        let value = hive.find_value(&node, "tESTvALUE").unwrap().unwrap();
+        assert_eq!(value.name, "TestValue");
+        assert_eq!(value.as_u32(), Some(0x42));
     }
 }
