@@ -49,6 +49,9 @@ pub const PAGE_SHIFT: usize = 12;
 
 /// Initialise aarch64 architecture state.
 pub fn init() {
+    // Install TPIDR_EL1 before the scheduler records its current ETHREAD.
+    // SAFETY: architecture initialization runs once on the boot CPU.
+    unsafe { crate::arch::common::percpu::init(0); }
     #[cfg(feature = "btl")]
     btl::init();
 

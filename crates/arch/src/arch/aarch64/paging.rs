@@ -120,6 +120,14 @@ struct CrossRootScratchPage([u64; 512]);
 
 static mut CROSS_ROOT_SCRATCH: CrossRootScratchPage = CrossRootScratchPage([0; 512]);
 
+/// Virtual address of the leaf PTE that maps `CROSS_ROOT_SCRATCH`.
+///
+/// Cross-root table edits remap this scratch page repeatedly.  Walking the
+/// active root for every remap can fault when one of the *current* root's
+/// dynamically allocated page-table pages is not identity-mapped.  Caching
+/// the leaf PTE once keeps the hot path independent of that identity map.
+static CROSS_ROOT_SCRATCH_PTE: AtomicUsize = AtomicUsize::new(0);
+
 /// Report the physical extent occupied by the preallocated page tables.
 /// The PFN database reserves this extent immediately after it is seeded so
 /// `alloc_zeroed_page` can never zero a live page-table frame.
@@ -134,6 +142,95 @@ pub fn static_page_table_range() -> Option<(u64, u64)> {
 pub fn cross_root_scratch_range() -> Option<(u64, u64)> {
     let start_va = ptr::addr_of!(CROSS_ROOT_SCRATCH) as u64;
     Some((start_va, 4096))
+}
+
+/// Map the live kernel image into an arbitrary root before a context switch.
+///
+/// Process roots inherit the system mappings, but the root-switch path needs
+/// a guaranteed complete view of ntoskrnl code and data.  Mapping the image
+/// range explicitly avoids silent faults on pages that happen to live in a
+/// page-table page which is not identity-mapped in the destination root.
+fn map_kernel_image_into_root(root_pfn: u64) {
+    let (mut image_base, mut image_size) = crate::arch::kernel_image_range();
+    let code_page = (map_kernel_image_into_root as *const () as u64) & PAGE_MASK;
+    let code_visible = image_base != 0
+        && code_page >= image_base
+        && code_page < image_base.saturating_add(image_size);
+    if !code_visible {
+        // EDK2 relocates AArch64 loaders, while the LoadedImage protocol can
+        // still report the PE preferred base.  The switch path only needs the
+        // live image's code and static data, so map a deterministic window
+        // around the executing function when the supplied range is invalid.
+        image_base = code_page & !0x00FF_FFFF;
+        image_size = 0x0100_0000;
+    }
+    if image_base == 0 || image_size == 0 {
+        crate::hal::serial::write_string_always("[TTBR] kernel image range missing\r\n");
+        return;
+    }
+    crate::hal::serial::write_string_always("[TTBR] kernel image map begin base=0x");
+    crate::hal::serial::write_hex_u64_always(image_base);
+    crate::hal::serial::write_string_always(" size=0x");
+    crate::hal::serial::write_hex_u64_always(image_size);
+    crate::hal::serial::write_string_always("\r\n");
+    let start = image_base & PAGE_MASK;
+    let end = (image_base.checked_add(image_size).unwrap_or(start))
+        .next_multiple_of(PAGE_SIZE);
+    let mut page = start;
+    while page < end {
+        let Some(physical) = translate_virt(page) else {
+            page = page.saturating_add(PAGE_SIZE);
+            continue;
+        };
+        if !unsafe { map_page_in_root_raw(
+            root_pfn,
+            page,
+            physical,
+            super::paging_enhanced::flags::KERNEL_CODE,
+        ) } {
+            crate::hal::serial::write_string_always("[TTBR] kernel image map failed at 0x");
+            crate::hal::serial::write_hex_u64_always(page);
+            crate::hal::serial::write_string_always("\r\n");
+            return;
+        }
+        page = page.saturating_add(PAGE_SIZE);
+    }
+    crate::hal::serial::write_string_always("[TTBR] kernel image map done\r\n");
+}
+
+/// Map the cross-root scratch page to `pa` in the active root.
+///
+/// The scratch page is used as an alias for page-table pages belonging to a
+/// different root.  Its PTE is cached after the first successful walk so the
+/// cross-root writer never needs to walk the active root again.
+fn map_cross_root_scratch(pa: u64) -> bool {
+    let va = ptr::addr_of!(CROSS_ROOT_SCRATCH) as u64;
+    let desc = make_page_desc(pa, 0x40C);
+    let cached_pte = CROSS_ROOT_SCRATCH_PTE.load(Ordering::Acquire) as *mut u64;
+    if !cached_pte.is_null() {
+        unsafe {
+            core::ptr::write_volatile(cached_pte, desc);
+            asm!("dsb ishst", options(nostack));
+            asm!("tlbi vae1is, {}", in(reg) (va >> 12) & 0x0000_0FFF_FFFF_FFFF, options(nostack));
+            asm!("dsb ish", options(nostack));
+            asm!("isb", options(nostack));
+        }
+        return true;
+    }
+
+    let pte = unsafe { leaf_pte_ptr_for(va) };
+    if pte.is_null() {
+        return false;
+    }
+    CROSS_ROOT_SCRATCH_PTE.store(pte as usize, Ordering::Release);
+    unsafe {
+        core::ptr::write_volatile(pte, desc);
+        asm!("dsb ishst", options(nostack));
+        asm!("tlbi vae1is, {}", in(reg) (va >> 12) & 0x0000_0FFF_FFFF_FFFF, options(nostack));
+        asm!("dsb ish", options(nostack));
+        asm!("isb", options(nostack));
+    }
+    true
 }
 
 fn alloc_page_table_frame() -> Option<(u64, u64)> {
@@ -253,7 +350,7 @@ unsafe fn leaf_pte_ptr_for_root(root_phys: u64, va: u64, sync: bool) -> *mut u64
     let current_root = current_l0_phys();
     let scratch = ptr::addr_of!(CROSS_ROOT_SCRATCH) as u64;
     let use_alias = !sync && l0_phys != current_root;
-    let root_visible = !use_alias || map_page_raw(scratch, l0_phys, 0x40C);
+    let root_visible = !use_alias || map_cross_root_scratch(l0_phys);
     if !root_visible {
         return core::ptr::null_mut();
     }
@@ -267,7 +364,7 @@ unsafe fn leaf_pte_ptr_for_root(root_phys: u64, va: u64, sync: bool) -> *mut u64
     let l1_phys = if (l0e & 0x3) == 0x3 {
         l0e & 0x0000_FFFF_FFFF_F000
     } else {
-        let Some((new_va, new_phys)) = alloc_page_table_frame() else {
+        let Some((_new_va, new_phys)) = alloc_page_table_frame() else {
             crate::hal::serial::write_string_always("K:a64-walk-l0-alloc-failed\r\n");
             return core::ptr::null_mut();
         };
@@ -280,7 +377,7 @@ unsafe fn leaf_pte_ptr_for_root(root_phys: u64, va: u64, sync: bool) -> *mut u64
     };
 
     let l1 = if use_alias {
-        if !map_page_raw(scratch, l1_phys, 0x40C) {
+        if !map_cross_root_scratch(l1_phys) {
             return core::ptr::null_mut();
         }
         scratch as *mut u64
@@ -308,7 +405,7 @@ unsafe fn leaf_pte_ptr_for_root(root_phys: u64, va: u64, sync: bool) -> *mut u64
                 let sub_pa = block_pa + (i as u64) * 0x20_0000;
                 core::ptr::write_volatile(
                     l2_new.add(i),
-                    (sub_pa & 0x0000_FFFF_C000_0000) | attrs | 0x1,
+                    (sub_pa & 0x0000_FFFF_FFE0_0000) | attrs | 0x1,
                 );
             }
         }
@@ -321,7 +418,7 @@ unsafe fn leaf_pte_ptr_for_root(root_phys: u64, va: u64, sync: bool) -> *mut u64
     };
 
     let l2 = if use_alias {
-        if !map_page_raw(scratch, l2_phys, 0x40C) {
+        if !map_cross_root_scratch(l2_phys) {
             return core::ptr::null_mut();
         }
         scratch as *mut u64
@@ -368,7 +465,7 @@ unsafe fn leaf_pte_ptr_for_root(root_phys: u64, va: u64, sync: bool) -> *mut u64
     };
 
     let l3 = if use_alias {
-        if !map_page_raw(scratch, l3_phys, 0x40C) {
+        if !map_cross_root_scratch(l3_phys) {
             return core::ptr::null_mut();
         }
         scratch as *mut u64
@@ -413,7 +510,7 @@ pub fn map_page(va: u64, pa: u64, flags: u64) -> bool {
         asm!("dsb ishst", options(nostack));
         // Invalidate any cached translation-fault entry for this VA
         // from a walk that happened before the leaf was installed.
-        asm!("tlbi vae1, {}", in(reg) va & !0xFFF, options(nostack));
+        asm!("tlbi vae1, {}", in(reg) (va >> 12) & 0x0000_0FFF_FFFF_FFFF, options(nostack));
         asm!("isb", options(nostack));
         // Verify the write actually landed — read it back. On
         // systems where the L3 page itself is in unmapped memory,
@@ -429,11 +526,7 @@ pub fn map_page(va: u64, pa: u64, flags: u64) -> bool {
 /// kernel may execute from a mapping that is not present in the target
 /// root; briefly selecting that root would immediately fault.
 pub unsafe fn map_page_in_root(root_pfn: u64, va: u64, pa: u64, flags: u64) -> bool {
-    let root_phys = if root_pfn & 0x0000_FFFF_FFFF_F000 == root_pfn {
-        root_pfn
-    } else {
-        root_pfn << 12
-    };
+    let root_phys = pfn_to_phys(root_pfn);
     let current_root = current_l0_phys();
     if root_phys == current_root {
         return map_page(va, pa, flags);
@@ -446,6 +539,26 @@ pub unsafe fn map_page_in_root(root_pfn: u64, va: u64, pa: u64, flags: u64) -> b
     }
     let desc = make_page_desc(pa, arch_flags_for(flags));
     core::ptr::write_volatile(l3_pte, desc);
+    asm!("dsb ishst", options(nostack));
+    true
+}
+
+/// Map a page into an arbitrary AArch64 root using native descriptor flags.
+///
+/// Critical bootstrap mappings use this when the portable-flag conversion is
+/// insufficient: MMIO pages must retain device attributes, not normal-memory
+/// attributes.
+pub unsafe fn map_page_in_root_raw(root_pfn: u64, va: u64, pa: u64, native_flags: u64) -> bool {
+    let root_phys = pfn_to_phys(root_pfn);
+    let current_root = current_l0_phys();
+    if root_phys == current_root {
+        return map_page_raw(va, pa, native_flags);
+    }
+    let l3_pte = leaf_pte_ptr_for_root(root_phys, va, false);
+    if l3_pte.is_null() {
+        return false;
+    }
+    core::ptr::write_volatile(l3_pte, make_page_desc(pa, native_flags));
     asm!("dsb ishst", options(nostack));
     true
 }
@@ -464,7 +577,7 @@ pub fn map_page_raw(va: u64, pa: u64, raw_flags: u64) -> bool {
     unsafe {
         core::ptr::write_volatile(l3_pte, desc);
         asm!("dsb ishst", options(nostack));
-        asm!("tlbi vae1is, {}", in(reg) va & !0xFFF, options(nostack));
+        asm!("tlbi vae1is, {}", in(reg) (va >> 12) & 0x0000_0FFF_FFFF_FFFF, options(nostack));
         asm!("dsb ish", options(nostack));
         asm!("isb", options(nostack));
     }
@@ -483,7 +596,7 @@ pub fn unmap_page(va: u64) -> Option<u64> {
         }
         let pa = pte & 0x0000_FFFF_FFFF_F000;
         core::ptr::write_volatile(l3_pte, 0);
-        asm!("tlbi VAE1, {}", in(reg) va & !0xFFF, options(nostack));
+        asm!("tlbi VAE1, {}", in(reg) (va >> 12) & 0x0000_0FFF_FFFF_FFFF, options(nostack));
         asm!("dsb nsh", options(nostack));
         asm!("isb", options(nostack));
         Some(pa)
@@ -532,11 +645,7 @@ pub fn translate_virt(va: u64) -> Option<u64> {
 
 /// Report whether a page is mapped in an arbitrary AArch64 translation root.
 pub fn page_is_mapped_in_root(root_pfn: u64, va: u64) -> bool {
-    let l0_phys = if root_pfn & 0x0000_FFFF_FFFF_F000 == root_pfn {
-        root_pfn << 12
-    } else {
-        root_pfn & 0x0000_FFFF_FFFF_F000
-    };
+    let l0_phys = pfn_to_phys(root_pfn);
     let l0 = l0_phys as *const u64;
     unsafe {
         let l0e = core::ptr::read_volatile(l0.add(((va >> 39) & 0x1FF) as usize));
@@ -601,21 +710,26 @@ pub fn leaf_entry(va: u64) -> Option<u64> {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 pub unsafe fn load_page_root(pml4_pfn: u64) {
     let pa = pfn_to_phys(pml4_pfn);
-    // The process root contains both the low-half user mappings and
-    // the high-half kernel mappings. AArch64 selects TTBR0 for low
-    // VAs and TTBR1 for high VAs, so both must use the same root.
+    crate::hal::serial::write_string_always("[TTBR] load begin ");
+    crate::hal::serial::write_hex_u64_always(pa);
+    crate::hal::serial::write_string_always("\r\n");
+    // The process root was built by copying the system root's kernel
+    // half (see create_user_address_space / refresh_kernel_mappings),
+    // so every kernel mapping is already present.  Just switch the
+    // translation registers and flush stale translations.
+    asm!("tlbi vmalle1is", options(nostack));
+    asm!("dsb ishst", options(nostack));
     asm!("msr TTBR1_EL1, {}", in(reg) pa, options(nostack));
     asm!("msr TTBR0_EL1, {}", in(reg) pa, options(nostack));
     asm!("dsb nsh", options(nostack));
-    // Flush all EL1 TLB entries. Stale entries from the previous
-    // root can shadow fresh page-table walks because both roots
-    // share the same TTBR registers (no ASID tag distinguishes
-    // them), so a switch without a flush lets old translations
-    // satisfy accesses that belong to the new address space.
-    asm!("tlbi vmalle1", options(nostack));
     asm!("isb", options(nostack));
-    crate::mm::vas::set_current_root(pa);
+    crate::hal::serial::write_string_always("[TTBR] root stored\r\n");
 }
+
+/// Make every page-table page of the destination root reachable through the
+/// active root. AArch64's cross-root writer uses physical addresses directly;
+/// unlike RISC-V, this kernel does not keep a full RAM identity map on all
+/// process roots, so the intermediate tables can fault during writes.
 
 /// Configure the translation regime for the 48-bit user/kernel split
 /// used by the portable memory manager. QEMU/EDK2 may leave TTBR0
@@ -653,7 +767,7 @@ pub fn read_page_root_pfn() -> u64 {
 /// Invalidate a single TLB entry for the given virtual address.
 pub fn invalidate_tlb(va: u64) {
     unsafe {
-        asm!("tlbi VAE1, {}", in(reg) va & !0xFFF, options(nostack));
+        asm!("tlbi VAE1, {}", in(reg) (va >> 12) & 0x0000_0FFF_FFFF_FFFF, options(nostack));
         asm!("dsb nsh", options(nostack));
         asm!("isb", options(nostack));
     }

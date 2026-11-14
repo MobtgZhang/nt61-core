@@ -159,7 +159,22 @@ pub struct TrapFrame {
     /// User-mode stack pointer saved from `sscratch` after the trap-entry
     /// stack swap. The SSDT uses it to read stack arguments.
     pub sp: u64,
+    pub t3: u64,
+    pub t4: u64,
+    pub t5: u64,
+    pub t6: u64,
 }
+
+// These offsets are part of the assembly trap-entry ABI.
+const _: () = {
+    assert!(core::mem::size_of::<TrapFrame>() == 280);
+    assert!(core::mem::offset_of!(TrapFrame, t0) == 8);
+    assert!(core::mem::offset_of!(TrapFrame, sepc) == 208);
+    assert!(core::mem::offset_of!(TrapFrame, sstatus) == 216);
+    assert!(core::mem::offset_of!(TrapFrame, sp) == 240);
+    assert!(core::mem::offset_of!(TrapFrame, t3) == 248);
+    assert!(core::mem::offset_of!(TrapFrame, t6) == 272);
+};
 
 /// Address / page-fault information extracted from `stval` and the
 /// `scause` register.

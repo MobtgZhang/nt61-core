@@ -68,7 +68,7 @@ const PTE_D: u64 = 1 << 7;
 
 /// Sv39 stores the 44-bit PPN in PTE bits [53:10]. Recover the aligned
 /// physical address by shifting the PPN back into bits [55:12].
-const PTE_PPN_MASK: u64 = 0x000F_FFFF_FFFF_FC00;
+const PTE_PPN_MASK: u64 = 0x003F_FFFF_FFFF_FC00;
 fn pte_pa(entry: u64) -> u64 {
     ((entry & PTE_PPN_MASK) >> 10) << 12
 }
@@ -83,8 +83,11 @@ fn pte_pa(entry: u64) -> u64 {
 /// RAM window plus a small amount of MMIO without taking pages from
 /// the PFN allocator.
 const IDENTITY_PT_POOL_PAGES: usize = 4096;
-static mut IDENTITY_PT_POOL: [[u64; 512]; IDENTITY_PT_POOL_PAGES] =
-    [[0; 512]; IDENTITY_PT_POOL_PAGES];
+#[repr(C, align(4096))]
+struct IdentityPageTables([[u64; 512]; IDENTITY_PT_POOL_PAGES]);
+
+static mut IDENTITY_PT_POOL: IdentityPageTables =
+    IdentityPageTables([[0; 512]; IDENTITY_PT_POOL_PAGES]);
 static mut IDENTITY_PT_USED: usize = 0;
 static mut IDENTITY_PT_ALLOCATED: usize = 0;
 
@@ -114,9 +117,6 @@ pub fn reset_bootstrap_identity_pool() {
 fn alloc_identity_pt() -> Option<u64> {
     let used = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(IDENTITY_PT_USED)) };
     if used >= IDENTITY_PT_POOL_PAGES {
-        crate::hal::serial::write_string_always("[RVIPT] pool exhausted used=");
-        crate::hal::serial::write_hex_u64_always(used as u64);
-        crate::hal::serial::write_string_always("\r\n");
         // Once the PFN database is online, the full RAM identity
         // window has already been installed. Dynamic page-table pages
         // are therefore safely writable while their own descriptor is
@@ -209,7 +209,6 @@ unsafe fn identity_l1_pte_for_at(root_phys: u64, va: u64) -> *mut u64 {
 /// identity mapped at the exact moment its own parent table is being
 /// created.
 unsafe fn identity_leaf_pte_for_at(root_phys: u64, va: u64) -> *mut u64 {
-    let l1_idx = ((va >> 21) & 0x1FF) as usize;
     let l2_idx = ((va >> 12) & 0x1FF) as usize;
     let l1 = identity_l1_pte_for_at(root_phys, va);
     if l1.is_null() {
@@ -229,7 +228,7 @@ unsafe fn identity_leaf_pte_for_at(root_phys: u64, va: u64) -> *mut u64 {
             None => return core::ptr::null_mut(),
         };
         let descriptor = make_nonleaf_pte(new_phys);
-        core::ptr::write_volatile(l1.add(l1_idx), descriptor);
+        core::ptr::write_volatile(l1, descriptor);
         new_phys
     };
 
@@ -411,11 +410,11 @@ unsafe fn leaf_pte_for_at(root_phys: u64, va: u64) -> *mut u64 {
         };
         ptr::write_bytes(new_phys as *mut u8, 0, 4096);
         let base = pte_pa(l0e);
-        let flags = l0e & 0xFFF;
+        let flags = l0e & !PTE_PPN_MASK;
         let table = new_phys as *mut u64;
         for index in 0..512usize {
             let pa = base + (index as u64) * (2 * 1024 * 1024);
-            core::ptr::write_volatile(table.add(index), pa | flags);
+            core::ptr::write_volatile(table.add(index), ((pa >> 12) << 10) | flags);
         }
         let descriptor = make_nonleaf_pte(new_phys);
         core::ptr::write_volatile(l0.add(l0_idx), descriptor);
@@ -444,11 +443,11 @@ unsafe fn leaf_pte_for_at(root_phys: u64, va: u64) -> *mut u64 {
         };
         ptr::write_bytes(new_phys as *mut u8, 0, 4096);
         let base = pte_pa(l1e);
-        let flags = l1e & 0xFFF;
+        let flags = l1e & !PTE_PPN_MASK;
         let table = new_phys as *mut u64;
         for index in 0..512usize {
             let pa = base + (index as u64) * PAGE_SIZE;
-            core::ptr::write_volatile(table.add(index), pa | flags);
+            core::ptr::write_volatile(table.add(index), ((pa >> 12) << 10) | flags);
         }
         let descriptor = make_nonleaf_pte(new_phys);
         core::ptr::write_volatile(l1.add(l1_idx), descriptor);
@@ -558,6 +557,12 @@ pub fn unmap_page(va: u64) -> Option<u64> {
 }
 
 pub fn translate_virt(va: u64) -> Option<u64> {
+    // In Bare mode the CPU uses the address as a physical address. Tables
+    // being prepared for a later SATP switch do not describe live mappings;
+    // consulting them here incorrectly rejects early display DMA buffers.
+    if current_satp_root_phys() == 0 {
+        return Some(va);
+    }
     unsafe {
         let l0_phys = root_phys();
         let l0_idx = ((va >> 30) & 0x1FF) as usize;
@@ -803,7 +808,7 @@ fn map_root_tables_into_self(dst_pfn: u64) {
     let dst_pa = pfn_to_phys(dst_pfn);
     let flags = crate::mm::pte::PTE_P | crate::mm::pte::PTE_RW;
     let mut mapped = 0u64;
-    if map_page_in_root_quiet(dst_pfn, dst_pa, dst_pa, flags) {
+    if page_is_mapped_in_root(dst_pfn, dst_pa) || map_page_in_root_quiet(dst_pfn, dst_pa, dst_pa, flags) {
         mapped += 1;
     }
     let dst = dst_pa as *const u64;
@@ -814,7 +819,7 @@ fn map_root_tables_into_self(dst_pfn: u64) {
                 continue;
             }
             let l1_pa = pte_pa(e0);
-            if map_page_in_root_quiet(dst_pfn, l1_pa, l1_pa, flags) {
+            if page_is_mapped_in_root(dst_pfn, l1_pa) || map_page_in_root_quiet(dst_pfn, l1_pa, l1_pa, flags) {
                 mapped += 1;
             }
             let l1 = l1_pa as *const u64;
@@ -824,7 +829,7 @@ fn map_root_tables_into_self(dst_pfn: u64) {
                     continue;
                 }
                 let l2_pa = pte_pa(e1);
-                if map_page_in_root_quiet(dst_pfn, l2_pa, l2_pa, flags) {
+                if page_is_mapped_in_root(dst_pfn, l2_pa) || map_page_in_root_quiet(dst_pfn, l2_pa, l2_pa, flags) {
                     mapped += 1;
                 }
             }
@@ -873,7 +878,7 @@ pub unsafe fn load_page_root(pml4_pfn: u64) {
     // heap) can live behind a finer-grained root descriptor. The
     // existing guard only fills invalid windows, so run it on every
     // switch to fill those missing pages without replacing valid ones.
-    prepare_switch_mappings(pml4_pfn);
+    prepare_switch_mappings_if_needed(pml4_pfn);
     let switch_pa = pa;
     // satp = MODE (from sv48::choose_mode) << 60 | ASID (0) << 44 | PPN
     let mode = crate::arch::riscv64::sv48::choose_mode();
@@ -982,6 +987,9 @@ fn prepare_switch_mappings(root_pfn: u64) {
     // wrong physical page or permissions and leave the kernel
     // unmapped immediately after the address-space switch.
     let map_guard_page = |page: u64, flags: u64| -> bool {
+        if page_is_mapped_in_root(root_pfn, page) {
+            return true;
+        }
         if current_satp_root_phys() == 0 {
             map_page_in_root_quiet(root_pfn, page, page, flags)
         } else {
@@ -1006,7 +1014,7 @@ fn prepare_switch_mappings(root_pfn: u64) {
     let mut image_page = image_start;
     let mut image_map_failures = 0u64;
     while image_page < image_end {
-        if !map_page_in_root_quiet(root_pfn, image_page, image_page, KERNEL_DATA) {
+        if !map_guard_page(image_page, KERNEL_DATA) {
             image_map_failures += 1;
         }
         image_page += PAGE_SIZE;
@@ -1186,7 +1194,9 @@ pub fn flush_tlb() {
 pub fn identity_map_region(pa: u64, size: u64) -> bool {
     const PAGE_SIZE: u64 = 4096;
     const SUPERPAGE_SIZE: u64 = 2 * 1024 * 1024;
-    const HEAP_FLAGS: u64 = PTE_R | PTE_W; // read-write, no execute (NX)
+    // make_pte takes portable flags, not Sv39 R/W bits (bit 2 would
+    // accidentally grant user access to the entire kernel identity map).
+    const HEAP_FLAGS: u64 = crate::mm::pte::PTE_P | crate::mm::pte::PTE_RW;
     let pa_aligned = pa & !(PAGE_SIZE - 1);
     let end = pa.saturating_add(size);
     if root_phys() == 0 {
@@ -1195,6 +1205,14 @@ pub fn identity_map_region(pa: u64, size: u64) -> bool {
     let root = root_phys();
     let mut cur = pa_aligned;
     while cur < end {
+        let root_entry = unsafe {
+            core::ptr::read_volatile((root as *const u64).add(((cur >> 30) & 0x1ff) as usize))
+        };
+        if is_valid(root_entry) && is_leaf(root_entry) {
+            // A 1-GiB leaf has no next-level table to dereference.
+            cur = ((cur >> 30) + 1) << 30;
+            continue;
+        }
         let aligned_2m = cur & !(SUPERPAGE_SIZE - 1);
         let can_use_superpage = cur == aligned_2m && end.saturating_sub(cur) >= SUPERPAGE_SIZE;
         let l1_pte = unsafe { identity_l1_pte_for_at(root, cur) };

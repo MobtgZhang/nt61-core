@@ -13,6 +13,8 @@
 ))]
 use core::arch::asm;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 // `core::arch::asm!` and `global_asm!` are the only way to write
 // inline assembly in stable Rust. The `asm!` form requires
 // `target_feature = "asm"` on some targets, but for the four
@@ -57,6 +59,10 @@ pub use x86_64::*;
 pub fn install_exception_vectors() {
     #[cfg(target_arch = "loongarch64")]
     {
+        // Firmware may leave EUEN.FPE clear. The boot renderer runs before
+        // init_hardware(), so enable scalar FP before entering Rust paths
+        // that use it. Exception entry already preserves the scalar state.
+        unsafe { loongarch64::fpu::enable(false, false); }
         loongarch64::init_page_walk();
         loongarch64::idt::init();
     }
@@ -472,6 +478,19 @@ pub fn page_user_accessible(entry: u64, require_write: bool) -> bool {
     {
         return (entry & (3 << 2)) == (3 << 2) && (!require_write || (entry & (1 << 1)) != 0);
     }
+}
+
+/// Check user execute permissions in an architecture-specific leaf PTE.
+pub fn page_user_executable(entry: u64) -> bool {
+    if !page_user_accessible(entry, false) { return false; }
+    #[cfg(target_arch = "x86_64")]
+    { entry & 1 != 0 && entry & (1 << 63) == 0 }
+    #[cfg(target_arch = "aarch64")]
+    { entry & 1 != 0 && entry & (1 << 54) == 0 }
+    #[cfg(target_arch = "riscv64")]
+    { entry & 1 != 0 && entry & (1 << 3) != 0 }
+    #[cfg(target_arch = "loongarch64")]
+    { entry & 1 != 0 && entry & (1 << 62) == 0 }
 }
 
 /// Return the physical kernel page root when the PFN database must
@@ -1503,6 +1522,23 @@ pub fn identity_map_region(pa: u64, size: u64) -> bool {
     {
         loongarch64::paging::identity_map_region(pa, size)
     }
+}
+
+/// Base and size of the live ntoskrnl image, published by the memory manager
+/// after the loader hands over boot information.
+static KERNEL_IMAGE_BASE: AtomicU64 = AtomicU64::new(0);
+static KERNEL_IMAGE_SIZE: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_kernel_image_range(base: u64, size: u64) {
+    KERNEL_IMAGE_BASE.store(base, Ordering::Release);
+    KERNEL_IMAGE_SIZE.store(size, Ordering::Release);
+}
+
+pub fn kernel_image_range() -> (u64, u64) {
+    (
+        KERNEL_IMAGE_BASE.load(Ordering::Acquire),
+        KERNEL_IMAGE_SIZE.load(Ordering::Acquire),
+    )
 }
 
 /// Re-encode a portable x86-format root entry for the active MMU.

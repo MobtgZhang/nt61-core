@@ -200,7 +200,7 @@ impl KTrapFrame {
 /// vectors, the CPU's error code sits in the stack frame at
 /// `rip - 8` (i.e. the word immediately before the RIP slot).
 pub fn vector_has_error_code(v: u64) -> bool {
-    matches!(v, 8 | 10 | 11 | 12 | 13 | 14 | 17)
+    matches!(v, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 21 | 29 | 30)
 }
 
 /// # Safety
@@ -351,42 +351,8 @@ pub unsafe extern "win64" fn dispatch_trap_frame(vector: u64, tf: *mut TrapFrame
     if tf.is_null() {
         return;
     }
-    let mut canonical_frame = TrapFrame::default();
-    let has_cpu_error_code = matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17);
-    let tf_ref: &mut TrapFrame = if has_cpu_error_code {
-        unsafe { &mut *tf }
-    } else {
-        // Non-error-code vectors do not push an error code, so the CPU's
-        // RIP/CS/RFLAGS/RSP/SS occupy the Rust struct slots named
-        // error_code/rip/cs/rflags/rsp. The in-place shift used here
-        // previously overwrote the actual IRET frame and made iretq load
-        // the user RIP as CS. Build a canonical view for Rust handlers,
-        // but leave the CPU frame untouched for the assembly epilogue.
-        let raw = unsafe { &*tf };
-        canonical_frame.rax = raw.rax;
-        canonical_frame.rcx = raw.rcx;
-        canonical_frame.rdx = raw.rdx;
-        canonical_frame.rbx = raw.rbx;
-        canonical_frame.rbp = raw.rbp;
-        canonical_frame.rsi = raw.rsi;
-        canonical_frame.rdi = raw.rdi;
-        canonical_frame.r8 = raw.r8;
-        canonical_frame.r9 = raw.r9;
-        canonical_frame.r10 = raw.r10;
-        canonical_frame.r11 = raw.r11;
-        canonical_frame.r12 = raw.r12;
-        canonical_frame.r13 = raw.r13;
-        canonical_frame.r14 = raw.r14;
-        canonical_frame.r15 = raw.r15;
-        canonical_frame.vector = vector;
-        canonical_frame.error_code = 0;
-        canonical_frame.rip = raw.error_code;
-        canonical_frame.cs = raw.rip;
-        canonical_frame.rflags = raw.cs;
-        canonical_frame.rsp = raw.rflags;
-        canonical_frame.ss = raw.rsp;
-        &mut canonical_frame
-    };
+    // Assembly normalizes both IRQs and CPU exceptions to this layout.
+    let tf_ref = unsafe { &mut *tf };
     #[cfg(target_arch = "x86_64")]
     if vector == 14 {
         let frame = &*tf_ref;
@@ -473,15 +439,6 @@ pub unsafe extern "win64" fn dispatch_trap_frame(vector: u64, tf: *mut TrapFrame
         } else {
             0
         };
-        // CRITICAL: DO NOT write to (*tf).vector or (*tf).error_code.
-        // Those struct fields overlap with CPU-pushed trap frame slots
-        // (offset 0x78 is the CPU's error_code slot for vectors that
-        // push one, and offset 0x80 is the CPU's user RIP slot).
-        // Writing to them would clobber the values the CPU needs to
-        // resume via iretq. The `vector` value is recovered from the
-        // function parameter, and the CPU-pushed error_code has been
-        // saved into the local `error_code` variable above.
-
         // ke_sched P0-7: the interrupt dispatcher never published an
         // IRQL, so every handler ran at PASSIVE_LEVEL and kernel code
         // could not tell it was inside an interrupt. Raise the IRQL to
@@ -656,9 +613,10 @@ pub unsafe extern "win64" fn dispatch_trap_frame(vector: u64, tf: *mut TrapFrame
             0xFF => {}
 
             // === Unknown vectors ===
-            _v => {
-                // _v is intentionally unused - unknown vectors are logged/ignored
-                // // crate::kprintln!("[FAULT] unhandled interrupt/exception vector {} (raw=0x{:x})", _v, _v);
+            v => {
+                crate::hal::x86_64::serial::write_string_always("[IRQ] unhandled vector=0x");
+                crate::hal::x86_64::serial::write_hex_u64_always(v);
+                crate::hal::x86_64::serial::write_string_always("\r\n");
             }
         }
 
@@ -949,11 +907,10 @@ unsafe fn early_pf_halt() {
 
 /// handle #DF (Double Fault) - IST3 should be set but we handle gracefully
 /// #DF is fatal in most cases, but we log for debugging
-fn handle_double_fault(_error_code: u64, _tf: &TrapFrame) {
-    // _error_code and _tf are intentionally unused - reserved for future logging
-    // // crate::kprintln!("[FAULT] #DF (Double Fault) - fatal error");
-    // // crate::kprintln!("  RIP=0x{:016x} RSP=0x{:016x}", _tf.rip, _tf.rsp);
-    // // crate::kprintln!("  RFLAGS=0x{:016x} CS=0x{:x}", _tf.rflags, _tf.cs);
+fn handle_double_fault(error_code: u64, _tf: &TrapFrame) {
+    crate::hal::x86_64::serial::write_string_always("[FAULT] #DF (Double Fault) error=0x");
+    crate::hal::x86_64::serial::write_hex_u64_always(error_code);
+    crate::hal::x86_64::serial::write_string_always("\r\n");
     // In a real kernel, this would trigger BugCheck or triple fault
     // For now, halt the system
     loop {
@@ -965,12 +922,12 @@ fn handle_double_fault(_error_code: u64, _tf: &TrapFrame) {
 
 /// handle #GP (General Protection Fault)
 /// This is critical - can be caused by bad selector, privilege violation, etc.
-fn handle_general_protection(_error_code: u64, tf: &TrapFrame) {
-    let _selector_id = _error_code & 0xFFFF;
-    let _ext = (_error_code >> 16) & 1 != 0;
+fn handle_general_protection(error_code: u64, tf: &TrapFrame) {
+    let selector_id = error_code & 0xFFFF;
+    let ext = (error_code >> 16) & 1 != 0;
     let frame_base = tf as *const TrapFrame as *const u64;
     crate::hal::x86_64::serial::write_string_always("[GP] err=");
-    crate::hal::x86_64::serial::write_hex_u64_always(_error_code);
+    crate::hal::x86_64::serial::write_hex_u64_always(error_code);
     crate::hal::x86_64::serial::write_string_always(" cs=");
     crate::hal::x86_64::serial::write_hex_u64_always(tf.cs);
     crate::hal::x86_64::serial::write_string_always(" rip=");
@@ -983,6 +940,11 @@ fn handle_general_protection(_error_code: u64, tf: &TrapFrame) {
     crate::hal::x86_64::serial::write_hex_u64_always(tf.rax);
     crate::hal::x86_64::serial::write_string_always(" rbx=");
     crate::hal::x86_64::serial::write_hex_u64_always(tf.rbx);
+    crate::hal::x86_64::serial::write_string_always(" selector=0x");
+    crate::hal::x86_64::serial::write_hex_u64_always(selector_id);
+    crate::hal::x86_64::serial::write_string_always(" ext=");
+    crate::hal::x86_64::serial::write_string_always(if ext { "1" } else { "0" });
+    crate::hal::x86_64::serial::write_string_always("\r\n");
     crate::hal::x86_64::serial::write_string_always(" rcx=");
     crate::hal::x86_64::serial::write_hex_u64_always(tf.rcx);
     crate::hal::x86_64::serial::write_string_always(" rdx=");
@@ -1260,15 +1222,17 @@ fn handle_stack_fault(error_code: u64, tf: &TrapFrame) {
 
 /// handle #NP (Segment Not Present)
 /// Usually caused by loading a non-present segment
-fn handle_segment_not_present(_error_code: u64, _tf: &TrapFrame) {
-    let _selector_id = _error_code & 0xFFFF;
-    let _ext = (_error_code >> 16) & 1 != 0;
-    let _ti = (_error_code >> 14) & 1 != 0; // TI bit: LDT vs GDT
-                                            // _selector_id, _ext, _ti, and _tf are intentionally unused - reserved for future logging
-
-    // // crate::kprintln!("[FAULT] #NP (Segment Not Present)");
-    // // crate::kprintln!("  Error code: ID={} EXT={} TI={} Selector=0x{:04x}", _selector_id, _ext, _ti, _selector_id);
-    // // crate::kprintln!("  RIP=0x{:016x}", _tf.rip);
+fn handle_segment_not_present(error_code: u64, _tf: &TrapFrame) {
+    let selector_id = error_code & 0xFFFF;
+    let ext = (error_code >> 16) & 1 != 0;
+    let ti = (error_code >> 14) & 1 != 0; // TI bit: LDT vs GDT
+    crate::hal::x86_64::serial::write_string_always("[FAULT] #NP selector=0x");
+    crate::hal::x86_64::serial::write_hex_u64_always(selector_id);
+    crate::hal::x86_64::serial::write_string_always(" ext=");
+    crate::hal::x86_64::serial::write_string_always(if ext { "1" } else { "0" });
+    crate::hal::x86_64::serial::write_string_always(" ti=");
+    crate::hal::x86_64::serial::write_string_always(if ti { "1" } else { "0" });
+    crate::hal::x86_64::serial::write_string_always("\r\n");
 }
 
 /// handle #UD (Invalid Opcode)
@@ -1325,10 +1289,10 @@ fn handle_invalid_opcode(tf: &TrapFrame) {
 
 /// handle #NM (Device Not Available)
 /// Caused by executing x87/FPU instruction when CR0.TS=1
-fn handle_device_not_available(_tf: &TrapFrame) {
-    // _tf is intentionally unused - reserved for future logging
-    // // crate::kprintln!("[FAULT] #NM (Device Not Available)");
-    // // crate::kprintln!("  RIP=0x{:016x}", _tf.rip);
+fn handle_device_not_available(tf: &TrapFrame) {
+    crate::hal::x86_64::serial::write_string_always("[FAULT] #NM rip=0x");
+    crate::hal::x86_64::serial::write_hex_u64_always(tf.rip);
+    crate::hal::x86_64::serial::write_string_always("\r\n");
 
     // Clear the TS bit and restore FPU state
     unsafe {
@@ -1342,10 +1306,10 @@ fn handle_device_not_available(_tf: &TrapFrame) {
 
 /// handle #MC (Machine Check)
 /// Non-maskable hardware error
-fn handle_machine_check(_tf: &TrapFrame) {
-    // _tf is intentionally unused - reserved for future logging
-    // // crate::kprintln!("[FAULT] #MC (Machine Check)");
-    // // crate::kprintln!("  RIP=0x{:016x}", _tf.rip);
+fn handle_machine_check(tf: &TrapFrame) {
+    crate::hal::x86_64::serial::write_string_always("[FAULT] #MC rip=0x");
+    crate::hal::x86_64::serial::write_hex_u64_always(tf.rip);
+    crate::hal::x86_64::serial::write_string_always("\r\n");
 
     // Machine check is typically fatal
     loop {
@@ -1357,11 +1321,12 @@ fn handle_machine_check(_tf: &TrapFrame) {
 
 /// handle #AC (Alignment Check)
 /// Memory access at misaligned address when CR0.AM=1 and EFLAGS.AC=1
-fn handle_alignment_check(_error_code: u64, tf: &TrapFrame) {
-    // _error_code is intentionally unused - reserved for future logging
-    // // crate::kprintln!("[FAULT] #AC (Alignment Check)");
-    // // crate::kprintln!("  Error code: 0x{:016x}", _error_code);
-    // // crate::kprintln!("  RIP=0x{:016x}", tf.rip);
+fn handle_alignment_check(error_code: u64, tf: &TrapFrame) {
+    crate::hal::x86_64::serial::write_string_always("[FAULT] #AC error=0x");
+    crate::hal::x86_64::serial::write_hex_u64_always(error_code);
+    crate::hal::x86_64::serial::write_string_always(" rip=0x");
+    crate::hal::x86_64::serial::write_hex_u64_always(tf.rip);
+    crate::hal::x86_64::serial::write_string_always("\r\n");
 
     let user_mode = tf.cs & 3 != 0;
     if !user_mode {

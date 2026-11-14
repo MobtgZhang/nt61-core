@@ -59,6 +59,7 @@ pub type VirtAddr = u64;
 pub type PhysAddr = u64;
 
 #[repr(C, align(4096))]
+#[derive(Clone, Copy)]
 pub struct PageAlignedTable(pub [u64; 512]);
 
 const PAGE_TABLE_ENTRIES: usize = 512;
@@ -78,6 +79,7 @@ struct PagingState {
     root: PageAlignedTable,
     bootstrap: BootstrapPageTables,
     leaf_keys: [Option<LeafTableKey>; MAX_LEAF_TABLES],
+    directories: [PageAlignedTable; 512],
 }
 
 impl PagingState {
@@ -86,6 +88,7 @@ impl PagingState {
             root: PageAlignedTable([0; 512]),
             bootstrap: BootstrapPageTables([0; 512 * BOOTSTRAP_TABLE_COUNT]),
             leaf_keys: [None; MAX_LEAF_TABLES],
+            directories: [PageAlignedTable([0; 512]); 512],
         }
     }
 }
@@ -453,15 +456,18 @@ pub fn leaf_entry(va: u64) -> Option<u64> {
         if !is_table_loong(l0e) {
             return None;
         }
-        let l1e = core::ptr::read_volatile(table_pa_loong(l0e) as *const u64);
+        let l1 = table_pa_loong(l0e) as *const u64;
+        let l1e = core::ptr::read_volatile(l1.add(((va >> 39) & 0x1FF) as usize));
         if !is_table_loong(l1e) {
             return None;
         }
-        let l2e = core::ptr::read_volatile(table_pa_loong(l1e) as *const u64);
+        let l2 = table_pa_loong(l1e) as *const u64;
+        let l2e = core::ptr::read_volatile(l2.add(((va >> 30) & 0x1FF) as usize));
         if !is_table_loong(l2e) {
             return None;
         }
-        let dir1e = core::ptr::read_volatile(table_pa_loong(l2e) as *const u64);
+        let dir1 = table_pa_loong(l2e) as *const u64;
+        let dir1e = core::ptr::read_volatile(dir1.add(((va >> 21) & 0x1FF) as usize));
         if !is_table_loong(dir1e) {
             return None;
         }
@@ -774,7 +780,6 @@ pub fn identity_map_region(pa: u64, size: u64) -> bool {
             let tables = (&state.bootstrap as *const BootstrapPageTables) as u64;
             let l1_pa = tables;
             let l2_pa = tables + PAGE_SIZE;
-            let dir1_pa = tables + 2 * PAGE_SIZE;
             let mut cur = pa_aligned;
             while cur < end {
                 let l0_idx = ((cur >> 48) & 0x1FF) as usize;
@@ -809,10 +814,15 @@ pub fn identity_map_region(pa: u64, size: u64) -> bool {
                 };
                 let l2 = l2_pa_used as *mut u64;
                 let l2e = core::ptr::read_volatile(l2.add(l2_idx));
-                if !is_table_loong(l2e) {
-                    core::ptr::write_volatile(l2.add(l2_idx), make_table_desc_loong(dir1_pa));
-                }
-
+                // Every 1-GiB window needs its own directory. Reusing one
+                // directory aliases high PFN storage onto low kernel RAM.
+                let dir1_pa = if is_table_loong(l2e) {
+                    table_pa_loong(l2e)
+                } else {
+                    let address = core::ptr::addr_of!(state.directories[l2_idx]) as u64;
+                    core::ptr::write_volatile(l2.add(l2_idx), make_table_desc_loong(address));
+                    address
+                };
                 let dir1 = dir1_pa as *mut u64;
                 let dir1e = core::ptr::read_volatile(dir1.add(l3_idx));
                 if !is_table_loong(dir1e) {

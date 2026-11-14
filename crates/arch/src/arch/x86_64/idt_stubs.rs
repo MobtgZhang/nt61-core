@@ -80,28 +80,17 @@ global_asm!(
 
 global_asm!(
 
-    // ---- raw-bytes helper --------------------------------------------
-    // `emit_stub N` writes an interrupt stub for vector N.
-    //
-    // The interrupted RDI is saved first, then the vector number is
-    // pushed above it.  The common dispatcher restores RDI from the
-    // saved slot before unwinding both bookkeeping slots.
-    //
-    // The label is declared `.global` so external C code (in
-    // `arch::x86_64::idt`) can take its address when wiring up
-    // the IDT.
-    //
-    // We deliberately skip `.type` because its GNU `@function`
-    // form is rejected on the Windows COFF object format that
-    // `x86_64-unknown-uefi` uses. `STT_FUNC` / `.def` are
-    // GAS-only conveniences, not required for correctness.
-    // -------------------------------------------------------------------
+    // Normalize every entry to vector, error code, RIP, CS, RFLAGS, RSP,
+    // SS. Save RDI without an extra slot between vector and error code.
     ".macro emit_stub n",
     "  .global int_stub_\\n",
     "int_stub_\\n:",
+    "  .if (\\n != 8) && (\\n != 10) && (\\n != 11) && (\\n != 12) && (\\n != 13) && (\\n != 14) && (\\n != 17) && (\\n != 21) && (\\n != 29) && (\\n != 30)",
+    "  push 0",
+    "  .endif",
     "  push rdi",
     "  mov edi, \\n",
-    "  push rdi",
+    "  xchg rdi, [rsp]",
     "  jmp int_common_dispatch",
     ".endm",
 
@@ -174,31 +163,8 @@ global_asm!(
     "emit_stub 248", "emit_stub 249", "emit_stub 250", "emit_stub 251",
     "emit_stub 252", "emit_stub 253", "emit_stub 254", "emit_stub 255",
 
-    // ---- Common interrupt dispatcher ---------------------------------
-    // Saves GPRs, calls dispatch_trap_frame, restores GPRs, iretq.
-    //
-    // The int_stub_N stubs pass the vector number in RDI (no stack
-    // push). The CPU pushed SS, RSP, RFLAGS, CS, RIP [, error_code]
-    // at interrupt entry. For vectors that push an error code (8,
-    // 10, 11, 12, 13, 14, 17) we must skip it before iretq.
-    //
-    // Stack at int_common_dispatch entry:
-    //   [rsp + 0]  user RIP
-    //   [rsp + 8]  user CS
-    //   [rsp + 16] user RFLAGS
-    //   [rsp + 24] user RSP
-    //   [rsp + 32] user SS
-    //   [rsp + 40] error_code  (only for vectors 8/10/11/12/13/14/17)
-    //
-    // Stack after 14 GPR pushes (rsp -= 112):
-    //   [rsp + 0]   = rax (last push)
-    //   [rsp + 8]   = rcx
-    //   ...
-    //   [rsp + 48]  = rdi (== vector, set by int_stub_N)
-    //   ...
-    //   [rsp + 112] = r15 (first push)
-    //   [rsp + 120] = (no longer vector, since stub doesn't push)
-    // -------------------------------------------------------------------
+    // Fifteen GPR slots followed by the normalized CPU frame. This
+    // layout is exactly dispatch::TrapFrame, for IRQs and exceptions.
     ".balign 16",
     "int_common_dispatch:",
     // If the interrupt came from Ring 3, GS currently holds the user
@@ -206,8 +172,8 @@ global_asm!(
     // before any handler can touch per-CPU data.  At common-entry RSP
     // points at the vector slot pushed by int_stub_N; the saved RDI is
     // immediately above it, followed by the CPU frame.
-    "  cmp word ptr [rsp + 0x08], 0x2b",
-    "  jne 6f",
+    "  test byte ptr [rsp + 0x18], 3",
+    "  jz 6f",
     "  swapgs",
     "6:",
     "  cld",
@@ -215,60 +181,20 @@ global_asm!(
     "  push r11", "  push r10", "  push r9",  "  push r8",
     "  push rdi", "  push rsi", "  push rbp", "  push rbx",
     "  push rdx", "  push rcx", "  push rax",
-    // The 15 GPR pushes grow the frame downward in REVERSE order of
-    // the TrapFrame struct fields, so the saved rdi (=vector, placed
-    // here by int_stub_N) is at [rsp + 0x30] right now.
-    //
-    // The Windows x64 ABI is in effect here: a Rust `extern "C"`
-    // function built for `x86_64-unknown-uefi` expects the first
-    // argument in RCX, the second in RDX. So we pass vector via
-    // RCX and &TrapFrame via RDX, NOT the SysV RDI/RSI convention.
-    "  mov rcx, [rsp + 0x80]",             // rcx = vector (pushed by int_stub)
+    // Win64 ABI: RCX = vector, RDX = &TrapFrame.
+    "  mov rcx, [rsp + 0x78]",
     "  mov rdx, rsp",                      // rdx = &TrapFrame
     "  sub rsp, 0x20",                     // Win64 shadow space
     "  call dispatch_trap_frame",
     "  add rsp, 0x20",
-    // After 15 GPR pushes, the bookkeeping slots and CPU frame sit
-    // above the GPRs:
-    //
-    // Both frame classes contain the vector slot directly above the
-    // 15 GPR slots, and the saved RDI is above the vector slot.
-    // Error-code vectors additionally contain the CPU error code above
-    // the saved RDI. Restore every pushed GPR and the caller's RDI on
-    // both paths; otherwise a resumable user-mode exception returns
-    // with garbage register state.
-    "  mov r12, [rsp + 0x78]",             // r12 = vector
-    "  mov rdi, r12",
-    "  cmp rdi, 8",     "  je 2f",
-    "  cmp rdi, 10",    "  je 2f",
-    "  cmp rdi, 11",    "  je 2f",
-    "  cmp rdi, 12",    "  je 2f",
-    "  cmp rdi, 13",    "  je 2f",
-    "  cmp rdi, 14",    "  je 2f",
-    "  cmp rdi, 17",    "  je 2f",
-    "  jmp 1f",
-    "2:",
     "  pop rax", "  pop rcx", "  pop rdx", "  pop rbx",
     "  pop rbp", "  pop rsi", "  pop rdi",
     "  pop r8", "  pop r9", "  pop r10", "  pop r11",
     "  pop r12", "  pop r13", "  pop r14", "  pop r15",
-    "  mov rdi, [rsp + 0x08]",            // restore interrupted RDI
-    "  add rsp, 0x18",                    // skip vector, saved RDI, error code
-    "  jmp 3f",
-    "1:",
-    "  pop rax", "  pop rcx", "  pop rdx", "  pop rbx",
-    "  pop rbp", "  pop rsi", "  pop rdi",
-    "  pop r8", "  pop r9", "  pop r10", "  pop r11",
-    "  pop r12", "  pop r13", "  pop r14", "  pop r15",
-    "  mov rdi, [rsp + 0x08]",            // restore interrupted RDI
-    "  add rsp, 0x10",                    // skip vector and saved RDI
-    "3:",
-    // Restore the GS convention for the interrupted context.  Interrupt
-    // entry performed swapgs only when CPL was 3, so perform the paired
-    // swap here only when the iret frame returns to Ring 3.  Kernel
-    // interrupts and kernel-to-kernel reschedules must not swap GS.
-    "  cmp word ptr [rsp + 0x08], 0x2b",
-    "  jne 5f",
+    "  add rsp, 0x10",                    // vector and error code
+    // Pair swapgs only for a return to user mode.
+    "  test byte ptr [rsp + 0x08], 3",
+    "  jz 5f",
     "  swapgs",
     "5:",
     // CRITICAL: The iret frame's SS slot is whatever SS was active

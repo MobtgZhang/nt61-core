@@ -100,6 +100,9 @@ pub fn init_page_walk() {
 
 /// Initialise LoongArch64 architecture state.
 pub fn init() {
+    // Install the kernel per-CPU base before the scheduler uses it.
+    // SAFETY: architecture initialization runs once on the boot CPU.
+    unsafe { crate::arch::common::percpu::init(0); }
     // Install the exception/TLB-refill vectors before the memory
     // manager enables mapped-address mode. A missing mapping during
     // early paging must be handled by the kernel, not by the

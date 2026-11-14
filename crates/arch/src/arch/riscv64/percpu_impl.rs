@@ -1,9 +1,8 @@
 //! riscv64 per-CPU implementation.
 //
 //! Uses the `tp` (thread pointer) register, which is typically set by
-//! the bootloader to point to the per-CPU area. We use `sscratch` CSR
-//! as a swap register: on entry from user mode, we swap tp and sscratch
-//! to get the kernel's per-CPU area, and swap back on return.
+//! the kernel to point to the per-CPU area. `sscratch` holds the kernel
+//! stack while user mode is running; trap entry preserves `tp`.
 //
 //! ## Memory layout (must match arch::common::percpu::PerCpuArea)
 //
@@ -11,12 +10,12 @@
 //! |--------|-------|
 //! | 0x00 | `user_sp` (saved user stack pointer) |
 //! | 0x08 | `kernel_sp` (kernel stack pointer) |
-//! | 0x0C | `cpu_id` |
-//! | 0x10 | `current_thread` |
-//! | 0x18 | `current_process` |
-//! | 0x20 | `irql` |
-//! | 0x28 | `syscall_count` |
-//! | 0x30 | `interrupt_count` |
+//! | 0x10 | `cpu_id` |
+//! | 0x18 | `current_thread` |
+//! | 0x20 | `current_process` |
+//! | 0x28 | `irql` |
+//! | 0x30 | `syscall_count` |
+//! | 0x38 | `interrupt_count` |
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -158,7 +157,7 @@ pub fn __percpu_get_current_cpu_id() -> u32 {
     }
     let cpu_id: u32;
     unsafe {
-        cpu_id = *(base as *const u32).add(3); // offset 0x0C
+        cpu_id = (*(base as *const PerCpuArea)).cpu_id;
     }
     cpu_id
 }
@@ -197,7 +196,7 @@ pub fn __percpu_set_current_thread(thread: *mut Ethread) {
         return;
     }
     unsafe {
-        let ptr = (base as *mut *mut Ethread).add(2); // offset 0x10
+        let ptr = core::ptr::addr_of_mut!((*(base as *mut PerCpuArea)).current_thread);
         ptr.write(thread);
     }
 }
@@ -210,7 +209,7 @@ pub fn __percpu_get_current_thread() -> *mut Ethread {
         return core::ptr::null_mut();
     }
     unsafe {
-        let ptr = (base as *const *mut Ethread).add(2); // offset 0x10
+        let ptr = core::ptr::addr_of!((*(base as *const PerCpuArea)).current_thread);
         ptr.read()
     }
 }
@@ -223,7 +222,7 @@ pub fn __percpu_set_current_process(process: *mut Eprocess) {
         return;
     }
     unsafe {
-        let ptr = (base as *mut *mut Eprocess).add(3); // offset 0x18
+        let ptr = core::ptr::addr_of_mut!((*(base as *mut PerCpuArea)).current_process);
         ptr.write(process);
     }
 }
@@ -236,7 +235,7 @@ pub fn __percpu_get_current_process() -> *mut Eprocess {
         return core::ptr::null_mut();
     }
     unsafe {
-        let ptr = (base as *const *mut Eprocess).add(3); // offset 0x18
+        let ptr = core::ptr::addr_of!((*(base as *const PerCpuArea)).current_process);
         ptr.read()
     }
 }

@@ -445,8 +445,11 @@ pub unsafe extern "C" fn ntoskrnl_kisystemstartup_thunk(
     crate::boot_debug_println!(
         "[NTOSKRNL-HOST] K08d: pnp::start_all_pending (start unbound PCI devices)"
     );
-    let _started = crate::drivers::bus::pnp::start_all_pending();
-    crate::boot_debug_println!("[NTOSKRNL-HOST] K08d: pnp::start_all_pending returned");
+    let started = crate::drivers::bus::pnp::start_all_pending();
+    crate::boot_debug_println!(
+        "[NTOSKRNL-HOST] K08d: pnp::start_all_pending returned (started={})",
+        started
+    );
 
     // Converge with kernel_main Phases 8/10: the process/thread
     // subsystem must be live before the SMSS chain creates processes,

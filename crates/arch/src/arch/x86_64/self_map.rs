@@ -207,6 +207,8 @@ pub fn ensure_low_identity_map(pa_base: u64, size: u64) -> bool {
     // U (0x4) deliberately omitted: kernel identity mappings must not be
     // user-accessible (ring-3 pointers must not reach low physical pages).
     const PDE_2MB_FLAGS: u64 = 0x1 | 0x2 | 0x20 | 0x40 | 0x80; // P|RW|A|D|PS
+    const ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+    const ONE_GB_MASK: u64 = 0x000F_FFFF_C000_0000;
 
     let start = pa_base & !(TWO_MB - 1);
     let end_unaligned = pa_base.saturating_add(size);
@@ -289,6 +291,19 @@ pub fn ensure_low_identity_map(pa_base: u64, size: u64) -> bool {
 
             // PDPTE -> PD (allocate on demand)
             let pdpte = pdpt.add(pdpt_idx);
+            let entry = core::ptr::read_volatile(pdpte).raw();
+            if entry & 0x81 == 0x81 {
+                // OVMF may identity-map the PCI aperture using 1 GiB
+                // leaves. A leaf points at memory/MMIO, never at a PD.
+                // Walking it as a table writes into the device aperture
+                // (or low RAM) and makes a valid mapping appear broken.
+                if entry & ONE_GB_MASK != cur & ONE_GB_MASK || entry & 0x6 != 0x2 {
+                    ok = false;
+                    break;
+                }
+                cur += TWO_MB;
+                continue;
+            }
             if !(*pdpte).is_hardware() {
                 let new_pd = match crate::mm::pfn::allocate_pfn() {
                     Some(p) => pfn_to_phys(p),
@@ -368,7 +383,7 @@ pub fn ensure_low_identity_map(pa_base: u64, size: u64) -> bool {
                 verify_cur += TWO_MB;
                 continue;
             }
-            let pdpt_phys = pml4e_raw & !0xFFFu64;
+            let pdpt_phys = pml4e_raw & ADDRESS_MASK;
             let pdpt = pdpt_phys as *mut MMPTE;
             let pdpte = (*pdpt.add(pdpt_idx)).raw();
             if pdpte & 1 == 0 {
@@ -376,7 +391,14 @@ pub fn ensure_low_identity_map(pa_base: u64, size: u64) -> bool {
                 verify_cur += TWO_MB;
                 continue;
             }
-            let pd_phys = pdpte & !0xFFFu64;
+            if pdpte & 0x80 != 0 {
+                if pdpte & ONE_GB_MASK != verify_cur & ONE_GB_MASK || pdpte & 0x6 != 0x2 {
+                    bad += 1;
+                }
+                verify_cur += TWO_MB;
+                continue;
+            }
+            let pd_phys = pdpte & ADDRESS_MASK;
             let pd = pd_phys as *mut MMPTE;
             let pde = (*pd.add(pd_idx)).raw();
             count += 1;
@@ -396,6 +418,13 @@ pub fn ensure_low_identity_map(pa_base: u64, size: u64) -> bool {
             verify_cur += TWO_MB;
         }
         crate::boot_debug_println!("[VAS] verify: {} PDEs, {} bad", count, bad);
+        if !ok || bad != 0 {
+            crate::hal::serial::write_string_always("[MMIO] identity mapping failed base=");
+            crate::hal::serial::write_hex_u64_always(pa_base);
+            crate::hal::serial::write_string_always(" bad=");
+            crate::hal::serial::write_hex_u64_always(bad);
+            crate::hal::serial::write_string_always("\r\n");
+        }
         ok & (bad == 0)
     }
 }

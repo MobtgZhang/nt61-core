@@ -80,20 +80,8 @@ impl From<u32> for TrapKind {
     }
 }
 
-/// Trap frame pushed by `loongarch64_exception`. The layout mirrors
-/// the order of `st.d` instructions in `idt.rs`.
-///
-/// | offset | Field | Source |
-/// |--------|-------|--------|
-/// | 0x00   | ra    |        |
-/// | 0x08   | tp    |        |
-/// | 0x10   | s0..s8 |       |
-/// | 0x60   | fp    |        |
-/// | 0x68   | a0..a7 |       |
-/// | 0xA8   | t0..t7 |       |
-///
-/// Phase 1 only uses a0..a7 for syscall argument parsing; we expose
-/// the full layout for forward compatibility.
+/// Complete exception context, including the return CSRs and FPU state.
+/// The offsets are shared with the assembly entry in `idt.rs`.
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct TrapFrame {
@@ -105,7 +93,26 @@ pub struct TrapFrame {
     pub t: [u64; 8], // t0..t7
     /// User-mode stack pointer saved by the EENTRY stub.
     pub sp: u64,
+    pub t8: u64,
+    pub r21: u64,
+    pub era: u64,
+    pub prmd: u64,
+    pub euen: u64,
+    pub badv: u64,
+    pub estat: u64,
+    pub fpr: [u64; 32],
+    pub fcsr: u64,
+    pub fcc: [u8; 8],
 }
+
+const _: () = {
+    assert!(core::mem::offset_of!(TrapFrame, sp) == 224);
+    assert!(core::mem::offset_of!(TrapFrame, era) == 248);
+    assert!(core::mem::offset_of!(TrapFrame, fpr) == 288);
+    assert!(core::mem::offset_of!(TrapFrame, fcsr) == 544);
+    assert!(core::mem::offset_of!(TrapFrame, fcc) == 552);
+    assert!(core::mem::size_of::<TrapFrame>() == 560);
+};
 
 /// Address-error / page-fault information extracted from the
 /// `BADV` (Bad Virtual Address) CSR.
@@ -150,7 +157,7 @@ pub fn read_badv() -> u64 {
     v
 }
 
-/// read PRMD (Previous Mode) CSR (0x1) — bit 0 = PIE, bit 1 = PPL.
+/// Read PRMD: PPLV in bits 1:0 and PIE in bit 2.
 #[inline(always)]
 pub fn read_prmd() -> u32 {
     let v: u32;
@@ -169,8 +176,9 @@ pub fn read_prmd() -> u32 {
 /// `kprintln!` to keep the build small.
 #[no_mangle]
 pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
-    let estat = read_estat();
-    crate::arch::boot::early_write_str(b"[TRAP_ENTER]\r\n");
+    // SAFETY: the assembly entry supplies a live, uniquely owned frame.
+    let context = unsafe { &mut *frame };
+    let estat = context.estat as u32;
     let exc_code = (estat >> 16) & 0x3F;
     let kind: TrapKind = exc_code.into();
 
@@ -191,7 +199,7 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
         | TrapKind::PageModified
         | TrapKind::PageNotReadable
         | TrapKind::PageNotExecutable => {
-            let badv = read_badv();
+            let badv = context.badv;
             // PME (code 4): store to a V=1/W=0 page. PNR (5) / PNX (6):
             // read/fetch denied by the extended permission bits. Route
             // all of them into the generic access-fault handler so
@@ -206,7 +214,7 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
                 read: !is_write,
                 write: is_write,
                 execute: is_inst,
-                user: true,
+                user: context.prmd & 3 == 3,
                 reserved_bit: false,
                 instruction_fetch: is_inst,
             };
@@ -222,20 +230,11 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
             );
         }
         TrapKind::IllegalInstruction => {
-            let era = read_era();
+            let era = context.era;
             panic!("LA64 illegal instruction @ ERA={:#x}", era);
         }
         TrapKind::Breakpoint => {
-            let era = read_era();
-            // Treat as no-op; advance past the `break` so we don't
-            // re-trigger. Real debugger support lands in Phase 2.
-            unsafe {
-                asm!(
-                    "csrwr {era}, 0x6",  // ERA = next instruction
-                    era = in(reg) era + 4,
-                    options(nostack),
-                );
-            }
+            context.era = context.era.wrapping_add(4);
         }
         TrapKind::Int => {
             let is = estat & 0x7FFF; // IS[14:0]
@@ -276,7 +275,7 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
             }
         }
         _ => {
-            let era = read_era();
+            let era = context.era;
             panic!(
                 "LA64 unhandled trap: {:?} (ESTAT={:#x}) @ ERA={:#x}",
                 kind, estat, era
