@@ -9,10 +9,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::drivers::virtio::gpu::GpuSession;
 use crate::drivers::virtio::pci::PciTransport;
-#[cfg(not(target_arch = "x86_64"))]
-use crate::hal::common::pit;
-#[cfg(target_arch = "x86_64")]
-use crate::hal::x86_64::pit;
 use crate::ke::sync::Spinlock;
 
 const T_TEXT0: u32 = 120;
@@ -60,30 +56,14 @@ impl AnimationCanvas {
 }
 
 static ANIMATION_CANVAS: Spinlock<AnimationCanvas> = Spinlock::new(AnimationCanvas::new());
+// A GPU resource is not a CPU-visible firmware framebuffer. Keep the
+// desktop's backing store separate from the resource used for scanout.
+static SOFTWARE_FRAMEBUFFER: Spinlock<AnimationCanvas> = Spinlock::new(AnimationCanvas::new());
 static BOOT_GPU: Spinlock<Option<GpuSession>> = Spinlock::new(None);
 static BOOT_GPU_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 static DEBUG_FRAME: AtomicU32 = AtomicU32::new(0);
 static GPU_PROBE_DEBUG: AtomicBool = AtomicBool::new(false);
 static GPU_PRESENT_FAILED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Copy)]
-struct RenderJob {
-    canvas_ptr: *mut u8,
-    width: u32,
-    height: u32,
-    cx: f32,
-    cy: f32,
-    scale: f32,
-    t_ms: u32,
-    strip_count: u32,
-}
-
-unsafe impl Send for RenderJob {}
-
-static RENDER_JOB: Spinlock<Option<RenderJob>> = Spinlock::new(None);
-static NEXT_STRIP: AtomicU32 = AtomicU32::new(0);
-static STRIPS_DONE: AtomicU32 = AtomicU32::new(0);
-static AP_RENDER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn gpu_present(width: u32, height: u32, canvas_ptr: *mut u8) -> bool {
     if !GPU_PROBE_DEBUG.load(Ordering::Acquire) {
@@ -117,8 +97,21 @@ fn gpu_present(width: u32, height: u32, canvas_ptr: *mut u8) -> bool {
         }
 
         let Some(mut transport) = transport else {
-            BOOT_GPU_UNAVAILABLE.store(true, Ordering::Release);
+            // PCI mappings can become available after the first boot frame.
+            // A failed transport probe must not disable the later handover.
             return false;
+        };
+        // Allocate the CPU framebuffer before handing any backing memory to
+        // the device. Allocation failure can then be retried without leaving
+        // an active DMA resource owned by a discarded GPU session.
+        let software_framebuffer = if !super::is_lfb_active() {
+            let mut framebuffer = SOFTWARE_FRAMEBUFFER.lock();
+            let Some((pointer, _)) = ensure_canvas(&mut framebuffer, width, height) else {
+                return false;
+            };
+            Some(pointer)
+        } else {
+            None
         };
         let Some(mut gpu) =
             (unsafe { crate::drivers::virtio::gpu::VirtioGpu::probe(0, &mut transport) })
@@ -135,6 +128,22 @@ fn gpu_present(width: u32, height: u32, canvas_ptr: *mut u8) -> bool {
             return false;
         }
         crate::hal::serial::write_string_always("[ANIM] gpu display init ok\r\n");
+        if let Some(pointer) = software_framebuffer {
+            let info = crate::hal::common::framebuffer_impl::FramebufferInfo {
+                address: pointer as u64,
+                width,
+                height,
+                pitch: width * 4,
+                bpp: 32,
+            };
+            crate::hal::common::framebuffer_impl::init(info);
+            #[cfg(target_arch = "x86_64")]
+            crate::hal::framebuffer::init(Some(crate::hal::framebuffer::FramebufferInfo {
+                address: info.address, width, height, pitch: info.pitch, bpp: 32,
+            }));
+            super::init_from_framebuffer(info.address, width, height, info.pitch);
+            crate::hal::serial::write_string_always("[ANIM] installed GPU software framebuffer\r\n");
+        }
         *session_guard = Some(GpuSession { gpu, transport });
         return true;
     }
@@ -154,7 +163,7 @@ pub(super) fn paint_boot_screen(percent: u32) {
 }
 
 pub(super) fn paint_boot_screen_time(t_ms: u32) {
-    let debug_frame = DEBUG_FRAME.fetch_add(1, Ordering::AcqRel);
+    let _debug_frame = DEBUG_FRAME.fetch_add(1, Ordering::AcqRel);
     let has_lfb = super::is_lfb_active() && super::fb_base() != 0;
     let (width, height, pitch) = if has_lfb {
         (super::fb_width(), super::fb_height(), super::fb_pitch())
@@ -168,11 +177,11 @@ pub(super) fn paint_boot_screen_time(t_ms: u32) {
     }
 
     let mut canvas_guard = ANIMATION_CANVAS.lock();
-    let Some((canvas_ptr, _canvas_len)) = ensure_canvas(&mut canvas_guard, width, height) else {
+    let Some((canvas_ptr, canvas_len)) = ensure_canvas(&mut canvas_guard, width, height) else {
         return;
     };
     unsafe {
-        core::ptr::write_bytes(canvas_ptr, 0, _canvas_len);
+        core::ptr::write_bytes(canvas_ptr, 0, canvas_len);
     }
     super::set_render_target(canvas_ptr as u64, width * 4);
 
@@ -180,39 +189,13 @@ pub(super) fn paint_boot_screen_time(t_ms: u32) {
     let cx = width as f32 * 0.5;
     let cy = height as f32 * 0.5;
     prepare_ray_field(width, height, cx, cy, scale);
-    let strip_count = crate::ke::scheduler::get_cpu_count().clamp(1, 4);
-    let render_job = RenderJob {
-        canvas_ptr,
-        width,
-        height,
-        cx,
-        cy,
-        scale,
-        t_ms,
-        strip_count,
-    };
-    NEXT_STRIP.store(0, Ordering::Release);
-    STRIPS_DONE.store(0, Ordering::Release);
-    *RENDER_JOB.lock() = Some(render_job);
-
-    render_strip(0);
-    let strip_deadline_us =
-        pit::get_system_time_us().saturating_add(if AP_RENDER_ACTIVE.load(Ordering::Acquire) {
-            10_000
-        } else {
-            1_000
-        });
-    while STRIPS_DONE.load(Ordering::Acquire) < strip_count {
-        if pit::get_system_time_us() >= strip_deadline_us {
-            NEXT_STRIP.store(strip_count, Ordering::Release);
-            for fallback_strip in 0..strip_count {
-                render_strip(fallback_strip);
-            }
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    *RENDER_JOB.lock() = None;
+    // Render and present on the display owner. An AP must never keep writing
+    // a strip after this frame is presented or the next frame reuses its buffer.
+    let mut frame = FrameView::new(canvas_ptr, width, height);
+    draw_rays(&mut frame, cx, cy, scale, t_ms);
+    draw_flag(&mut frame, cx, cy, scale, t_ms);
+    draw_orbs(&mut frame, cx, cy, scale, t_ms);
+    draw_flash(&mut frame, cx, cy, scale, t_ms);
     draw_text(width, height, cx, cy, scale, t_ms);
 
     if !gpu_present(width, height, canvas_ptr) {
@@ -225,48 +208,36 @@ pub(super) fn paint_boot_screen_time(t_ms: u32) {
     super::clear_render_target();
 }
 
-pub fn poll_animation_strip(cpu: u32) -> bool {
-    if cpu == 0 {
-        return false;
-    }
-    let Some(job) = *RENDER_JOB.lock() else {
-        return false;
-    };
-    let strip = NEXT_STRIP.fetch_add(1, Ordering::AcqRel);
-    if strip >= job.strip_count {
-        return false;
-    }
-    AP_RENDER_ACTIVE.store(true, Ordering::Release);
-    render_strip(strip);
-    true
+pub fn poll_animation_strip(_cpu: u32) -> bool {
+    false
 }
 
-fn render_strip(strip: u32) {
-    let Some(job) = *RENDER_JOB.lock() else {
-        return;
-    };
-    let strip_start = (job.height * strip / job.strip_count) as usize;
-    let strip_end = if strip + 1 == job.strip_count {
-        job.height as usize
-    } else {
-        (job.height * (strip + 1) / job.strip_count) as usize
-    };
-    if strip_start >= strip_end {
-        STRIPS_DONE.fetch_add(1, Ordering::AcqRel);
+/// Safe/debug modes still need a live scanout, even without the animation.
+pub(super) fn initialize_basic_display() {
+    if !super::is_lfb_active() || super::fb_base() == 0 {
         return;
     }
-    let mut frame = FrameView::new_range(
-        job.canvas_ptr,
-        job.width,
-        job.height,
-        strip_start as u32,
-        strip_end as u32,
-    );
-    draw_rays(&mut frame, job.cx, job.cy, job.scale, job.t_ms);
-    draw_flag(&mut frame, job.cx, job.cy, job.scale, job.t_ms);
-    draw_orbs(&mut frame, job.cx, job.cy, job.scale, job.t_ms);
-    draw_flash(&mut frame, job.cx, job.cy, job.scale, job.t_ms);
-    STRIPS_DONE.fetch_add(1, Ordering::AcqRel);
+    let (width, height, pitch) = (super::fb_width(), super::fb_height(), super::fb_pitch());
+    if width == 0 || height == 0 || pitch < width.saturating_mul(4) {
+        return;
+    }
+    // Scanout and the mirror must share the same persistent, tightly packed
+    // backing store. Firmware framebuffers may have padding between rows.
+    let mut canvas = ANIMATION_CANVAS.lock();
+    let Some((pointer, _)) = ensure_canvas(&mut canvas, width, height) else {
+        return;
+    };
+    for row in 0..height as usize {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (super::fb_base() as *const u8).add(row * pitch as usize),
+                pointer.add(row * width as usize * 4),
+                width as usize * 4,
+            );
+        }
+    }
+    let _ = gpu_present(width, height, pointer);
+    crate::hal::common::framebuffer_impl::mark_damage(0, 0, width, height);
 }
 
 struct FrameView {
@@ -288,15 +259,7 @@ impl FrameView {
         }
     }
 
-    fn new_range(base: *mut u8, width: u32, height: u32, y_start: u32, y_end: u32) -> Self {
-        Self {
-            base: base.cast::<u32>(),
-            width,
-            height,
-            y_start: y_start.min(height),
-            y_end: y_end.clamp(y_start.min(height), height),
-        }
-    }
+
 
     #[inline]
     fn add(&mut self, x: u32, y: u32, blue: f32, green: f32, red: f32) {
@@ -407,6 +370,11 @@ pub(super) fn present_desktop_frame() -> bool {
     if !super::MODE_LFB.load(Ordering::Acquire) {
         return false;
     }
+    // Firmware framebuffers are already visible; only an owned VirtIO
+    // scanout needs the mirror. Preserve canvas -> session lock ordering.
+    if BOOT_GPU_UNAVAILABLE.load(Ordering::Acquire) || BOOT_GPU.lock().is_none() {
+        return true;
+    }
     let width = super::FB_WIDTH.load(Ordering::Acquire);
     let height = super::FB_HEIGHT.load(Ordering::Acquire);
     let pitch = super::FB_PITCH.load(Ordering::Acquire);
@@ -414,32 +382,32 @@ pub(super) fn present_desktop_frame() -> bool {
     if fb_base == 0 || width == 0 || height == 0 || pitch == 0 {
         return false;
     }
+    let Some(damage) = crate::hal::common::framebuffer_impl::take_damage() else {
+        return true; // An idle desktop never copies or submits a frame.
+    };
     let mut canvas_guard = ANIMATION_CANVAS.lock();
-    let Some((canvas_ptr, _canvas_len)) = ensure_canvas(&mut canvas_guard, width, height) else {
+    let Some((canvas_ptr, _)) = ensure_canvas(&mut canvas_guard, width, height) else {
+        crate::hal::common::framebuffer_impl::mark_damage(damage.x, damage.y, damage.width, damage.height);
         return false;
     };
-    copy_lfb_to_canvas(fb_base, canvas_ptr, width, height, pitch);
-    gpu_present(width, height, canvas_ptr)
-}
-
-fn copy_lfb_to_canvas(fb_base: u64, canvas: *mut u8, width: u32, height: u32, pitch: u32) {
-    if pitch == width * 4 {
+    for row in damage.y..damage.y + damage.height {
+        // SAFETY: damage is clipped to the installed framebuffer; the canvas
+        // is a persistent tightly packed BGRX allocation of the same geometry.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                fb_base as *const u8,
-                canvas,
-                width as usize * height as usize * 4,
-            );
-        }
-    } else {
-        for row in 0..height {
-            unsafe {
-                let source = (fb_base as *const u8).add((row * pitch) as usize);
-                let target = canvas.add((row * width * 4) as usize);
-                core::ptr::copy_nonoverlapping(source, target, (width * 4) as usize);
-            }
+            let source = (fb_base as *const u8).add(row as usize * pitch as usize + damage.x as usize * 4);
+            let target = canvas_ptr.add((row as usize * width as usize + damage.x as usize) * 4);
+            core::ptr::copy_nonoverlapping(source, target, damage.width as usize * 4);
         }
     }
+    let mut session_guard = BOOT_GPU.lock();
+    let result = session_guard.as_mut().is_some_and(|session| {
+        session.gpu.display_geometry() == Some((width, height)) &&
+        session.gpu.present_region(&mut session.transport, damage.x, damage.y, damage.width, damage.height)
+    });
+    if !result {
+        crate::hal::common::framebuffer_impl::mark_damage(damage.x, damage.y, damage.width, damage.height);
+    }
+    result
 }
 
 static RAY_FIELD: Spinlock<alloc::vec::Vec<u8>> = Spinlock::new(alloc::vec::Vec::new());
@@ -736,7 +704,7 @@ fn draw_pane(frame: &mut FrameView, cx: f32, cy: f32, scale: f32, t: u32, pane: 
 }
 
 fn draw_orbs(frame: &mut FrameView, cx: f32, cy: f32, scale: f32, t: u32) {
-    if t < T_ORB0 || t > T_BLOOM1 {
+    if !(T_ORB0..=T_BLOOM1).contains(&t) {
         return;
     }
     let alpha = orb_alpha(t);
@@ -831,7 +799,7 @@ fn draw_orbs(frame: &mut FrameView, cx: f32, cy: f32, scale: f32, t: u32) {
 }
 
 fn draw_flash(frame: &mut FrameView, cx: f32, cy: f32, scale: f32, t: u32) {
-    if T_DANCE1 <= t && t < T_FLASH1 {
+    if (T_DANCE1..T_FLASH1).contains(&t) {
         let progress = clamp01((t - T_DANCE1) as f32 / (T_FLASH1 - T_DANCE1) as f32);
         let raw = libm::sinf(progress * PI).max(0.0);
         let intensity = raw * libm::sqrtf(raw);
@@ -842,7 +810,7 @@ fn draw_flash(frame: &mut FrameView, cx: f32, cy: f32, scale: f32, t: u32) {
             let core = falloff * falloff * falloff * intensity_value * 0.70;
             (255.0 * core, 255.0 * core, 255.0 * core)
         });
-        if T_FLASH0 <= t && t <= T_FLASH0 + 300 {
+        if (T_FLASH0..=T_FLASH0 + 300).contains(&t) {
             let quick = (t - T_FLASH0) as f32 / 300.0;
             let wash = libm::sinf(quick * PI).max(0.0) * 0.05;
             let add = 255.0 * wash;
@@ -933,9 +901,9 @@ fn draw_text(width: u32, height: u32, _cx: f32, _cy: f32, scale: f32, t: u32) {
     let text_alpha = clamp01((t - T_TEXT0 as f32) / (T_TEXT1 - T_TEXT0) as f32);
     if text_alpha > 0.002 {
         let y = (height as f32 * 0.682) as u32;
-        super::boot_draw_label_at(
-            &STARTING_LABEL,
-            "Starting Windows",
+        draw_label_bitmap(
+            STARTING_LABEL,
+            (228, 25),
             width,
             y,
             (text_alpha * 255.0) as u32,
@@ -948,9 +916,9 @@ fn draw_text(width: u32, height: u32, _cx: f32, _cy: f32, scale: f32, t: u32) {
     let copyright_alpha = clamp01((t - T_CPY0 as f32) / (T_CPY1 - T_CPY0) as f32);
     if copyright_alpha > 0.002 {
         let y = (height as f32 * 0.935) as u32;
-        super::boot_draw_label_at(
-            &COPYRIGHT_LABEL,
-            "© Microsoft Corporation",
+        draw_label_bitmap(
+            COPYRIGHT_LABEL,
+            (169, 14),
             width,
             y,
             (copyright_alpha * 255.0) as u32,
@@ -962,5 +930,34 @@ fn draw_text(width: u32, height: u32, _cx: f32, _cy: f32, scale: f32, t: u32) {
     }
 }
 
-static STARTING_LABEL: spin::Once<Option<super::BootLabel>> = spin::Once::new();
-static COPYRIGHT_LABEL: spin::Once<Option<super::BootLabel>> = spin::Once::new();
+// Fixed labels are rasterized from the repository's DejaVu Sans face.
+// Early boot must not parse and free a complete TrueType font in an ISR.
+static STARTING_LABEL: &[u8] = include_bytes!("assets/starting.alpha");
+static COPYRIGHT_LABEL: &[u8] = include_bytes!("assets/copyright.alpha");
+
+fn draw_label_bitmap(
+    coverage: &[u8],
+    dimensions: (u32, u32),
+    screen_width: u32,
+    y: u32,
+    alpha: u32,
+    blue: u32,
+    green: u32,
+    red: u32,
+    pixel_height: u32,
+) {
+    let (source_width, source_height) = dimensions;
+    let height = pixel_height.max(1);
+    let width = (source_width * height / source_height).max(1);
+    let x = screen_width.saturating_sub(width) / 2;
+    for row in 0..height {
+        for column in 0..width {
+            let source = (row * source_height / height * source_width
+                + column * source_width / width) as usize;
+            let blended = u32::from(coverage[source]) * alpha / 255;
+            if blended != 0 {
+                super::boot_blend_pixel(x + column, y + row, blue, green, red, blended);
+            }
+        }
+    }
+}

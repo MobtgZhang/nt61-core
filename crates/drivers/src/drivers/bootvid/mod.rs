@@ -429,7 +429,19 @@ fn newline() {
 /// code path.
 fn putchar(ch: u8) {
     if MODE_LFB.load(Ordering::Acquire) {
+        let x = CURSOR_X.load(Ordering::Acquire);
+        let y = CURSOR_Y.load(Ordering::Acquire);
         putchar_lfb(ch);
+        // VirtIO scanout mirrors only damaged pixels. Text bypasses the
+        // desktop drawing API, so it must publish its own damage as well.
+        // A line feed or wrap can scroll the whole framebuffer.
+        let width = FB_WIDTH.load(Ordering::Acquire);
+        let height = FB_HEIGHT.load(Ordering::Acquire);
+        if ch == b'\n' || CURSOR_Y.load(Ordering::Acquire) != y {
+            crate::hal::common::framebuffer_impl::mark_damage(0, 0, width, height);
+        } else if ch >= b' ' {
+            crate::hal::common::framebuffer_impl::mark_damage(x, y, glyph_cell_width(), FONT_HEIGHT);
+        }
         return;
     }
     putchar_vga(ch);
@@ -590,6 +602,23 @@ fn putchar_lfb(ch: u8) {
     }
 
     let Some(face) = font_face() else {
+        // The font parser is unavailable before heap setup and on the
+        // RISC-V bring-up path. Still paint real glyphs, not empty cells.
+        for row in 0..FONT_HEIGHT {
+            let bits = crate::hal::common::framebuffer_impl::bitmap_glyph_row(
+                ch, (row * 16 / FONT_HEIGHT) as usize,
+            );
+            for col in 0..cell_width {
+                if bits & (0x80 >> (col * 8 / cell_width)) == 0 { continue; }
+                let (x, y) = (px + col, py + row);
+                if x < width && y < height {
+                    unsafe {
+                        ((base + u64::from(y * pitch + x * 4)) as *mut u32)
+                            .write_volatile(u32::from_le_bytes(fg));
+                    }
+                }
+            }
+        }
         advance_cursor_lfb(px, cell_width, width);
         return;
     };
@@ -835,6 +864,7 @@ pub fn vid_reset_display(bios: bool) {
         }
         CURSOR_X.store(0, Ordering::Release);
         CURSOR_Y.store(0, Ordering::Release);
+        crate::hal::common::framebuffer_impl::mark_damage(0, 0, width, height);
         return;
     }
     for i in 0..VGA_CELLS {
@@ -884,6 +914,7 @@ pub fn vid_clear_black() {
     }
     CURSOR_X.store(0, Ordering::Release);
     CURSOR_Y.store(0, Ordering::Release);
+    crate::hal::common::framebuffer_impl::mark_damage(0, 0, width, height);
 }
 
 /// `vid_set_cursor_position` — programmatic cursor placement.
@@ -900,6 +931,9 @@ pub fn vid_set_cursor_position(x: u16, y: u16) {
 pub fn vid_scroll_up() {
     if MODE_LFB.load(Ordering::Acquire) {
         scroll_up_lfb();
+        crate::hal::common::framebuffer_impl::mark_damage(
+            0, 0, FB_WIDTH.load(Ordering::Acquire), FB_HEIGHT.load(Ordering::Acquire),
+        );
     } else {
         scroll_up_vga();
     }
@@ -1040,6 +1074,10 @@ pub fn present_desktop_frame() -> bool {
     win7::present_desktop_frame()
 }
 
+pub fn initialize_basic_display() {
+    win7::initialize_basic_display();
+}
+
 /// Draw four colored orbs moving toward the flag center with soft trails.
 fn boot_draw_converging_orbs(screen_width: u32, screen_height: u32, logo_size: u32, progress: u32) {
     let progress = progress.clamp(0, 100);
@@ -1137,7 +1175,7 @@ fn boot_orb(center_x: u32, center_y: u32, size: u32, blue: u32, green: u32, red:
     let origin_x = center_x.saturating_sub(size / 2);
     let origin_y = center_y.saturating_sub(size / 2);
     let radius = size.max(1) / 2;
-    let radius_sq = (radius * radius).max(1) as u32;
+    let radius_sq = (radius * radius).max(1);
     for row in 0..size {
         let dy = row as i32 - radius as i32;
         for column in 0..size {
@@ -1248,7 +1286,7 @@ fn boot_flag_glow(center_x: u32, center_y: u32, size: u32, alpha: u32) {
                 continue;
             }
             let falloff = 255 - distance_sq * 210 / radius_sq;
-            let pixel_alpha = ((base_alpha as u32) * falloff / 255).max(0).min(255) as u32;
+            let pixel_alpha = ((base_alpha as u32) * falloff / 255).min(255);
             if pixel_alpha == 0 {
                 continue;
             }

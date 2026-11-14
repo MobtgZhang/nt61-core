@@ -11,10 +11,12 @@ static BOOT_ANIMATION_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static BOOT_ANIMATION_LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
 static BOOT_ANIMATION_ANIMATION_MS: AtomicU64 = AtomicU64::new(0);
 static BOOT_ANIMATION_PAINTING: AtomicBool = AtomicBool::new(false);
-static DEBUG_POLL: AtomicU64 = AtomicU64::new(0);
 
 const WIN7_ANIMATION_MS: u64 = 7_200;
 const WIN7_FRAME_INTERVAL_MS: u64 = 30;
+// Initialization may keep the boot CPU busy for seconds between polls.
+// Bound each advance so those gaps cannot skip the visible sequence.
+const WIN7_MAX_FRAME_STEP_MS: u64 = 100;
 
 /// Bring up the platform's text console (VGA mirror on x86_64,
 /// log-ring on the other architectures). Idempotent across
@@ -151,6 +153,14 @@ pub fn mark_boot_animation_complete() {
     BOOT_ANIMATION_TARGET_READY.store(true, Ordering::Release);
 }
 
+/// Safe/debug boots hand the display to the shell without starting a sequence.
+pub fn skip_boot_animation() {
+    BOOT_ANIMATION_RUNNING.store(false, Ordering::Release);
+    BOOT_ANIMATION_SEQUENCE_DONE.store(true, Ordering::Release);
+    BOOT_ANIMATION_FINISHED.store(true, Ordering::Release);
+    crate::ke::scheduler::set_early_ap_polling(false);
+}
+
 /// Block until the full Windows 7 sequence has played. CMD mode uses
 /// this because it has no desktop-ready handoff and must not enter the
 /// text console while the animation thread still owns the screen.
@@ -180,78 +190,29 @@ pub fn poll_boot_animation() {
         return;
     }
 
-    let started_ms = BOOT_ANIMATION_STARTED_MS.load(Ordering::Acquire);
     let now_ms = boot_now_ms();
-    let elapsed_ms = now_ms.saturating_sub(started_ms);
-    let animation_ms = elapsed_ms.min(WIN7_ANIMATION_MS);
-    crate::hal::serial::write_string_always("[ANIM] poll state started=");
-    crate::hal::serial::write_hex_u64_always(started_ms);
-    crate::hal::serial::write_string_always(" now=");
-    crate::hal::serial::write_hex_u64_always(now_ms);
-    crate::hal::serial::write_string_always(" animation=");
-    crate::hal::serial::write_hex_u64_always(animation_ms);
-    crate::hal::serial::write_string_always(" done=");
-    crate::hal::serial::write_hex_u64_always(
-        BOOT_ANIMATION_SEQUENCE_DONE.load(Ordering::Acquire) as u64
-    );
-    crate::hal::serial::write_string_always("\r\n");
-    BOOT_ANIMATION_ANIMATION_MS.store(animation_ms, Ordering::Release);
     let last_frame_ms = BOOT_ANIMATION_LAST_FRAME_MS.load(Ordering::Acquire);
-    let _ = (DEBUG_POLL.fetch_add(1, Ordering::AcqRel), last_frame_ms);
-
-    if animation_ms >= WIN7_ANIMATION_MS {
-        if !BOOT_ANIMATION_SEQUENCE_DONE.load(Ordering::Acquire) {
+    let delta_ms = now_ms.saturating_sub(last_frame_ms);
+    if delta_ms >= WIN7_FRAME_INTERVAL_MS {
+        let animation_ms = BOOT_ANIMATION_ANIMATION_MS.load(Ordering::Acquire)
+            .saturating_add(delta_ms.min(WIN7_MAX_FRAME_STEP_MS))
+            .min(WIN7_ANIMATION_MS);
+        BOOT_ANIMATION_LAST_FRAME_MS.store(now_ms, Ordering::Release);
+        crate::drivers::bootvid::paint_boot_screen_time(animation_ms as u32);
+        BOOT_ANIMATION_ANIMATION_MS.store(animation_ms, Ordering::Release);
+        if animation_ms == WIN7_ANIMATION_MS {
+            // Publish completion only after the final image has been presented.
             BOOT_ANIMATION_SEQUENCE_DONE.store(true, Ordering::Release);
             BOOT_ANIMATION_FINISHED.store(true, Ordering::Release);
             BOOT_ANIMATION_RUNNING.store(false, Ordering::Release);
             crate::ke::scheduler::set_early_ap_polling(false);
-        } else if now_ms.saturating_sub(last_frame_ms) >= WIN7_FRAME_INTERVAL_MS {
-            let next_animation_ms = animation_ms.saturating_add(WIN7_FRAME_INTERVAL_MS);
-            BOOT_ANIMATION_LAST_FRAME_MS.store(now_ms, Ordering::Release);
-            BOOT_ANIMATION_ANIMATION_MS.store(next_animation_ms, Ordering::Release);
-            crate::drivers::bootvid::paint_boot_screen_time(
-                next_animation_ms.min(u32::MAX as u64) as u32
-            );
+            crate::hal::serial::write_string_always("[ANIM] sequence complete\r\n");
         }
-    } else if !BOOT_ANIMATION_SEQUENCE_DONE.load(Ordering::Acquire)
-        && now_ms.saturating_sub(last_frame_ms) >= WIN7_FRAME_INTERVAL_MS
-    {
-        BOOT_ANIMATION_LAST_FRAME_MS.store(now_ms, Ordering::Release);
-        let next_animation_ms = animation_ms.saturating_add(WIN7_FRAME_INTERVAL_MS);
-        BOOT_ANIMATION_ANIMATION_MS.store(next_animation_ms, Ordering::Release);
-        crate::drivers::bootvid::paint_boot_screen_time(next_animation_ms as u32);
-    }
-
-    if BOOT_ANIMATION_TARGET_READY.load(Ordering::Acquire) {
-        BOOT_ANIMATION_FINISHED.store(true, Ordering::Release);
-        BOOT_ANIMATION_RUNNING.store(false, Ordering::Release);
-        crate::ke::scheduler::set_early_ap_polling(false);
     }
 
     BOOT_ANIMATION_PAINTING.store(false, Ordering::Release);
 }
 
 fn boot_now_ms() -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        crate::hal::x86_64::pit::get_system_time_ms()
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        crate::hal::aarch64::timer::time_ms()
-    }
-
-    #[cfg(target_arch = "riscv64")]
-    {
-        use crate::arch::riscv64::pit::{time, TIMER_TICKS_PER_MS};
-        time() / TIMER_TICKS_PER_MS
-    }
-
-    #[cfg(target_arch = "loongarch64")]
-    {
-        let counter: u64;
-        unsafe { core::arch::asm!("csrrd {}, 0x20", out(reg) counter) };
-        counter / 100_000
-    }
+    crate::hal::common::pit::get_system_time_ms()
 }

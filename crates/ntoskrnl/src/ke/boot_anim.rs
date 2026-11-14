@@ -53,19 +53,39 @@ extern "C" fn boot_animation_thread_entry(_context: u64) {
         }
     }
 
+    display_thread_entry(0);
+}
+
+extern "C" fn display_thread_entry(_context: u64) {
     // Mirror phase: the Ring-3 shell now paints straight into the LFB.
     // When the virtio-gpu scanout is alive it can no longer see those
-    // writes directly, so copy the LFB into the persistent GPU resource
-    // and flush it at ~30 Hz.
+    // writes directly, so copy damaged rectangles into the persistent GPU
+    // resource every 16 ms. An unchanged desktop performs no transfer.
     loop {
         let _ = wait_single(mirror_tick(), 16);
         crate::drivers::bootvid::present_desktop_frame();
     }
 }
 
+/// Basic framebuffer presentation for Safe Mode and Debug CMD. No logo or
+/// animation is started, but the software framebuffer must reach the GPU.
+pub fn start_basic_display_thread() {
+    if THREAD_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::arch::boot::skip_boot_animation();
+    crate::drivers::bootvid::initialize_basic_display();
+    mirror_tick();
+    let result =
+        crate::ps::thread::ps_create_system_thread(display_thread_entry as *const () as u64, 0);
+    if !result.success {
+        THREAD_STARTED.store(false, Ordering::Release);
+    }
+}
+
 /// Start the boot-animation system thread.  Idempotent: the timer-ISR
 /// fallback in `poll_services()` still works if the scheduler is not
-/// ready yet (very early boot, Safe-Mode polled shell, ...).
+/// ready yet during early boot.
 pub fn start_animation_thread() {
     if THREAD_STARTED.swap(true, Ordering::AcqRel) {
         return;
