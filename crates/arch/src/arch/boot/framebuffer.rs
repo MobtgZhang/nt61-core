@@ -25,11 +25,8 @@ pub fn adopt_bootinfo_framebuffer(boot: &BootInfo) -> bool {
         boot.framebuffer_size.min(64 * 1024 * 1024)
     }
     .max(4096);
-    // Map the LFB base into the kernel's address space if needed.
-    // On x86_64 the firmware left an identity map below 4 GiB so
-    // no extra mapping is required; on the other architectures
-    // the kernel needs to explicitly map the framebuffer page(s)
-    // before any pixel write would otherwise fault.
+    // Map the exact pixel address, including the GOP's offset within
+    // its first physical page, into the kernel's address space.
     let framebuffer_va = map_framebuffer_region(boot.framebuffer_base, mapped_size);
 
     // Try the cross-arch LFB writer first. This is the source of
@@ -80,11 +77,10 @@ pub fn adopt_bootinfo_framebuffer(boot: &BootInfo) -> bool {
     true
 }
 
-/// Map the LFB region into the kernel page tables. On x86_64 the
-/// firmware already leaves an identity map for everything below 4
-/// GiB so this is a no-op. On the other architectures we ask the
-/// per-arch MM layer to map `[pa, pa+size)` so the kernel can write
-/// to the GOP LFB without faulting.
+/// Map the LFB region into the kernel page tables. GOP pixel memory
+/// need not begin at a page boundary (OVMF VirtIO uses an offset of
+/// 24 bytes). Page-table entries map aligned pages, whereas callers
+/// must receive the address of the first pixel within that mapping.
 ///
 /// A zero `size` is treated as "guess based on dimensions" (8 MiB
 /// is enough for any sane 32 bpp panel up to ~1080p).
@@ -92,9 +88,12 @@ fn map_framebuffer_region(pa: u64, size: u64) -> u64 {
     let size = if size == 0 { 8 * 1024 * 1024 } else { size };
     #[cfg(target_arch = "x86_64")]
     {
-        let page_count = size.div_ceil(0x1000);
+        let page_offset = pa & 0xfff;
+        let page_base = pa - page_offset;
+        let page_count = (size + page_offset).div_ceil(0x1000);
         crate::boot_debug_println!("[FBR1] mapping framebuffer");
-        let mapped = crate::mm::syspte::map_io_space(pa, page_count);
+        let mapped = crate::mm::syspte::map_io_space(page_base, page_count)
+            .map(|base| base + page_offset);
         crate::boot_debug_println!("[FBR2] framebuffer mapped");
         mapped.unwrap_or(pa) // Identity fallback remains valid only for firmware-exposed low addresses.
     }

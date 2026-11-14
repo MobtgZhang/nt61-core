@@ -3,6 +3,7 @@ use crate::window::Rect;
 use alloc::vec::Vec;
 
 pub mod aero;
+pub mod scene;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SurfaceHandle(pub u32);

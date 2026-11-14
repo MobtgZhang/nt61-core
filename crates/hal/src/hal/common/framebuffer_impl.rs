@@ -55,6 +55,18 @@ static FB_CURSOR_X: AtomicU32 = AtomicU32::new(0);
 static FB_CURSOR_Y: AtomicU32 = AtomicU32::new(0);
 static FB_ATTR: AtomicU8 = AtomicU8::new(0x07);
 
+static DISPLAY_DAMAGE: super::display_damage::DisplayDamage = super::display_damage::DisplayDamage::new();
+
+pub fn mark_damage(x: u32, y: u32, width: u32, height: u32) {
+    let w = FB_WIDTH.load(Ordering::Acquire);
+    let h = FB_HEIGHT.load(Ordering::Acquire);
+    DISPLAY_DAMAGE.mark(x, y, width.min(w.saturating_sub(x)), height.min(h.saturating_sub(y)));
+}
+
+pub fn take_damage() -> Option<super::display_damage::DamageRect> {
+    DISPLAY_DAMAGE.take()
+}
+
 /// RGB → packed `u32` pixel helper for 32-bit framebuffers.
 /// Layout is BGRA so the byte stream the VGA writes matches the
 /// standard OVMF GOP format byte-for-byte.
@@ -83,6 +95,7 @@ pub fn init(info: FramebufferInfo) -> FramebufferInfo {
     FB_CURSOR_X.store(0, Ordering::Release);
     FB_CURSOR_Y.store(0, Ordering::Release);
     FB_ATTR.store(0x07, Ordering::Release);
+    mark_damage(0, 0, info.width, info.height);
     FramebufferInfo {
         address: info.address,
         width: info.width,
@@ -188,6 +201,7 @@ pub fn set_pixel(x: u32, y: u32, color: u32) {
             _ => {}
         }
     }
+    mark_damage(x, y, 1, 1);
 }
 
 /// Read a packed RGB pixel. Returns `None` for inactive or unusual
@@ -258,6 +272,7 @@ pub fn scroll_up(lines: u32) {
         unsafe {
             core::ptr::write_bytes(addr as *mut u8, 0, total_bytes);
         }
+        mark_damage(0, 0, FB_WIDTH.load(Ordering::Acquire), h);
         return;
     }
     let shift = (lines as usize) * pitch;
@@ -269,6 +284,7 @@ pub fn scroll_up(lines: u32) {
         );
         core::ptr::write_bytes((addr + total_bytes - shift) as *mut u8, 0, shift);
     }
+    mark_damage(0, 0, FB_WIDTH.load(Ordering::Acquire), h);
 }
 
 /// 8x16 VGA font for printable ASCII. Each row is a 16-bit
@@ -567,6 +583,11 @@ pub fn attr_fg(attr: u8) -> u32 {
 
 pub fn attr_bg(attr: u8) -> u32 {
     attr_fg((attr >> 4) & 0x0F)
+}
+
+/// Allocation-free glyph rows for the early console and emergency display.
+pub fn bitmap_glyph_row(ch: u8, row: usize) -> u8 {
+    FONT.get(ch as usize).and_then(|glyph| glyph.get(row)).copied().unwrap_or(0)
 }
 
 fn draw_glyph_8x16(px: u32, py: u32, ch: u8, fg: u32, bg: u32) {

@@ -9,6 +9,10 @@
 use super::{queue::QueueBuffer, status, Transport, FEATURE_VERSION_1};
 
 use core::cell::UnsafeCell;
+use crate::ke::sync::Spinlock;
+
+// All devices share stable DMA command storage; serialize its complete lifetime.
+static COMMAND_LOCK: Spinlock<()> = Spinlock::new(());
 
 pub const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 pub const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
@@ -163,7 +167,6 @@ const _: () = assert!(core::mem::size_of::<CtrlHeader>() == 24);
 const _: () = assert!(core::mem::size_of::<ResourceCreate2d>() == 40);
 const _: () = assert!(core::mem::size_of::<ResourceMemoryEntry>() == 16);
 const _: () = assert!(core::mem::size_of::<ResourceAttachBacking>() == 32);
-const _: () = assert!(core::mem::size_of::<ResourceCreate2d>() == 40);
 const _: () = assert!(core::mem::size_of::<SetScanout>() == 48);
 const _: () = assert!(core::mem::size_of::<ResourceCreateBlob>() == 56);
 const _: () = assert!(core::mem::size_of::<SetScanoutBlob>() == 96);
@@ -179,6 +182,7 @@ pub struct VirtioGpu {
     width: u32,
     height: u32,
     blob_supported: bool,
+    failed: bool,
 }
 
 impl VirtioGpu {
@@ -194,10 +198,14 @@ impl VirtioGpu {
         transport.write_status(status::ACKNOWLEDGE | status::DRIVER);
 
         let device_features = transport.read_device_features();
+        if device_features & FEATURE_VERSION_1 == 0 {
+            transport.write_status(status::FAILED);
+            return None;
+        }
         let features = FEATURE_VERSION_1 | (device_features & F_RESOURCE_BLOB);
         transport.write_driver_features(features);
         transport.write_status(status::ACKNOWLEDGE | status::DRIVER | status::FEATURES_OK);
-        if transport.read_status() & status::FAILED != 0 {
+        if transport.read_status() & (status::FEATURES_OK | status::FAILED) != status::FEATURES_OK {
             return None;
         }
 
@@ -220,6 +228,7 @@ impl VirtioGpu {
             width: 0,
             height: 0,
             blob_supported: device_features & F_RESOURCE_BLOB != 0,
+            failed: false,
         })
     }
 
@@ -239,14 +248,67 @@ impl VirtioGpu {
         width: u32,
         height: u32,
     ) -> bool {
-        if width == 0 || height == 0 || fb_addr.is_null() {
+        let _commands = COMMAND_LOCK.lock();
+        if self.failed || self.resource_id != 0 { return false; }
+        let initialized = self.initialize_display_locked(transport, scanout_id, fb_addr, width, height);
+        if !initialized {
+            // Stop all device access before shared command storage can be reused.
+            transport.reset();
+            self.failed = true;
+            self.resource_id = 0;
+        }
+        initialized
+    }
+
+    unsafe fn initialize_display_locked(
+        &mut self, transport: &mut dyn Transport, scanout_id: u32,
+        fb_addr: *const u8, width: u32, height: u32,
+    ) -> bool {
+        if width == 0 || height == 0 || fb_addr.is_null()
+            || scanout_id >= self.num_scanouts
+            || width.checked_mul(height).and_then(|n| n.checked_mul(4)).is_none()
+        {
+            crate::hal::serial::write_string_always("[GPU] invalid scanout count=");
+            crate::hal::serial::write_hex_u64_always(self.num_scanouts as u64);
+            crate::hal::serial::write_string_always(" width=");
+            crate::hal::serial::write_hex_u64_always(width as u64);
+            crate::hal::serial::write_string_always(" height=");
+            crate::hal::serial::write_hex_u64_always(height as u64);
+            crate::hal::serial::write_string_always("\r\n");
             return false;
         }
 
+        // Never describe discontiguous guest pages as one DMA entry.
+        let Some(base) = crate::mm::virt_to_phys(fb_addr as u64) else {
+            crate::hal::serial::write_string_always("[GPU] canvas address unmapped\r\n");
+            return false;
+        };
+        let bytes = width as u64 * height as u64 * 4;
+        let mut offset = 4096 - ((fb_addr as u64) & 4095);
+        while offset < bytes {
+            if crate::mm::virt_to_phys(fb_addr as u64 + offset) != Some(base + offset) {
+                crate::hal::serial::write_string_always("[GPU] noncontiguous canvas base=");
+                crate::hal::serial::write_hex_u64_always(base);
+                crate::hal::serial::write_string_always(" offset=");
+                crate::hal::serial::write_hex_u64_always(offset);
+                crate::hal::serial::write_string_always(" actual=");
+                crate::hal::serial::write_hex_u64_always(crate::mm::virt_to_phys(fb_addr as u64 + offset).unwrap_or(u64::MAX));
+                crate::hal::serial::write_string_always("\r\n");
+                return false;
+            }
+            offset += 4096;
+        }
         if self.blob_supported {
-            return self.initialize_display_blob(transport, scanout_id, fb_addr, width, height);
+            if self.initialize_display_blob(transport, scanout_id, fb_addr, width, height) {
+                return self.present_region_locked(transport, 0, 0, width, height);
+            }
+            // An advertised optional blob path can still be rejected by the
+            // host backend. Keep the standard 2D display path available.
+            if self.failed { return false; }
+            self.blob_supported = false;
         }
         self.initialize_display_2d(transport, scanout_id, fb_addr, width, height)
+            && self.present_region_locked(transport, 0, 0, width, height)
     }
 
     unsafe fn initialize_display_blob(
@@ -287,7 +349,7 @@ impl VirtioGpu {
             return false;
         };
         unsafe { transport.notify(0) };
-        if self.wait_completion(head).is_none() {
+        if self.wait_completion(transport, head).is_none() {
             crate::hal::serial::write_string_always("[GPU] blob create completion failed\r\n");
             return false;
         }
@@ -311,44 +373,15 @@ impl VirtioGpu {
             strides: [width * 4; 4],
             offsets: [0; 4],
         };
-        crate::hal::serial::write_string_always("[GPU] scanout blob size=0x");
-        crate::hal::serial::write_hex_u64_always(core::mem::size_of::<SetScanoutBlob>() as u64);
-        crate::hal::serial::write_string_always("\r\n");
-        let scanout_buffer = Self::scratch_buffer(scanout);
-        Self::clear_response();
-        crate::hal::serial::write_string_always("[GPU] scanout buffer len=0x");
-        crate::hal::serial::write_hex_u64_always(scanout_buffer.len as u64);
-        crate::hal::serial::write_string_always("\r\n");
         let Some(head) = self
             .ctrl_queue
-            .add_chain(&[scanout_buffer, Self::response_buffer()])
+            .add_chain(&[Self::scratch_buffer(scanout), Self::response_buffer()])
         else {
             crate::hal::serial::write_string_always("[GPU] blob scanout add_chain failed\r\n");
             return false;
         };
-        let (desc_addr, desc_len, desc_flags, desc_next) = self.ctrl_queue.debug_descriptor(head);
-        crate::hal::serial::write_string_always("[GPU] scanout desc addr=0x");
-        crate::hal::serial::write_hex_u64_always(desc_addr);
-        crate::hal::serial::write_string_always(" len=0x");
-        crate::hal::serial::write_hex_u64_always(desc_len as u64);
-        crate::hal::serial::write_string_always(" flags=0x");
-        crate::hal::serial::write_hex_u64_always(desc_flags as u64);
-        crate::hal::serial::write_string_always(" next=0x");
-        crate::hal::serial::write_hex_u64_always(desc_next as u64);
-        crate::hal::serial::write_string_always("\r\n");
-        let (next_addr, next_len, next_flags, next_next) =
-            self.ctrl_queue.debug_descriptor(desc_next);
-        crate::hal::serial::write_string_always("[GPU] scanout next desc addr=0x");
-        crate::hal::serial::write_hex_u64_always(next_addr);
-        crate::hal::serial::write_string_always(" len=0x");
-        crate::hal::serial::write_hex_u64_always(next_len as u64);
-        crate::hal::serial::write_string_always(" flags=0x");
-        crate::hal::serial::write_hex_u64_always(next_flags as u64);
-        crate::hal::serial::write_string_always(" next=0x");
-        crate::hal::serial::write_hex_u64_always(next_next as u64);
-        crate::hal::serial::write_string_always("\r\n");
         unsafe { transport.notify(0) };
-        if self.wait_completion(head).is_none() {
+        if self.wait_completion(transport, head).is_none() {
             crate::hal::serial::write_string_always("[GPU] blob scanout completion failed\r\n");
             return false;
         }
@@ -361,6 +394,7 @@ impl VirtioGpu {
             crate::hal::serial::write_string_always(" resource_id=");
             crate::hal::serial::write_hex_u64_always(resource_id as u64);
             crate::hal::serial::write_string_always("\r\n");
+            self.release_resource(transport, resource_id);
             return false;
         }
 
@@ -395,7 +429,7 @@ impl VirtioGpu {
             return false;
         };
         unsafe { transport.notify(0) };
-        if self.wait_completion(head).is_none() {
+        if self.wait_completion(transport, head).is_none() {
             crate::hal::serial::write_string_always("[GPU] create completion failed\r\n");
             return false;
         }
@@ -411,33 +445,26 @@ impl VirtioGpu {
             crate::hal::serial::write_string_always("[GPU] backing translate failed\r\n");
             return false;
         };
-        crate::hal::serial::write_string_always("[GPU] backing va=0x");
-        crate::hal::serial::write_hex_u64_always(fb_addr as u64);
-        crate::hal::serial::write_string_always(" pa=0x");
-        crate::hal::serial::write_hex_u64_always(backing_phys);
-        crate::hal::serial::write_string_always(" size=");
-        crate::hal::serial::write_hex_u64_always((width * height * 4).into());
-        crate::hal::serial::write_string_always("\r\n");
-        let mut backing = ResourceMemoryEntry {
+        let backing = ResourceMemoryEntry {
             addr: backing_phys,
             size: width * height * 4,
             _padding: 0,
         };
-        let mut attach = ResourceAttachBacking {
+        let attach = ResourceAttachBacking {
             hdr: Self::header(CMD_RESOURCE_ATTACH_BACKING),
             resource_id,
             num_entries: 1,
         };
         let Some(head) = self.ctrl_queue.add_chain(&[
-            Self::read_buffer(&mut attach),
-            Self::read_buffer(&mut backing),
+            Self::scratch_buffer(attach),
+            Self::aux_buffer(backing),
             Self::response_buffer(),
         ]) else {
             crate::hal::serial::write_string_always("[GPU] attach add_chain failed\r\n");
             return false;
         };
         unsafe { transport.notify(0) };
-        if self.wait_completion(head).is_none() {
+        if self.wait_completion(transport, head).is_none() {
             crate::hal::serial::write_string_always("[GPU] attach completion failed\r\n");
             return false;
         }
@@ -447,7 +474,7 @@ impl VirtioGpu {
             return false;
         }
 
-        let mut scanout = SetScanout {
+        let scanout = SetScanout {
             hdr: Self::header(CMD_SET_SCANOUT),
             r_x: 0,
             r_y: 0,
@@ -458,13 +485,13 @@ impl VirtioGpu {
         };
         let Some(head) = self
             .ctrl_queue
-            .add_chain(&[Self::read_buffer(&mut scanout), Self::response_buffer()])
+            .add_chain(&[Self::scratch_buffer(scanout), Self::response_buffer()])
         else {
             crate::hal::serial::write_string_always("[GPU] scanout add_chain failed\r\n");
             return false;
         };
         unsafe { transport.notify(0) };
-        if self.wait_completion(head).is_none() {
+        if self.wait_completion(transport, head).is_none() {
             crate::hal::serial::write_string_always("[GPU] scanout completion failed\r\n");
             return false;
         }
@@ -483,94 +510,53 @@ impl VirtioGpu {
     /// Present the persistent backing store. This performs no resource
     /// creation and no CPU framebuffer copy.
     pub fn present_display(&mut self, transport: &mut dyn Transport) -> bool {
-        if self.resource_id == 0 {
-            return false;
-        }
-
-        if self.blob_supported {
-            return self.flush_display(transport);
-        }
-
-        let transfer = TransferToHost2d {
-            hdr: Self::header(CMD_TRANSFER_TO_HOST_2D),
-            rect_x: 0,
-            rect_y: 0,
-            rect_width: self.width,
-            rect_height: self.height,
-            offset: 0,
-            resource_id: self.resource_id,
-            _padding: 0,
-        };
-        let Some(head) = self
-            .ctrl_queue
-            .add_chain(&[Self::scratch_buffer(transfer), Self::response_buffer()])
-        else {
-            return false;
-        };
-        unsafe { transport.notify(0) };
-        if self.wait_completion(head).is_none() {
-            crate::hal::serial::write_string_always("[GPU] transfer completion failed\r\n");
-            return false;
-        }
-        let response = Self::read_response();
-        if response.cmd_type != CMD_RESP_OK_TRANSFER_2D {
-            crate::hal::serial::write_string_always("[GPU] transfer response failed ok=0x");
-            crate::hal::serial::write_hex_u64_always(CMD_RESP_OK_TRANSFER_2D as u64);
-            crate::hal::serial::write_string_always(" got=0x");
-            crate::hal::serial::write_hex_u64_always(response.cmd_type as u64);
-            crate::hal::serial::write_string_always("\r\n");
-            return false;
-        }
-
-        let flush = ResourceFlush {
-            hdr: Self::header(CMD_RESOURCE_FLUSH),
-            rect_x: 0,
-            rect_y: 0,
-            rect_width: self.width,
-            rect_height: self.height,
-            resource_id: self.resource_id,
-            _padding: 0,
-        };
-        let Some(head) = self
-            .ctrl_queue
-            .add_chain(&[Self::scratch_buffer(flush), Self::response_buffer()])
-        else {
-            return false;
-        };
-        unsafe { transport.notify(0) };
-        if self.wait_completion(head).is_none() {
-            crate::hal::serial::write_string_always("[GPU] flush completion failed\r\n");
-            return false;
-        }
-        let response = Self::read_response();
-        if response.cmd_type != CMD_RESP_OK_NODATA {
-            crate::hal::serial::write_string_always("[GPU] flush response failed\r\n");
-            return false;
-        }
-        true
+        self.present_region(transport, 0, 0, self.width, self.height)
     }
 
-    fn flush_display(&mut self, transport: &mut dyn Transport) -> bool {
-        let flush = ResourceFlush {
-            hdr: Self::header(CMD_RESOURCE_FLUSH),
-            rect_x: 0,
-            rect_y: 0,
-            rect_width: self.width,
-            rect_height: self.height,
-            resource_id: self.resource_id,
-            _padding: 0,
-        };
-        let Some(head) = self
-            .ctrl_queue
-            .add_chain(&[Self::scratch_buffer(flush), Self::response_buffer()])
-        else {
-            return false;
-        };
-        unsafe { transport.notify(0) };
-        if self.wait_completion(head).is_none() {
-            return false;
+    /// Submit clipped damage against the persistent scanout. Empty damage
+    /// is a successful no-op; guest offsets use the full resource stride.
+    pub fn present_region(&mut self, transport: &mut dyn Transport, x: u32, y: u32, width: u32, height: u32) -> bool {
+        let _commands = COMMAND_LOCK.lock();
+        self.present_region_locked(transport, x, y, width, height)
+    }
+
+    fn present_region_locked(&mut self, transport: &mut dyn Transport, x: u32, y: u32, width: u32, height: u32) -> bool {
+        if self.failed || self.resource_id == 0 { return false; }
+        let width = width.min(self.width.saturating_sub(x));
+        let height = height.min(self.height.saturating_sub(y));
+        if width == 0 || height == 0 { return true; }
+        if !self.blob_supported {
+            let transfer = TransferToHost2d {
+                hdr: Self::header(CMD_TRANSFER_TO_HOST_2D),
+                rect_x: x, rect_y: y, rect_width: width, rect_height: height,
+                offset: (y as u64 * self.width as u64 + x as u64) * 4,
+                resource_id: self.resource_id, _padding: 0,
+            };
+            let Some(head) = self.ctrl_queue.add_chain(&[Self::scratch_buffer(transfer), Self::response_buffer()]) else { return false; };
+            // SAFETY: the queue and persistent backing stay mapped until completion.
+            unsafe { transport.notify(0) };
+            if self.wait_completion(transport, head).is_none() || Self::read_response().cmd_type != CMD_RESP_OK_NODATA {
+                return false;
+            }
         }
-        Self::read_response().cmd_type == CMD_RESP_OK_NODATA
+        let flush = ResourceFlush {
+            hdr: Self::header(CMD_RESOURCE_FLUSH), rect_x: x, rect_y: y,
+            rect_width: width, rect_height: height, resource_id: self.resource_id, _padding: 0,
+        };
+        let Some(head) = self.ctrl_queue.add_chain(&[Self::scratch_buffer(flush), Self::response_buffer()]) else { return false; };
+        // SAFETY: command buffers and queue remain valid until completion.
+        unsafe { transport.notify(0) };
+        self.wait_completion(transport, head).is_some() && Self::read_response().cmd_type == CMD_RESP_OK_NODATA
+    }
+
+    fn release_resource(&mut self, transport: &mut dyn Transport, resource_id: u32) {
+        #[repr(C)]
+        struct Unref { hdr: CtrlHeader, resource_id: u32, padding: u32 }
+        let request = Unref { hdr: Self::header(CMD_RESOURCE_UNREF), resource_id, padding: 0 };
+        if let Some(head) = self.ctrl_queue.add_chain(&[Self::scratch_buffer(request), Self::response_buffer()]) {
+            unsafe { transport.notify(0); }
+            let _ = self.wait_completion(transport, head);
+        }
     }
 
     pub fn display_geometry(&self) -> Option<(u32, u32)> {
@@ -593,10 +579,6 @@ impl VirtioGpu {
             ctx_id: 0,
             ring_idx: 0,
         }
-    }
-
-    fn read_buffer<T>(value: &mut T) -> QueueBuffer {
-        QueueBuffer::new(value as *mut T as *mut u8, core::mem::size_of::<T>(), false)
     }
 
     fn scratch_buffer<T>(value: T) -> QueueBuffer {
@@ -622,6 +604,7 @@ impl VirtioGpu {
     }
 
     fn response_buffer() -> QueueBuffer {
+        Self::clear_response();
         QueueBuffer::new(
             GPU_RESPONSE.0.get() as *mut u8,
             core::mem::size_of::<CtrlHeader>(),
@@ -648,17 +631,23 @@ impl VirtioGpu {
         }
     }
 
-    fn wait_completion(&mut self, expected_head: u16) -> Option<()> {
+    fn wait_completion(&mut self, transport: &mut dyn Transport, expected_head: u16) -> Option<()> {
         let mut timeout = 0u64;
         loop {
-            if let Some((head_idx, _)) = self.ctrl_queue.pop_used() {
-                if head_idx == expected_head {
+            if let Some((head_idx, len)) = self.ctrl_queue.pop_used() {
+                if head_idx == expected_head && len >= core::mem::size_of::<CtrlHeader>() {
                     return Some(());
                 }
+                // A malformed completion cannot be treated as a successful frame.
+                unsafe { transport.reset(); }
+                self.failed = true;
+                return None;
             }
             timeout += 1;
             if timeout > 50_000_000 {
-                crate::hal::serial::write_string_always("[GPU] completion timeout\r\n");
+                crate::hal::serial::write_string_always("[GPU] completion timeout; resetting device\r\n");
+                unsafe { transport.reset(); }
+                self.failed = true;
                 return None;
             }
             core::hint::spin_loop();

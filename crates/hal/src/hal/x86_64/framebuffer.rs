@@ -111,13 +111,13 @@ pub fn init_from_bootinfo(
     width: u32,
     height: u32,
     stride: u32,
-    _format: u32,
+    format: u32,
 ) -> FramebufferInfo {
     // Mirror into the cross-arch LFB writer so any caller that
     // touches `crate::hal::common::framebuffer::*` (notably the
     // bootvid subsystem) sees the new base/width/height.
     if let Some(common_info) =
-        crate::hal::common::framebuffer::init_from_bootinfo(base, width, height, stride, _format)
+        crate::hal::common::framebuffer::init_from_bootinfo(base, width, height, stride, format)
     {
         // Set default attribute to 0x07 (light grey on black) so
         // bootvid's cursor paint uses the standard colour.

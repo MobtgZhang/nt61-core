@@ -54,6 +54,7 @@ struct FreeBlock {
 pub struct StaticHeapAllocator<const SIZE: usize> {
     heap: UnsafeCell<MaybeUninit<[u8; SIZE]>>,
     locked: AtomicBool,
+    initialized: AtomicBool,
     free_head: AtomicPtr<FreeBlock>,
 }
 
@@ -64,6 +65,7 @@ impl<const SIZE: usize> StaticHeapAllocator<SIZE> {
         Self {
             heap: UnsafeCell::new(MaybeUninit::uninit()),
             locked: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
             free_head: AtomicPtr::new(ptr::null_mut()),
         }
     }
@@ -123,24 +125,9 @@ impl<const SIZE: usize> StaticHeapAllocator<SIZE> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::StaticHeapAllocator;
-    use core::alloc::{GlobalAlloc, Layout};
-
-    #[test]
-    fn high_alignment_allocations_are_reclaimable() {
-        static HEAP: StaticHeapAllocator<{ 128 * 1024 }> = StaticHeapAllocator::new();
-
-        unsafe {
-            let first = HEAP.alloc(Layout::from_size_align(64, 4096).unwrap());
-            assert!(!first.is_null());
-            assert_eq!(first as usize % 4096, 0);
-            HEAP.dealloc(first, Layout::from_size_align(64, 4096).unwrap());
-
-            let second = HEAP.alloc(Layout::from_size_align(64, 4096).unwrap());
-            assert_eq!(second, first);
-        }
+impl<const SIZE: usize> Default for StaticHeapAllocator<SIZE> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -151,9 +138,12 @@ unsafe impl<const SIZE: usize> GlobalAlloc for StaticHeapAllocator<SIZE> {
         }
 
         self.lock();
-        if self.free_head.load(Ordering::Acquire).is_null() {
+        // An empty free list also means exhaustion. Reinitializing it there
+        // would hand the next window memory still owned by a live surface.
+        if !self.initialized.load(Ordering::Relaxed) {
             let first = self.initialize();
             self.free_head.store(first, Ordering::Release);
+            self.initialized.store(true, Ordering::Relaxed);
         }
 
         let mut previous: *mut FreeBlock = ptr::null_mut();
@@ -234,7 +224,7 @@ unsafe impl<const SIZE: usize> GlobalAlloc for StaticHeapAllocator<SIZE> {
         ptr::null_mut()
     }
 
-    unsafe fn dealloc(&self, pointer: *mut u8, _layout: Layout) {
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         if pointer.is_null() {
             return;
         }
@@ -266,14 +256,14 @@ unsafe impl<const SIZE: usize> GlobalAlloc for StaticHeapAllocator<SIZE> {
             );
         }
 
-        if _layout.size() >= TRACE_THRESHOLD {
+        if layout.size() >= TRACE_THRESHOLD {
             let hook = ALLOC_TRACE_HOOK.load(Ordering::Acquire);
             if !hook.is_null() {
                 let hook: HeapTraceHook = unsafe { core::mem::transmute(hook) };
                 unsafe {
                     hook(HeapTrace::Free {
-                        size: _layout.size(),
-                        align: _layout.align(),
+                        size: layout.size(),
+                        align: layout.align(),
                         pointer,
                     })
                 };
@@ -316,5 +306,42 @@ unsafe impl<const SIZE: usize> GlobalAlloc for StaticHeapAllocator<SIZE> {
             }
         }
         self.unlock();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StaticHeapAllocator;
+    use core::alloc::{GlobalAlloc, Layout};
+
+    #[test]
+    fn exhaustion_never_reinitializes_live_allocations() {
+        static HEAP: StaticHeapAllocator<256> = StaticHeapAllocator::new();
+        let large = Layout::from_size_align(208, 16).unwrap();
+        let small = Layout::from_size_align(16, 16).unwrap();
+        unsafe {
+            let live = HEAP.alloc(large);
+            assert!(!live.is_null());
+            live.write_bytes(0xA5, large.size());
+            assert!(HEAP.alloc(small).is_null(), "exhaustion must not recycle a live block");
+            assert!(core::slice::from_raw_parts(live, large.size()).iter().all(|byte| *byte == 0xA5));
+            HEAP.dealloc(live, large);
+            assert_eq!(HEAP.alloc(large), live);
+        }
+    }
+
+    #[test]
+    fn high_alignment_allocations_are_reclaimable() {
+        static HEAP: StaticHeapAllocator<{ 128 * 1024 }> = StaticHeapAllocator::new();
+
+        unsafe {
+            let first = HEAP.alloc(Layout::from_size_align(64, 4096).unwrap());
+            assert!(!first.is_null());
+            assert_eq!(first as usize % 4096, 0);
+            HEAP.dealloc(first, Layout::from_size_align(64, 4096).unwrap());
+
+            let second = HEAP.alloc(Layout::from_size_align(64, 4096).unwrap());
+            assert_eq!(second, first);
+        }
     }
 }

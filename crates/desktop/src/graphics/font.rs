@@ -1,4 +1,5 @@
-use alloc::vec::Vec;
+use alloc::{rc::Rc, vec::Vec};
+use core::cell::RefCell;
 
 use nt61_fonts::{FontFace, FontLineMetrics, GlyphMetrics, RasterizedGlyph};
 
@@ -36,11 +37,12 @@ pub struct TextLayout {
 #[derive(Debug)]
 pub struct FontLib {
     faces: Vec<FontFace>,
+    glyphs: RefCell<Vec<(char, u32, Rc<RasterizedGlyph>)>>,
 }
 
 impl FontLib {
     pub fn from_bytes(data: &[u8]) -> Result<Self, FontError> {
-        let mut library = Self { faces: Vec::new() };
+        let mut library = Self { faces: Vec::new(), glyphs: RefCell::new(Vec::new()) };
         library.load(data)?;
         Ok(library)
     }
@@ -56,6 +58,7 @@ impl FontLib {
     pub fn load(&mut self, data: &[u8]) -> Result<(), FontError> {
         let face = FontFace::from_bytes(data).map_err(|_| FontError::InvalidFont)?;
         self.faces.push(face);
+        self.glyphs.get_mut().clear();
         Ok(())
     }
 
@@ -88,6 +91,19 @@ impl FontLib {
         self.face(0)?.rasterize(ch, pixel_size)
     }
 
+    fn cached_glyph(&self, ch: char, pixel_size: u32) -> Option<Rc<RasterizedGlyph>> {
+        if let Some((_, _, glyph)) = self.glyphs.borrow().iter()
+            .find(|(key, size, _)| *key == ch && *size == pixel_size) {
+            return Some(Rc::clone(glyph));
+        }
+        let glyph = Rc::new(self.rasterize(ch, pixel_size)?);
+        let mut cache = self.glyphs.borrow_mut();
+        // Bounded per-renderer storage; coverage is shared across colors and windows.
+        if cache.len() == 256 { cache.remove(0); }
+        cache.push((ch, pixel_size, Rc::clone(&glyph)));
+        Some(glyph)
+    }
+
     pub fn measure(&self, text: &str, pixel_size: u32) -> Option<TextLayout> {
         let mut width = 0_u32;
         let mut line_count = 0_u32;
@@ -116,6 +132,19 @@ impl FontLib {
         })
     }
 
+    /// Long labels are clipped in one pass, without allocating and measuring
+    /// every progressively shorter candidate during pointer hover repaints.
+    pub fn fitting_prefix<'a>(&self, text: &'a str, pixel_size: u32, width: u32) -> Option<&'a str> {
+        let mut used = 0u32;
+        for (at, ch) in text.char_indices() {
+            if ch == '\n' { return Some(&text[..at]); }
+            let advance = advance_pixels(self.glyph_metrics(ch, pixel_size)?.advance_width);
+            if advance > width.saturating_sub(used) { return Some(&text[..at]); }
+            used += advance;
+        }
+        Some(text)
+    }
+
     pub fn draw_text(
         &self,
         target: &mut Surface,
@@ -133,7 +162,7 @@ impl FontLib {
             let mut pen_x = x;
             for ch in line.chars() {
                 let glyph = self
-                    .rasterize(ch, pixel_size)
+                    .cached_glyph(ch, pixel_size)
                     .ok_or(TextError::GlyphUnavailable)?;
                 let top_y = baseline - (glyph.metrics.height as i32 + glyph.metrics.ymin);
                 let origin_x = pen_x + glyph.metrics.xmin;
@@ -184,6 +213,22 @@ mod tests {
     }
 
     #[test]
+    fn fitting_prefix_preserves_utf8_and_matches_measured_width() {
+        let font = FontLib::ui().unwrap();
+        let text = "Explorer café";
+        for width in 0..200 {
+            let prefix = font.fitting_prefix(text, 14, width).unwrap();
+            assert!(text.starts_with(prefix));
+            assert!(font.measure(prefix, 14).unwrap().width <= width);
+            if let Some(next) = text[prefix.len()..].chars().next() {
+                let longer = &text[..prefix.len() + next.len_utf8()];
+                assert!(font.measure(longer, 14).unwrap().width > width);
+            }
+        }
+        assert_eq!(font.fitting_prefix("line\nnext", 14, 1000), Some("line"));
+    }
+
+    #[test]
     fn text_layout_uses_font_metrics() {
         let font = FontLib::monospace().expect("embedded monospace font must parse");
         let layout = font.measure("AB", 16).expect("layout must be available");
@@ -202,5 +247,43 @@ mod tests {
         assert!(font
             .draw_text(&mut surface, "A", 32, 32, 12, 0xFF00_0000)
             .is_ok());
+    }
+
+    #[test]
+    #[ignore = "manual rendering performance measurement"]
+    fn repeated_window_labels_benchmark() {
+        let font = FontLib::ui().unwrap();
+        let mut surface = Surface::new(640, 460);
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            for (row, text) in ["Windows Explorer", "Administrator", "Documents", "Computer",
+                "Control Panel", "Calculator", "Applications  |  Task  |  Status"].iter().enumerate() {
+                font.draw_text(&mut surface, text, 12, row as i32 * 24, 16, 0xFFFFFFFF).unwrap();
+            }
+        }
+        std::println!("100 window label frames: {:?}", start.elapsed());
+        assert!(surface.pixels().iter().any(|p| *p != 0));
+    }
+
+    #[test]
+    fn cached_glyphs_preserve_pixels_and_distinguish_sizes() {
+        let font = FontLib::ui().unwrap();
+        let first = font.cached_glyph('A', 16).unwrap();
+        let again = font.cached_glyph('A', 16).unwrap();
+        assert!(Rc::ptr_eq(&first, &again));
+        let large = font.cached_glyph('A', 24).unwrap();
+        assert!(!Rc::ptr_eq(&first, &large));
+        let original = font.rasterize('A', 16).unwrap();
+        for y in 0..original.metrics.height {
+            for x in 0..original.metrics.width {
+                assert_eq!(first.coverage_at(x, y), original.coverage_at(x, y));
+            }
+        }
+        for ch in (32..400).filter_map(char::from_u32) { let _ = font.cached_glyph(ch, 16); }
+        assert!(font.glyphs.borrow().len() <= 256);
+        let font_data = UI_FONT;
+        let mut font = font;
+        font.load(font_data).unwrap();
+        assert!(font.glyphs.borrow().is_empty());
     }
 }

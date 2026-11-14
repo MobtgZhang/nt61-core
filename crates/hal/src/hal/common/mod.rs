@@ -8,6 +8,7 @@ pub mod console;
 pub mod dma;
 pub mod framebuffer;
 pub mod framebuffer_impl;
+pub mod display_damage;
 pub mod interrupts;
 pub mod io_port;
 pub mod keyboard_input;
@@ -38,7 +39,7 @@ pub fn shutdown() {
     // port. QEMU exposes the PM1a_CNT register at I/O port 0x604;
     // Bochs uses 0xB004. Writing SLP_EN | SLP_TYP=S5 triggers an
     // immediate shutdown on emulated hardware. On physical hardware
-    // the firmware sets SLP_TYP from the _S5 object; a real AML
+    // the firmware sets SLP_TYP from the S5 object; a real AML
     // interpreter would be needed to evaluate it, so we fall back
     // to the halt loop there.
     #[cfg(target_arch = "x86_64")]
