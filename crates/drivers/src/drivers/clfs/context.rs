@@ -182,7 +182,7 @@ pub struct ClfsClientContext {
     /// File attribute flags (FILE_ATTRIBUTE_*).
     pub f_attributes: u16,
     /// Unused / padding.
-    pub _padding: u16,
+    pub padding: u16,
     /// Flush threshold in bytes — when the client's data exceeds this,
     /// the log manager will attempt to flush.
     pub cb_flush_threshold: u32,
@@ -225,7 +225,7 @@ impl ClfsClientContext {
             cid_node: ClfsNodeId::client_context(),
             cid_client: cid,
             f_attributes: 0,
-            _padding: 0,
+            padding: 0,
             cb_flush_threshold: 40_000, // Default: 40KB
             c_shadow_sectors: 0,
             cb_undo_commitment: 0,

@@ -447,7 +447,7 @@ pub struct NvmeIdentifyController {
     /// Maximum NAMed Queues
     pub mnqn: u32,
     /// Reserved
-    _reserved: [u8; 768],
+    reserved: [u8; 768],
 }
 
 /// Identify Namespace data structure
@@ -482,7 +482,7 @@ pub struct NvmeIdentifyNamespace {
     pub eui64: [u8; 8],
     /// LBA Format Support
     pub lbaf: [NvmeLbaFormat; 16],
-    _reserved: [u8; 192],
+    reserved: [u8; 192],
 }
 
 impl NvmeIdentifyNamespace {

@@ -795,7 +795,7 @@ pub fn control_transfer(
 /// Enumerate a device on a port
 pub fn enumerate_device(controller: usize, port: u8) -> Result<UsbDevice, &'static str> {
     // Reset port
-    let _speed = reset_port(controller, port)?;
+    let speed = reset_port(controller, port)?;
 
     // Step 2: GET_DESCRIPTOR (Device).
     let mut buf = [0u8; 18];
@@ -817,7 +817,7 @@ pub fn enumerate_device(controller: usize, port: u8) -> Result<UsbDevice, &'stat
     Ok(UsbDevice {
         address: 1,
         port,
-        speed: _speed,
+        speed,
         state: UsbDeviceState::Configured,
         descriptor,
         configuration: 1,

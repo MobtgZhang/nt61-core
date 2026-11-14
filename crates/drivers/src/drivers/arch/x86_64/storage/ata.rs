@@ -598,11 +598,7 @@ pub fn read_sectors_lba48(idx: usize, lba: u64, count: u16, buf: &mut [u16]) -> 
         }
 
         // Wait for completion
-        if !wait_not_busy(io + 7, ATA_TIMEOUT_US) {
-            return false;
-        }
-
-        true
+        wait_not_busy(io + 7, ATA_TIMEOUT_US)
     }
 }
 
@@ -656,11 +652,7 @@ pub fn write_sectors_lba48(idx: usize, lba: u64, count: u16, buf: &[u16]) -> boo
         }
 
         // Wait for completion
-        if !wait_not_busy(io + 7, ATA_TIMEOUT_US) {
-            return false;
-        }
-
-        true
+        wait_not_busy(io + 7, ATA_TIMEOUT_US)
     }
 }
 

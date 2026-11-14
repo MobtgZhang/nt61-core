@@ -869,16 +869,12 @@ pub fn send_codec_cmd(hda_idx: usize, codec: u8, nid: u8, verb: u16) -> Option<u
 /// Get controller info
 pub fn get_info(hda_idx: usize) -> Option<(&'static str, u16, u8, u8)> {
     unsafe {
-        if let Some(ref hda) = HDAS[hda_idx] {
-            Some((
+        HDAS[hda_idx].as_ref().map(|hda| (
                 "Intel HDA",
                 hda.gcap,
                 hda.n_streams_out + hda.n_streams_in + hda.n_streams_bidi,
                 hda.n_codecs,
             ))
-        } else {
-            None
-        }
     }
 }
 

@@ -198,7 +198,7 @@ impl RadeonCursor {
     /// Note: AMD cursors typically use the alpha channel for transparency.
     ///
     /// # Arguments
-    /// * `_key` - ARGB color to use as transparency key (reserved for future use)
+    /// * `key` - ARGB color to use as transparency key (reserved for future use)
     pub fn set_color_key(&self, _key: u32) {
         // AMD cursor hardware uses alpha channel for transparency
         // This method is provided for API compatibility

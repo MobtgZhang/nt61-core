@@ -63,7 +63,7 @@ pub fn init() {
             let base = ((base_hi as u64) << 32) | (base_lo as u64);
             // Sanity-check the base: must be a plausible MMIO
             // address, never 0 or inside low RAM.
-            if base < 0x1000 || base > 0xFFFF_FFFF_FFFF_0000 {
+            if !(0x1000..=0xFFFF_FFFF_FFFF_0000).contains(&base) {
                 return;
             }
             let Some(mmio) = crate::mm::syspte::map_io_space(base & !0xFFF, 4) else {

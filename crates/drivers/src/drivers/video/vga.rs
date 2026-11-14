@@ -214,7 +214,7 @@ fn clear_screen(attr: u8) {
 #[derive(Debug)]
 pub struct VgaState {
     /// Display type detected at init.
-    _display_type: DisplayType,
+    display_type: DisplayType,
     /// Whether the hardware was detected.
     _hardware_present: bool,
     /// Virtual address of the VGA text buffer (0xB8000 mapped).
@@ -231,7 +231,7 @@ impl VgaState {
         let display_type = detect_display_type();
         let fb_virt = VGA_TEXT_PHYS; // kernel must have mapped this
         Some(Self {
-            _display_type: display_type,
+            display_type,
             _hardware_present: true,
             fb_virt,
         })
@@ -252,7 +252,7 @@ impl VgaState {
                     cx = 0;
                     if cy + 1 >= VGA_HEIGHT {
                         // Scroll up by one row
-                        self._scroll_up();
+                        self.scroll_up();
                     } else {
                         cy += 1;
                     }
@@ -266,7 +266,7 @@ impl VgaState {
                     if cx >= VGA_WIDTH {
                         cx = 0;
                         if cy + 1 >= VGA_HEIGHT {
-                            self._scroll_up();
+                            self.scroll_up();
                         } else {
                             cy += 1;
                         }
@@ -278,7 +278,7 @@ impl VgaState {
     }
 
     /// Scroll the screen up by one row (复制显存行).
-    fn _scroll_up(&mut self) {
+    fn scroll_up(&mut self) {
         // Copy rows 1..24 to rows 0..23 (move 23 rows of 80*2 bytes)
         let row_bytes = (VGA_WIDTH * 2) as usize;
         let total_rows = (VGA_HEIGHT - 1) as usize;

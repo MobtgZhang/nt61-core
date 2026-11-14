@@ -100,13 +100,13 @@ fn vbe_outw(port: u16, val: u16) {
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
-fn vbe_inw(_port: u16) -> u16 {
+fn vbe_inw(port: u16) -> u16 {
     0
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
-fn vbe_outw(_port: u16, _val: u16) {}
+fn vbe_outw(port: u16, val: u16) {}
 
 // =====================================================================
 // Bochs VBE Hardware Access

@@ -1206,7 +1206,7 @@ mod tests {
         let mode = DisplayMode::new(1024, 768, 60, 32);
         let head = DisplayHead::new(DisplayConnector::AnalogVga, mode);
         assert_eq!(head.connector, DisplayConnector::AnalogVga);
-        assert_eq!(head.enabled, false);
+        assert!(!head.enabled);
         assert!(head.clone_of.is_none());
     }
 

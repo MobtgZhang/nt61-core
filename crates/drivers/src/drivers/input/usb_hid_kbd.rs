@@ -326,8 +326,8 @@ fn vk_to_ascii(vk: u16, modifier: u8) -> Option<u8> {
 
 /// Enqueue a character to the system keyboard input queue.
 /// This bridges USB keyboard input to the PS/2 keyboard queue.
-fn enqueue_usb_char(_ch: u8) {
-    crate::drivers::arch::keyboard_enqueue_char(_ch);
+fn enqueue_usb_char(ch: u8) {
+    crate::drivers::arch::keyboard_enqueue_char(ch);
 }
 
 /// handle a single key press event.

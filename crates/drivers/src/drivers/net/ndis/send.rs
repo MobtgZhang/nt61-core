@@ -165,7 +165,7 @@ pub mod send_flags {
 pub fn process_send_nbl(
     adapter: *mut MiniportAdapterContext,
     nbl: *mut NetBufferList,
-    _send_flags: u32,
+    send_flags: u32,
 ) -> i32 {
     if adapter.is_null() || nbl.is_null() {
         return ndis_status::FAILURE;
@@ -213,7 +213,7 @@ pub fn process_send_nbl(
 
 /// Return NBLs to the protocol driver
 pub fn return_nbls(
-    _adapter: *mut MiniportAdapterContext,
+    adapter: *mut MiniportAdapterContext,
     nbl: *mut NetBufferList,
     _return_flags: u32,
 ) {

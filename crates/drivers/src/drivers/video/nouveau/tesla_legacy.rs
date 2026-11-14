@@ -401,10 +401,10 @@ pub fn read_reg(base: u64, offset: u32) -> u32 {
 /// Print Tesla legacy GPU detection information
 pub fn print_detection_info() {
     if let Some((device_id, arch)) = get_legacy_gpu_info() {
-        let _name = device_name(device_id);
+        let name = device_name(device_id);
         log::video_log(
             "nouveau",
-            &alloc::format!("Found: {} ({})", _name, arch.name()),
+            &alloc::format!("Found: {} ({})", name, arch.name()),
         );
         // Publish a packed summary `(arch_id << 16) | device_id` so
         // callers can introspect discovery without touching the console.
