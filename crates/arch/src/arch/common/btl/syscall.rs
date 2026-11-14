@@ -19,7 +19,7 @@ pub enum BridgeOutcome {
     MemoryFault,
 }
 
-const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xC000_001C;
+const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xC000_000C;
 const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
 
 impl BridgeOutcome {
@@ -43,6 +43,7 @@ fn read_x86_32_stack_args(
 ) -> Option<[usize; 8]> {
     const WORD_SIZE: usize = core::mem::size_of::<u32>();
     let mut raw = [0u8; 8 * WORD_SIZE];
+    if count > raw.len() / WORD_SIZE { return None; }
     let bytes = count * WORD_SIZE;
     let n = memory.read_virt(stack_base, &mut raw[..bytes]);
     if n < bytes {
@@ -70,6 +71,7 @@ fn read_x86_64_stack_args_into(
 
     const WORD_SIZE: usize = core::mem::size_of::<u64>();
     let mut raw = [0u8; 4 * WORD_SIZE];
+    if count > raw.len() / WORD_SIZE || count > out.len() { return false; }
     let bytes = count * WORD_SIZE;
     let n = memory.read_virt(stack_base, &mut raw[..bytes]);
     if n < bytes {
@@ -83,7 +85,10 @@ fn read_x86_64_stack_args_into(
     true
 }
 
-/// Bridge one guest syscall to the native NT SSDT.
+/// Bridge a syscall whose service number has ALREADY been resolved to the
+/// kernel's internal SSDT. This is not the Win7 PE guest-number resolver.
+/// 32-bit pointer/structure-bearing services require a dedicated WOW64 thunk;
+/// callers must not forward those to native handlers through this adapter.
 ///
 /// # Safety
 /// Must be called from a valid BTL syscall context. The SSDT handler
@@ -99,6 +104,9 @@ pub unsafe fn dispatch_nt_syscall(
     };
 
     let arg_count = entry.arg_count as usize;
+    // These legacy native handlers read trailing usize values directly. Do not
+    // let them consume a 32-bit argument block as a native stack frame.
+    if abi != GuestAbi::X86_64 && arg_count > 8 { return BridgeOutcome::InvalidService; }
     let normalized = normalize_syscall_args(abi, guest_regs);
     let (register_args, register_count, stack_pointer) = match abi {
         GuestAbi::X86_64 => {
@@ -110,7 +118,9 @@ pub unsafe fn dispatch_nt_syscall(
                 let Some(stack_base) = normalized.stack_arg_base else {
                     return BridgeOutcome::MemoryFault;
                 };
-                let stack_base = stack_base + core::mem::size_of::<u64>() as u64;
+                let Some(stack_base) = stack_base.checked_add(0x28) else {
+                    return BridgeOutcome::MemoryFault;
+                };
                 let mut args = normalized.register_args;
                 if !read_x86_64_stack_args_into(memory, stack_base, stack_count, &mut args[4..]) {
                     return BridgeOutcome::MemoryFault;
@@ -276,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn x86_64_reads_fifth_arg_after_return_address() {
+    fn x86_64_reads_fifth_arg_after_return_and_shadow_space() {
         unsafe {
             register_syscall(
                 TEST_SERVICE_X86_64_STACK,
@@ -288,10 +298,8 @@ mod tests {
         }
         let mut backing = [0u8; 0x100];
         let mut mem = flat_memory(&mut backing);
-        let stack: [u8; 16] = [
-            0xFF, 0, 0, 0, 0, 0, 0, 0, // return address
-            0x77, 0, 0, 0, 0, 0, 0, 0, // arg4
-        ];
+        let mut stack = [0xEE; 48]; // poison the return address and home area
+        stack[40..48].copy_from_slice(&0x77u64.to_le_bytes());
         assert!(mem.write_virt(0x80, &stack));
 
         let mut regs = alloc::vec![0u64; 17];

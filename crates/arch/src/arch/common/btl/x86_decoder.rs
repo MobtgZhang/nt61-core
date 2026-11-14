@@ -7,7 +7,8 @@
 //! handles by trapping back to the kernel.
 
 use super::ir::{
-    AluOp, BranchCond, IROp, IrInst, MemOperand, SimdOp, SimdSrc, SimdWidth, X86Reg, X86Xmm,
+    AluOp, BranchCond, DecodeMode, IROp, IrInst, MemOperand, Segment, SimdOp, SimdSrc, SimdWidth,
+    X86Reg, X86Xmm,
 };
 
 /// Maximum bytes per guest basic block.
@@ -183,10 +184,13 @@ struct Decoder<'a> {
     has_f2: bool,
     /// EVEX R' extension: extends register index from XMM0-15 to XMM16-31.
     evex_reg_ext: bool,
+    mode: DecodeMode,
+    segment: Segment,
+    byte_operand: bool,
 }
 
 impl<'a> Decoder<'a> {
-    fn new(bytes: &'a [u8], base_va: u64) -> Self {
+    fn new(bytes: &'a [u8], base_va: u64, mode: DecodeMode) -> Self {
         Self {
             bytes,
             offset: 0,
@@ -196,15 +200,43 @@ impl<'a> Decoder<'a> {
             rex_r: false,
             rex_x: false,
             rex_b: false,
-            op_size_64: true,
+            op_size_64: false,
             addr_size_64: true,
             has_66: false,
             has_f3: false,
             has_f2: false,
             evex_reg_ext: false,
+            mode,
+            segment: Segment::Flat,
+            byte_operand: false,
         }
     }
 
+    fn operand_width(&self) -> u8 {
+        if self.byte_operand {
+            1
+        } else if self.rex_w {
+            8
+        } else if self.has_66 {
+            2
+        } else {
+            4
+        }
+    }
+    fn address_width(&self) -> u8 {
+        if self.addr_size_64 {
+            8
+        } else {
+            4
+        }
+    }
+    fn fetch_imm(&mut self) -> Option<i64> {
+        if self.operand_width() == 2 {
+            Some(i16::from_le_bytes([self.fetch()?, self.fetch()?]) as i64)
+        } else {
+            Some(self.fetch_le32()? as i64)
+        }
+    }
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.offset).copied()
     }
@@ -229,11 +261,11 @@ impl<'a> Decoder<'a> {
     }
 
     fn current_va(&self) -> u64 {
-        self.base_va + self.offset as u64
+        self.base_va.wrapping_add(self.offset as u64)
     }
 
     fn current_va_at_start(&self, start: usize) -> u64 {
-        self.base_va + start as u64
+        self.base_va.wrapping_add(start as u64)
     }
 
     /// Consume legacy prefixes and REX prefix.
@@ -243,8 +275,10 @@ impl<'a> Decoder<'a> {
         self.rex_r = false;
         self.rex_x = false;
         self.rex_b = false;
-        self.op_size_64 = true;
-        self.addr_size_64 = true;
+        self.op_size_64 = false;
+        self.segment = Segment::Flat;
+        self.byte_operand = false;
+        self.addr_size_64 = self.mode == DecodeMode::X64;
         self.has_66 = false;
         self.has_f3 = false;
         self.has_f2 = false;
@@ -270,12 +304,18 @@ impl<'a> Decoder<'a> {
                 Some(PREFIX_SEGMENT_ES)
                 | Some(PREFIX_SEGMENT_CS)
                 | Some(PREFIX_SEGMENT_SS)
-                | Some(PREFIX_SEGMENT_DS)
-                | Some(PREFIX_SEGMENT_FS)
-                | Some(PREFIX_SEGMENT_GS) => {
+                | Some(PREFIX_SEGMENT_DS) => {
                     self.offset += 1;
                 }
-                Some(b) if (REX_PREFIX..=0x4F).contains(&b) => {
+                Some(PREFIX_SEGMENT_FS) => {
+                    self.segment = Segment::Fs;
+                    self.offset += 1;
+                }
+                Some(PREFIX_SEGMENT_GS) => {
+                    self.segment = Segment::Gs;
+                    self.offset += 1;
+                }
+                Some(b) if self.mode == DecodeMode::X64 && (REX_PREFIX..=0x4F).contains(&b) => {
                     self.has_rex = true;
                     self.rex_w = b & REX_W != 0;
                     self.rex_r = b & REX_R != 0;
@@ -296,7 +336,7 @@ impl<'a> Decoder<'a> {
         let reg_field = (modrm >> 3) & 0x07;
         let rm_field = modrm & 0x07;
         let reg = X86Reg::from_modrm(reg_field, self.rex_r);
-        let width = if self.op_size_64 { 8u8 } else { 4u8 };
+        let width = self.operand_width();
 
         match mode {
             0x03 => {
@@ -310,7 +350,7 @@ impl<'a> Decoder<'a> {
                     let sib_index = (sib >> 3) & 0x07;
                     let sib_base = sib & 0x07;
                     let scale = 1u8 << sib_scale_code;
-                    let idx = if sib_index == 0x04 {
+                    let idx = if sib_index == 0x04 && !self.rex_x {
                         None
                     } else {
                         Some(X86Reg::from_modrm(sib_index, self.rex_x))
@@ -326,7 +366,16 @@ impl<'a> Decoder<'a> {
                         )
                     }
                 } else if rm_field == 0x05 && mode == 0x00 {
-                    (Some(X86Reg::Rip), None, 1, false)
+                    (
+                        if self.addr_size_64 {
+                            Some(X86Reg::Rip)
+                        } else {
+                            None
+                        },
+                        None,
+                        1,
+                        true,
+                    )
                 } else {
                     (
                         Some(X86Reg::from_modrm(rm_field, self.rex_b)),
@@ -364,51 +413,54 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn decode_alu_rm_r(&mut self, alu: AluOp) -> Option<IROp> {
-        let (dst, src, _) = self.decode_modrm()?;
-        match src {
-            Ok(src_reg) => Some(IROp::AluReg {
-                op: alu,
-                dst,
-                src: src_reg,
-            }),
-            Err(mem) => Some(IROp::AluMem { op: alu, dst, mem }),
-        }
-    }
-
-    fn decode_alu_r_rm(&mut self, alu: AluOp) -> Option<IROp> {
+    fn decode_alu_rm_r(&mut self, op: AluOp) -> Option<IROp> {
         let (src, dst, _) = self.decode_modrm()?;
-        match dst {
-            Ok(dst_reg) => Some(IROp::AluReg {
-                op: alu,
-                dst: dst_reg,
-                src,
-            }),
-            Err(mem) => Some(IROp::AluMem {
-                op: alu,
-                dst: src,
-                mem,
-            }),
-        }
+        Some(match dst {
+            Ok(dst) => IROp::AluReg { op, dst, src },
+            Err(mem) => IROp::AluStore { op, mem, src },
+        })
+    }
+    fn decode_alu_r_rm(&mut self, op: AluOp) -> Option<IROp> {
+        let (dst, src, _) = self.decode_modrm()?;
+        Some(match src {
+            Ok(src) => IROp::AluReg { op, dst, src },
+            Err(mem) => IROp::AluMem { op, dst, mem },
+        })
     }
 
     /// Decode one instruction and return the IR op.
     fn decode_one(&mut self) -> Option<IROp> {
         let start = self.offset;
         self.consume_prefixes();
+        if self.offset - start >= 15 {
+            return Some(IROp::Unsupported);
+        }
         let op = self.fetch()?;
+        // 16-bit addressing is deliberately rejected until its BX/SI forms exist.
+        if self.mode == DecodeMode::X86 && self.bytes[start..self.offset].contains(&0x67) {
+            return Some(IROp::Unsupported);
+        }
 
+        // REP/REPNZ are not interchangeable with ordinary integer semantics.
+        if (self.has_f2 || self.has_f3) && op != 0x0f && op != 0x90 {
+            return Some(IROp::Unsupported);
+        }
         if op == OPCODE_SYSCALL_HI {
             let op2 = self.fetch()?;
             return match op2 {
-                OPCODE_SYSCALL_LO => Some(IROp::Syscall),
+                OPCODE_SYSCALL_LO if self.mode == DecodeMode::X64 => Some(IROp::Syscall),
+                0x34 if self.mode == DecodeMode::X86 => Some(IROp::Syscall),
                 // SSE data movement.
                 SSE_MOVAPS => self.decode_simd_mov(SimdWidth::PackedF32),
                 SSE_MOVAPS_STORE => self.decode_simd_store(SimdWidth::PackedF32),
-                SSE_MOVUPS => self.decode_simd_mov(SimdWidth::PackedF32),
-                SSE_MOVUPS_STORE => self.decode_simd_store(SimdWidth::PackedF32),
-                SSE_MOVDQA => self.decode_simd_mov(SimdWidth::PackedI128),
-                SSE_MOVDQA_STORE => self.decode_simd_store(SimdWidth::PackedI128),
+                SSE_MOVUPS => self.decode_simd_mov(self.simd_width()),
+                SSE_MOVUPS_STORE => self.decode_simd_store(self.simd_width()),
+                SSE_MOVDQA if self.has_66 || self.has_f3 => {
+                    self.decode_simd_mov(SimdWidth::PackedI128)
+                }
+                SSE_MOVDQA_STORE if self.has_66 || self.has_f3 => {
+                    self.decode_simd_store(SimdWidth::PackedI128)
+                }
                 // SSE arithmetic.
                 SSE_ADD => self.decode_simd_arith(SimdOp::Add),
                 SSE_SUB => self.decode_simd_arith(SimdOp::Sub),
@@ -420,10 +472,8 @@ impl<'a> Decoder<'a> {
                 SSE_PAND => self.decode_simd_arith(SimdOp::And),
                 SSE_POR => self.decode_simd_arith(SimdOp::Or),
                 SSE_PXOR => self.decode_simd_arith(SimdOp::Xor),
-                // VEX (AVX / AVX-512) encoding.
-                VEX_PREFIX_2B => self.decode_vex_2b(),
-                VEX_PREFIX_3B => self.decode_vex_3b(),
-                EVEX_PREFIX => self.decode_evex(),
+                // AVX requires distinct three-operand/upper-lane semantics.
+                // Do not misinterpret extended 0F opcodes as VEX prefixes.
                 OPCODE_JCC_REL32_BASE..=0x8F => {
                     let cc = op2 - OPCODE_JCC_REL32_BASE;
                     let rel = self.fetch_le32()?;
@@ -443,6 +493,38 @@ impl<'a> Decoder<'a> {
         let result = match op {
             OPCODE_NOP => Some(IROp::Nop),
             OPCODE_RET_NEAR => Some(IROp::Ret),
+            0xC2 => Some(IROp::RetImm {
+                bytes: u16::from_le_bytes([self.fetch()?, self.fetch()?]),
+            }),
+            0x68 => Some(IROp::PushImm {
+                value: self.fetch_imm()?,
+            }),
+            0x6A => Some(IROp::PushImm {
+                value: self.fetch()? as i8 as i64,
+            }),
+            0xCD => Some(if self.fetch()? == 0x2e {
+                IROp::Syscall
+            } else {
+                IROp::Unsupported
+            }),
+            0xFF => {
+                let group = (self.peek()? >> 3) & 7;
+                let (_, target, _) = self.decode_modrm()?;
+                match (group, target) {
+                    (2 | 4, Ok(target)) => Some(IROp::JumpReg {
+                        target,
+                        call: group == 2,
+                    }),
+                    (2 | 4, Err(mut mem)) => {
+                        mem.width = if self.mode == DecodeMode::X64 { 8 } else { 4 };
+                        Some(IROp::JumpMem {
+                            mem,
+                            call: group == 2,
+                        })
+                    }
+                    _ => Some(IROp::Unsupported),
+                }
+            }
 
             OPCODE_MOV_R_IMM64..=0xBF if self.op_size_64 => {
                 let reg = X86Reg::from_modrm(op & 0x07, self.rex_b);
@@ -452,20 +534,28 @@ impl<'a> Decoder<'a> {
 
             OPCODE_MOV_R_IMM64..=0xBF => {
                 let reg = X86Reg::from_modrm(op & 0x07, self.rex_b);
-                let imm = self.fetch_le32()?;
+                let imm = self.fetch_imm()?;
                 Some(IROp::MovImm {
                     dst: reg,
                     imm: imm as i64,
                 })
             }
 
-            OPCODE_MOV_R8_IMM8 => {
+            OPCODE_MOV_R8_IMM8..=0xB7 => {
+                self.byte_operand = true;
+                if !self.has_rex && (op & 7) >= 4 {
+                    return Some(IROp::Unsupported);
+                }
                 let reg = X86Reg::from_modrm(op & 0x07, self.rex_b);
                 let imm = self.fetch()? as i8 as i64;
                 Some(IROp::MovImm { dst: reg, imm })
             }
 
-            OPCODE_MOV_RM_R => {
+            OPCODE_MOV_RM_R | 0x88 => {
+                self.byte_operand = op == 0x88;
+                if self.byte_operand && !self.has_rex && self.uses_high_byte_registers()? {
+                    return Some(IROp::Unsupported);
+                }
                 let (src, dst, _) = self.decode_modrm()?;
                 match dst {
                     Ok(dst_reg) => Some(IROp::MovReg { dst: dst_reg, src }),
@@ -473,7 +563,11 @@ impl<'a> Decoder<'a> {
                 }
             }
 
-            OPCODE_MOV_R_RM => {
+            OPCODE_MOV_R_RM | 0x8A => {
+                self.byte_operand = op == 0x8A;
+                if self.byte_operand && !self.has_rex && self.uses_high_byte_registers()? {
+                    return Some(IROp::Unsupported);
+                }
                 let (dst, src, _) = self.decode_modrm()?;
                 match src {
                     Ok(src_reg) => Some(IROp::MovReg { dst, src: src_reg }),
@@ -481,45 +575,57 @@ impl<'a> Decoder<'a> {
                 }
             }
 
-            OPCODE_MOV_MOFFS_RAX => {
-                let disp = self.fetch_le32()?;
-                Some(IROp::Store {
-                    mem: MemOperand {
-                        base: None,
-                        index: None,
-                        scale: 1,
-                        disp,
-                        width: 8,
-                    },
-                    src: X86Reg::Rax,
-                })
-            }
-
-            OPCODE_MOV_RAX_MOFFS => {
-                let disp = self.fetch_le32()?;
-                Some(IROp::Load {
-                    dst: X86Reg::Rax,
-                    mem: MemOperand {
-                        base: None,
-                        index: None,
-                        scale: 1,
-                        disp,
-                        width: 8,
-                    },
-                })
-            }
-
-            OPCODE_MOV_RM_IMM => {
-                let (_, src, _) = self.decode_modrm()?;
-                match src {
-                    // MOV r64, imm32 (sign-extended with REX.W).
-                    Ok(dst_reg) => {
-                        let imm = self.fetch_le32()? as i64;
-                        Some(IROp::MovImm { dst: dst_reg, imm })
-                    }
-                    // Store-immediate is not modelled in the IR.
-                    Err(_) => Some(IROp::Unsupported),
+            OPCODE_MOV_MOFFS_RAX | OPCODE_MOV_RAX_MOFFS => {
+                let addr = if self.addr_size_64 {
+                    self.fetch_le64()? as u64
+                } else {
+                    self.fetch_le32()? as u32 as u64
+                };
+                // MemOperand has a signed disp32, so larger moffs require an extended IR.
+                if self.addr_size_64 && addr != addr as i32 as i64 as u64 {
+                    return Some(IROp::Unsupported);
                 }
+                let mem = MemOperand {
+                    base: None,
+                    index: None,
+                    scale: 1,
+                    disp: addr as i32,
+                    width: self.operand_width(),
+                };
+                Some(if op == OPCODE_MOV_RAX_MOFFS {
+                    IROp::Load {
+                        dst: X86Reg::Rax,
+                        mem,
+                    }
+                } else {
+                    IROp::Store {
+                        mem,
+                        src: X86Reg::Rax,
+                    }
+                })
+            }
+            OPCODE_MOV_RM_IMM | 0xC6 => {
+                self.byte_operand = op == 0xC6;
+                if self.peek()? & 0x38 != 0 {
+                    return Some(IROp::Unsupported);
+                }
+                if self.byte_operand
+                    && !self.has_rex
+                    && self.peek()? >> 6 == 3
+                    && self.peek()? & 7 >= 4
+                {
+                    return Some(IROp::Unsupported);
+                }
+                let (_, dst, _) = self.decode_modrm()?;
+                let value = if self.byte_operand {
+                    self.fetch()? as i64
+                } else {
+                    self.fetch_imm()?
+                };
+                Some(match dst {
+                    Ok(dst) => IROp::MovImm { dst, imm: value },
+                    Err(mem) => IROp::StoreImm { mem, value },
+                })
             }
 
             OPCODE_LEA => {
@@ -530,12 +636,12 @@ impl<'a> Decoder<'a> {
                 }
             }
 
-            OPCODE_PUSH_R => {
+            OPCODE_PUSH_R..=0x57 => {
                 let reg = X86Reg::from_modrm(op & 0x07, self.rex_b);
                 Some(IROp::Push { src: reg })
             }
 
-            OPCODE_POP_R => {
+            OPCODE_POP_R..=0x5F => {
                 let reg = X86Reg::from_modrm(op & 0x07, self.rex_b);
                 Some(IROp::Pop { dst: reg })
             }
@@ -614,7 +720,12 @@ impl<'a> Decoder<'a> {
                 // Peek the raw ModR/M byte so we can extract the ALU sub-op
                 // from the reg field before decode_modrm consumes it.
                 let modrm_byte = self.bytes.get(self.offset).copied().unwrap_or(0);
-                let (dst, _, _) = self.decode_modrm()?;
+                self.byte_operand = op == OPCODE_ALU_IMM_BASE;
+                if self.byte_operand && !self.has_rex && modrm_byte >> 6 == 3 && modrm_byte & 7 >= 4
+                {
+                    return Some(IROp::Unsupported);
+                }
+                let (_, dst, _) = self.decode_modrm()?;
                 // The ALU sub-operation is encoded in the ModR/M reg field.
                 let alu_idx = (modrm_byte >> 3) & 0x07;
                 let alu_op = match alu_idx {
@@ -628,76 +739,101 @@ impl<'a> Decoder<'a> {
                 };
                 // 0x80/0x83 use a sign-extended imm8; 0x81 uses a full imm32.
                 let imm = if op == OPCODE_ALU_IMM32 {
-                    self.fetch_le32()? as i64
+                    self.fetch_imm()?
                 } else {
                     self.fetch()? as i8 as i64
                 };
-                Some(IROp::AluImm {
-                    op: alu_op,
-                    dst,
-                    imm,
+                Some(match dst {
+                    Ok(dst) => IROp::AluImm {
+                        op: alu_op,
+                        dst,
+                        imm,
+                    },
+                    Err(mem) => IROp::AluStoreImm {
+                        op: alu_op,
+                        mem,
+                        imm,
+                    },
                 })
             }
 
-            OPCODE_ADD_AL_IMM8 => Some(IROp::AluImm {
-                op: AluOp::Add,
-                dst: X86Reg::Rax,
-                imm: self.fetch()? as i8 as i64,
-            }),
+            OPCODE_ADD_AL_IMM8 => {
+                self.byte_operand = true;
+                Some(IROp::AluImm {
+                    op: AluOp::Add,
+                    dst: X86Reg::Rax,
+                    imm: self.fetch()? as i8 as i64,
+                })
+            }
             OPCODE_ADD_AL_IMM32 => Some(IROp::AluImm {
                 op: AluOp::Add,
                 dst: X86Reg::Rax,
-                imm: self.fetch_le32()? as i64,
+                imm: self.fetch_imm()?,
             }),
-            OPCODE_SUB_AL_IMM8 => Some(IROp::AluImm {
-                op: AluOp::Sub,
-                dst: X86Reg::Rax,
-                imm: self.fetch()? as i8 as i64,
-            }),
+            OPCODE_SUB_AL_IMM8 => {
+                self.byte_operand = true;
+                Some(IROp::AluImm {
+                    op: AluOp::Sub,
+                    dst: X86Reg::Rax,
+                    imm: self.fetch()? as i8 as i64,
+                })
+            }
             OPCODE_SUB_AL_IMM32 => Some(IROp::AluImm {
                 op: AluOp::Sub,
                 dst: X86Reg::Rax,
-                imm: self.fetch_le32()? as i64,
+                imm: self.fetch_imm()?,
             }),
-            OPCODE_AND_AL_IMM8 => Some(IROp::AluImm {
-                op: AluOp::And,
-                dst: X86Reg::Rax,
-                imm: self.fetch()? as i8 as i64,
-            }),
+            OPCODE_AND_AL_IMM8 => {
+                self.byte_operand = true;
+                Some(IROp::AluImm {
+                    op: AluOp::And,
+                    dst: X86Reg::Rax,
+                    imm: self.fetch()? as i8 as i64,
+                })
+            }
             OPCODE_AND_AL_IMM32 => Some(IROp::AluImm {
                 op: AluOp::And,
                 dst: X86Reg::Rax,
-                imm: self.fetch_le32()? as i64,
+                imm: self.fetch_imm()?,
             }),
-            OPCODE_OR_AL_IMM8 => Some(IROp::AluImm {
-                op: AluOp::Or,
-                dst: X86Reg::Rax,
-                imm: self.fetch()? as i8 as i64,
-            }),
+            OPCODE_OR_AL_IMM8 => {
+                self.byte_operand = true;
+                Some(IROp::AluImm {
+                    op: AluOp::Or,
+                    dst: X86Reg::Rax,
+                    imm: self.fetch()? as i8 as i64,
+                })
+            }
             OPCODE_OR_AL_IMM32 => Some(IROp::AluImm {
                 op: AluOp::Or,
                 dst: X86Reg::Rax,
-                imm: self.fetch_le32()? as i64,
+                imm: self.fetch_imm()?,
             }),
-            OPCODE_XOR_AL_IMM8 => Some(IROp::AluImm {
-                op: AluOp::Xor,
-                dst: X86Reg::Rax,
-                imm: self.fetch()? as i8 as i64,
-            }),
+            OPCODE_XOR_AL_IMM8 => {
+                self.byte_operand = true;
+                Some(IROp::AluImm {
+                    op: AluOp::Xor,
+                    dst: X86Reg::Rax,
+                    imm: self.fetch()? as i8 as i64,
+                })
+            }
             OPCODE_XOR_AL_IMM32 => Some(IROp::AluImm {
                 op: AluOp::Xor,
                 dst: X86Reg::Rax,
-                imm: self.fetch_le32()? as i64,
+                imm: self.fetch_imm()?,
             }),
-            OPCODE_CMP_AL_IMM8 => Some(IROp::AluImm {
-                op: AluOp::Cmp,
-                dst: X86Reg::Rax,
-                imm: self.fetch()? as i8 as i64,
-            }),
+            OPCODE_CMP_AL_IMM8 => {
+                self.byte_operand = true;
+                Some(IROp::AluImm {
+                    op: AluOp::Cmp,
+                    dst: X86Reg::Rax,
+                    imm: self.fetch()? as i8 as i64,
+                })
+            }
             OPCODE_CMP_AL_IMM32 => Some(IROp::AluImm {
                 op: AluOp::Cmp,
                 dst: X86Reg::Rax,
-                imm: self.fetch_le32()? as i64,
+                imm: self.fetch_imm()?,
             }),
 
             _ => Some(IROp::Unsupported),
@@ -724,9 +860,9 @@ impl<'a> Decoder<'a> {
     /// Decode a SIMD move (dst_xmm ← src).
     fn decode_simd_mov(&mut self, width: SimdWidth) -> Option<IROp> {
         let modrm = self.fetch()?;
-        let reg_idx = (modrm >> 3) & 0x0F;
+        let reg_idx = (modrm >> 3) & 0x07;
         let mode = (modrm >> 6) & 0x03;
-        let rm_field = modrm & 0x0F;
+        let rm_field = modrm & 0x07;
         let dst = X86Xmm::from_modrm(reg_idx, self.rex_r);
         if mode == 3 {
             let src = X86Xmm::from_modrm(rm_field, self.rex_b);
@@ -748,9 +884,9 @@ impl<'a> Decoder<'a> {
     /// Decode a SIMD store (mem ← src_xmm).
     fn decode_simd_store(&mut self, width: SimdWidth) -> Option<IROp> {
         let modrm = self.fetch()?;
-        let reg_idx = (modrm >> 3) & 0x0F;
+        let reg_idx = (modrm >> 3) & 0x07;
         let mode = (modrm >> 6) & 0x03;
-        let rm_field = modrm & 0x0F;
+        let rm_field = modrm & 0x07;
         let src = X86Xmm::from_modrm(reg_idx, self.rex_r);
         if mode == 3 {
             let dst = X86Xmm::from_modrm(rm_field, self.rex_b);
@@ -769,9 +905,9 @@ impl<'a> Decoder<'a> {
     fn decode_simd_arith(&mut self, op: SimdOp) -> Option<IROp> {
         let width = self.simd_width();
         let modrm = self.fetch()?;
-        let reg_idx = (modrm >> 3) & 0x0F;
+        let reg_idx = (modrm >> 3) & 0x07;
         let mode = (modrm >> 6) & 0x03;
-        let rm_field = modrm & 0x0F;
+        let rm_field = modrm & 0x07;
         let dst = X86Xmm::from_modrm(reg_idx, self.rex_r);
         if mode == 3 {
             let src = X86Xmm::from_modrm(rm_field, self.rex_b);
@@ -794,151 +930,36 @@ impl<'a> Decoder<'a> {
 
     /// Decode a memory operand for SIMD (32-bit displacement always,
     /// no SIB simplification — the BTL runtime handles the general case).
-    fn decode_simd_mem_operand(&mut self, rm_field: u8, mode: u8) -> Option<MemOperand> {
-        if mode == 0 {
-            // [rip + disp32] (rm=101) or [base] for other rm values.
-            if rm_field == 5 {
-                let disp = self.fetch_le32()?;
-                Some(MemOperand {
-                    base: None,
-                    index: None,
-                    scale: 1,
-                    disp,
-                    width: 16,
-                })
-            } else {
-                let base = X86Reg::from_modrm(rm_field, self.rex_b);
-                Some(MemOperand {
-                    base: Some(base),
-                    index: None,
-                    scale: 1,
-                    disp: 0,
-                    width: 16,
-                })
+    fn decode_simd_mem_operand(&mut self, _rm_field: u8, _mode: u8) -> Option<MemOperand> {
+        self.offset -= 1;
+        let (_, operand, _) = self.decode_modrm()?;
+        match operand {
+            Err(mut mem) => {
+                mem.width = 16;
+                Some(mem)
             }
-        } else if mode == 1 {
-            let base = X86Reg::from_modrm(rm_field, self.rex_b);
-            let disp = i32::from(self.fetch()? as i8);
-            Some(MemOperand {
-                base: Some(base),
-                index: None,
-                scale: 1,
-                disp,
-                width: 16,
-            })
-        } else {
-            let base = X86Reg::from_modrm(rm_field, self.rex_b);
-            let disp = self.fetch_le32()?;
-            Some(MemOperand {
-                base: Some(base),
-                index: None,
-                scale: 1,
-                disp,
-                width: 16,
-            })
+            _ => None,
         }
     }
 
-    /// Parse a 2-byte VEX prefix (C5) and decode the instruction.
-    /// 2-byte VEX: C5 R BvvvvL pp op2.
-    fn decode_vex_2b(&mut self) -> Option<IROp> {
-        let vex = self.fetch()?;
-        let vex_r = (vex >> 7) & 1 != 0;
-        let _vex_b = (vex >> 6) & 1 != 0;
-        let _vex_l = (vex >> 2) & 1 != 0;
-        let _vex_pp = vex & 0x03;
-        let opcode = self.fetch()?;
-        self.decode_vex_simd(vex_r, opcode)
-    }
-
-    /// Parse a 3-byte VEX prefix (C4) and decode the instruction.
-    /// 3-byte VEX: C4 RXB mmmmm WvvvvL pp op2.
-    fn decode_vex_3b(&mut self) -> Option<IROp> {
-        let vex1 = self.fetch()?;
-        let vex_r = (vex1 >> 7) & 1 != 0;
-        let _vex_x = (vex1 >> 6) & 1 != 0;
-        let _vex_b = (vex1 >> 5) & 1 != 0;
-        let _escape = vex1 & 0x1F;
-        let vex2 = self.fetch()?;
-        let _vex_w = (vex2 >> 7) & 1 != 0;
-        let _vex_l = (vex2 >> 2) & 1 != 0;
-        let _vex_pp = vex2 & 0x03;
-        let opcode = self.fetch()?;
-        self.decode_vex_simd(vex_r, opcode)
-    }
-
-    /// Common VEX SIMD decode: vmovaps/vmovups/vmovapd/vmovupd/vmovdqa/vmovdqu.
-    /// VEX.NDS.128/256/512: dst ← src2 (VEX.vvvv) for the move forms.
-    fn decode_evex(&mut self) -> Option<IROp> {
-        let p0 = self.fetch()?;
-        let p1 = self.fetch()?;
-        let _p2 = self.fetch()?;
-        let opcode = self.fetch()?;
-
-        self.evex_reg_ext = (p1 >> 2) & 1 != 0;
-        let vex_r = (p0 >> 6) & 1 != 0;
-
-        self.decode_vex_simd(vex_r, opcode)
-    }
-
-    fn decode_vex_simd(&mut self, vex_r: bool, opcode: u8) -> Option<IROp> {
-        let width = SimdWidth::PackedF32;
-        let decode_xmm_dst = |dec: &Self, reg_idx: u8, inv_r: bool| -> X86Xmm {
-            if dec.evex_reg_ext {
-                X86Xmm::from_evex(reg_idx, true, !inv_r)
-            } else {
-                X86Xmm::from_modrm(reg_idx, !inv_r)
-            }
-        };
-        match opcode {
-            SSE_MOVAPS | SSE_MOVUPS => {
-                let modrm = self.fetch()?;
-                let reg_idx = (modrm >> 3) & 0x0F;
-                let mode = (modrm >> 6) & 0x03;
-                let rm_field = modrm & 0x0F;
-                let dst = decode_xmm_dst(self, reg_idx, vex_r);
-                if mode == 3 {
-                    let src = X86Xmm::from_modrm(rm_field, false);
-                    Some(IROp::SimdMov {
-                        dst,
-                        src: SimdSrc::Xmm(src),
-                        width,
-                    })
-                } else {
-                    let mem = self.decode_simd_mem_operand(rm_field, mode)?;
-                    Some(IROp::SimdMov {
-                        dst,
-                        src: SimdSrc::Mem(mem),
-                        width,
-                    })
-                }
-            }
-            SSE_MOVAPS_STORE | SSE_MOVUPS_STORE => {
-                let modrm = self.fetch()?;
-                let reg_idx = (modrm >> 3) & 0x0F;
-                let mode = (modrm >> 6) & 0x03;
-                let rm_field = modrm & 0x0F;
-                let src = decode_xmm_dst(self, reg_idx, vex_r);
-                if mode == 3 {
-                    let dst = X86Xmm::from_modrm(rm_field, false);
-                    Some(IROp::SimdMov {
-                        dst,
-                        src: SimdSrc::Xmm(src),
-                        width,
-                    })
-                } else {
-                    let mem = self.decode_simd_mem_operand(rm_field, mode)?;
-                    Some(IROp::SimdStore { mem, src, width })
-                }
-            }
-            _ => Some(IROp::Unsupported),
-        }
+    fn uses_high_byte_registers(&self) -> Option<bool> {
+        let byte = self.peek()?;
+        Some(((byte >> 3) & 7) >= 4 || (byte >> 6 == 3 && (byte & 7) >= 4))
     }
 }
 
 /// Decode a basic block from guest code bytes, producing IR.
 pub fn decode_block(bytes: &[u8], base_va: u64, out: &mut [IrInst]) -> usize {
-    let mut dec = Decoder::new(bytes, base_va);
+    decode_block_mode(bytes, base_va, DecodeMode::X64, out)
+}
+
+pub fn decode_block_mode(
+    bytes: &[u8],
+    base_va: u64,
+    mode: DecodeMode,
+    out: &mut [IrInst],
+) -> usize {
+    let mut dec = Decoder::new(bytes, base_va, mode);
     let mut written = 0;
     while written < out.len() {
         let va = dec.current_va();
@@ -948,18 +969,29 @@ pub fn decode_block(bytes: &[u8], base_va: u64, out: &mut [IrInst]) -> usize {
             None => break,
         };
         let len = (dec.offset - start) as u8;
-        if len == 0 {
+        if len == 0 || len > 15 {
             break;
         }
         out[written] = IrInst {
             op,
             guest_va: va,
             guest_len: len,
+            operand_width: dec.operand_width(),
+            address_width: dec.address_width(),
+            segment: dec.segment,
         };
         written += 1;
         if matches!(
             op,
-            IROp::Ret | IROp::Jmp { .. } | IROp::Syscall | IROp::Unsupported
+            IROp::Ret
+                | IROp::RetImm { .. }
+                | IROp::Call { .. }
+                | IROp::JumpReg { .. }
+                | IROp::JumpMem { .. }
+                | IROp::Jcc { .. }
+                | IROp::Jmp { .. }
+                | IROp::Syscall
+                | IROp::Unsupported
         ) {
             break;
         }
@@ -969,12 +1001,16 @@ pub fn decode_block(bytes: &[u8], base_va: u64, out: &mut [IrInst]) -> usize {
 
 /// Decode a single instruction. Returns (IrInst, bytes_consumed).
 pub fn decode_one(bytes: &[u8], base_va: u64) -> Option<(IrInst, usize)> {
-    let mut dec = Decoder::new(bytes, base_va);
+    decode_one_mode(bytes, base_va, DecodeMode::X64)
+}
+
+pub fn decode_one_mode(bytes: &[u8], base_va: u64, mode: DecodeMode) -> Option<(IrInst, usize)> {
+    let mut dec = Decoder::new(bytes, base_va, mode);
     let va = dec.current_va();
     let start = dec.offset;
     let op = dec.decode_one()?;
     let len = dec.offset - start;
-    if len == 0 {
+    if len == 0 || len > 15 {
         return None;
     }
     Some((
@@ -982,6 +1018,9 @@ pub fn decode_one(bytes: &[u8], base_va: u64) -> Option<(IrInst, usize)> {
             op,
             guest_va: va,
             guest_len: len as u8,
+            operand_width: dec.operand_width(),
+            address_width: dec.address_width(),
+            segment: dec.segment,
         },
         len,
     ))

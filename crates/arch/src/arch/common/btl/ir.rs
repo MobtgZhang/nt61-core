@@ -298,6 +298,13 @@ pub enum IROp {
         target: u64,
     },
     Ret,
+    RetImm { bytes: u16 },
+    PushImm { value: i64 },
+    StoreImm { mem: MemOperand, value: i64 },
+    AluStore { op: AluOp, mem: MemOperand, src: X86Reg },
+    AluStoreImm { op: AluOp, mem: MemOperand, imm: i64 },
+    JumpReg { target: X86Reg, call: bool },
+    JumpMem { mem: MemOperand, call: bool },
     Syscall,
     /// SIMD move: dst_xmm = src (reg or memory).
     SimdMov {
@@ -328,12 +335,23 @@ pub enum SimdSrc {
     Mem(MemOperand),
 }
 
+/// Guest instruction-set mode. This belongs to a thread, never a global CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeMode { X86, X64 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Segment { Flat, Fs, Gs }
+
 /// One lowered IR instruction with its guest VA and length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IrInst {
     pub op: IROp,
     pub guest_va: u64,
     pub guest_len: u8,
+    /// Operand/address sizes in bytes, retained through lowering.
+    pub operand_width: u8,
+    pub address_width: u8,
+    pub segment: Segment,
 }
 
 impl IrInst {
@@ -342,6 +360,9 @@ impl IrInst {
             op: IROp::Nop,
             guest_va: 0,
             guest_len: 0,
+            operand_width: 8,
+            address_width: 8,
+            segment: Segment::Flat,
         }
     }
 }

@@ -1,13 +1,13 @@
-//! Minimal x86_64 guest-code interpreter over the shared BTL IR.
+//! x86/x64 interpreter over the shared BTL IR.
 //!
-//! The non-x86 BTL backends translate guest code to host machine
-//! code for execution. This interpreter provides the same guest
-//! semantics over the shared IR so that register / memory / syscall
-//! behaviour can be unit-tested on any host without a JIT target.
-//! It is also the fallback path when the JIT emits an unsupported
-//! instruction and the trap handler chooses to interpret.
+//! This is the checked execution backend used on all supported hosts. Guest
+//! state and memory remain isolated. Native JIT execution stays disabled until
+//! it can preserve the same semantics; unsupported instructions stop precisely.
 
-use super::ir::{AluOp, BranchCond, IROp, MemOperand, X86Reg};
+use super::ir::{
+    AluOp, BranchCond, DecodeMode, IROp, IrInst, MemOperand, Segment, SimdOp, SimdSrc, SimdWidth,
+    X86Reg,
+};
 use super::memory::GuestMemory;
 
 #[cfg(test)]
@@ -50,26 +50,29 @@ pub(crate) mod test_support {
     }
 }
 
-/// Opaque execution state for a translated x86_64 guest thread.
+/// Architectural state owned by one guest thread, including its TEB segment bases.
 #[derive(Clone, Copy, Debug)]
 pub struct GuestState {
-    /// Guest GPRs indexed by `X86Reg as usize` (RIP stored separately).
     pub regs: [u64; 16],
-    /// Guest RFLAGS (status flags plus AF/DF; system flags are preserved).
     pub rflags: u64,
-    /// Guest instruction pointer.
     pub rip: u64,
+    pub mode: DecodeMode,
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub xmm: [[u8; 16]; 32],
 }
-
 impl GuestState {
     pub const fn new() -> Self {
         Self {
             regs: [0; 16],
-            rflags: RFLAGS_FIXED,
+            rflags: 2,
             rip: 0,
+            mode: DecodeMode::X64,
+            fs_base: 0,
+            gs_base: 0,
+            xmm: [[0; 16]; 32],
         }
     }
-
     pub fn reg(&self, r: X86Reg) -> u64 {
         if r == X86Reg::Rip {
             self.rip
@@ -77,306 +80,437 @@ impl GuestState {
             self.regs[r as usize]
         }
     }
-
     pub fn set_reg(&mut self, r: X86Reg, v: u64) {
-        if r == X86Reg::Rip {
-            self.rip = v;
+        let v = if self.mode == DecodeMode::X86 {
+            v as u32 as u64
         } else {
-            self.regs[r as usize] = v;
+            v
+        };
+        if r == X86Reg::Rip {
+            self.rip = v
+        } else {
+            self.regs[r as usize] = v
         }
     }
-
-    fn flag(&self, bit: u32) -> bool {
-        (self.rflags & (1 << bit)) != 0
+    fn write_reg(&mut self, r: X86Reg, v: u64, width: u8) {
+        self.set_reg(
+            r,
+            if width < 4 {
+                (self.reg(r) & !mask(width)) | (v & mask(width))
+            } else {
+                v & mask(width)
+            },
+        );
     }
-
+    fn flag(&self, bit: u32) -> bool {
+        self.rflags & (1 << bit) != 0
+    }
     fn set_flag(&mut self, bit: u32, v: bool) {
-        self.rflags = ((self.rflags & !(1u64 << bit)) | ((v as u64) << bit))
-            | (self.rflags & RFLAGS_SYSTEM)
-            | RFLAGS_FIXED;
+        self.rflags = (self.rflags & !(1 << bit)) | ((v as u64) << bit) | 2;
+    }
+    fn stack_width(&self, inst: &IrInst) -> u8 {
+        if inst.operand_width == 2 {
+            2
+        } else if self.mode == DecodeMode::X86 {
+            4
+        } else {
+            8
+        }
     }
 }
-
 impl Default for GuestState {
     fn default() -> Self {
         Self::new()
     }
 }
-
 const FLAG_CF: u32 = 0;
 const FLAG_PF: u32 = 2;
+const FLAG_AF: u32 = 4;
 const FLAG_ZF: u32 = 6;
 const FLAG_SF: u32 = 7;
-const FLAG_AF: u32 = 4;
-const FLAG_DF: u32 = 10;
 const FLAG_OF: u32 = 11;
-const RFLAGS_FIXED: u64 = 0x2;
-const RFLAGS_SYSTEM: u64 =
-    (1u64 << FLAG_IF) | (1u64 << 12) | (1u64 << 13) | (1u64 << 14) | (1u64 << FLAG_RF);
-const FLAG_IF: u32 = 9;
-const FLAG_RF: u32 = 16;
-
-const MASK8: u64 = 0xFF;
-
-fn parity8(v: u64) -> bool {
-    (v & MASK8).count_ones().is_multiple_of(2)
+fn mask(width: u8) -> u64 {
+    if width == 8 {
+        u64::MAX
+    } else {
+        (1u64 << (width * 8)) - 1
+    }
 }
-
-/// Set ZF/SF/PF from the result; CF/OF per operation.
-fn update_flags(state: &mut GuestState, op: AluOp, a: u64, b: u64, result: u64) {
-    state.set_flag(FLAG_ZF, result == 0);
-    state.set_flag(FLAG_SF, (result >> 63) != 0);
-    state.set_flag(FLAG_PF, parity8(result));
+fn alu(state: &mut GuestState, op: AluOp, a: u64, b: u64, width: u8) -> u64 {
+    let m = mask(width);
+    let a = a & m;
+    let b = b & m;
+    let sign = 1u64 << (width * 8 - 1);
+    let r = (match op {
+        AluOp::Add => a.wrapping_add(b),
+        AluOp::Sub | AluOp::Cmp => a.wrapping_sub(b),
+        AluOp::And | AluOp::Test => a & b,
+        AluOp::Or => a | b,
+        AluOp::Xor => a ^ b,
+    }) & m;
+    state.set_flag(FLAG_ZF, r == 0);
+    state.set_flag(FLAG_SF, r & sign != 0);
+    state.set_flag(FLAG_PF, (r as u8).count_ones() % 2 == 0);
     match op {
         AluOp::Add => {
-            let carry = (a ^ result) & (b ^ result);
-            state.set_flag(FLAG_CF, result < a);
-            state.set_flag(FLAG_OF, (carry >> 63) != 0);
-            state.set_flag(FLAG_AF, (((a ^ b ^ result) & 0x10) >> 4) != 0);
+            state.set_flag(FLAG_CF, r < a);
+            state.set_flag(FLAG_OF, (!(a ^ b) & (a ^ r) & sign) != 0);
+            state.set_flag(FLAG_AF, (a ^ b ^ r) & 16 != 0);
         }
         AluOp::Sub | AluOp::Cmp => {
-            let diff = a ^ b;
-            let borrow = a ^ result;
             state.set_flag(FLAG_CF, a < b);
-            state.set_flag(FLAG_OF, (diff & borrow & (1u64 << 63)) != 0);
-            state.set_flag(FLAG_AF, (((a ^ result) & (b ^ a) & 0x10) >> 4) != 0);
+            state.set_flag(FLAG_OF, ((a ^ b) & (a ^ r) & sign) != 0);
+            state.set_flag(FLAG_AF, (a ^ b ^ r) & 16 != 0);
         }
         _ => {
             state.set_flag(FLAG_CF, false);
             state.set_flag(FLAG_OF, false);
         }
     }
+    r
 }
-
-fn eval_cond(state: &GuestState, cond: BranchCond) -> bool {
-    let zf = state.flag(FLAG_ZF);
-    let sf = state.flag(FLAG_SF);
-    let cf = state.flag(FLAG_CF);
-    let of = state.flag(FLAG_OF);
-    let pf = state.flag(FLAG_PF);
-    match cond {
+fn eval_cond(s: &GuestState, c: BranchCond) -> bool {
+    let z = s.flag(FLAG_ZF);
+    let n = s.flag(FLAG_SF);
+    let b = s.flag(FLAG_CF);
+    let o = s.flag(FLAG_OF);
+    let p = s.flag(FLAG_PF);
+    match c {
         BranchCond::Always => true,
-        BranchCond::Overflow => of,
-        BranchCond::NotOverflow => !of,
-        BranchCond::Below => cf,
-        BranchCond::AboveOrEqual => !cf,
-        BranchCond::Equal => zf,
-        BranchCond::NotEqual => !zf,
-        BranchCond::BelowOrEqual => cf || zf,
-        BranchCond::Above => !cf && !zf,
-        BranchCond::Sign => sf,
-        BranchCond::NotSign => !sf,
-        BranchCond::Parity => pf,
-        BranchCond::NotParity => !pf,
-        BranchCond::Less => sf != of,
-        BranchCond::GreaterOrEqual => sf == of,
-        BranchCond::LessOrEqual => zf || (sf != of),
-        BranchCond::Greater => !zf && (sf == of),
+        BranchCond::Overflow => o,
+        BranchCond::NotOverflow => !o,
+        BranchCond::Below => b,
+        BranchCond::AboveOrEqual => !b,
+        BranchCond::Equal => z,
+        BranchCond::NotEqual => !z,
+        BranchCond::BelowOrEqual => b || z,
+        BranchCond::Above => !b && !z,
+        BranchCond::Sign => n,
+        BranchCond::NotSign => !n,
+        BranchCond::Parity => p,
+        BranchCond::NotParity => !p,
+        BranchCond::Less => n != o,
+        BranchCond::GreaterOrEqual => n == o,
+        BranchCond::LessOrEqual => z || n != o,
+        BranchCond::Greater => !z && n == o,
     }
 }
-
-/// Compute the effective address of a memory operand.
-fn effective_address(state: &GuestState, mem: &MemOperand) -> u64 {
-    let base = mem.base.map(|b| state.reg(b)).unwrap_or(0);
-    let index = mem.index.map(|i| state.reg(i)).unwrap_or(0);
-    base.wrapping_add(index * mem.scale as u64)
-        .wrapping_add(mem.disp as u64)
+fn effective_address(s: &GuestState, m: &MemOperand, i: &IrInst, segment: bool) -> u64 {
+    let base = m
+        .base
+        .map(|r| {
+            if r == X86Reg::Rip {
+                i.guest_va.wrapping_add(i.guest_len as u64)
+            } else {
+                s.reg(r)
+            }
+        })
+        .unwrap_or(0);
+    let offset = base
+        .wrapping_add(
+            m.index
+                .map(|r| s.reg(r))
+                .unwrap_or(0)
+                .wrapping_mul(m.scale as u64),
+        )
+        .wrapping_add(m.disp as i64 as u64);
+    let offset = if i.address_width == 4 {
+        offset as u32 as u64
+    } else {
+        offset
+    };
+    let base = if !segment {
+        0
+    } else {
+        match i.segment {
+            Segment::Flat => 0,
+            Segment::Fs => s.fs_base,
+            Segment::Gs => s.gs_base,
+        }
+    };
+    let addr = base.wrapping_add(offset);
+    if s.mode == DecodeMode::X86 {
+        addr as u32 as u64
+    } else {
+        addr
+    }
 }
-
-fn mem_read(memory: &mut dyn GuestMemory, addr: u64, width: u8) -> Option<u64> {
-    let mut raw = [0u8; 8];
-    let n = memory.read_virt(addr, &mut raw[..width as usize]);
-    if n < width as usize {
+fn mem_read(m: &mut dyn GuestMemory, a: u64, w: u8) -> Option<u64> {
+    if !matches!(w, 1 | 2 | 4 | 8) {
         return None;
     }
-    Some(u64::from_le_bytes(raw))
+    let mut b = [0; 8];
+    if m.read_virt(a, &mut b[..w as usize]) != w as usize {
+        None
+    } else {
+        Some(u64::from_le_bytes(b))
+    }
 }
-
-fn mem_write(memory: &mut dyn GuestMemory, addr: u64, value: u64, width: u8) -> bool {
-    memory.write_virt(addr, &value.to_le_bytes()[..width as usize])
+fn mem_write(m: &mut dyn GuestMemory, a: u64, v: u64, w: u8) -> bool {
+    matches!(w, 1 | 2 | 4 | 8) && m.write_virt(a, &v.to_le_bytes()[..w as usize])
 }
-
-fn do_alu(state: &mut GuestState, op: AluOp, a: u64, b: u64) -> u64 {
-    let result = match op {
-        AluOp::Add => a.wrapping_add(b),
-        AluOp::Sub => a.wrapping_sub(b),
-        AluOp::Cmp => a.wrapping_sub(b),
-        AluOp::And | AluOp::Test => a & b,
-        AluOp::Or => a | b,
-        AluOp::Xor => a ^ b,
-    };
-    update_flags(state, op, a, b, result);
-    result
-}
-
-/// Outcome of interpreting one block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecOutcome {
-    /// Block retired; `next_rip` is where guest execution continues.
     Retired { next_rip: u64 },
-    /// Hit an unsupported instruction at `guest_va`.
     Unsupported { guest_va: u64 },
-    /// Guest memory fault at `guest_va`.
     MemoryFault { guest_va: u64 },
 }
-
-/// Hook invoked on `IROp::Syscall`. Implementations bridge to the
-/// NT SSDT or a test double and may mutate guest state / memory.
 pub trait SyscallHook {
     fn syscall(&mut self, state: &mut GuestState, memory: &mut dyn GuestMemory);
 }
 
-/// Interpret a decoded IR block starting at the current `state.rip`.
+/// Execute at architectural instruction boundaries. A fault leaves registers,
+/// flags and RIP at the faulting instruction so exception delivery can restart it.
 pub fn execute_block(
-    ir: &[super::ir::IrInst],
-    state: &mut GuestState,
-    memory: &mut dyn GuestMemory,
-    hooks: &mut dyn SyscallHook,
+    ir: &[IrInst],
+    s: &mut GuestState,
+    m: &mut dyn GuestMemory,
+    h: &mut dyn SyscallHook,
 ) -> ExecOutcome {
-    for inst in ir {
-        if inst.guest_va + inst.guest_len as u64 <= state.rip {
-            continue;
+    for i in ir {
+        if i.guest_va != s.rip {
+            return ExecOutcome::Retired { next_rip: s.rip };
         }
-        match inst.op {
-            IROp::Nop => {}
-            IROp::MovImm { dst, imm } => state.set_reg(dst, imm as u64),
-            IROp::MovReg { dst, src } => {
-                let v = state.reg(src);
-                state.set_reg(dst, v);
-            }
-            IROp::Load { dst, ref mem } => {
-                let addr = effective_address(state, mem);
-                match mem_read(memory, addr, mem.width) {
-                    Some(v) => state.set_reg(dst, v),
-                    None => {
-                        return ExecOutcome::MemoryFault {
-                            guest_va: inst.guest_va,
-                        }
-                    }
-                }
-            }
-            IROp::Store { ref mem, src } => {
-                let addr = effective_address(state, mem);
-                let v = state.reg(src);
-                if !mem_write(memory, addr, v, mem.width) {
-                    return ExecOutcome::MemoryFault {
-                        guest_va: inst.guest_va,
-                    };
-                }
-            }
-            IROp::AluReg { op, dst, src } => {
-                let a = state.reg(dst);
-                let b = state.reg(src);
-                let result = do_alu(state, op, a, b);
-                if !matches!(op, AluOp::Cmp | AluOp::Test) {
-                    state.set_reg(dst, result);
-                }
-            }
-            IROp::AluImm { op, dst, imm } => {
-                let a = state.reg(dst);
-                let result = do_alu(state, op, a, imm as u64);
-                if !matches!(op, AluOp::Cmp | AluOp::Test) {
-                    state.set_reg(dst, result);
-                }
-            }
-            IROp::AluMem { op, dst, ref mem } => {
-                let addr = effective_address(state, mem);
-                match mem_read(memory, addr, mem.width) {
-                    Some(b) => {
-                        let a = state.reg(dst);
-                        let result = do_alu(state, op, a, b);
-                        if !matches!(op, AluOp::Cmp | AluOp::Test) {
-                            state.set_reg(dst, result);
-                        }
-                    }
-                    None => {
-                        return ExecOutcome::MemoryFault {
-                            guest_va: inst.guest_va,
-                        }
-                    }
-                }
-            }
-            IROp::Lea { dst, ref mem } => {
-                let addr = effective_address(state, mem);
-                state.set_reg(dst, addr);
-            }
-            IROp::Push { src } => {
-                let new_sp = state.reg(X86Reg::Rsp).wrapping_sub(8);
-                state.set_reg(X86Reg::Rsp, new_sp);
-                if !mem_write(memory, new_sp, state.reg(src), 8) {
-                    return ExecOutcome::MemoryFault {
-                        guest_va: inst.guest_va,
-                    };
-                }
-            }
-            IROp::Pop { dst } => {
-                let sp = state.reg(X86Reg::Rsp);
-                match mem_read(memory, sp, 8) {
-                    Some(v) => {
-                        state.set_reg(dst, v);
-                        state.set_reg(X86Reg::Rsp, sp.wrapping_add(8));
-                    }
-                    None => {
-                        return ExecOutcome::MemoryFault {
-                            guest_va: inst.guest_va,
-                        }
-                    }
-                }
-            }
-            IROp::Jmp { target } => {
-                state.rip = target;
-                return ExecOutcome::Retired { next_rip: target };
-            }
-            IROp::Jcc { cond, target } => {
-                if eval_cond(state, cond) {
-                    state.rip = target;
-                    return ExecOutcome::Retired { next_rip: target };
-                }
-            }
-            IROp::Call { target } => {
-                let ret_rip = inst.guest_va + inst.guest_len as u64;
-                let new_sp = state.reg(X86Reg::Rsp).wrapping_sub(8);
-                state.set_reg(X86Reg::Rsp, new_sp);
-                if !mem_write(memory, new_sp, ret_rip, 8) {
-                    return ExecOutcome::MemoryFault {
-                        guest_va: inst.guest_va,
-                    };
-                }
-                state.rip = target;
-                return ExecOutcome::Retired { next_rip: target };
-            }
-            IROp::Ret => {
-                let sp = state.reg(X86Reg::Rsp);
-                match mem_read(memory, sp, 8) {
-                    Some(v) => {
-                        state.set_reg(X86Reg::Rsp, sp.wrapping_add(8));
-                        state.rip = v;
-                        return ExecOutcome::Retired { next_rip: v };
-                    }
-                    None => {
-                        return ExecOutcome::MemoryFault {
-                            guest_va: inst.guest_va,
-                        }
-                    }
-                }
-            }
-            IROp::Syscall => {
-                hooks.syscall(state, memory);
-            }
-            IROp::Unsupported
-            | IROp::SimdMov { .. }
-            | IROp::SimdStore { .. }
-            | IROp::SimdArith { .. } => {
-                return ExecOutcome::Unsupported {
-                    guest_va: inst.guest_va,
-                };
-            }
+        let before = *s;
+        if let Err(out) = execute_one(i, s, m, h) {
+            *s = before;
+            return out;
         }
-        // Default advance to the next instruction's guest VA.
-        state.rip = inst.guest_va + inst.guest_len as u64;
+        if matches!(
+            i.op,
+            IROp::Jmp { .. }
+                | IROp::Jcc { .. }
+                | IROp::Call { .. }
+                | IROp::Ret
+                | IROp::RetImm { .. }
+                | IROp::JumpReg { .. }
+                | IROp::JumpMem { .. }
+                | IROp::Syscall
+        ) {
+            return ExecOutcome::Retired { next_rip: s.rip };
+        }
     }
-    ExecOutcome::Retired {
-        next_rip: state.rip,
+    ExecOutcome::Retired { next_rip: s.rip }
+}
+fn execute_one(
+    i: &IrInst,
+    s: &mut GuestState,
+    m: &mut dyn GuestMemory,
+    h: &mut dyn SyscallHook,
+) -> Result<(), ExecOutcome> {
+    let fault = ExecOutcome::MemoryFault {
+        guest_va: i.guest_va,
+    };
+    let unsupported = ExecOutcome::Unsupported {
+        guest_va: i.guest_va,
+    };
+    let w = i.operand_width;
+    if !matches!(w, 1 | 2 | 4 | 8) || i.guest_len == 0 || i.guest_len > 15 {
+        return Err(unsupported);
+    }
+    let next = i.guest_va.wrapping_add(i.guest_len as u64);
+    s.set_reg(X86Reg::Rip, next);
+    let stores_result = |op| !matches!(op, AluOp::Cmp | AluOp::Test);
+    match i.op {
+        IROp::Nop => {}
+        IROp::MovImm { dst, imm } => s.write_reg(dst, imm as u64, w),
+        IROp::MovReg { dst, src } => s.write_reg(dst, s.reg(src), w),
+        IROp::Load { dst, mem } => {
+            let a = effective_address(s, &mem, i, true);
+            let v = mem_read(m, a, mem.width).ok_or(fault)?;
+            s.write_reg(dst, v, w);
+        }
+        IROp::Store { mem, src } => {
+            let a = effective_address(s, &mem, i, true);
+            if !mem_write(m, a, s.reg(src), mem.width) {
+                return Err(fault);
+            }
+        }
+        IROp::StoreImm { mem, value } => {
+            let a = effective_address(s, &mem, i, true);
+            if !mem_write(m, a, value as u64, mem.width) {
+                return Err(fault);
+            }
+        }
+        IROp::AluReg { op, dst, src } => {
+            let r = alu(s, op, s.reg(dst), s.reg(src), w);
+            if stores_result(op) {
+                s.write_reg(dst, r, w)
+            }
+        }
+        IROp::AluImm { op, dst, imm } => {
+            let r = alu(s, op, s.reg(dst), imm as u64, w);
+            if stores_result(op) {
+                s.write_reg(dst, r, w)
+            }
+        }
+        IROp::AluMem { op, dst, mem } => {
+            let a = effective_address(s, &mem, i, true);
+            let b = mem_read(m, a, mem.width).ok_or(fault)?;
+            let r = alu(s, op, s.reg(dst), b, w);
+            if stores_result(op) {
+                s.write_reg(dst, r, w)
+            }
+        }
+        IROp::AluStore { op, mem, src } => {
+            let a = effective_address(s, &mem, i, true);
+            let b = mem_read(m, a, mem.width).ok_or(fault)?;
+            let r = alu(s, op, b, s.reg(src), w);
+            if stores_result(op) && !mem_write(m, a, r, mem.width) {
+                return Err(fault);
+            }
+        }
+        IROp::AluStoreImm { op, mem, imm } => {
+            let a = effective_address(s, &mem, i, true);
+            let b = mem_read(m, a, mem.width).ok_or(fault)?;
+            let r = alu(s, op, b, imm as u64, w);
+            if stores_result(op) && !mem_write(m, a, r, mem.width) {
+                return Err(fault);
+            }
+        }
+        IROp::Lea { dst, mem } => {
+            let a = effective_address(s, &mem, i, false);
+            s.write_reg(dst, a, w)
+        }
+        IROp::Push { src } => {
+            let v = s.reg(src);
+            push(s, m, i, v).ok_or(fault)?;
+        }
+        IROp::PushImm { value } => {
+            push(s, m, i, value as u64).ok_or(fault)?;
+        }
+        IROp::Pop { dst } => {
+            let sp = s.reg(X86Reg::Rsp);
+            let sw = s.stack_width(i);
+            let v = mem_read(m, sp, sw).ok_or(fault)?;
+            s.set_reg(X86Reg::Rsp, sp.wrapping_add(sw as u64));
+            s.write_reg(dst, v, sw);
+        }
+        IROp::Jmp { target } => s.set_reg(X86Reg::Rip, target),
+        IROp::Jcc { cond, target } => {
+            if eval_cond(s, cond) {
+                s.set_reg(X86Reg::Rip, target)
+            }
+        }
+        IROp::Call { target } => {
+            push(s, m, i, next).ok_or(fault)?;
+            s.set_reg(X86Reg::Rip, target);
+        }
+        IROp::Ret | IROp::RetImm { .. } => {
+            let sp = s.reg(X86Reg::Rsp);
+            let sw = s.stack_width(i);
+            let v = mem_read(m, sp, sw).ok_or(fault)?;
+            let extra = if let IROp::RetImm { bytes } = i.op {
+                bytes as u64
+            } else {
+                0
+            };
+            s.set_reg(X86Reg::Rsp, sp.wrapping_add(sw as u64).wrapping_add(extra));
+            s.set_reg(X86Reg::Rip, v);
+        }
+        IROp::JumpReg { target, call } => {
+            let v = s.reg(target);
+            if call {
+                push(s, m, i, next).ok_or(fault)?;
+            }
+            s.set_reg(X86Reg::Rip, v);
+        }
+        IROp::JumpMem { mem, call } => {
+            let a = effective_address(s, &mem, i, true);
+            let v = mem_read(m, a, mem.width).ok_or(fault)?;
+            if call {
+                push(s, m, i, next).ok_or(fault)?;
+            }
+            s.set_reg(X86Reg::Rip, v);
+        }
+        IROp::Syscall => {
+            if s.mode == DecodeMode::X64 {
+                s.set_reg(X86Reg::Rcx, next);
+                s.set_reg(X86Reg::R11, s.rflags);
+            }
+            h.syscall(s, m);
+        }
+        IROp::SimdMov { dst, src, width } => {
+            let n = simd_size(width);
+            let v = simd_read(s, m, i, src, n).ok_or(fault)?;
+            if n == 16 {
+                s.xmm[dst as usize] = v
+            } else {
+                if matches!(src, SimdSrc::Mem(_)) {
+                    s.xmm[dst as usize] = [0; 16]
+                }
+                s.xmm[dst as usize][..n].copy_from_slice(&v[..n]);
+            }
+        }
+        IROp::SimdStore { mem, src, width } => {
+            let a = effective_address(s, &mem, i, true);
+            if !m.write_virt(a, &s.xmm[src as usize][..simd_size(width)]) {
+                return Err(fault);
+            }
+        }
+        IROp::SimdArith {
+            op,
+            dst,
+            src,
+            width,
+        } => {
+            // Bitwise SSE has identical semantics for integer and floating lanes.
+            // Floating arithmetic waits for MXCSR rounding/exception modelling.
+            if !matches!(op, SimdOp::And | SimdOp::Or | SimdOp::Xor) {
+                return Err(unsupported);
+            }
+            let b = simd_read(s, m, i, src, simd_size(width)).ok_or(fault)?;
+            for (a, b) in s.xmm[dst as usize].iter_mut().zip(b) {
+                *a = match op {
+                    SimdOp::And => *a & b,
+                    SimdOp::Or => *a | b,
+                    _ => *a ^ b,
+                }
+            }
+        }
+        IROp::Unsupported => return Err(unsupported),
+    }
+    Ok(())
+}
+fn push(s: &mut GuestState, m: &mut dyn GuestMemory, i: &IrInst, v: u64) -> Option<()> {
+    let sw = s.stack_width(i);
+    let sp = s.reg(X86Reg::Rsp).wrapping_sub(sw as u64);
+    let sp = if s.mode == DecodeMode::X86 {
+        sp as u32 as u64
+    } else {
+        sp
+    };
+    if !mem_write(m, sp, v, sw) {
+        return None;
+    }
+    s.set_reg(X86Reg::Rsp, sp);
+    Some(())
+}
+fn simd_size(w: SimdWidth) -> usize {
+    match w {
+        SimdWidth::ScalarF32 => 4,
+        SimdWidth::ScalarF64 => 8,
+        _ => 16,
+    }
+}
+fn simd_read(
+    s: &GuestState,
+    m: &mut dyn GuestMemory,
+    i: &IrInst,
+    src: SimdSrc,
+    n: usize,
+) -> Option<[u8; 16]> {
+    match src {
+        SimdSrc::Xmm(r) => Some(s.xmm[r as usize]),
+        SimdSrc::Mem(mem) => {
+            let a = effective_address(s, &mem, i, true);
+            let mut b = [0; 16];
+            if m.read_virt(a, &mut b[..n]) == n {
+                Some(b)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -525,6 +659,9 @@ mod tests {
             },
             guest_va: 0x1000,
             guest_len: 3,
+            operand_width: 8,
+            address_width: 8,
+            segment: crate::arch::common::btl::ir::Segment::Flat,
         }];
         let out = execute_block(&ir, &mut state, &mut mem, &mut hook);
         assert!(matches!(out, ExecOutcome::MemoryFault { .. }));

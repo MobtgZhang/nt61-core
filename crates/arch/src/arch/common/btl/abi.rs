@@ -83,7 +83,7 @@ pub fn normalize_syscall_args(abi: GuestAbi, guest_regs: &[u64]) -> NormalizedSy
             // arguments live in that block; the bridge copies them
             // out through guest memory before dispatch.
             if let Some(edx) = guest_regs.get(X86Reg::Rdx as usize) {
-                out.stack_arg_base = Some(*edx);
+                out.stack_arg_base = Some(*edx as u32 as u64);
             }
         }
     }

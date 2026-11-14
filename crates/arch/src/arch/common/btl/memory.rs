@@ -16,6 +16,15 @@ pub trait GuestPaging {
     /// address on identity-mapped kernels). Returns `None` when the
     /// page is not mapped.
     fn translate(&self, va: u64) -> Option<u64>;
+
+    /// Copy one page chunk while its host mapping remains alive.
+    /// `buf` points to a valid kernel buffer of `len` bytes.
+    unsafe fn copy_page(&self, va: u64, buf: *mut u8, len: usize, from_guest: bool) -> bool {
+        let Some(host) = self.translate(va) else { return false; };
+        if from_guest { core::ptr::copy(host as *const u8, buf, len); }
+        else { core::ptr::copy(buf, host as *mut u8, len); }
+        true
+    }
 }
 
 /// Guest memory access surface used by the BTL syscall bridge and
@@ -25,6 +34,13 @@ pub trait GuestMemory {
     fn read_virt(&mut self, va: u64, buf: &mut [u8]) -> usize;
     /// Copy bytes into guest VA; returns `true` when all copied.
     fn write_virt(&mut self, va: u64, data: &[u8]) -> bool;
+    /// Validate writable output before a service performs host IO.
+    fn probe_write(&mut self, _va: u64, _len: usize) -> bool { false }
+    /// Instruction fetch must enforce guest execute permissions. Data-only
+    /// adapters fail closed until they explicitly implement executable memory.
+    fn fetch_virt(&mut self, _va: u64, _buf: &mut [u8]) -> usize {
+        0
+    }
 }
 
 /// Null guest-memory view. It fails closed, making it suitable for
@@ -51,6 +67,10 @@ pub struct ArchLeafPaging;
 
 impl GuestPaging for ArchLeafPaging {
     fn validate(&self, va: u64, len: usize, write: bool) -> bool {
+        // Never let a guest use a kernel alias, even if a bad PTE has U set.
+        if va < 0x10000 || va.checked_add(len as u64).is_none_or(|end| end > 0x0000_8000_0000_0000) {
+            return false;
+        }
         let Some(end) = va.checked_add(len as u64) else {
             return false;
         };
@@ -71,7 +91,23 @@ impl GuestPaging for ArchLeafPaging {
     }
 
     fn translate(&self, va: u64) -> Option<u64> {
-        crate::arch::translate_virt(va)
+        // The page walk returns a physical address, not a permanent kernel VA.
+        let _ = va;
+        None
+    }
+
+    unsafe fn copy_page(&self, va: u64, buf: *mut u8, len: usize, from_guest: bool) -> bool {
+        #[cfg(not(test))]
+        {
+            let Some(physical) = crate::arch::translate_virt(va) else { return false; };
+            let Ok(guard) = crate::mm::vm::direct_map_guard(physical & !0xFFF, 0x1000) else { return false; };
+            let alias = (guard.va() + (physical & 0xFFF)) as *mut u8;
+            if from_guest { core::ptr::copy(alias, buf, len); }
+            else { core::ptr::copy(buf, alias, len); }
+            true
+        }
+        #[cfg(test)]
+        { let _ = (va, buf, len, from_guest); false }
     }
 }
 
@@ -94,16 +130,8 @@ impl<P: GuestPaging> GuestAddressSpace<P> {
         while copied < len {
             let bytes_in_page = (0x1000 - (guest_va & 0xFFF)) as usize;
             let chunk = (len - copied).min(bytes_in_page);
-            let Some(pa) = self.paging.translate(guest_va) else {
-                break;
-            };
             unsafe {
-                let (src, dst) = if from_guest {
-                    (pa as *const u8, buf.add(copied))
-                } else {
-                    (buf.add(copied) as *const u8, pa as *mut u8)
-                };
-                core::ptr::copy(src, dst, chunk);
+                if !self.paging.copy_page(guest_va, buf.add(copied), chunk, from_guest) { break; }
             }
             copied += chunk;
             guest_va = guest_va.wrapping_add(chunk as u64);
@@ -119,6 +147,32 @@ impl<P: GuestPaging> GuestMemory for GuestAddressSpace<P> {
 
     fn write_virt(&mut self, va: u64, data: &[u8]) -> bool {
         self.copy_chunked(va, data.as_ptr() as *mut u8, data.len(), false) == data.len()
+    }
+}
+
+// The active process adapter deliberately uses checked user-copy rather than
+// treating translate_virt's physical address as a host pointer. In particular,
+// LoongArch/RISC-V mappings are not generally identity mappings.
+#[cfg(not(test))]
+pub struct CurrentProcessMemory;
+
+#[cfg(not(test))]
+impl GuestMemory for CurrentProcessMemory {
+    fn read_virt(&mut self, va: u64, buf: &mut [u8]) -> usize {
+        if crate::mm::user_copy::copy_from_user(buf, va).is_ok() { buf.len() } else { 0 }
+    }
+    fn write_virt(&mut self, va: u64, data: &[u8]) -> bool {
+        crate::mm::user_copy::copy_to_user(va, data).is_ok()
+    }
+    fn fetch_virt(&mut self, va: u64, buf: &mut [u8]) -> usize {
+        if !crate::mm::user_copy::is_user_range(va, buf.len()) { return 0; }
+        let Some(end) = va.checked_add(buf.len() as u64) else { return 0; };
+        let mut page = va & !0xFFF;
+        while page < end {
+            if !crate::arch::leaf_entry(page).is_some_and(crate::arch::page_user_executable) { return 0; }
+            page += 0x1000;
+        }
+        self.read_virt(va, buf)
     }
 }
 
