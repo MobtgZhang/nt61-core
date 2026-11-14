@@ -97,18 +97,12 @@ pub fn enable_memory_bus_master(bus: u8, device: u8, function: u8) {
 // The layout follows the PCIe ECAM standard the host firmware
 // implements:
 // - Standard ECAM (PCI Express Base spec, pci-host-ecam-generic
-//   in Linux, QEMU riscv64 virt GPEx): one 4096-byte window per
+//   on QEMU virt, including LoongArch): one 4096-byte window per
 //   function, 32 KiB per device (8 functions), 1 MiB per bus:
 //     address = base + (bus << 20) + (dev << 15) + (func << 12) + offset
-// - Compressed ECAM (LoongArch LS7A host bridge, QEMU loongarch64
-//   virt): 4096 bytes per device window split into 512-byte function
-//   slots, 128 KiB per bus:
-//     address = base + (bus << 17) + (dev << 12) + (func << 9) + offset
-//
-// The stride set is a compile-time per-arch property because the host
-// bridge (and therefore the firmware table describing it) differs per
-// machine; hal.dll is the one place allowed to encode it (mirrors
-// Windows hal!HalTranslateBusAddress).
+// An MCFG or pci-host-ecam-generic window uses this layout regardless
+// of CPU architecture. Applying LS7A's compressed configuration layout
+// here aliases functions and misses devices (e.g. LoongArch's tablet).
 
 /// ECAM window strides (bytes): bus, device, function.
 struct EcamLayout {
@@ -117,22 +111,9 @@ struct EcamLayout {
     function: u64,
 }
 
-#[cfg(target_arch = "riscv64")]
 const ECAM_LAYOUT: EcamLayout = EcamLayout {
     bus: 1 << 20,
     device: 8 << 12,
-    function: 1 << 12,
-};
-#[cfg(target_arch = "loongarch64")]
-const ECAM_LAYOUT: EcamLayout = EcamLayout {
-    bus: 1 << 17,
-    device: 1 << 12,
-    function: 1 << 9,
-};
-#[cfg(not(any(target_arch = "riscv64", target_arch = "loongarch64")))]
-const ECAM_LAYOUT: EcamLayout = EcamLayout {
-    bus: 1 << 20,
-    device: 1 << 15,
     function: 1 << 12,
 };
 

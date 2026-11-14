@@ -77,7 +77,7 @@ use crate::servers::smss;
 /// to cover every BOOT_START entry the build tool writes into the
 /// on-disk NTFS image. Extra slots stay at `loaded = false` and
 /// are skipped at runtime.
-const MAX_BOOT_START_DRIVERS: usize = 16;
+const MAX_BOOT_START_DRIVERS: usize = 13;
 
 /// The driver paths the loader scans for, in the same order the
 /// build tool (`tools/src/fs/build.rs::build_system_images`)
@@ -90,14 +90,11 @@ const BOOT_START_DRIVER_PATHS: [&str; MAX_BOOT_START_DRIVERS] = [
     "\\Windows\\System32\\drivers\\classpnp.sys",
     "\\Windows\\System32\\drivers\\partmgr.sys",
     "\\Windows\\System32\\drivers\\volmgr.sys",
-    "\\Windows\\System32\\drivers\\storahci.sys",
-    "\\Windows\\System32\\drivers\\iastor.sys",
-    "\\Windows\\System32\\drivers\\stornvme.sys",
+    "\\Windows\\System32\\drivers\\msahci.sys",
     "\\Windows\\System32\\drivers\\pci.sys",
     "\\Windows\\System32\\drivers\\acpi.sys",
     "\\Windows\\System32\\drivers\\intelppm.sys",
     "\\Windows\\System32\\drivers\\mssmbios.sys",
-    "\\Windows\\System32\\drivers\\hpet.sys",
     // Display drivers — these are the drivers the operator
     // expects to see in the serial log when the GUI panel
     // transitions from the OVMF "Loading..." splash to the
@@ -156,14 +153,14 @@ pub fn load_and_init_boot_start_drivers() {
         serial::write_string(path);
         serial::write_string("\r\n");
 
-        let _bytes = match smss::read_pe_from_disk(path) {
+        let bytes = match smss::read_pe_from_disk(path) {
             Some(data) => {
                 let v: &Vec<u8> = &data;
                 Some(v.clone())
             }
             None => None,
         };
-        let _ = _bytes;
+        let _ = bytes;
 
         let basename = path.rsplit('\\').next().unwrap_or(path);
         let basename_lc: String = basename
@@ -215,7 +212,7 @@ pub fn load_and_init_boot_start_drivers() {
                 serial::write_string("[K07]   dispatching to acpi_pm (timer init)\r\n");
                 crate::drivers::timer::init();
             }
-            "storahci.sys" | "iastor.sys" => {
+            "msahci.sys" | "iastor.sys" => {
                 serial::write_string("[K07]   dispatching to drivers::storage::ahci::init()\r\n");
                 crate::drivers::storage::ahci::init();
             }

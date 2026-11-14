@@ -780,9 +780,9 @@ unsafe extern "C" fn ahci_read_dispatch(
     _device: *mut crate::io::DeviceObject,
     irp: *mut crate::io::Irp,
 ) -> i32 {
-    let (offset, _count, buffer) = crate::io::dispatch::storage_request_parameters(irp);
+    let (offset, count, buffer) = crate::io::dispatch::storage_request_parameters(irp);
     let lba = (offset / 512) as u32;
-    let _ = (offset, _count);
+    let _ = (offset, count);
     if read_sector(0, 0, lba, core::slice::from_raw_parts_mut(buffer, 512)) {
         crate::libs::ntdll::status::STATUS_SUCCESS
     } else {
@@ -798,9 +798,9 @@ unsafe extern "C" fn ahci_write_dispatch(
     _device: *mut crate::io::DeviceObject,
     irp: *mut crate::io::Irp,
 ) -> i32 {
-    let (offset, _count, buffer) = crate::io::dispatch::storage_request_parameters(irp);
+    let (offset, count, buffer) = crate::io::dispatch::storage_request_parameters(irp);
     let lba = (offset / 512) as u32;
-    let _ = (offset, _count);
+    let _ = (offset, count);
     if write_sector(0, 0, lba, core::slice::from_raw_parts(buffer, 512)) {
         crate::libs::ntdll::status::STATUS_SUCCESS
     } else {
@@ -812,7 +812,7 @@ unsafe extern "C" fn ahci_write_dispatch(
 /// register DeviceObjects into the storage dispatch registry.
 fn register_dispatch_objects() {
     unsafe {
-        let driver = crate::io::allocate_driver(b"\\Driver\\storahci");
+        let driver = crate::io::allocate_driver(b"\\Driver\\msahci");
         if driver.is_null() {
             return;
         }

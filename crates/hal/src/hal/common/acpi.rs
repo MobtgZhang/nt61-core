@@ -62,7 +62,7 @@ pub struct Rsdp2 {
     length: u32,
     xsdt_address: u64,
     extended_checksum: u8,
-    _reserved: [u8; 3],
+    reserved: [u8; 3],
 }
 
 /// The physical address of the RSDP as supplied by the firmware.
@@ -401,7 +401,7 @@ pub fn validate_rsdp(rsdp_phys: u64) -> bool {
 /// read a byte from the CMOS register file. Stub on non-x86_64 —
 /// LoongArch / ARM64 / RISC-V64 use ACPI for time-keeping instead.
 #[cfg(target_arch = "x86_64")]
-pub fn read_cmos(reg: u8) -> u8 {
+    pub fn read_cmos(reg: u8) -> u8 {
     let addr = 0x70u16;
     let data = 0x71u16;
     crate::hal::x86_64::io_port::write_port_uchar(addr, 0x80 | (reg & 0x7F));
@@ -524,7 +524,7 @@ pub struct MadtIoApic {
     pub entry_type: u8,
     pub length: u8,
     pub io_apic_id: u8,
-    pub _reserved: u8,
+    pub reserved: u8,
     pub io_apic_address: u32,
     pub global_system_interrupt_base: u32,
 }
@@ -696,9 +696,9 @@ fn parse_madt_locked(header: *const AcpiTableHeader) -> bool {
                         let _gsi_base = e.global_system_interrupt_base;
                         acpi_debug!(
                             "    [acpi] MADT: found I/O APIC id={} addr=0x{:x} gsi_base={}",
-                            _io_apic_id,
+                            io_apic_id,
                             _io_apic_addr,
-                            _gsi_base
+                            gsi_base
                         );
                     }
                 }
@@ -714,7 +714,7 @@ fn parse_madt_locked(header: *const AcpiTableHeader) -> bool {
                         info.int_overrides[info.int_override_count] = e;
                         info.int_override_count += 1;
                         acpi_debug!("    [acpi] MADT: interrupt override: bus={} src={} gsi={} flags=0x{:x}",
-                                   _bus, _source, _gsi, _flags);
+                                   bus, source, gsi, flags);
                     }
                 }
                 MADT_ENTRY_LOCAL_APIC_NMI if info.nmi_source_count < MAX_NMI_SOURCES => {
@@ -728,9 +728,9 @@ fn parse_madt_locked(header: *const AcpiTableHeader) -> bool {
                     info.nmi_source_count += 1;
                     acpi_debug!(
                         "    [acpi] MADT: local APIC NMI: proc={} lint={} flags=0x{:x}",
-                        _proc_id,
-                        _lint,
-                        _flags
+                        proc_id,
+                        lint,
+                        flags
                     );
                 }
                 _ => {
@@ -793,7 +793,7 @@ mod tests {
 /// FADT field offsets, mirrored from the ACPI 6.3 §5.2.9 layout as defined
 /// by ACPICA (`source/include/actbl.h`, `struct acpi_table_fadt`).
 mod fadt_off {
-    pub const REVISION: usize = 4;
+    pub const REVISION: usize = 8;
     pub const LENGTH: usize = 4;
     pub const PREFERRED_PROFILE: usize = 45;
     pub const SCI_INTERRUPT: usize = 46;
@@ -874,6 +874,10 @@ pub struct FadtInfo {
     pub gpe0_len: u8,
     pub gpe1_len: u8,
     pub flags: u32,
+    pub reset_address_space: u8,
+    pub reset_bit_width: u8,
+    pub reset_bit_offset: u8,
+    pub arm_boot_arch: u16,
     pub reset_register: u64,
     pub reset_value: u8,
 }
@@ -989,8 +993,12 @@ pub fn parse_fadt() -> Option<FadtInfo> {
         gpe0_len: read_u8(table, fadt_off::GPE0_BLOCK_LENGTH),
         gpe1_len: read_u8(table, fadt_off::GPE1_BLOCK_LENGTH),
         flags: fadt_read_u32(table, fadt_off::FLAGS),
+        reset_address_space: if length > 116 { read_u8(table, 116) } else { 0xff },
+        reset_bit_width: if length > 117 { read_u8(table, 117) } else { 0 },
+        reset_bit_offset: if length > 118 { read_u8(table, 118) } else { 0 },
+        arm_boot_arch: if length >= 131 { read_u16(table, 129) } else { 0 },
         reset_register: fadt_read_u64(table, fadt_off::RESET_REGISTER_ADDRESS),
-        reset_value: read_u8(table, fadt_off::RESET_VALUE),
+        reset_value: if length > fadt_off::RESET_VALUE as u32 { read_u8(table, fadt_off::RESET_VALUE) } else { 0 },
     })
 }
 

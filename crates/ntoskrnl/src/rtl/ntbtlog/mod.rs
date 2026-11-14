@@ -61,15 +61,16 @@ impl BootLogEntry {
             path_buf[i] = b;
         }
 
+        let clock = crate::hal::common::cmos::query_real_time_clock().unwrap_or_default();
         Self {
             entry_type,
             path: path_buf,
-            year: 2026,
-            month: 6,
-            day: 30,
-            hour: 9,
-            minute: 0,
-            second: 0,
+            year: clock.year,
+            month: clock.month,
+            day: clock.day,
+            hour: clock.hour,
+            minute: clock.minute,
+            second: clock.second(),
             millisecond: 0,
         }
     }
@@ -116,8 +117,9 @@ impl BootLogEntry {
         pos += 1;
 
         // BOOTLOG_LOADED or BOOTLOG_NOT_LOADED
-        line[pos..pos + 17].copy_from_slice(self.entry_type.as_str());
-        pos += 17;
+        let label = self.entry_type.as_str();
+        line[pos..pos + label.len()].copy_from_slice(label);
+        pos += label.len();
         line[pos] = b' ';
         pos += 1;
 
@@ -207,7 +209,8 @@ pub fn log_driver_load(path: &[u8]) {
 
     let entry = BootLogEntry::new(BootEntryType::Loaded, path);
     let line = entry.format_line();
-    writer::write_line(&line);
+    let length = line.iter().position(|&b| b == b'\n').map(|n| n + 1).unwrap_or(line.len());
+    writer::write_line(&line[..length]);
 }
 
 /// Log a driver that was not loaded
@@ -218,7 +221,8 @@ pub fn log_driver_not_load(path: &[u8]) {
 
     let entry = BootLogEntry::new(BootEntryType::NotLoaded, path);
     let line = entry.format_line();
-    writer::write_line(&line);
+    let length = line.iter().position(|&b| b == b'\n').map(|n| n + 1).unwrap_or(line.len());
+    writer::write_line(&line[..length]);
 }
 
 /// Log ntoskrnl.exe loading

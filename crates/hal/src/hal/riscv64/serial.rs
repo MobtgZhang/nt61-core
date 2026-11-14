@@ -131,6 +131,11 @@ pub fn write_u32_hex(v: u32) {
     }
 }
 
+pub fn write_u64_hex(v: u64) {
+    write_string("0x");
+    write_hex_u64(v);
+}
+
 /// write a 64-bit value as 16 hex digits (uppercase, no prefix).
 /// Provided so that callers using the unified `crate::hal::serial`
 /// facade (e.g. `mm::pool`, `mm::mod`) can rely on the same name

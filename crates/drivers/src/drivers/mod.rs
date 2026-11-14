@@ -83,6 +83,8 @@ pub mod volsnap;
 /// functional driver in the order Windows does. Idempotent —
 /// every inner `init()` is a no-op if it has already run.
 pub fn init() {
+    use nt61_boot_types::boot_options::{active, BootOptions};
+    let policy = active();
     // // kprintln!("  Initialising driver subsystem...");
     crate::hal::serial::write_string_always("[DRV] bus begin\r\n");
     bus::init();
@@ -97,16 +99,16 @@ pub fn init() {
     usb::init();
     crate::hal::serial::write_string_always("[DRV] usb done\r\n");
     crate::hal::serial::write_string_always("[DRV] net begin\r\n");
-    net::init();
+    if policy.network_enabled() { net::init(); }
     crate::hal::serial::write_string_always("[DRV] net done\r\n");
     crate::hal::serial::write_string_always("[DRV] audio begin\r\n");
-    audio::init();
+    if !policy.has(BootOptions::SAFE) { audio::init(); }
     crate::hal::serial::write_string_always("[DRV] audio done\r\n");
     crate::hal::serial::write_string_always("[DRV] input begin\r\n");
     input::init();
     crate::hal::serial::write_string_always("[DRV] input done\r\n");
     crate::hal::serial::write_string_always("[DRV] video begin\r\n");
-    video::init();
+    if !policy.has(BootOptions::LOW_RES) && !policy.has(BootOptions::SAFE) { video::init(); }
     crate::hal::serial::write_string_always("[DRV] video done\r\n");
     // `video::init()` brings up the BOCHS VBE driver (x86_64)
     // which exposes a 1024×768×32 linear framebuffer at the
@@ -129,7 +131,7 @@ pub fn init() {
     // through to the no-op (or worse, the legacy VGA buffer).
     bootvid::force_lfb_console();
     timer::init();
-    ndis::init();
+    if policy.network_enabled() { ndis::init(); }
     wdf::init();
     // bootvid now has a cross-arch LFB backend driven by the
     // shared `hal::common::framebuffer` writer; the legacy VGA

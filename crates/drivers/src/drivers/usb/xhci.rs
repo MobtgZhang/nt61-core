@@ -741,18 +741,17 @@ fn init_controller(bar_phys: u64) -> Option<XhciController> {
     })
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+pub fn init() {
+    crate::hal::serial::write_string_always("[XHCI] skipped\r\n");
+}
+
+#[cfg(target_arch = "x86_64")]
 pub fn init() {
     // Enumerate the PCI tree and build controllers from real BAR
     // values. When no xHCI device is present the registry stays
     // empty and `count()` honestly reports 0; no placeholder
     // controller is registered.
-    // Non-x86 platforms do not yet have a device MMIO map for
-    // dynamically assigned PCI BARs. Touching such a BAR faults.
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        crate::hal::serial::write_string_always("[XHCI] skipped\r\n");
-        return;
-    }
     let devices = crate::hal::common::pci::enumerate();
     crate::hal::serial::write_string_always("[XHCI] devices scanned\r\n");
     for dev in devices {
@@ -1530,7 +1529,7 @@ pub fn get_descriptor(controller: usize, _port: u8) -> Result<UsbDeviceDescripto
 
 /// Enumerate a device on a port
 pub fn enumerate_device(controller: usize, port: u8) -> Result<UsbDevice, &'static str> {
-    let _speed = reset_port(controller, port)?;
+    let speed = reset_port(controller, port)?;
 
     // Step 2: GET_DESCRIPTOR (Device) on the default control pipe to
     // learn the max packet size and device class.
@@ -1555,7 +1554,7 @@ pub fn enumerate_device(controller: usize, port: u8) -> Result<UsbDevice, &'stat
     Ok(UsbDevice {
         address: 1,
         port,
-        speed: _speed,
+        speed,
         state: UsbDeviceState::Configured,
         descriptor,
         configuration: 1,

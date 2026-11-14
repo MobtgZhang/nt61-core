@@ -2,9 +2,8 @@
 //
 //! This module provides a compatible interface to the platform timer.
 //! On x86_64, it re-exports the PIT implementation.
-//! On other platforms, it provides stub functions.
+//! Other platforms use their architectural monotonic counters.
 
-#[cfg(target_arch = "x86_64")]
 #[cfg(target_arch = "x86_64")]
 pub use crate::hal::x86_64::pit::*;
 
@@ -50,34 +49,44 @@ mod riscv_timer {
 #[cfg(target_arch = "riscv64")]
 pub use riscv_timer::*;
 
-#[cfg(all(
-    not(target_arch = "x86_64"),
-    not(target_arch = "aarch64"),
-    not(target_arch = "riscv64")
-))]
-mod stub {
-    /// Get the current tick count.
+#[cfg(target_arch = "loongarch64")]
+mod loongarch_timer {
+    /// The stable counter runs independently of interrupt delivery.
     pub fn get_ticks() -> u64 {
-        0
+        let ticks: u64;
+        // SAFETY: RDTIME is available at kernel privilege on LoongArch64.
+        unsafe {
+            core::arch::asm!("rdtime.d {}, $zero", out(reg) ticks, options(nomem, nostack));
+        }
+        ticks
     }
 
-    /// Increment tick count.
     pub fn increment_ticks() {}
 
-    /// Get system time in milliseconds since kernel boot.
-    pub fn get_system_time_ms() -> u64 {
-        0
+    fn frequency() -> u64 {
+        // SAFETY: CPUCFG words 4/5 report the stable-counter clock and ratio.
+        let (base, ratio) = unsafe {
+            (
+                crate::arch::loongarch64::soc::cpucfg_read(4),
+                crate::arch::loongarch64::soc::cpucfg_read(5),
+            )
+        };
+        let multiplier = ratio & 0xffff;
+        let divisor = (ratio >> 16) & 0xffff;
+        if base == 0 || multiplier == 0 || divisor == 0 {
+            return 100_000_000; // QEMU virt stable-counter default.
+        }
+        base.saturating_mul(multiplier) / divisor
     }
 
-    /// Get system time in microseconds since kernel boot.
+    pub fn get_system_time_ms() -> u64 {
+        (get_ticks() as u128 * 1000 / frequency().max(1) as u128) as u64
+    }
+
     pub fn get_system_time_us() -> u64 {
-        0
+        (get_ticks() as u128 * 1_000_000 / frequency().max(1) as u128) as u64
     }
 }
 
-#[cfg(all(
-    not(target_arch = "x86_64"),
-    not(target_arch = "aarch64"),
-    not(target_arch = "riscv64")
-))]
-pub use stub::*;
+#[cfg(target_arch = "loongarch64")]
+pub use loongarch_timer::*;

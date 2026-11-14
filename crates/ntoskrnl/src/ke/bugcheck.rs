@@ -6,7 +6,7 @@
 //! with the bugcheck code and the four NT-style parameters, then
 //! halts the system.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// BugCheck codes (subset).
 //
@@ -116,6 +116,18 @@ impl BugCheckCode {
     }
 }
 
+static AUTO_REBOOT: AtomicBool = AtomicBool::new(false);
+
+/// Cache policy while the registry is available; the crash path must not lock it.
+pub fn configure_restart_policy() {
+    let configured = crate::registry::cm::query_dword(
+        "System\\CurrentControlSet\\Control\\CrashControl", "AutoReboot",
+    ).unwrap_or(1) != 0;
+    let enabled = nt61_boot_types::boot_options::active().automatic_restart(configured);
+    AUTO_REBOOT.store(enabled, Ordering::Release);
+    crate::hal::serial::write_string_always(if enabled { "[CRASH-POLICY] automatic restart enabled\r\n" } else { "[CRASH-POLICY] automatic restart disabled\r\n" });
+}
+
 static LAST_CODE: AtomicU32 = AtomicU32::new(0);
 static LAST_P1: AtomicU64 = AtomicU64::new(0);
 static LAST_P2: AtomicU64 = AtomicU64::new(0);
@@ -222,8 +234,19 @@ fn paint_bugcheck(code: BugCheckCode, p1: u64, p2: u64, p3: u64, p4: u64) -> ! {
     let _ = (p1, p2, p3, p4); // fold into secondary if needed
     let secondary_str = core::str::from_utf8(&secondary[..i]).unwrap_or("KERNEL BUGCHECK");
     crate::drivers::bootvid::bugcheck_screen(code_u32, secondary_str);
-    // Stop other CPUs.
+    // Stop scheduling and interrupts before examining the cached crash policy.
     crate::ke::dispatch::set_panic_stop();
+    crate::arch::disable_interrupts();
+    if AUTO_REBOOT.load(Ordering::Acquire) {
+        crate::hal::serial::write_string_always("[BUGCHECK] restarting in 5 seconds\r\n");
+        // Architectural counters keep running with interrupts disabled.
+        let start = crate::hal::common::pit::get_system_time_ms();
+        while crate::hal::common::pit::get_system_time_ms().wrapping_sub(start) < 5_000 {
+            core::hint::spin_loop();
+        }
+        crate::hal::common::power::return_to_firmware(crate::hal::common::power::FirmwareAction::Reboot);
+    }
+    crate::hal::serial::write_string_always("[BUGCHECK] automatic restart disabled; system halted\r\n");
     loop {
         crate::arch::halt();
     }

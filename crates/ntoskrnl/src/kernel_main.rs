@@ -24,7 +24,6 @@
 extern crate alloc;
 
 use crate::{arch, drivers, fs, hal, io, ke, lpc, mm, ob, ps, registry, servers};
-use alloc::format;
 
 /// Gate-bypassing boot-progress marker.
 ///
@@ -256,8 +255,28 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // Determine boot mode and configure output channels through the
     // platform boot facade.
     // ========================================================================
+    let boot_options = nt61_boot_types::boot_options::BootOptions(boot_info.boot_flags);
+    nt61_boot_types::boot_options::install(boot_options);
     let boot_mode = BootMode::from_u32(boot_info.boot_mode);
     crate::arch::boot::configure_boot_display(boot_mode);
+    if boot_options.has(nt61_boot_types::boot_options::BootOptions::BOOT_LOG) {
+        crate::rtl::ntbtlog::enable_boot_log();
+        crate::rtl::ntbtlog::begin_boot_sequence();
+        crate::rtl::ntbtlog::log_ntoskrnl();
+        crate::rtl::ntbtlog::log_hal();
+        if boot_info.boot_driver_records != 0 && boot_info.boot_driver_records_count <= 64 {
+            // SAFETY: loader-owned records remain live through kernel initialization.
+            let records = unsafe { core::slice::from_raw_parts(
+                boot_info.boot_driver_records as *const nt61_boot_types::boot_types::BootDriverLoadRecord,
+                boot_info.boot_driver_records_count as usize) };
+            for record in records {
+                let length = record.name.iter().position(|&b| b == 0).unwrap_or(record.name.len());
+                if record.loaded { crate::rtl::ntbtlog::log_driver_load(&record.name[..length]); }
+                else { crate::rtl::ntbtlog::log_driver_not_load(&record.name[..length]); }
+            }
+        }
+    }
+
     #[cfg(target_arch = "loongarch64")]
     crate::arch::loongarch64::paging::vector_page_check("display");
 
@@ -363,6 +382,8 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // winload loaded into memory and published via BootInfo.hives.
     // Without this call every cm::query_* path silently returns None.
     registry::cm::init(boot_info);
+    crate::ke::bugcheck::configure_restart_policy();
+    crate::hal::common::power::init();
 
     // ============================================================================
     // PHASE 5: I/O Manager (io)
@@ -412,7 +433,7 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // Bring the TCP/IP protocol stack up immediately after its NIC
     // miniports are registered; otherwise `ethif` has no MAC/interface
     // bindings and DHCP cannot transmit.
-    crate::netstack::init();
+    if boot_options.network_enabled() { crate::netstack::init(); }
 
     // ============================================================================
     // PHASE 9: Process / Thread Subsystem (ps)
@@ -455,6 +476,8 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
         crate::boot_types::BootMode::Desktop | crate::boot_types::BootMode::Cmd
     ) {
         crate::ke::boot_anim::start_animation_thread();
+    } else {
+        crate::ke::boot_anim::start_basic_display_thread();
     }
 
     crate::servers::init();
@@ -498,7 +521,7 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // PHASE 13: End-to-end network verification (QEMU slirp only)
     // ============================================================================
     phase_header!(13, "Network E2E");
-    if crate::netstack::e2e_test::run_e2e_test() {
+    if boot_options.network_enabled() && crate::netstack::e2e_test::run_e2e_test() {
         boot_println!("    network E2E: all stages passed");
     } else {
         boot_println!("    network E2E: some stages failed (see log)");
@@ -507,42 +530,31 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // Start on-disk services after the network stack is ready. The
     // launcher is content-driven: without an installed configuration it
     // is a no-op for ordinary images.
-    let _ = crate::servers::sshd::launcher::start_from_disk();
+    if !boot_options.has(nt61_boot_types::boot_options::BootOptions::SAFE) {
+        let _ = crate::servers::sshd::launcher::start_from_disk();
+    }
 
     // ============================================================================
     // PHASE 14: Print IDLE banner
     // ============================================================================
+    if crate::rtl::ntbtlog::is_enabled() {
+        crate::rtl::ntbtlog::end_boot_sequence();
+        if let Some(log) = crate::rtl::ntbtlog::get_log_contents() {
+            let result = crate::fs::system_volume::write("C:\\Windows\\ntbtlog.txt", log)
+                .or_else(|_| crate::fs::system_volume::create("C:\\Windows\\ntbtlog.txt", log));
+            crate::hal::serial::write_string_always(if result.is_ok() { "[BOOTLOG] ntbtlog.txt written\r\n" } else { "[BOOTLOG] ntbtlog.txt write failed\r\n" });
+        }
+    }
     crate::rtl::klog::phase_trace_marker(14);
     boot_header!("NT6.1.7601 - System Ready");
     boot_debug_println!("NT6.1.7601 reached IDLE");
     boot_print!("System ready (FULL BOOT)\r\n");
 
     // ============================================================================
-    // PHASE 15: Enter first user thread (Ring 3) or Safe-Mode shell.
-    //
-    // The boot mode is selected by `bootmgr` and forwarded through
-    // `boot_info.boot_mode`. The four valid NT 6.1 boot
-    // configurations are:
-    //
-    //  * `Desktop`        -> no log output, boot animation, Ring 3.
-    //                         (future: desktop GUI)
-    //  * `Cmd`            -> no log output, boot animation, Ring 3
-    //                         cmd.exe. (future: CMD GUI window)
-    //  * `DebugCmd`       -> full verbose boot log, no animation,
-    //                         Ring 3 cmd.exe.
-    //  * `SafeMode`       -> full verbose boot log, no animation,
-    //                         user-mode subsystem init stays disabled,
-    //                         enter kernel-side CMD shell (polled I/O).
-    // `enter_first_user_thread()` is `-> !` and never returns.
-    //
-    // CRITICAL: for `SafeModeCmd` we deliberately do NOT call
-    // `arch::enable_interrupts_once()`. The PIT (IRQ0) dispatch
-    // calls `ke::scheduler::tick()` which calls `schedule()` to
-    // swap thread context once a quantum expires — that swap
-    // discards the boot stack frame and the next `boot_println!`
-    // returns to garbage, producing a #DF / triple-fault. The
-    // Safe-Mode shell therefore runs with interrupts masked and
-    // uses POLLED I/O.
+    // PHASE 15: Enter the selected user-mode shell. Desktop and CMD
+    // play the animation; safe/debug modes use the basic display mirror.
+    // Safe Mode keeps the session infrastructure and selects either the
+    // desktop or the alternate command shell after reducing driver policy.
     // ============================================================================
     crate::rtl::klog::phase_trace_marker(15);
     let mode = BootMode::from_u32(boot_info.boot_mode);
@@ -558,18 +570,6 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
         BootMode::SafeMode => boot_print!("Safe Mode\r\n"),
     }
 
-    // Phase 15 - boot-mode dispatch.
-    //
-    // Desktop / Cmd: no log output was shown during the phases
-    // (suppressed by configure_boot_display). Run the boot
-    // animation, clear the screen, and enter Ring 3 cmd.exe.
-    //
-    // DebugCmd: full verbose log was shown, no animation. Enter
-    // Ring 3 cmd.exe directly.
-    //
-    // SafeMode: full verbose log, no animation, user-mode
-    // subsystem init stays disabled (Phase 12 leaves it off), enter the
-    // kernel-side CMD shell with polled I/O.
     match mode {
         BootMode::Desktop => {
             crate::rtl::klog::phase_trace_marker(151);
@@ -606,6 +606,8 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
             servers::smss::launch_cmd_shell();
         }
         BootMode::DebugCmd => {
+            crate::arch::mark_interrupts_ready();
+            crate::arch::enable_interrupts();
             crate::rtl::klog::phase_trace_marker(155);
             boot_println!("Debug CMD: entering user-mode cmd.exe");
             crate::hal::keyboard_input::init();
@@ -615,13 +617,15 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
             servers::smss::launch_cmd_shell();
         }
         BootMode::SafeMode => {
-            boot_println!("Safe Mode: entering kernel-side command shell");
-            mask_all_irqs_for_safe_mode();
-            arch::disable_interrupts();
+            crate::arch::mark_interrupts_ready();
+            crate::arch::enable_interrupts();
             crate::hal::keyboard_input::init();
             crate::hal::text_console::init();
-            arch::show_safe_mode_console();
-            run_safe_mode_shell(servers::cmd::ShellMode::SafeModeCmd);
+            if boot_options.has(nt61_boot_types::boot_options::BootOptions::SAFE_SHELL) {
+                servers::smss::launch_cmd_shell();
+            }
+            crate::drivers::bootvid::set_gui_console_active(true);
+            servers::smss::start_desktop_boot_sequence();
         }
     }
 }
@@ -849,7 +853,7 @@ fn load_system_files() {
         boot_milestone!("KERNEL", "system image read complete");
         match crate::loader::load_image_full(name, &raw_pe, db, preferred_base) {
             Some(image) => {
-                boot_ok!(format!(
+                boot_ok!(alloc::format!(
                     "Loaded {}: base=0x{:x} entry=0x{:x} size=0x{:x}",
                     name, image.image_base, image.entry_point, image.image_size
                 ));
@@ -1136,11 +1140,8 @@ fn init_system_process_working_set(sys: *mut ps::process::Eprocess) {
 /// In Windows 7:
 /// - Session 0 is the system session (services, lsass)
 /// - Session 1+ are user sessions (interactive logon)
-fn start_session_manager(mode: BootMode) {
-    if mode == BootMode::SafeMode {
-        boot_println!("  Phase 12: Safe Mode - user-mode subsystem init disabled");
-        return;
-    }
+fn start_session_manager(_mode: BootMode) {
+
     boot_println!("  Phase 12: Starting Session Manager (smss.exe)...");
 
     // 1. create SMSS process

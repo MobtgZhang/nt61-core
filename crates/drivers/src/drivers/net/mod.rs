@@ -23,13 +23,11 @@ pub mod virtio_net;
 
 /// Initialise the network driver stack. Walks PCI for each
 /// supported NIC and registers it.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn init() {}
+
+#[cfg(target_arch = "x86_64")]
 pub fn init() {
-    // kprintln!("    Network drivers: e1000, rtl8139, virtio-net");
-    // PCI NICs use dynamically assigned MMIO BARs. Non-x86
-    // architectures do not yet expose a general device MMIO map,
-    // so initializing these drivers can hang on a BAR probe.
-    #[cfg(not(target_arch = "x86_64"))]
-    return;
     e1000::init();
     crate::drivers::arch::init_rtl8139();
     virtio_net::init();

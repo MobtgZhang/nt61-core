@@ -413,6 +413,7 @@ fn try_runtime_function_handler(
                 image_base,
                 &func,
                 handler_data,
+                context_frame.rsp,
             ));
         }
     }
@@ -427,6 +428,7 @@ fn call_exception_handler(
     image_base: u64,
     _function_entry: &RuntimeFunction,
     handler_data: *const u8,
+    establisher_frame: u64,
 ) -> ExceptionDisposition {
     // handler_data points to the handler RVA (a u32) followed by
     // handler-specific data. Read the RVA and compute the absolute
@@ -459,7 +461,7 @@ fn call_exception_handler(
         control_pc: exception_record.exception_address,
         image_base,
         function_entry: 0,
-        establisher_frame: 0,
+        establisher_frame,
         target_ip: 0,
         context: context_frame as *mut _,
         language_handler: 0,
@@ -482,7 +484,7 @@ fn call_exception_handler(
         let mut record = *exception_record;
         handler_fn(
             &mut record as *mut ExceptionRecord,
-            0,
+            establisher_frame,
             context_frame,
             &mut dispatch,
         )
@@ -654,7 +656,7 @@ impl Default for ContextFrame {
 
 /// Raise a software exception
 pub fn raise_exception(_code: u32, _address: u64) {
-    // _code and _address are intentionally unused - reserved for future implementation
+    // code and address are intentionally unused - reserved for future implementation
     // // kprintln!("[EXCEPTION] Software exception raised: code=0x{:08x}", code);
 
     // In a real implementation, this would:
@@ -787,10 +789,10 @@ pub fn dispatch_exception_full(
 
 /// handle access violation with detailed information
 pub fn handle_access_violation(_address: u64, _write: bool, _execute: bool) -> Option<u64> {
-    // _address, _write, and _execute are intentionally unused - reserved for future logging
+    // address, write, and execute are intentionally unused - reserved for future logging
     // // kprintln!(
     // //         "[EXCEPTION] Access Violation at 0x{:016x} write={} execute={}",
-    // //         _address, _write, _execute
+    // //         address, write, execute
     // //     );
 
     // In a real implementation:
@@ -808,8 +810,8 @@ pub fn handle_access_violation(_address: u64, _write: bool, _execute: bool) -> O
 
 /// Breakpoint handler (ContextFrame version)
 pub fn handle_breakpoint_context(_context: &mut ContextFrame) {
-    // _context is intentionally unused - reserved for future logging
-    // // kprintln!("[EXCEPTION] Breakpoint at RIP=0x{:016x}", _context.rip);
+    // context is intentionally unused - reserved for future logging
+    // // kprintln!("[EXCEPTION] Breakpoint at RIP=0x{:016x}", context.rip);
 
     // Step over the breakpoint instruction
     // In real Windows, this decrements RIP to step back
@@ -1021,11 +1023,11 @@ pub fn rtl_virtual_unwind(
 ) -> u64 {
     // Calculate the RVA of the control PC
     let _rva = (control_pc - image_base) as u32;
-    // _rva is intentionally unused - reserved for future logging
+    // rva is intentionally unused - reserved for future logging
 
     // // kprintln!(
     // //         "[UNWIND] RtlVirtualUnwind: image_base=0x{:016x}, control_pc=0x{:016x}, rva=0x{:08x}",
-    // //         image_base, control_pc, _rva
+    // //         image_base, control_pc, rva
     // //     );
 
     // Get the unwind info for this function
@@ -1213,7 +1215,7 @@ fn apply_unwind_code(
             // Frame pointer was set to RSP + scaled offset
             // The actual frame pointer restoration is handled by establisher_frame
             let _offset = unwind_code_offset(code);
-            // // kprintln!("[UNWIND] SetFp: frame_offset={}", _offset);
+            // // kprintln!("[UNWIND] SetFp: frame_offset={}", offset);
         }
 
         UnwindOperationCode::SaveIntNonVol => {
@@ -1473,8 +1475,8 @@ pub fn rtl_dispatch_exception(
 
     // 2. Walk the stack using RUNTIME_FUNCTION tables
     let mut control_pc = context_frame.rip;
-    // _establisher_frame tracks the frame pointer at each unwound function; reserved for future logging
-    let mut _establisher_frame = context_frame.rsp;
+    // establisher_frame tracks the frame pointer at each unwound function; reserved for future logging
+    let mut establisher_frame = context_frame.rsp;
 
     // Limit unwinding iterations to prevent infinite loops
     let mut unwind_count = 0;
@@ -1505,6 +1507,7 @@ pub fn rtl_dispatch_exception(
                             &func,
                             unwind_info,
                             handler_data,
+                            establisher_frame,
                         );
 
                         if result != ExceptionDisposition::ContinueSearch {
@@ -1528,7 +1531,7 @@ pub fn rtl_dispatch_exception(
 
                     // Move to next frame
                     control_pc = return_pc;
-                    _establisher_frame = handler_frame;
+                    establisher_frame = handler_frame;
 
                     if control_pc == 0 {
                         break;
@@ -1587,6 +1590,7 @@ fn call_exception_handler_with_unwind(
     function_entry: &RuntimeFunction,
     _unwind_info: &UnwindInfo,
     handler_data: *const u8,
+    establisher_frame: u64,
 ) -> ExceptionDisposition {
     // Delegate to the shared handler invocation which reads the
     // handler RVA and builds the dispatcher context.
@@ -1596,6 +1600,7 @@ fn call_exception_handler_with_unwind(
         image_base,
         function_entry,
         handler_data,
+        establisher_frame,
     )
 }
 

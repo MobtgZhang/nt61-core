@@ -22,11 +22,6 @@ pub fn init() {
     eventlog::init();
     eventlog::kernel_events::log_boot_start();
 
-    // Boot log entry: kernel started.
-    ntbtlog::enable_boot_log();
-    ntbtlog::begin_boot_sequence();
-    ntbtlog::log_driver_load(b"\\SystemRoot\\System32\\ntoskrnl.exe");
-
     // SAC stays disabled unless EMS is enabled in BCD; report init status.
     sac::init();
 }
