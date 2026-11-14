@@ -437,7 +437,7 @@ fn resolve_demand_zero_inner(
       //     // // // kprintln!("[DEMAND_ZERO_INNER] pte_bits=0x{:x}", pte_bits);
       // read current PTE value before write
     let _pte_before = unsafe { (*pte_ptr).raw() };
-    //     // // // kprintln!("[DEMAND_ZERO_INNER] pte_before=0x{:016x}", _pte_before);
+    //     // // // kprintln!("[DEMAND_ZERO_INNER] pte_before=0x{:016x}", pte_before);
     unsafe {
         (*pte_ptr).set_hardware(pa, pte_bits);
     }

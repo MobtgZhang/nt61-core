@@ -337,8 +337,8 @@ pub enum Wow64ThreadState {
 }
 
 /// Get the Wow64 state of a thread.
-pub fn get_wow64_thread_state(_thread: &Ethread) -> Wow64ThreadState {
-    if _thread.get_wow64_context32().is_some() {
+pub fn get_wow64_thread_state(thread: &Ethread) -> Wow64ThreadState {
+    if thread.get_wow64_context32().is_some() {
         Wow64ThreadState::Present
     } else {
         Wow64ThreadState::NotPresent
@@ -346,8 +346,8 @@ pub fn get_wow64_thread_state(_thread: &Ethread) -> Wow64ThreadState {
 }
 
 /// Check if a thread is a Wow64 thread.
-pub fn is_wow64_thread(_thread: &Ethread) -> bool {
-    _thread.is_wow64_thread()
+pub fn is_wow64_thread(thread: &Ethread) -> bool {
+    thread.is_wow64_thread()
 }
 
 // =============================================================================

@@ -360,7 +360,7 @@ pub struct FpuSaveArea32 {
     /// Register area (8 registers * 10 bytes each = 80 bytes).
     pub register_area: [u8; 80], // 0x1C
     /// Reserved padding to make total size 112 bytes (0x70).
-    pub _reserved: u32, // 0x6C - padding to reach 112 bytes total
+    pub reserved: u32, // 0x6C - padding to reach 112 bytes total
 }
 
 impl Default for FpuSaveArea32 {
@@ -374,7 +374,7 @@ impl Default for FpuSaveArea32 {
             data_offset: 0,
             data_selector: 0,
             register_area: [0; 80],
-            _reserved: 0,
+            reserved: 0,
         }
     }
 }
@@ -1127,7 +1127,7 @@ pub struct Teb32 {
     pub spare_u32_124: ULONG32, // +0x3FC
 
     /// Padding to reach 0x1000 bytes (TEB is one page)
-    pub _padding: [u8; 0x1000 - 0x400],
+    pub padding: [u8; 0x1000 - 0x400],
 }
 
 impl Default for Teb32 {
@@ -1283,7 +1283,7 @@ impl Default for Teb32 {
             spare_u32_122: 0,
             spare_u32_123: 0,
             spare_u32_124: 0,
-            _padding: [0; 0x1000 - 0x400],
+            padding: [0; 0x1000 - 0x400],
         }
     }
 }

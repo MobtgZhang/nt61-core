@@ -295,7 +295,7 @@ pub struct Irp {
     pub allocate_stack: u8,
     pub current_stack: *mut IoStackLocation,
     pub original_irp: *mut Irp,
-    /// wdm.h `_IRP.UserBuffer`: caller buffer for buffered / direct I/O.
+    /// wdm.h `IRP.UserBuffer`: caller buffer for buffered / direct I/O.
     pub user_buffer: *mut (),
     /// I/O completion port the IRP is bound to (0 = no port). Port ids are
     /// the ids returned by `iocp::create_io_completion_port`, so 0 is never
@@ -2503,106 +2503,106 @@ pub struct FastIoDispatch {
     /// FastIoCheckIfPossible - verify fast I/O can be used.
     pub fast_io_check_if_possible: Option<
         unsafe extern "C" fn(
-            _device: *mut DeviceObject,
-            _file: *mut FileObject,
-            _byte_offset: u64,
-            _length: u32,
-            _lock: bool,
+            device: *mut DeviceObject,
+            file: *mut FileObject,
+            byte_offset: u64,
+            length: u32,
+            lock: bool,
             _check_for_read: bool,
-            _wait: bool,
+            wait: bool,
             _alert: bool,
         ) -> bool,
     >,
     /// FastIoRead - read without creating an IRP.
     pub fast_io_read: Option<
         unsafe extern "C" fn(
-            _device: *mut DeviceObject,
-            _file: *mut FileObject,
-            _buffer: *mut u8,
-            _length: u32,
-            _wait: bool,
+            device: *mut DeviceObject,
+            file: *mut FileObject,
+            buffer: *mut u8,
+            length: u32,
+            wait: bool,
         ) -> bool,
     >,
     /// FastIoWrite - write without creating an IRP.
     pub fast_io_write: Option<
         unsafe extern "C" fn(
-            _device: *mut DeviceObject,
-            _file: *mut FileObject,
-            _buffer: *const u8,
-            _length: u32,
-            _wait: bool,
+            device: *mut DeviceObject,
+            file: *mut FileObject,
+            buffer: *const u8,
+            length: u32,
+            wait: bool,
         ) -> bool,
     >,
     /// FastIoQueryBasicInfo - query basic file information.
     pub fast_io_query_basic_info: Option<
         unsafe extern "C" fn(
-            _device: *mut DeviceObject,
-            _file: *mut FileObject,
-            _wait: bool,
+            device: *mut DeviceObject,
+            file: *mut FileObject,
+            wait: bool,
         ) -> bool,
     >,
     /// FastIoQueryStandardInfo - query standard file information.
     pub fast_io_query_standard_info: Option<
         unsafe extern "C" fn(
-            _device: *mut DeviceObject,
-            _file: *mut FileObject,
-            _wait: bool,
+            device: *mut DeviceObject,
+            file: *mut FileObject,
+            wait: bool,
         ) -> bool,
     >,
     /// FastIoLock - lock a region of a file.
     pub fast_io_lock: Option<
         unsafe extern "C" fn(
-            _device: *mut DeviceObject,
-            _file: *mut FileObject,
-            _byte_offset: u64,
-            _length: u64,
-            _wait: bool,
+            device: *mut DeviceObject,
+            file: *mut FileObject,
+            byte_offset: u64,
+            length: u64,
+            wait: bool,
             _exclusive: bool,
         ) -> bool,
     >,
     /// FastIoUnlockSingle - unlock a single region.
     pub fast_io_unlock_single: Option<
         unsafe extern "C" fn(
-            _device: *mut DeviceObject,
-            _file: *mut FileObject,
-            _byte_offset: u64,
-            _length: u64,
+            device: *mut DeviceObject,
+            file: *mut FileObject,
+            byte_offset: u64,
+            length: u64,
         ) -> bool,
     >,
     /// FastIoUnlockAll - unlock all regions.
     pub fast_io_unlock_all:
-        Option<unsafe extern "C" fn(_device: *mut DeviceObject, _file: *mut FileObject) -> bool>,
+        Option<unsafe extern "C" fn(device: *mut DeviceObject, file: *mut FileObject) -> bool>,
     /// FastIoUnlockAllByKey - unlock by key.
     pub fast_io_unlock_all_by_key: Option<
-        unsafe extern "C" fn(_device: *mut DeviceObject, _file: *mut FileObject, _key: u64) -> bool,
+        unsafe extern "C" fn(device: *mut DeviceObject, file: *mut FileObject, key: u64) -> bool,
     >,
     /// FastIoDeviceControl - device I/O control.
     pub fast_io_device_control: Option<
         unsafe extern "C" fn(
-            _device: *mut DeviceObject,
-            _file: *mut FileObject,
-            _wait: bool,
+            device: *mut DeviceObject,
+            file: *mut FileObject,
+            wait: bool,
             _input: bool,
         ) -> bool,
     >,
     /// FastIoAcquireForModWrite - acquire for modified write.
     pub fast_io_acquire_for_mod_write: Option<
         unsafe extern "C" fn(
-            _device: *mut DeviceObject,
-            _file: *mut FileObject,
-            _byte_offset: u64,
-            _length: u64,
+            device: *mut DeviceObject,
+            file: *mut FileObject,
+            byte_offset: u64,
+            length: u64,
         ) -> bool,
     >,
     /// FastIoReleaseForModWrite - release from modified write.
     pub fast_io_release_for_mod_write:
-        Option<unsafe extern "C" fn(_device: *mut DeviceObject, _file: *mut FileObject) -> bool>,
+        Option<unsafe extern "C" fn(device: *mut DeviceObject, file: *mut FileObject) -> bool>,
     /// FastIoAcquireForCcFlush - acquire for cache flush.
     pub fast_io_acquire_for_cc_flush:
-        Option<unsafe extern "C" fn(_device: *mut DeviceObject, _file: *mut FileObject) -> bool>,
+        Option<unsafe extern "C" fn(device: *mut DeviceObject, file: *mut FileObject) -> bool>,
     /// FastIoReleaseForCcFlush - release from cache flush.
     pub fast_io_release_for_cc_flush:
-        Option<unsafe extern "C" fn(_device: *mut DeviceObject, _file: *mut FileObject) -> bool>,
+        Option<unsafe extern "C" fn(device: *mut DeviceObject, file: *mut FileObject) -> bool>,
 }
 
 impl FastIoDispatch {

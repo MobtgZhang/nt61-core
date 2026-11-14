@@ -255,7 +255,7 @@ pub fn build_device_io_control_irp(
         }
 
         // METHOD_BUFFERED / METHOD_OUT_DIRECT place the caller's output
-        // buffer in _IRP.UserBuffer; the input buffer travels in
+        // buffer in IRP.UserBuffer; the input buffer travels in
         // Parameters.DeviceIoControl.Type3InputBuffer.
         (*irp).user_buffer = output_buffer as *mut ();
     }

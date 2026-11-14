@@ -48,7 +48,7 @@ static SYSTEM_PTE_LOCK: Spinlock<()> = Spinlock::new(());
 /// cover. The PTEs are installed as 4-KiB pages mapping consecutive
 /// physical pages (the caller is responsible for the contents).
 #[cfg(target_arch = "x86_64")]
-pub fn reserve_system_ptes(count: u64) -> Option<u64> {
+    pub fn reserve_system_ptes(count: u64) -> Option<u64> {
     if count == 0 {
         return None;
     }

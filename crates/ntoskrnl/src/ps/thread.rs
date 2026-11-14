@@ -181,7 +181,7 @@ pub struct Kthread {
     // Windows 7 x64 documented KTHREAD size is 0x360 bytes. The fields
     // above cover offsets up to 0x26C (decay tracking). The remaining
     // bytes between 0x26C and the compiled struct end hold a mixture of
-    // undocumented fields (NT!_KTHREAD.First/Last/Bound/etc.) which
+    // undocumented fields (NT!KTHREAD.First/Last/Bound/etc.) which
     // are not required for our current boot path.
     //
     // We size `_pad_to_end` so the *total* struct compiles to 0x380
@@ -713,7 +713,7 @@ pub struct ApcState {
     /// Saved APC state disable flag
     pub saved_apc_state_disable: u8,
     /// Padding to keep KTHREAD 8-byte aligned at this offset
-    _pad: [u8; 4],
+    pad: [u8; 4],
 }
 
 // Compile-time layout assertions (Windows 7 x64 compatibility).
@@ -752,7 +752,7 @@ impl ApcState {
             user_apc_in_progress: 0,
             apc_queue_flag: 0,
             saved_apc_state_disable: 0,
-            _pad: [0; 4],
+            pad: [0; 4],
         };
         // Initialise both list heads to point at themselves so
         // `IsListEmpty` returns true.
@@ -1270,7 +1270,7 @@ pub struct ThreadContext {
     /// Was the thread in Ring 3 at last save?
     pub was_in_ring3: u8,
     /// Padding for alignment
-    pub _pad: [u8; 7],
+    pub pad: [u8; 7],
 }
 
 // =============================================================================

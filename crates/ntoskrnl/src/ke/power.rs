@@ -461,7 +461,7 @@ fn restore_device_power() {
 /// ACPI shutdown
 fn acpi_shutdown() {
     kprintln!("[KE-POWER] ACPI shutdown");
-    // Real implementation would:, 1. write to PM1a/PM1b control registers, 2. Execute ACPI _PTS(5) and _S5 methods);;
+    // Real implementation would:, 1. write to PM1a/PM1b control registers, 2. Execute ACPI _PTS(5) and S5 methods);;
 }
 
 /// Enter CPU C-state

@@ -742,8 +742,8 @@ pub fn smoke_test() -> bool {
     }
 
     // Test bitmap creation
-    let _bitmap = create_bitmap_info(800, 600, 32);
-    let _ = &_bitmap;
+    let bitmap = create_bitmap_info(800, 600, 32);
+    let _ = &bitmap;
     // kprintln!("      [OK] CreateBitmapInfo");
 
     // Test surface allocation

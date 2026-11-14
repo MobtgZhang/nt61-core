@@ -696,13 +696,13 @@ fn get_tick_count() -> u64 {
 /// Print pager status.
 pub fn print_status() {
     // Reserved for future use: pager statistics
-    let _stats = get_stats();
-    let _ = &_stats;
-    let _ = &_stats;
+    let stats = get_stats();
+    let _ = &stats;
+    let _ = &stats;
     // Reserved for future use: memory pressure detection
-    let _pressure = detect_memory_pressure();
-    let _ = &_pressure;
-    let _ = &_pressure;
+    let pressure = detect_memory_pressure();
+    let _ = &pressure;
+    let _ = &pressure;
 
     // [DISABLED] // // kprintln!("[PAGER] Status:");
     // [DISABLED] // // kprintln!("  Memory Pressure: {:?}", pressure);
@@ -712,8 +712,8 @@ pub fn print_status() {
     // [DISABLED] // // kprintln!("  Pages Paged In: {}", stats.pages_paged_in);
 
     // Reserved for future use: working set information
-    let _ws = get_working_set_info();
-    let _ = &_ws;
-    let _ = &_ws;
+    let ws = get_working_set_info();
+    let _ = &ws;
+    let _ = &ws;
     // [DISABLED] // // kprintln!("  Working Set: {} pages", ws.current_size);
 }

@@ -13,7 +13,7 @@
 //!      * PID 1152 - LSASS
 //! 2. The well-known EPROCESS / KTHREAD / ETHREAD layouts are
 //!    well-formed (their sizes are the same as the published
-//!    `nt!_EPROCESS` / `nt!_KTHREAD` / `nt!_ETHREAD` types).
+//!    `nt!EPROCESS` / `nt!KTHREAD` / `nt!ETHREAD` types).
 //! 3. The dispatcher header has the right type tag for each
 //!    object (process = 3, thread = 6) — the kernel's wait
 //!    machinery uses the type to identify the object.
@@ -94,7 +94,7 @@ fn step1_pid_constants() -> bool {
 
 /// Step 2: well-known layout sizes.
 ///
-/// Windows 7 _EPROCESS is around 0x4D0 bytes; the bootstrap uses
+/// Windows 7 EPROCESS is around 0x4D0 bytes; the bootstrap uses
 /// the same shape but with a smaller `VadTree`. The size must
 /// stay under a single 4 KiB page so the `mm::frame::allocate_pages`
 /// back-end in `create_user_process` is sufficient.

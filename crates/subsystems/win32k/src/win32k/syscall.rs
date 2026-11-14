@@ -734,7 +734,7 @@ pub extern "C" fn nt_gdi_create_bitmap(frame: &SyscallFrame) -> u64 {
     let bits_per_pixel = unsafe { get_arg3(frame) } as u16;
     let _ = &bits_per_pixel;
 
-    // kprintln!("[win32k] NT_GDI_CREATE_BITMAP: {}x{}x{}, {}bpp", width, height, _planes, bits_per_pixel);
+    // kprintln!("[win32k] NT_GDI_CREATE_BITMAP: {}x{}x{}, {}bpp", width, height, planes, bits_per_pixel);
 
     // Call the GDI objects module to create a bitmap
     crate::libs::win32k::objects::gdi_create_bitmap(width, height, bits_per_pixel)
@@ -2240,7 +2240,7 @@ pub extern "C" fn nt_user_call_next_hook_ex(frame: &SyscallFrame) -> u64 {
 
     // kprintln!(
     //         "[win32k] NT_USER_CALL_NEXT_HOOK_EX: hhk={:#x}, code={}, wparam={:#x}, lparam={:#x}",
-    //         _hhk, code, wparam, lparam
+    //         hhk, code, wparam, lparam
     //     );
 
     // Hook chain: return 0 (no hooks registered).
@@ -2973,7 +2973,7 @@ pub extern "C" fn nt_user_delete_menu(frame: &SyscallFrame) -> u64 {
     let _ = &u_flags;
 
     // kprintln!("[win32k] NT_USER_DELETE_MENU: hmenu={:#x}, pos={}, flags={:#x}",
-    //               _h_menu, _u_position, _u_flags);
+    //               h_menu, u_position, u_flags);
 
     crate::libs::win32k::user_state::delete_menu_item(h_menu, u_position as u32, u_flags as u32)
         as u64
@@ -4052,7 +4052,7 @@ pub extern "C" fn nt_user_message_box(frame: &SyscallFrame) -> u64 {
 
     // kprintln!(
     //         "[win32k] NtUserMessageBox: hwnd={:#x}, type={:#x}",
-    //         _hwnd, u_type
+    //         hwnd, u_type
     //     );
 
     // Simplified implementation: Return IDOK for MB_OK type
@@ -4071,7 +4071,7 @@ pub extern "C" fn nt_user_get_dlg_item(frame: &SyscallFrame) -> u64 {
     let n_id = unsafe { get_arg1(frame) };
     let _ = &n_id;
 
-    // kprintln!("[win32k] NtUserGetDlgItem: hwnd={:#x}, id={}", _hwnd, _n_id);
+    // kprintln!("[win32k] NtUserGetDlgItem: hwnd={:#x}, id={}", hwnd, n_id);
 
     find_dialog_item(hwnd, n_id as u32).unwrap_or(0)
 }
@@ -4202,7 +4202,7 @@ pub extern "C" fn nt_user_append_menu(frame: &SyscallFrame) -> u64 {
 
     // kprintln!(
     //         "[win32k] NtUserAppendMenu: hmenu={:#x}, flags={:#x}, id={}",
-    //         _h_menu, _u_flags, _u_id_new_item
+    //         h_menu, u_flags, u_id_new_item
     //     );
 
     let mut text = alloc::vec![0u16; 256];
@@ -4240,7 +4240,7 @@ pub extern "C" fn nt_user_track_popup_menu(frame: &SyscallFrame) -> u64 {
 
     // kprintln!(
     //         "[win32k] NtUserTrackPopupMenu: hmenu={:#x}, x={}, y={}",
-    //         _h_menu, _x, _y
+    //         h_menu, x, y
     //     );
 
     // TrackPopupMenu: return 0 (no item selected).
@@ -4315,7 +4315,7 @@ pub extern "C" fn nt_user_set_win_event_hook(frame: &SyscallFrame) -> u64 {
 
     // kprintln!(
     //         "[win32k] NT_USER_SET_WIN_EVENT_HOOK: event={}-{}, process={}, thread={}",
-    //         _event_min, _event_max, _id_process, _id_thread
+    //         event_min, event_max, id_process, id_thread
     //     );
 
     let handle = 0x0013_0001u64;

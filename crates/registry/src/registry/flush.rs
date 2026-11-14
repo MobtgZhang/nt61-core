@@ -210,17 +210,17 @@ impl FlushManager {
         }
     }
 
-    fn perform_flush(&self, _hive_id: usize, _flags: FlushFlags) -> bool {
-        if !_flags.persistent {
+    fn perform_flush(&self, hive_id: usize, flags: FlushFlags) -> bool {
+        if !flags.persistent {
             return true;
         }
 
-        let bytes = match super::cm::export_hive_by_id(_hive_id) {
+        let bytes = match super::cm::export_hive_by_id(hive_id) {
             Some(bytes) => bytes,
             None => return false,
         };
 
-        let path = match _hive_id {
+        let path = match hive_id {
             0 => "C:\\Windows\\System32\\config\\SYSTEM",
             1 => "C:\\Windows\\System32\\config\\SOFTWARE",
             2 => "C:\\Windows\\System32\\config\\SECURITY",

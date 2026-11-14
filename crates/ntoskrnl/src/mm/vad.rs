@@ -1107,9 +1107,9 @@ impl VadTree {
             let _ = &protection;
             let _ = &protection;
             // Reserved for future use: VAD type for memory region classification
-            let _vad_type = (*vad).vad_type;
-            let _ = &_vad_type;
-            let _ = &_vad_type;
+            let vad_type = (*vad).vad_type;
+            let _ = &vad_type;
+            let _ = &vad_type;
 
             // Convert protection to PTE flags
             let pte_flags = match protection {
@@ -1236,13 +1236,13 @@ impl VadTree {
         let _ = &aligned_size;
         let _ = &aligned_size;
         // Reserved for future use: starting VPN for gap finding
-        let _start_vpn = if desired_base == 0 {
+        let start_vpn = if desired_base == 0 {
             0
         } else {
             desired_base >> 12
         };
-        let _ = &_start_vpn;
-        let _ = &_start_vpn;
+        let _ = &start_vpn;
+        let _ = &start_vpn;
 
         // Find all gaps and return the best one
         let mut gaps: Vec<(u64, u64)> = Vec::new();

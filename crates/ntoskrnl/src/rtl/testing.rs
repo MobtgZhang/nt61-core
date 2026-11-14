@@ -24,7 +24,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// Test result statistics for a subsystem
 pub struct TestStats {
     /// Subsystem name for output formatting
-    _name: &'static str,
+    name: &'static str,
     /// Total number of tests run
     total: u32,
     /// Number of tests passed
@@ -43,7 +43,7 @@ impl TestStats {
     /// create a new TestStats for a subsystem
     pub fn new(name: &'static str) -> Self {
         Self {
-            _name: name,
+            name: name,
             total: 0,
             passed: 0,
             failed: 0,
@@ -59,8 +59,8 @@ impl TestStats {
             crate::boot_println!("========================================");
             crate::boot_println!(
                 "[{} SMOKE] Running {} smoke tests...",
-                self._name,
-                self._name
+                self.name,
+                self.name
             );
             crate::boot_println!("========================================");
         }
@@ -80,10 +80,10 @@ impl TestStats {
 
         if result {
             self.passed += 1;
-            crate::boot_println!("  [{} SMOKE]   PASS: {}", self._name, name);
+            crate::boot_println!("  [{} SMOKE]   PASS: {}", self.name, name);
         } else {
             self.failed += 1;
-            crate::boot_println!("  [{} SMOKE]   FAIL: {}", self._name, name);
+            crate::boot_println!("  [{} SMOKE]   FAIL: {}", self.name, name);
         }
 
         result
@@ -97,7 +97,7 @@ impl TestStats {
     pub fn test_skipped(&mut self, name: &str, reason: &str) {
         self.start();
         self.skipped += 1;
-        crate::boot_println!("  [{} SMOKE]   SKIP: {} ({})", self._name, name, reason);
+        crate::boot_println!("  [{} SMOKE]   SKIP: {} ({})", self.name, name, reason);
     }
 
     /// Run a test with detailed failure information
@@ -108,10 +108,10 @@ impl TestStats {
 
         if result {
             self.passed += 1;
-            crate::boot_println!("  [{} SMOKE]   PASS: {} - {}", self._name, name, details);
+            crate::boot_println!("  [{} SMOKE]   PASS: {} - {}", self.name, name, details);
         } else {
             self.failed += 1;
-            crate::boot_println!("  [{} SMOKE]   FAIL: {} - {}", self._name, name, details);
+            crate::boot_println!("  [{} SMOKE]   FAIL: {} - {}", self.name, name, details);
         }
 
         result
@@ -124,17 +124,17 @@ impl TestStats {
         crate::boot_println!("========================================");
         crate::boot_println!(
             "[{} SMOKE] Results: {}/{} tests passed",
-            self._name,
+            self.name,
             self.passed,
             self.total
         );
 
         if self.failed == 0 {
-            crate::boot_println!("[{} SMOKE] STATUS: ALL TESTS PASSED", self._name);
+            crate::boot_println!("[{} SMOKE] STATUS: ALL TESTS PASSED", self.name);
         } else {
             crate::boot_println!(
                 "[{} SMOKE] STATUS: {}/{} TESTS FAILED",
-                self._name,
+                self.name,
                 self.failed,
                 self.total
             );
@@ -142,7 +142,7 @@ impl TestStats {
         if self.skipped > 0 {
             crate::boot_println!(
                 "[{} SMOKE] {} test(s) SKIPPED (not verified)",
-                self._name,
+                self.name,
                 self.skipped
             );
         }

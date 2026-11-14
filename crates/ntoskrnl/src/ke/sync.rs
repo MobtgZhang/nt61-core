@@ -157,8 +157,8 @@ impl<T: ?Sized> Spinlock<T> {
             .ok()
             .map(|_| SpinlockGuard {
                 lock: self,
-                _irql_guard: Some(irql_guard),
-                _interrupts: Some(interrupts),
+                irql_guard: Some(irql_guard),
+                interrupts: Some(interrupts),
             })
     }
 
@@ -205,8 +205,8 @@ impl<T: ?Sized> Spinlock<T> {
                 LAST_ACQUIRE_LINE.store(loc.line(), Ordering::Relaxed);
                 return SpinlockGuard {
                     lock: self,
-                    _irql_guard: Some(irql_guard),
-                    _interrupts: Some(interrupts),
+                    irql_guard: Some(irql_guard),
+                    interrupts: Some(interrupts),
                 };
             }
 
@@ -266,8 +266,8 @@ impl<T: ?Sized> Spinlock<T> {
 /// and interrupts are re-enabled.
 pub struct SpinlockGuard<'a, T: ?Sized + 'a> {
     lock: &'a Spinlock<T>,
-    _irql_guard: Option<IrqlRestore>, // Saved IRQL state, re-enabled on drop
-    _interrupts: Option<InterruptGuard>, // Local IF state, restored last
+    irql_guard: Option<IrqlRestore>, // Saved IRQL state, re-enabled on drop
+    interrupts: Option<InterruptGuard>, // Local IF state, restored last
 }
 
 impl<'a, T: ?Sized> core::ops::Deref for SpinlockGuard<'a, T> {

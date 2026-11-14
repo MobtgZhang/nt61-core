@@ -1930,17 +1930,17 @@ pub unsafe fn set_priority(thread: *mut Ethread, priority: i8) {
 }
 
 /// Initialize thread quantum based on process priority class.
-pub fn init_thread_quantum(_thread: *mut Ethread, quantum: Quantum) {
+pub fn init_thread_quantum(thread: *mut Ethread, quantum: Quantum) {
     let (initial, remaining) = match quantum {
         Quantum::Short => (QUANTUM_SHORT, QUANTUM_SHORT),
         Quantum::Standard => (QUANTUM_DEFAULT, QUANTUM_DEFAULT),
         Quantum::Long => (QUANTUM_FOREGROUND, QUANTUM_FOREGROUND),
     };
 
-    if !_thread.is_null() {
+    if !thread.is_null() {
         unsafe {
-            (*_thread).kthread.quantum_initial = initial;
-            (*_thread).kthread.quantum_remaining = remaining;
+            (*thread).kthread.quantum_initial = initial;
+            (*thread).kthread.quantum_remaining = remaining;
         }
     }
 }
@@ -2935,10 +2935,10 @@ pub fn init_scheduler_extensions(prcb: &mut Prcb, _cpu_id: u32) {
     // Initialize schedule_dpc (placeholder)
     prcb.schedule_dpc = 0;
 
-    // _cpu_id is intentionally unused - reserved for future logging
+    // cpu_id is intentionally unused - reserved for future logging
     // // kprintln!(
     // //         "[SCHED] Scheduler extensions initialized for CPU {}: dispatcher_lock, timer_table, idle_ready_threads",
-    // //         _cpu_id
+    // //         cpu_id
     // //     );
 }
 

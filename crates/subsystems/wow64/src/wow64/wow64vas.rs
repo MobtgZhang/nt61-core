@@ -189,7 +189,7 @@ pub fn allocate(
     align: u32,
     preferred_base: u32,
     allocation_type: u32,
-    _protect: u32,
+    protect: u32,
 ) -> Option<(u32, u32)> {
     let size = if size == 0 { WOW64_MINIMUM_ALLOC } else { size };
 
@@ -243,7 +243,7 @@ pub fn allocate(
             base,
             size: aligned_size,
             allocation_type,
-            protect: _protect,
+            protect: protect,
             in_use: true,
         });
         vas.allocation_count += 1;

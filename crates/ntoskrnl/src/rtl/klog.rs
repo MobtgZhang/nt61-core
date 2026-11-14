@@ -536,6 +536,10 @@ macro_rules! boot_print {
                 let _ = writer.write_fmt(core::format_args!($($arg)*));
             }
         }
+        #[cfg(test)]
+        {
+            let _ = core::format_args!($($arg)*);
+        }
     }};
 }
 
@@ -549,6 +553,10 @@ macro_rules! boot_print_always {
             let mut writer = $crate::rtl::klog::SerialWriter;
             let _ = writer.write_fmt(core::format_args!($($arg)*));
         }
+        }
+        #[cfg(test)]
+        {
+            let _ = core::format_args!($($arg)*);
         }
     }};
 }

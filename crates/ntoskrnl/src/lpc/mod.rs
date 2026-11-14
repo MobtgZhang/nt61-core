@@ -409,7 +409,7 @@ fn find_port_by_name_in(reg: &LpcRegistry, name: &[u16]) -> Option<u32> {
 /// not been called yet. Holding the returned guard prevents any
 /// other CPU from racing with us.
 struct RegGuard {
-    _reg_guard: crate::ke::sync::SpinlockGuard<'static, *mut LpcRegistry>,
+    reg_guard: crate::ke::sync::SpinlockGuard<'static, *mut LpcRegistry>,
     reg: &'static mut LpcRegistry,
 }
 
@@ -429,7 +429,7 @@ fn lock_registry() -> Option<RegGuard> {
     // (the pool owns the memory for the rest of the kernel's lifetime).
     let reg = unsafe { &mut *ptr };
     Some(RegGuard {
-        _reg_guard: guard,
+        reg_guard: guard,
         reg,
     })
 }

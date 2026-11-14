@@ -503,12 +503,12 @@ pub unsafe fn eng_fill_rectangle(
     }
 
     // Width and height computed for potential future use
-    let _width = right - left;
-    let _ = &_width;
-    let _ = &_width;
-    let _height = bottom - top;
-    let _ = &_height;
-    let _ = &_height;
+    let width = right - left;
+    let _ = &width;
+    let _ = &width;
+    let height = bottom - top;
+    let _ = &height;
+    let _ = &height;
 
     // For 32bpp surfaces
     if surf.format == PIXEL_FORMAT_32BPP || surf.format == PIXEL_FORMAT_32BPP_ARGB {

@@ -137,9 +137,9 @@ pub fn init() {
 /// Print current log level settings
 pub fn print_settings() {
     let _level = get_log_level();
-    // _level is intentionally unused - reserved for future logging
+    // level is intentionally unused - reserved for future logging
     // // kprintln!("=== Memory Manager Log Settings ===");
-    // // kprintln!("  Current level: {} ({})", _level.name(), _level as u8);
+    // // kprintln!("  Current level: {} ({})", level.name(), level as u8);
     // // kprintln!("  Level values: Fatal=0, Error=1, Warn=2, Info=3, Debug=4, Trace=5");
     // // kprintln!("================================");
 }

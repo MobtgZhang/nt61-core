@@ -1,6 +1,6 @@
 //! Page Table Entry (PTE) types and operations
 //
-//! NT-style `_MMPTE` union. The same 8-byte slot is interpreted in
+//! NT-style `MMPTE` union. The same 8-byte slot is interpreted in
 //! different ways depending on which bits are set:
 //
 //! 1. **Hardware** (`P=1`) — A real mapping. The hardware walks this

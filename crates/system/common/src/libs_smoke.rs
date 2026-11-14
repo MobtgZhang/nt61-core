@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-fn case(_label: &'static str, run: fn() -> bool) -> bool {
+fn case(_labell: &'static str, run: fn() -> bool) -> bool {
     let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
     let _ = &n;
     let ok = run();

@@ -679,8 +679,8 @@ pub fn query_working_set_ex(pml4_phys: u64) -> Vec<WorkingSetEntryEx> {
 
 /// Trim the process working set.
 pub fn mm_trim_process_working_set(_process_handle: u64, _min_size: i64) -> i32 {
-    // _process_handle and _min_size are intentionally unused - reserved for future logging
-    // [DISABLED] // // kprintln!("[WS] mm_trim_process_working_set: handle={:#x}, min={}", _process_handle, _min_size);
+    // _process_handle and min_size are intentionally unused - reserved for future logging
+    // [DISABLED] // // kprintln!("[WS] mm_trim_process_working_set: handle={:#x}, min={}", _process_handle, min_size);
 
     let pml4 = crate::mm::vas::current_root();
     if pml4 == 0 {
@@ -708,15 +708,15 @@ pub fn mm_trim_process_working_set(_process_handle: u64, _min_size: i64) -> i32 
 
 /// Set the minimum working set size for a process.
 pub fn set_process_working_set_minimum(_process_handle: u64, _min_size: u64) -> i32 {
-    // _process_handle and _min_size are intentionally unused - reserved for future logging
-    // [DISABLED] // // kprintln!("[WS] set_process_working_set_minimum: handle={:#x}, min={}", _process_handle, _min_size);
+    // _process_handle and min_size are intentionally unused - reserved for future logging
+    // [DISABLED] // // kprintln!("[WS] set_process_working_set_minimum: handle={:#x}, min={}", _process_handle, min_size);
     0
 }
 
 /// Set the maximum working set size for a process.
 pub fn set_process_working_set_maximum(_process_handle: u64, _max_size: u64) -> i32 {
-    // _process_handle and _max_size are intentionally unused - reserved for future logging
-    // [DISABLED] // // kprintln!("[WS] set_process_working_set_maximum: handle={:#x}, max={}", _process_handle, _max_size);
+    // _process_handle and max_size are intentionally unused - reserved for future logging
+    // [DISABLED] // // kprintln!("[WS] set_process_working_set_maximum: handle={:#x}, max={}", _process_handle, max_size);
     0
 }
 
