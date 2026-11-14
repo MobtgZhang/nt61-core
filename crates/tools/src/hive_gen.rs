@@ -208,6 +208,7 @@ pub fn build_bcd() -> Vec<u8> {
                 let mut ee = node("Elements");
                 // Timeout = 5 seconds (stored as DWORD, but in Elements as binary with Element value)
                 ee.subkeys.push(element_subkey_dword("15000011", 5));
+                ee.subkeys.push(element_subkey_string("23000003", "{9dea862d-5cdd-4e70-acc1-f32b344d4795}"));
                 ee.subkeys
                     .push(element_subkey_string("12000004", "Windows Boot Manager"));
                 ee.subkeys.push(element_subkey_string("12000005", "en-US"));
@@ -427,6 +428,10 @@ pub fn build_system() -> Vec<u8> {
         ctl.values
             .push(Value::dword("WaitToKillServiceTimeout", 5000));
     }
+    {
+        let crash = ensure_path(&mut root, "ControlSet001\\Control\\CrashControl");
+        crash.values.push(Value::dword("AutoReboot", 1));
+    }
     // ControlSet001\Control\Session Manager
     {
         let sm = ensure_path(&mut root, "ControlSet001\\Control\\Session Manager");
@@ -449,7 +454,7 @@ pub fn build_system() -> Vec<u8> {
         ("disk", 0u32),
         ("partmgr", 0),
         ("classpnp", 0),
-        ("storahci", 0),
+        ("msahci", 0),
         ("ntfs", 0),
         ("fastfat", 0),
         ("acpi", 0),
@@ -468,6 +473,17 @@ pub fn build_system() -> Vec<u8> {
             &format!(r"\SystemRoot\System32\drivers\{}.sys", name),
         ));
         svc.values.push(Value::sz("DisplayName", name));
+    }
+
+    if let Some(current) = root.subkeys.iter().find(|key| key.name == "ControlSet001") {
+        let mut good = current.clone();
+        good.name = "ControlSet002".to_string();
+        root.subkeys.push(good);
+    }
+    if let Some(select) = root.subkeys.iter_mut().find(|key| key.name == "Select") {
+        if let Some(value) = select.values.iter_mut().find(|value| value.name == "LastKnownGood") {
+            *value = Value::dword("LastKnownGood", 2);
+        }
     }
 
     HiveBuilder::new(root).with_name("system").finish()

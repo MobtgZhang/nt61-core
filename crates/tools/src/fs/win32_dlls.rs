@@ -526,29 +526,28 @@ pub const ALL_DLLS: &[DllSpec] = &[
 ///   directory and the string tables;
 /// * a `.reloc` section with the base relocations of the stubs.
 ///
-/// The stubs are `xor eax, eax; ret` (with the rest of the 16 bytes
-/// padded) so that calling an unimplemented export returns zero
-/// instead of jumping into random memory. The real implementations
-/// are reached through the import address table once the Ring 3
-/// runtime is wired up.
+/// This legacy x64 entry point is retained for tools inspecting the x64 surface.
+/// These exports remain placeholders; the native desktop links its runtime
+/// separately. An import table does not provide the missing API implementations.
 pub fn build_dll_image(spec: &DllSpec) -> Vec<u8> {
+    build_dll_image_native(spec, MACHINE_AMD64, &[0x31, 0xc0, 0xc3])
+}
+
+fn build_dll_image_native(spec: &DllSpec, machine: u16, return_code: &[u8]) -> Vec<u8> {
     let mut image = PeImageSpec::new(
         spec.image_base,
         super::pe::IMAGE_SUBSYSTEM_WINDOWS_GUI,
         true,
-        MACHINE_AMD64,
+        machine,
     );
     image.module_name = spec.file_name.to_string();
     image.entry_point_rva = TEXT_RVA;
 
     // The `.text` section: one stub per export.
-    let mut text = vec![0u8; spec.exports.len() as usize * STUB_STRIDE as usize];
+    let mut text = vec![0u8; spec.exports.len() * STUB_STRIDE as usize];
     for (index, _) in spec.exports.iter().enumerate() {
         let at = index * STUB_STRIDE as usize;
-        // `xor eax, eax` (31 C0) followed by `ret` (C3).
-        text[at] = 0x31;
-        text[at + 1] = 0xC0;
-        text[at + 2] = 0xC3;
+        text[at..at + return_code.len()].copy_from_slice(return_code);
     }
 
     // The exports. The ordinal is 1-based, matching Windows.
@@ -585,4 +584,45 @@ pub fn build_all_dlls() -> Vec<(&'static str, Vec<u8>)> {
         .iter()
         .map(|spec| (spec.file_name, build_dll_image(spec)))
         .collect()
+}
+
+/// Emit the system DLL for the selected native architecture.
+pub fn build_dll_image_for_arch(spec: &DllSpec, arch: &str) -> crate::error::Result<Vec<u8>> {
+    let (machine, code): (u16, &[u8]) = match arch {
+        "x86_64" | "x64" => (0x8664, &[0x31, 0xc0, 0xc3]), // xor eax,eax; ret
+        "aarch64" | "arm64" => (0xaa64, &[0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6]), // mov w0,#0; ret
+        "riscv64" => (0x5064, &[0x13, 0x05, 0x00, 0x00, 0x67, 0x80, 0x00, 0x00]), // li a0,0; ret
+        "loongarch64" => (0x6264, &[0x04, 0x00, 0x80, 0x02, 0x20, 0x00, 0x00, 0x4c]), // addi.w a0,zero,0; jr ra
+        _ => return Err(crate::error::BuildError::InvalidParam(format!("unsupported DLL architecture: {arch}"))),
+    };
+    Ok(build_dll_image_native(spec, machine, code))
+}
+
+#[cfg(test)]
+mod architecture_tests {
+    use super::*;
+
+    #[test]
+    fn system_dll_headers_and_instructions_match_every_native_architecture() {
+        let cases: &[(&str, u16, &[u8])] = &[
+            ("x86_64", 0x8664, &[0x31, 0xc0, 0xc3]),
+            ("aarch64", 0xaa64, &[0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6]),
+            ("riscv64", 0x5064, &[0x13, 0x05, 0x00, 0x00, 0x67, 0x80, 0x00, 0x00]),
+            ("loongarch64", 0x6264, &[0x04, 0x00, 0x80, 0x02, 0x20, 0x00, 0x00, 0x4c]),
+        ];
+        for &(arch, machine, code) in cases {
+            for spec in ALL_DLLS {
+                let bytes = build_dll_image_for_arch(spec, arch).unwrap();
+                let image = super::super::pe_read::parse(&bytes).expect("valid PE");
+                assert_eq!(image.machine, machine, "{arch}/{}", spec.file_name);
+                assert_eq!(image.exports_by_name.len(), spec.exports.len());
+                let text = image.sections.iter().find(|s| s.name == ".text").unwrap();
+                for index in 0..spec.exports.len() {
+                    let offset = text.pointer_to_raw_data as usize + index * STUB_STRIDE as usize;
+                    assert_eq!(&bytes[offset..offset + code.len()], code, "{arch}/{} export {index}", spec.file_name);
+                }
+            }
+        }
+        assert!(build_dll_image_for_arch(&ALL_DLLS[0], "=riscv64").is_err());
+    }
 }

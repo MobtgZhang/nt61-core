@@ -121,7 +121,7 @@ impl Default for BuildConfig {
 }
 
 /// Create directory structure
-pub fn create_directories(build_dir: &Path, _arch: Arch) -> std::io::Result<EspPaths> {
+pub fn create_directories(build_dir: &Path, arch: Arch) -> std::io::Result<EspPaths> {
     // Directory structure:
     // build/ (passed as build_dir)
     //   esp/         <- EFI partition files
@@ -362,6 +362,7 @@ pub fn generate_pe_files_to(system32_dir: &Path, arch: Arch) -> std::io::Result<
         Arch::LoongArch64 => "loongarch64",
     };
     nt61_tools::fs::build::set_pe_arch(arch_name);
+    nt61_tools::fs::applications::clean_obsolete(system32_dir)?;
     let images = nt61_tools::fs::build::build_system_images();
     let machine = arch.pe_machine_type();
 
@@ -371,7 +372,7 @@ pub fn generate_pe_files_to(system32_dir: &Path, arch: Arch) -> std::io::Result<
         // "cmd.exe", "drivers/foo.sys"), so joining with
         // system32_dir puts drivers inside
         // <system32>/drivers/foo.sys (which is what we want).
-        let dest_path = system32_dir.join(image.name);
+        let dest_path = nt61_tools::fs::applications::destination(system32_dir, image.name);
 
         if let Some(parent) = dest_path.parent() {
             fs::create_dir_all(parent)?;
@@ -402,7 +403,7 @@ pub fn generate_pe_files_to(system32_dir: &Path, arch: Arch) -> std::io::Result<
     Ok(())
 }
 
-pub fn generate_bcd(paths: &EspPaths, _timeout: u32) -> std::io::Result<()> {
+pub fn generate_bcd(paths: &EspPaths, timeout: u32) -> std::io::Result<()> {
     let bcd_path = paths.ms_boot_dir.join("BCD");
     println!("  Generating: {:?}", &bcd_path);
     let bytes = crate::hive_gen::build_bcd();

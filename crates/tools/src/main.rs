@@ -103,6 +103,17 @@ fn run() -> error::Result<()> {
 // CLI definition
 // =====================================================================
 
+fn parse_arch(value: &str) -> std::result::Result<String, String> {
+    match value {
+        "x86_64" | "x64" => Ok("x86_64".into()),
+        "aarch64" | "arm64" => Ok("aarch64".into()),
+        "riscv64" | "loongarch64" => Ok(value.into()),
+        _ => Err(format!(
+            "unsupported architecture '{value}'; expected x86_64, aarch64, riscv64 or loongarch64 (use --arch riscv64 or --arch=riscv64)"
+        )),
+    }
+}
+
 fn build_cli() -> Command {
     Command::new("build-tool")
         .about("NT6.1.7601 Build Tool — create disk images without shell dependencies")
@@ -126,8 +137,8 @@ fn build_cli() -> Command {
             Arg::new("build")
                 .long("build")
                 .value_name("SUB")
-                .value_parser(["system", "esp", "boot", "kernel", "all", "iso"])
-                .help("Build a sub-target: system (root tree), esp (EFI dir), boot, kernel, all (dual-partition disk), or iso (CD-ROM image)"),
+                .value_parser(["system", "esp", "boot", "kernel", "all", "iso", "image"])
+                .help("Build a sub-target: system (root tree), esp (EFI dir), boot, kernel, all (dual-partition disk), iso (CD-ROM image), or image (repackage staged trees)"),
         )
         .arg(
             Arg::new("build-dir")
@@ -137,18 +148,23 @@ fn build_cli() -> Command {
                 .help("Output root for --build (used for kernel/esp intermediates)"),
         )
         .arg(
+            Arg::new("source-dir").long("source-dir").value_name("DIR")
+                .help("Staged esp/ and system/ source for --build image; defaults to --build-dir"),
+        )
+        .arg(
             Arg::new("arch")
                 .long("arch")
                 .value_name("ARCH")
-                .default_value("x64")
-                .help("Architecture for --build esp (x64 | arm64 | arm | riscv64 | loongarch64)"),
+                .value_parser(parse_arch)
+                .default_value("x86_64")
+                .help("Build architecture: x86_64 | aarch64 | riscv64 | loongarch64 (aliases: x64, arm64)"),
         )
         .arg(
             Arg::new("format-flag")
                 .long("format-flag")
                 .value_name("FMT")
                 .default_value("fat32")
-                .help("Image format for --build all (fat32 | ntfs | ext4 | refs | qcow2 | ramfs)"),
+                .help("Image format for --build all (fat32 | ntfs | ext4 | refs | qcow2 | ramfs | img | iso)"),
         )
         .arg(
             Arg::new("size-mb")
@@ -306,6 +322,12 @@ fn run_build(sub: &str, m: &ArgMatches) -> error::Result<()> {
         "esp" => build_esp(&build_dir, &arch, m).map(|_| ()),
         "boot" => build_boot_only(&build_dir, &arch).map(|_| ()),
         "kernel" => build_kernel_only(&build_dir, &arch).map(|_| ()),
+        "image" => {
+            let source = m.get_one::<String>("source-dir").map(PathBuf::from).unwrap_or(build_dir.clone());
+            let p = fs::build::package_staged_image(&source, &build_dir, &fmt, size_mb)?;
+            logger::success(&format!("Image packaged: {}", p.display()));
+            Ok(())
+        }
         "all" => {
             let p = fs::build::full_build(&build_dir, &fmt, size_mb, &arch)?;
             logger::success(&format!("Image built: {}", p.display()));
@@ -820,6 +842,42 @@ fn require_string(m: &ArgMatches, key: &str, hint: &str) -> error::Result<String
 
 fn parse_partition(s: Option<&str>) -> Option<u32> {
     s.and_then(|v| v.parse().ok())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::build_cli;
+
+    #[test]
+    fn build_architectures_and_aliases_are_canonical() {
+        for (input, expected) in [
+            ("x86_64", "x86_64"),
+            ("x64", "x86_64"),
+            ("aarch64", "aarch64"),
+            ("arm64", "aarch64"),
+            ("riscv64", "riscv64"),
+            ("loongarch64", "loongarch64"),
+        ] {
+            for args in [
+                vec!["build-tool".to_owned(), "--arch".into(), input.into()],
+                vec!["build-tool".to_owned(), format!("--arch={input}")],
+            ] {
+                let matches = build_cli().try_get_matches_from(args).unwrap();
+                assert_eq!(matches.get_one::<String>("arch").unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_architectures_fail_before_building() {
+        for input in ["=riscv64", "=loongarch64", "risc64", "", "arm"] {
+            let error = build_cli()
+                .try_get_matches_from(["build-tool", "--build", "all", "--arch", input])
+                .unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert!(error.to_string().contains("unsupported architecture"));
+        }
+    }
 }
 
 /// A `SRC` or `DST` argument. Either a plain host path, or an image path

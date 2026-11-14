@@ -57,6 +57,7 @@ uuid = { version = "1.12", default-features = false }
 tempfile = { version = "3.8", optional = true }
 
 [dev-dependencies]
+nt61-bootfs = { path = "../bootfs" }
 tempfile = "3.8"
 # The metrics schema test parses `docs/desktop/win7-metrics.toml`.
 toml = "0.8"

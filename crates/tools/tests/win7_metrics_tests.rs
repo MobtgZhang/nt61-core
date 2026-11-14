@@ -225,7 +225,7 @@ fn all_opacity_values_are_in_range() {
             // Only keys that actually name an opacity are checked;
             // other floats in these tables are multipliers
             // (e.g. aero.glass_saturation is 1.30 by design).
-            if !key.ends_with("_alpha") {
+            if !key.ends_with("alpha") {
                 continue;
             }
             let alpha = value

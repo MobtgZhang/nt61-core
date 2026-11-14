@@ -8,6 +8,7 @@
 //!
 //! All these operations replace shell commands like `mkfs.fat`, `mcopy`, `mmd`, `cp`, and `mkdir`.
 
+pub mod applications;
 pub mod backend;
 pub mod build;
 pub mod copy;
@@ -44,7 +45,7 @@ pub fn new_guid_v4() -> uuid::Uuid {
         .unwrap_or_else(|_| std::process::id() as u64);
     let mut state = nanos ^ (std::process::id() as u64).wrapping_mul(0x9E3779B97F4A7C15);
     let mut bytes = [0u8; 16];
-    for value in bytes.chunks_exact_mut(8) {
+    for value in bytes.as_chunks_mut::<8>().0 {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;

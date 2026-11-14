@@ -978,7 +978,7 @@ fn read_elf_absolute_relocations(elf_path: &std::path::Path, image_base: u64) ->
         let name_off = read_u32(&buf[off..off + 4]) as usize;
         let sh_type = read_u32(&buf[off + 4..off + 8]);
         let sh_flags = read_u64(&buf[off + 8..off + 16]);
-        let _sh_addr = read_u64(&buf[off + 16..off + 24]);
+        let sh_addr = read_u64(&buf[off + 16..off + 24]);
         let sh_offset = read_u64(&buf[off + 24..off + 32]);
         let sh_size = read_u64(&buf[off + 32..off + 40]);
         Some((
@@ -986,7 +986,7 @@ fn read_elf_absolute_relocations(elf_path: &std::path::Path, image_base: u64) ->
             name_off,
             sh_type,
             sh_flags,
-            _sh_addr,
+            sh_addr,
             sh_offset,
             sh_size,
         ))
@@ -2179,7 +2179,7 @@ pub fn build_boot(target: &str) -> Result<PathBuf> {
             // patch runs — `patch_pe_subsystem` walks the section
             // table to decide where to drop the new `.reloc` section,
             // and reading pre-rebased VAs there produces garbage.
-            if let Ok((_entry, _boc, image_base)) = read_elf_image_layout(&bare) {
+            if let Ok((entry, _boc, image_base)) = read_elf_image_layout(&bare) {
                 let boot_relocations =
                     read_elf_absolute_relocations(&bare, image_base).unwrap_or_default();
                 let image_extent_rva = read_elf_image_extent(&bare)
@@ -2226,7 +2226,7 @@ pub fn build_boot(target: &str) -> Result<PathBuf> {
                 // nor how to relocate sections. Recover the values
                 // from the ELF we just wrapped.
                 if let Err(e) =
-                    patch_pe_entry_point_and_image_base(&canonical, _entry, _boc, image_base)
+                    patch_pe_entry_point_and_image_base(&canonical, entry, _boc, image_base)
                 {
                     log::warn(&format!(
                         "PE entry-point/ImageBase patch failed for boot \\
@@ -2494,29 +2494,16 @@ pub fn build_winload(target: &str) -> Result<PathBuf> {
 ///   * `fat32` — both ESP and System are FAT32 (legacy layout)
 ///   * `ntfs`  — ESP is FAT32, System is NTFS (default Windows 7 layout)
 ///   * `ext4`  — ESP is FAT32, System is EXT4 (Linux-native)
-pub fn full_build(build_dir: &Path, format: &str, _size_mb: u32, arch: &str) -> Result<PathBuf> {
+pub fn full_build(build_dir: &Path, format: &str, size_mb: u32, arch: &str) -> Result<PathBuf> {
     log::banner(
         "NT6.1.7601 Full Build",
         &format!("Format: {} / Arch: {}", format, arch),
     );
 
-    // QCOW2 is a container format, not a filesystem: build a FAT32
-    // dual-partition image first, then encode it as QCOW2 below.
-    let inner_format = if format.eq_ignore_ascii_case("qcow2") {
-        "fat32"
-    } else {
-        format
-    };
-    let fs_choice = super::image::DualPartitionFs::parse(inner_format).ok_or_else(|| {
-        BuildError::InvalidParam(format!(
-            "unknown --format-flag value: {} (expected fat32 | ntfs | ext4 | refs | qcow2 | ramfs)",
-            format
-        ))
-    })?;
+    if format.eq_ignore_ascii_case("iso") { return build_iso(build_dir, format, size_mb, arch); }
 
     let k_target = kernel_target_for(arch);
     let u_target = uefi_target_for(arch);
-    set_pe_arch(arch);
     set_pe_arch(arch);
 
     // Create build directories
@@ -2600,14 +2587,6 @@ pub fn full_build(build_dir: &Path, format: &str, _size_mb: u32, arch: &str) -> 
         } else {
             None
         })
-        // Install autoexec.bat at C:\tests\autoexec.bat so the CMD shell
-        // can run it directly via `tests\autoexec.bat` or `call tests\autoexec.bat`.
-        .add_autoexec_bat(
-            get_workspace_root()
-                .join("resources")
-                .join("bat")
-                .join("autoexec.bat"),
-        )
         .build()?;
 
     // Step 6: Create dual-partition disk image for NT6.1.7601
@@ -2623,29 +2602,7 @@ pub fn full_build(build_dir: &Path, format: &str, _size_mb: u32, arch: &str) -> 
     // The System partition filesystem is selected by `format` / `fs_choice`.
     // See `DualPartitionFs` for the available options.
     log::section("Creating Dual-Partition Disk Image");
-    let image_path = dirs.images.join("disk.img");
-
-    // ESP: 64MB, System: 512MB
-    super::image::create_dual_partition_image_with_fs(
-        &image_path,
-        64,           // ESP partition size in MB
-        512,          // System partition size in MB
-        &dirs.esp,    // ESP source directory (EFI/* files)
-        &dirs.system, // System source directory (Windows/* files)
-        fs_choice,
-    )?;
-
-    let image_path = if format.eq_ignore_ascii_case("qcow2") {
-        let raw_path = image_path.clone();
-        let raw = std::fs::read(&raw_path).map_err(BuildError::Io)?;
-        let qcow2 = super::image::encode_raw_as_qcow2(&raw);
-        let qcow2_path = dirs.images.join("disk.qcow2");
-        std::fs::write(&qcow2_path, qcow2).map_err(BuildError::Io)?;
-        std::fs::remove_file(&raw_path).map_err(BuildError::Io)?;
-        qcow2_path
-    } else {
-        image_path
-    };
+    let image_path = package_staged_image(build_dir, build_dir, format, size_mb)?;
 
     log::summary(6, 0);
     log::success(&format!("Build complete! Image: {}", image_path.display()));
@@ -2653,42 +2610,52 @@ pub fn full_build(build_dir: &Path, format: &str, _size_mb: u32, arch: &str) -> 
     Ok(image_path)
 }
 
+// Keep host packaging within winload's complete-volume snapshot budget.
+fn validate_boot_volume_size(size_mb: u32) -> Result<()> {
+    if size_mb > 2048 {
+        return Err(BuildError::InvalidParam("boot system volume must not exceed 2048 MiB (RAM snapshot limit)".into()));
+    }
+    Ok(())
+}
+
+/// Repackage previously compiled trees, useful for testing filesystems without
+/// rebuilding the kernel for every container. source_dir must be for one arch.
+pub fn package_staged_image(source_dir: &Path, output_dir: &Path, format: &str, size_mb: u32) -> Result<PathBuf> {
+    validate_boot_volume_size(size_mb)?;
+    let source = get_build_dir(source_dir);
+    let output = get_build_dir(output_dir);
+    for path in [&source.esp, &source.system] {
+        if !path.is_dir() { return Err(BuildError::MissingFile(path.display().to_string())); }
+    }
+    super::applications::clean_obsolete(&source.system.join("Windows/System32"))?;
+    std::fs::create_dir_all(&output.images)?;
+    if format.eq_ignore_ascii_case("iso") {
+        let path = output.images.join("nt61.iso");
+        std::fs::write(&path, package_boot_iso(&source.esp, &source.system, size_mb)?)?;
+        return Ok(path);
+    }
+    let inner = if format.eq_ignore_ascii_case("qcow2") { "ntfs" } else { format };
+    let filesystem = super::image::DualPartitionFs::parse(inner).ok_or_else(||
+        BuildError::InvalidParam(format!("unknown system filesystem: {format}")))?;
+    let path = output.images.join("disk.img");
+    super::image::create_dual_partition_image_with_fs(&path, 64, size_mb.max(512),
+        &source.esp, &source.system, filesystem)?;
+    if format.eq_ignore_ascii_case("qcow2") {
+        let raw = std::fs::read(&path)?;
+        let qcow = output.images.join("disk.qcow2");
+        std::fs::write(&qcow, super::image::encode_raw_as_qcow2(&raw))?;
+        std::fs::remove_file(path)?;
+        Ok(qcow)
+    } else { Ok(path) }
+}
+
 // =====================================================================
 // ISO Image Build
 // =====================================================================
 //
-// Build a bootable ISO-9660 image. The ISO has a flat directory
-// structure — no partition table, no separate ESP.  All files are
-// placed directly at the ISO root:
-//
-//   /EFI/BOOT/BOOTX64.EFI        <- nt61-boot.efi (El Torito boot)
-//   /EFI/Microsoft/Boot/BCD      <- BCD store
-//   /EFI/Microsoft/Boot/winload.efi <- OS loader
-//   /Windows/System32/...        <- kernel + system files
-//   /ProgramData/...
-//   /Program Files/...
-//   /Program Files (x86)/...
-//   /tests/autoexec.bat
-//   /Users/...
-//
-// Winload reads the kernel PE directly from the ISO9660 volume
-// via EFI_BLOCK_IO.
-
-/// Build the ISO-9660 bootable image. Called by `--build iso`.
-///
-/// The ISO has a FLAT directory structure — no partition table, no
-/// separate ESP.  All files are placed directly at the ISO root:
-///
-///   /EFI/BOOT/BOOTX64.EFI
-///   /EFI/Microsoft/Boot/BCD
-///   /EFI/Microsoft/Boot/winload.efi
-///   /Windows/System32/...
-///   /ProgramData/...
-///   /Program Files/...
-///   /Program Files (x86)/...
-///   /tests/autoexec.bat
-///   /Users/...
-pub fn build_iso(build_dir: &Path, _format: &str, _size_mb: u32, arch: &str) -> Result<PathBuf> {
+/// Build an optical RAM-backed system with a FAT El Torito boot volume.
+/// EFI and Windows use the same paths as the disk build inside that volume.
+pub fn build_iso(build_dir: &Path, _format: &str, size_mb: u32, arch: &str) -> Result<PathBuf> {
     log::banner(
         "NT6.1.7601 ISO Build",
         &format!("ISO-9660 / El Torito / Arch: {}", arch),
@@ -2702,6 +2669,8 @@ pub fn build_iso(build_dir: &Path, _format: &str, _size_mb: u32, arch: &str) -> 
 
     let k_target = kernel_target_for(arch);
     let u_target = uefi_target_for(arch);
+
+    set_pe_arch(arch);
 
     // Step 1: Build kernel. Failure here aborts the pipeline
     // immediately — see the matching comment in `full_build`.
@@ -2727,87 +2696,19 @@ pub fn build_iso(build_dir: &Path, _format: &str, _size_mb: u32, arch: &str) -> 
         } else {
             None
         })
-        .add_autoexec_bat(
-            get_workspace_root()
-                .join("resources")
-                .join("bat")
-                .join("autoexec.bat"),
-        )
         .build()?;
 
-    // Step 6: Build the ISO-9660 image.
-    //
-    // Per the user's spec, the ISO has a FLAT directory structure
-    // at the root level — no partition table, no separate ESP/system
-    // regions.  The UEFI firmware boots from the El Torito entry
-    // (BOOTX64.EFI), which reads BCD from the ISO and launches
-    // winload.efi.  Winload reads the kernel PE from the same ISO
-    // volume via the EFI_BLOCK_IO protocol on the CD-ROM device.
-    //
-    // Layout:
-    //   /EFI/BOOT/BOOTX64.EFI       <- boot manager (El Torito)
-    //   /EFI/Microsoft/Boot/BCD     <- BCD store
-    //   /EFI/Microsoft/Boot/winload.efi <- OS loader
-    //   /Windows/System32/...       <- kernel PE + system files
-    //   /ProgramData/...
-    //   /Program Files/...
-    //   /Program Files (x86)/...
-    //   /tests/autoexec.bat
-    //   /Users/...
-    //
-    // The system tree is copied at ISO root level (not embedded
-    // inside a FAT32 image).  Winload will read the kernel PE
-    // directly from the ISO9660 volume.
-
-    // Step 7: Build the ISO-9660 image
-    log::section("Building ISO-9660 Image");
-    let mut iso = super::iso9660::IsoImage::new();
-
-    // Per-arch fallback EFI file name. OVMF's UEFI removable media fallback
-    // looks for \EFI\BOOT\BOOT<arch>.EFI; the convention is "X64", "AA64",
-    // "RISCV64", "LOONGARCH64".
-    let iso_arch_label = match arch {
-        "x86_64" | "x64" => "X64",
+    let arch_label = match arch {
         "aarch64" | "arm64" => "AA64",
         "riscv64" => "RISCV64",
         "loongarch64" => "LOONGARCH64",
         _ => "X64",
     };
-
-    // /EFI/BOOT/BOOT<arch>.EFI — UEFI removable media path (El Torito)
-    if boot.exists() {
-        let boot_data = std::fs::read(&boot)?;
-        let boot_iso_path = format!("/EFI/BOOT/BOOT{}.EFI", iso_arch_label);
-        iso.add_file(&boot_iso_path, &boot_data)?;
-        log::info(&format!("  Added {}", boot_iso_path));
-    } else {
-        log::warn("  nt61-boot.efi not found; ISO may not be bootable via El Torito");
-    }
-
-    // /EFI/Microsoft/Boot/BCD
-    let bcd_data = crate::hive_gen::build_bcd();
-    iso.add_file("/EFI/Microsoft/Boot/BCD", &bcd_data)?;
-    log::info("  Added /EFI/Microsoft/Boot/BCD");
-
-    // /EFI/Microsoft/Boot/winload.efi — the OS loader
-    if winload.exists() {
-        let winload_data = std::fs::read(&winload)?;
-        iso.add_file("/EFI/Microsoft/Boot/winload.efi", &winload_data)?;
-        log::info("  Added /EFI/Microsoft/Boot/winload.efi");
-    }
-
-    // System tree at root level: Windows/, ProgramData/, Program Files/,
-    // Program Files (x86)/, tests/, Users/
-    if dirs.system.exists() {
-        copy_tree_to_iso(&mut iso, &dirs.system, "")?;
-    }
-
-    // Set up El Torito boot catalog — points to BOOTX64.EFI in the ISO.
-    // UEFI will load and execute the PE file directly (no emulation).
-    iso.add_boot_catalog(&[])?;
-    log::info("  El Torito boot catalog configured");
-
-    let iso_bytes = iso.finalize()?;
+    super::esp::EspBuilder::new(&dirs.esp, arch_label)?
+        .with_boot_efi(Some(&boot))?
+        .build()?;
+    super::esp::EspBuilder::write_bcd_file(&dirs.esp, &crate::hive_gen::build_bcd())?;
+    let iso_bytes = package_boot_iso(&dirs.esp, &dirs.system, size_mb)?;
     let iso_path = dirs.images.join("nt61.iso");
     std::fs::write(&iso_path, &iso_bytes).map_err(BuildError::Io)?;
 
@@ -2817,21 +2718,19 @@ pub fn build_iso(build_dir: &Path, _format: &str, _size_mb: u32, arch: &str) -> 
     Ok(iso_path)
 }
 
-/// Recursively copy a host directory tree into an ISO image.
-fn copy_tree_to_iso(iso: &mut super::iso9660::IsoImage, src: &Path, prefix: &str) -> Result<()> {
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let img_path = format!("{}/{}", prefix.trim_end_matches('/'), name);
-        if path.is_dir() {
-            copy_tree_to_iso(iso, &path, &img_path)?;
-        } else {
-            let data = std::fs::read(&path)?;
-            iso.add_file(&img_path, &data)?;
-        }
-    }
-    Ok(())
+/// Package staged system and EFI trees without recompiling them.
+/// The EFI firmware discovers the FAT image through the El Torito catalog;
+/// winload snapshots this filesystem before leaving boot services.
+pub fn package_boot_iso(esp: &Path, system: &Path, size_mb: u32) -> Result<Vec<u8>> {
+    validate_boot_volume_size(size_mb)?;
+    let mut boot_volume = super::fat32::Fat32Image::new(size_mb.max(512));
+    super::image::populate_fat32_image(&mut boot_volume, system)?;
+    super::image::populate_fat32_image(&mut boot_volume, esp)?;
+    let boot_bytes = boot_volume.finalize()?;
+    let mut iso = super::iso9660::IsoImage::new();
+    iso.add_file("/boot/efisys.bin", &boot_bytes)?;
+    iso.add_boot_catalog(&[])?;
+    iso.finalize()
 }
 
 // =====================================================================
@@ -2919,6 +2818,12 @@ pub fn build_userland_images(arch: &str) -> Result<()> {
         )));
     }
 
+    log::section("Building native desktop applications");
+    let status=Command::new("cargo").current_dir(&workspace_root)
+        .args(["build","--release","--target",explorer_target,"-p","nt61-desktop","--bin","application-host"])
+        .status().map_err(BuildError::Io)?;
+    if !status.success() {return Err(BuildError::ImageCreateFailed(format!("application-host build failed: {status}")));}
+
     log::section("Building nt61-driver");
     log::info(&format!("Target: {target}"));
     let mut driver_command = Command::new("cargo");
@@ -2981,6 +2886,7 @@ fn generate_pe_files_in_process(system32_dir: &Path) -> Result<()> {
     // Re-implement the generator here using stdlib-only PE writing.
     // The PE layout is defined by `build_pe_image` below; see
     // docs/winload.efi.md "PE Layouts" section for details.
+    super::applications::clean_obsolete(system32_dir).map_err(BuildError::Io)?;
     let images = build_system_images();
     let mut total: usize = 0;
     let mut driver_count: usize = 0;
@@ -2991,7 +2897,7 @@ fn generate_pe_files_in_process(system32_dir: &Path) -> Result<()> {
     // themselves — the rest of the layout is built on-disk by
     // the driver before this is called.
     for img in &images {
-        let dest = system32_dir.join(img.name);
+        let dest = super::applications::destination(system32_dir, img.name);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(BuildError::Io)?;
         }
@@ -3037,7 +2943,7 @@ fn generate_win32_dlls(system32_dir: &Path) -> Result<()> {
 
     let mut total = 0usize;
     for spec in win32_dlls::ALL_DLLS {
-        let bytes = win32_dlls::build_dll_image(spec);
+        let bytes = win32_dlls::build_dll_image_for_arch(spec, arch_name(current_pe_arch()))?;
         let dest = system32_dir.join(spec.file_name);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(BuildError::Io)?;
@@ -3225,7 +3131,7 @@ fn real_pe(artifact_name: &str) -> Vec<u8> {
         if bytes.len() >= 2 && &bytes[0..2] == b"MZ" {
             return bytes;
         }
-        if bytes.len() >= 5 && &bytes[0..5] == [0x7F, b'E', b'L', b'F', 2] {
+        if bytes.len() >= 5 && bytes[0..5] == [0x7F, b'E', b'L', b'F', 2] {
             if let Some(pe) = wrap_elf_to_pe(&candidate_path, arch) {
                 return pe;
             }
@@ -3264,7 +3170,7 @@ fn explorer_pe() -> Vec<u8> {
     );
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     if let Ok(elf) = std::fs::read(workspace_root.join(&elf_rel)) {
-        if elf.len() >= 5 && &elf[0..5] == [0x7F, b'E', b'L', b'F', 2] {
+        if elf.len() >= 5 && elf[0..5] == [0x7F, b'E', b'L', b'F', 2] {
             match super::elf_to_pe::elf_to_pe(&elf, arch_name(arch)) {
                 Some(pe) => {
                     log::info(&format!(
@@ -3295,7 +3201,7 @@ fn logonui_pe() -> Vec<u8> {
     );
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     if let Ok(elf) = std::fs::read(workspace_root.join(&elf_rel)) {
-        if elf.len() >= 5 && &elf[0..5] == [0x7F, b'E', b'L', b'F', 2] {
+        if elf.len() >= 5 && elf[0..5] == [0x7F, b'E', b'L', b'F', 2] {
             match super::elf_to_pe::elf_to_pe(&elf, arch_name(arch)) {
                 Some(pe) => {
                     log::info(&format!(
@@ -3470,7 +3376,7 @@ fn wrap_elf_to_pe(elf_path: &Path, arch: TargetArch) -> Option<Vec<u8>> {
 }
 
 pub fn build_system_images() -> Vec<SystemImage> {
-    vec![
+    let mut images=vec![
         SystemImage {
             name: "ntoskrnl.exe",
             bytes: real_pe("nt61-kernel.efi"),
@@ -3580,16 +3486,8 @@ pub fn build_system_images() -> Vec<SystemImage> {
             bytes: real_pe("nt61-driver-volmgr.efi"),
         },
         SystemImage {
-            name: "drivers/storahci.sys",
+            name: "drivers/msahci.sys",
             bytes: real_pe("nt61-driver-storahci.efi"),
-        },
-        SystemImage {
-            name: "drivers/iastor.sys",
-            bytes: real_pe("nt61-driver-iastor.efi"),
-        },
-        SystemImage {
-            name: "drivers/stornvme.sys",
-            bytes: real_pe("nt61-driver-stornvme.efi"),
         },
         // System infrastructure drivers.
         SystemImage {
@@ -3607,10 +3505,6 @@ pub fn build_system_images() -> Vec<SystemImage> {
         SystemImage {
             name: "drivers/mssmbios.sys",
             bytes: real_pe("nt61-driver-mssmbios.efi"),
-        },
-        SystemImage {
-            name: "drivers/hpet.sys",
-            bytes: real_pe("nt61-driver-hpet.efi"),
         },
         // Display driver stack — these are the three drivers
         // the user expects to see brought up before
@@ -3632,7 +3526,11 @@ pub fn build_system_images() -> Vec<SystemImage> {
             name: "drivers/videoprt.sys",
             bytes: real_pe("nt61-driver-videoprt.efi"),
         },
-    ]
+    ];
+    let root=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let arch=current_pe_arch();
+    images.extend(super::applications::package(&root,arch_name(arch),kernel_target_for(arch_name(arch))));
+    images
 }
 
 /// Generate x86_64 machine code for a Windows driver.
@@ -4019,6 +3917,29 @@ const USERINIT_IMAGE_BASE: u64 = 0x0000_1000_9000_0000;
 /// headers + .text section + .rdata section carrying the export
 /// table).
 fn build_subsystem_pe(image_base: u64, image_name: &str, text_stub: &[u8]) -> Vec<u8> {
+    build_subsystem_pe_for_arch(current_pe_arch(),image_base,image_name,text_stub)
+}
+
+fn build_subsystem_pe_for_arch(arch:TargetArch,image_base:u64,image_name:&str,text_stub:&[u8])->Vec<u8>{
+    if arch!=TargetArch::X86_64 {
+        // Session supervision on these ISAs is currently performed by SMSS in
+        // the kernel. An explicitly launched unimplemented user-mode supervisor
+        // exits with failure, using native instructions rather than x64 bytes.
+        let words:&[u32]=match arch {
+            TargetArch::AArch64=>&[0x52800020,0xD2804028,0xD4000001,0x14000000],
+            TargetArch::RiscV64=>&[0x00100513,0x20100893,0x00000073,0x0000006F],
+            TargetArch::LoongArch64=>&[0x02C00404,0x02C8040B,0x002B0000,0x50000000],
+            TargetArch::X86_64=>unreachable!(),
+        };
+        let code=words.iter().flat_map(|word|word.to_le_bytes()).collect();
+        let mut spec=super::pe::PeImageSpec::new(image_base,IMAGE_SUBSYSTEM_WINDOWS_CUI,false,arch.machine());
+        spec.module_name=image_name.into();spec.entry_point_rva=SECTION_ALIGNMENT;
+        spec.sections.push(super::pe::SectionSpec::code(code));
+        spec.sections.push(super::pe::SectionSpec::rdata(Vec::new()));
+        spec.export_named("subsystem_main",1,SECTION_ALIGNMENT);
+        return super::pe::emit(&spec).0;
+    }
+
     // ------------------------------------------------------------------
     // .text section
     // ------------------------------------------------------------------
@@ -4204,6 +4125,36 @@ fn cmd_exe_write_u64(buf: &mut [u8], off: usize, v: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subsystem_images_have_native_entry_instructions_on_every_architecture() {
+        for arch in [TargetArch::X86_64,TargetArch::AArch64,TargetArch::RiscV64,TargetArch::LoongArch64]{
+            for (base,name,stub) in [(LSM_IMAGE_BASE,"lsm.exe",&LSM_EXE_TEXT_STUB[..]),
+                (WINLOGON_IMAGE_BASE,"winlogon.exe",&WINLOGON_EXE_TEXT_STUB[..]),
+                (USERINIT_IMAGE_BASE,"userinit.exe",&USERINIT_EXE_TEXT_STUB[..])]{
+                let image=build_subsystem_pe_for_arch(arch,base,name,stub);
+                assert_eq!(u16::from_le_bytes(image[0x84..0x86].try_into().unwrap()),arch.machine());
+                let section=0x188;
+                let raw=u32::from_le_bytes(image[section+20..section+24].try_into().unwrap())as usize;
+                let expected:&[u8]=match arch{
+                    TargetArch::X86_64=>&stub[..4],
+                    TargetArch::AArch64=>&0x52800020u32.to_le_bytes(),
+                    TargetArch::RiscV64=>&0x00100513u32.to_le_bytes(),
+                    TargetArch::LoongArch64=>&0x02C00404u32.to_le_bytes(),
+                };
+                assert_eq!(&image[raw..raw+4],expected,"{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn boot_volume_size_obeys_snapshot_budget() {
+        assert!(validate_boot_volume_size(512).is_ok());
+        assert!(validate_boot_volume_size(1024).is_ok());
+        assert!(validate_boot_volume_size(2048).is_ok());
+        assert!(validate_boot_volume_size(2049).is_err());
+        assert!(validate_boot_volume_size(u32::MAX).is_err());
+    }
 
     /// `(name, virtual_address, virtual_size)` for every section in a
     /// PE32+ image produced by this module.
