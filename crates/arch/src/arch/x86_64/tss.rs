@@ -47,7 +47,7 @@ pub struct Tss {
     pub rsp0: u64,            // 0x04-0x0B
     pub rsp1: u64,            // 0x0C-0x13
     pub rsp2: u64,            // 0x14-0x1B
-    pub _reserved1: u32,      // 0x1C-0x1F (4 bytes per Intel spec)
+    pub reserved1: u32,      // 0x1C-0x1F (4 bytes per Intel spec)
     pub ist1: u64,            // 0x20-0x27
     pub ist2: u64,            // 0x28-0x2F
     pub ist3: u64,            // 0x30-0x37
@@ -55,7 +55,7 @@ pub struct Tss {
     pub ist5: u64,            // 0x40-0x47
     pub ist6: u64,            // 0x48-0x4F
     pub ist7: u64,            // 0x50-0x57
-    pub _reserved2: [u8; 16], // 0x58-0x67 (reserved per Intel)
+    pub reserved2: [u8; 16], // 0x58-0x67 (reserved per Intel)
     pub io_bitmap_base: u16,  // 0x68-0x69 (offset to I/O permission bitmap, or >= TSS limit)
 }
 
@@ -66,7 +66,7 @@ impl Tss {
             rsp0: 0,
             rsp1: 0,
             rsp2: 0,
-            _reserved1: 0,
+            reserved1: 0,
             ist1: 0,
             ist2: 0,
             ist3: 0,
@@ -74,7 +74,7 @@ impl Tss {
             ist5: 0,
             ist6: 0,
             ist7: 0,
-            _reserved2: [0; 16],
+            reserved2: [0; 16],
             io_bitmap_base: size_of::<Tss>() as u16,
         }
     }

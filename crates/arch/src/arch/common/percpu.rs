@@ -109,7 +109,7 @@ pub struct PerCpuArea {
     /// does not fit in a sign-extended 32-bit LEA immediate).
     pub syscall_snap_addr: u64,
     /// Reserved for future use / padding to 4 KiB.
-    pub _reserved: [u64; 500],
+    pub reserved: [u64; 500],
 }
 
 impl PerCpuArea {
@@ -130,7 +130,7 @@ impl PerCpuArea {
             system_pml4: 0,
             user_pml4: 0,
             syscall_snap_addr: 0,
-            _reserved: [0; 500],
+            reserved: [0; 500],
         }
     }
 }

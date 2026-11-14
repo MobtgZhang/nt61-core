@@ -7,6 +7,6 @@
 /// "not-implemented" error for every input — the integer decoder
 /// covers most guest code and SIMD coverage is added in a follow-up
 /// phase.
-pub fn decode_simd_one(_code: &[u8], _offset: usize) -> Result<super::Decoded, super::DecodeError> {
+pub fn decode_simd_one(code: &[u8], _offset: usize) -> Result<super::Decoded, super::DecodeError> {
     Err(super::DecodeError::BadOpcode)
 }

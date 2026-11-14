@@ -67,7 +67,10 @@ global_asm!(
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 #[no_mangle]
-pub unsafe extern "C" fn __smp_secondary_entry_rust(_hart: u64, _stack_top: u64) -> ! {
+pub unsafe extern "C" fn __smp_secondary_entry_rust(
+    _hart: u64,
+    _stack_top: u64,
+) -> ! {
     // Publish this hart's per-CPU base in `tp`.
     crate::boot_debug_println!("[AP] entry");
     let hart = current_hart_id();

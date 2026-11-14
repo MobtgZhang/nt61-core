@@ -10,8 +10,7 @@ pub use crate::hal::aarch64::apic::{
 
 /// Enable an SPI on the controller. On GICv2 this maps to writing the
 /// `ISENABLER` register.
-pub fn pic_enable_irq(irq: u32) {
-    let _ = irq;
+pub fn pic_enable_irq(_irq: u32) {
     // Real driver writes to GICD_ISENABLER. Stub for the bootstrap.
 }
 

@@ -186,9 +186,10 @@ pub unsafe fn enable_fpu() {
     unsafe {
         crate::hal::serial::write_string_always("[FPU] enabling\r\n");
         asm!("csrs sstatus, {}", in(reg) 0b01u64 << 13, options(nostack));
-        let _sstatus: u64;
-        asm!("csrr {}, sstatus", out(reg) _sstatus, options(nostack));
+        let sstatus: u64;
+        asm!("csrr {}, sstatus", out(reg) sstatus, options(nostack));
         crate::hal::serial::write_string_always("[FPU] sstatus enabled");
+        crate::hal::serial::write_u64_hex(sstatus);
         crate::hal::serial::write_string_always("\r\n");
     }
 }

@@ -586,7 +586,7 @@ pub fn smoke_test() -> bool {
     if !madt_ok {
         ok = false;
     }
-    // // kprintln!("    [SMP SMOKE] parse_madt() = {}", _madt_ok);
+    // // kprintln!("    [SMP SMOKE] parse_madt() = {}", madt_ok);
 
     // Step 4: After MADT parse, check if more CPUs are available
     let _count_after = cpu_count();

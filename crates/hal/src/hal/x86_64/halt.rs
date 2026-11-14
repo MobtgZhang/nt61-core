@@ -87,7 +87,7 @@ pub fn reboot_via_pci() -> ! {
 }
 
 /// Shutdown via ACPI S5 (soft-off). The spec-correct write uses
-/// the \_S5 SLP_TYP value, but some firmware stacks (including
+/// the \S5 SLP_TYP value, but some firmware stacks (including
 /// common QEMU machine models) only power off when the register
 /// is written with SLP_EN and SLP_TYP = 0, or via the legacy
 /// 0xB004 port. Each write either powers the machine off (and

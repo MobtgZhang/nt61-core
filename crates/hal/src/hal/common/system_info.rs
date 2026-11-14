@@ -40,8 +40,8 @@ pub fn processor_count() -> u32 {
 }
 
 #[cfg(target_arch = "x86_64")]
-pub fn processor_brand(index: u32) -> String {
-    if index == 0 {
+pub fn processor_brand(_index: u32) -> String {
+    if _index == 0 {
         cpu_brand_string().unwrap_or_else(|| String::from("x64 Processor"))
     } else {
         String::from("x64 Processor")

@@ -123,8 +123,8 @@ pub struct SpecVersion {
 /// Probe whether the given EID is implemented.
 ///
 /// Returns `true` if the firmware returns SBI_SUCCESS for `BASE::PROBE`.
-pub unsafe fn probe(_eid: u64) -> bool {
-    let r = sbi_call(eid::BASE, 3 /* PROBE */, _eid, 0, 0, 0, 0, 0);
+pub unsafe fn probe(eid: u64) -> bool {
+    let r = sbi_call(eid::BASE, 3 /* PROBE */, eid, 0, 0, 0, 0, 0);
     r.error == 0
 }
 

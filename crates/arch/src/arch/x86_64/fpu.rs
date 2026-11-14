@@ -225,13 +225,13 @@ extern "C" {
     ///
     /// Usage: xsave([state_buffer])
     /// Uses EDX:EAX for feature mask (save all enabled features)
-    fn _xrstor(state: *const u8, features: u64);
+    fn xrstor(state: *const u8, features: u64);
 
     /// XRSTOR - restore FPU/SSE/AVX state from memory
     ///
     /// Usage: xrstor([state_buffer], feature_mask)
     /// EDX:EAX contains which components to restore
-    fn _xsave(state: *mut u8, features: u64);
+    fn xsave(state: *mut u8, features: u64);
 }
 
 /// Save current FPU/SSE/AVX state to the given buffer

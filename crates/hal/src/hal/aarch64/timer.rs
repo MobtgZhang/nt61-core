@@ -43,9 +43,9 @@ pub fn init(hz: u64) {
         // QEMU virt: emulated 62.5 MHz.
         let _ = 62_500_000u64;
     }
-    // Programming the physical timer (CNTP_*_EL0) from EL1 traps
+    // Programming the physical timer (CNTP_*EL0) from EL1 traps
     // when `HCR_EL2.TGE` is set (which is the default for EDK2
-    // on QEMU `virt`). The virtual timer (CNTV_*_EL0) is not
+    // on QEMU `virt`). The virtual timer (CNTV_*EL0) is not
     // trapped the same way, but writing its comparator still
     // requires either EL0 access or a properly configured EL2
     // stub. Skipping the touch here keeps the bootstrap path free

@@ -128,7 +128,7 @@ pub struct TssDescriptor {
     pub flags: u8,
     pub base_high: u8,
     pub base_upper: u32,
-    pub _reserved: u32,
+    pub reserved: u32,
 }
 
 impl TssDescriptor {
@@ -141,7 +141,7 @@ impl TssDescriptor {
             flags: 0,
             base_high: 0,
             base_upper: 0,
-            _reserved: 0,
+            reserved: 0,
         }
     }
     pub fn from_tss(base: u64, limit: u32) -> Self {
@@ -153,7 +153,7 @@ impl TssDescriptor {
             flags: 0x40,
             base_high: ((base >> 24) & 0xFF) as u8,
             base_upper: ((base >> 32) & 0xFFFF_FFFF) as u32,
-            _reserved: 0,
+            reserved: 0,
         }
     }
 }

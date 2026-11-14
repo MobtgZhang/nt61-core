@@ -14,7 +14,9 @@ mod stub {
     }
 
     /// write a byte to an I/O port. No-op on non-x86_64.
-    pub fn write_port_uchar(_port: u16, _value: u8) {}
+    pub fn write_port_uchar(port: u16, value: u8) {
+        let _ = (port, value);
+    }
 
     /// read a word (16-bit) from an I/O port. No-op on non-x86_64.
     pub fn read_port_ushort(_port: u16) -> u16 {
@@ -22,7 +24,9 @@ mod stub {
     }
 
     /// write a word (16-bit) to an I/O port. No-op on non-x86_64.
-    pub fn write_port_ushort(_port: u16, _value: u16) {}
+    pub fn write_port_ushort(port: u16, value: u16) {
+        let _ = (port, value);
+    }
 
     /// read a long (32-bit) from an I/O port. No-op on non-x86_64.
     pub fn read_port_ulong(_port: u16) -> u32 {
@@ -30,7 +34,9 @@ mod stub {
     }
 
     /// write a long (32-bit) to an I/O port. No-op on non-x86_64.
-    pub fn write_port_ulong(_port: u16, _value: u32) {}
+    pub fn write_port_ulong(port: u16, value: u32) {
+        let _ = (port, value);
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
