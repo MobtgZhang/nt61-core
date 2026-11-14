@@ -1955,12 +1955,12 @@ pub fn create_user_process_from_path(
 /// to, and re-entering the syscall machinery would corrupt the
 /// CPU state saved in the trap frame.
 ///
-pub fn process_exit(_exit_code: u32) -> ! {
+pub fn process_exit(exit_code: u32) -> ! {
     // NT 6.1 runs PspExitProcess: tear down the address space, close
     // all handles, free the EPROCESS and its threads, then switch to
     // the idle thread so other processes can run.
     crate::hal::serial::write_string_always("K:exit-code=");
-    crate::hal::serial::write_hex_u64_always(_exit_code as u64);
+    crate::hal::serial::write_hex_u64_always(exit_code as u64);
     crate::hal::serial::write_string_always("\r\n");
 
     // CRITICAL: return to the SYSTEM address space first. The exiting
@@ -2004,6 +2004,13 @@ pub fn process_exit(_exit_code: u32) -> ! {
         found
     };
 
+    if exit_pid == crate::servers::smss::PID_LOGONUI {
+        if exit_code == 0 && INTERACTIVE_AUTHENTICATED.load(Ordering::Acquire) {
+            LOGON_HANDOFF_READY.store(true,Ordering::Release);
+        } else {
+            clear_logon_handoff();
+        }
+    }
     if exit_pid != 0 {
         crate::ps::job::remove_process_from_all_jobs(exit_pid);
         // Tear down the address space and resources.
@@ -2082,6 +2089,12 @@ pub fn process_exit(_exit_code: u32) -> ! {
 /// is dispatched into Ring 3. Non-zero ROOT means: when the logon
 /// process exits, immediately enter Ring 3 for the ready explorer
 /// image with the saved (root, rip, rsp).
+static INTERACTIVE_AUTHENTICATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static LOGON_HANDOFF_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called only after kernel credential verification and token installation.
+pub fn authorize_logon_handoff() { INTERACTIVE_AUTHENTICATED.store(true,Ordering::Release); }
+
 static LOGON_HANDOFF_ROOT: AtomicU64 = AtomicU64::new(0);
 static LOGON_HANDOFF_RIP: AtomicU64 = AtomicU64::new(0);
 static LOGON_HANDOFF_RSP: AtomicU64 = AtomicU64::new(0);
@@ -2093,6 +2106,8 @@ static LOGON_HANDOFF_THREAD: AtomicU64 = AtomicU64::new(0);
 /// Arm the logon-handoff target used by `process_exit`. Called from
 /// SMSS after explorer.exe is created but before LogonUI starts.
 pub fn set_logon_handoff(root_table_phys: u64, user_rip: u64, user_rsp: u64) {
+    INTERACTIVE_AUTHENTICATED.store(false,Ordering::Release);
+    LOGON_HANDOFF_READY.store(false,Ordering::Release);
     LOGON_HANDOFF_ROOT.store(root_table_phys, Ordering::Release);
     LOGON_HANDOFF_RIP.store(user_rip, Ordering::Release);
     LOGON_HANDOFF_RSP.store(user_rsp, Ordering::Release);
@@ -2101,6 +2116,11 @@ pub fn set_logon_handoff(root_table_phys: u64, user_rip: u64, user_rsp: u64) {
 /// Disarm the pending logon handoff (fallback path when LogonUI
 /// could not be loaded and SMSS dispatches explorer directly).
 pub fn clear_logon_handoff() {
+    INTERACTIVE_AUTHENTICATED.store(false, Ordering::Release);
+    LOGON_HANDOFF_READY.store(false, Ordering::Release);
+    LOGON_HANDOFF_THREAD.store(0, Ordering::Release);
+    LOGON_HANDOFF_RIP.store(0, Ordering::Release);
+    LOGON_HANDOFF_RSP.store(0, Ordering::Release);
     LOGON_HANDOFF_ROOT.store(0, Ordering::Release);
 }
 
@@ -2112,6 +2132,7 @@ pub fn set_logon_handoff_thread(thread: u64) {
 /// Consume the pending logon handoff from the idle loop: returns the
 /// (root, rip, rsp, main_thread) quadruple exactly once.
 pub fn take_logon_handoff() -> Option<(u64, u64, u64, u64)> {
+    if !LOGON_HANDOFF_READY.swap(false,Ordering::AcqRel) { return None; }
     let root = LOGON_HANDOFF_ROOT.swap(0, Ordering::AcqRel);
     if root == 0 {
         return None;

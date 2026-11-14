@@ -72,6 +72,23 @@ pub fn logon_user(name: &str) -> Option<*mut Token> {
     Some(crate::se::token::persist_token(&token))
 }
 
+/// Authenticate a local interactive user and create a real logon session and
+/// primary token. The caller owns the returned token reference.
+pub fn interactive_logon(name: &str, password: &[u8], session_id: u32) -> Option<*mut Token> {
+    if !users::verify_interactive_password(name,password) {return None;}
+    let account=users::lookup_by_name(name)?;
+    let mut id=super::token::luid::new();
+    // SAFETY: id is writable stack storage and account.sid lives for the call.
+    if !unsafe {super::logonsession::se_create_logon_session(
+        &mut id,&account.sid,super::logonsession::LogonType::Interactive,session_id)} {return None;}
+    let Some(token)=logon_user(name).filter(|token|!token.is_null()) else {
+        super::logonsession::se_delete_logon_session(&id);return None;
+    };
+    // SAFETY: logon_user returned an exclusively owned pool allocation.
+    unsafe {(*token).authentication_id=id;(*token).session_id=session_id;}
+    Some(token)
+}
+
 /// Build an impersonation token from a primary token. Used by
 /// `ImpersonateLoggedOnUser` / `SetThreadToken` paths.
 pub fn create_impersonation(primary_user_sid: sid, level: ImpersonationLevel) -> Token {
@@ -87,6 +104,7 @@ pub fn create_impersonation(primary_user_sid: sid, level: ImpersonationLevel) ->
 /// Returns `None` for SIDs we don't know.
 pub fn name_for_sid(sid: &sid) -> Option<&'static str> {
     let account = users::lookup_by_sid(sid)?;
+    if account.rid == 500 { return Some("Administrator"); }
     Some(match account.kind {
         users::AccountKind::System => "SYSTEM",
         users::AccountKind::Administrators => "Administrators",

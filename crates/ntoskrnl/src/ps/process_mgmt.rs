@@ -129,6 +129,9 @@ fn process_user_name(process: &crate::ps::process::Eprocess) -> alloc::string::S
     let Some(token) = (unsafe { process.get_token().as_ref() }) else {
         return alloc::string::String::from("NT AUTHORITY\\SYSTEM");
     };
+    if let Some(name) = crate::se::logon::name_for_sid(&token.user) {
+        return name.into();
+    }
     if token.is_local_system() {
         return alloc::string::String::from("NT AUTHORITY\\SYSTEM");
     }

@@ -1,5 +1,5 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 #![deny(warnings)]
 
 mod arch;
@@ -11,27 +11,35 @@ mod font_view;
 #[path = "../explorer/png.rs"]
 mod png;
 
+#[cfg(not(test))]
 use core::panic::PanicInfo;
-use core::str;
 use nt61_desktop::bmp;
 use nt61_desktop::compositor::aero;
 use nt61_desktop::controls::{ControlEvent, ControlKind, ControlTree, PointerAction};
 use nt61_desktop::graphics::blit::blit_rgba;
 use nt61_desktop::graphics::Surface;
-use nt61_desktop::login::AuthenticationProvider;
+
 use nt61_desktop::user_account_pictures::USER;
 use png::Image;
 
 extern crate alloc;
 
 const CURSOR_CUR: &[u8] = include_bytes!("../../../assets/windows7/cursors/aero_arrow_l.cur");
-const FLAG_ICO: &[u8] = include_bytes!("../../../assets/windows7/icons/shell32/ICON34_1.ico");
-const EASE_ICO: &[u8] = include_bytes!("../../../assets/windows7/icons/shell32/ICON29_1.ico");
-const POWER_ICO: &[u8] = include_bytes!("../../../assets/windows7/icons/shell32/ICON28_1.ico");
+const BRAND_BMP: &[u8] = include_bytes!("../../../assets/windows7/logon-buttons/brand.bmp");
+const TILE_BMP: &[u8] = include_bytes!("../../../assets/windows7/logon-buttons/user-tile.bmp");
+const EDIT_BMP: [&[u8];3] = [
+    include_bytes!("../../../assets/windows7/logon-buttons/edit-normal.bmp"),
+    include_bytes!("../../../assets/windows7/logon-buttons/edit-hover.bmp"),
+    include_bytes!("../../../assets/windows7/logon-buttons/edit-focus.bmp"),
+];
+const SUBMIT_BMP: &[u8] = include_bytes!("../../../assets/windows7/logon-buttons/submit.bmp");
+const SUBMIT_HOVER_BMP: &[u8] = include_bytes!("../../../assets/windows7/logon-buttons/submit-hover.bmp");
+const SUBMIT_PRESSED_BMP: &[u8] = include_bytes!("../../../assets/windows7/logon-buttons/submit-pressed.bmp");
+const EASE_BMP: &[u8] = include_bytes!("../../../assets/windows7/logon-buttons/ease-of-access.bmp");
+const POWER_BMP: &[u8] = include_bytes!("../../../assets/windows7/logon-buttons/power.bmp");
 const WALLPAPER_PNG: &[u8] = include_bytes!("../../../assets/windows7/wallpapers/login-1024.png");
 
-const MAX_PASSWORD: usize = 32;
-const USER_NAME: &str = "User";
+const USER_NAME: &str = "Administrator";
 const CONTROL_PASSWORD: u32 = 1001;
 const CONTROL_SUBMIT: u32 = 1002;
 const CONTROL_EASE: u32 = 1003;
@@ -42,6 +50,7 @@ use nt61_desktop::user_allocator::StaticHeapAllocator;
 #[global_allocator]
 static LOGONUI_ALLOCATOR: StaticHeapAllocator<{ 64 * 1024 * 1024 }> = StaticHeapAllocator::new();
 
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     use core::fmt::Write as _;
@@ -62,7 +71,6 @@ pub extern "C" fn kernel_entry() -> ! {
 }
 
 struct Layout {
-    avatar: u32,
     tile: u32,
     tile_y: u32,
     user_y: u32,
@@ -75,17 +83,17 @@ struct Layout {
 
 impl Layout {
     fn new(_width: u32, height: u32) -> Self {
-        let avatar = (height * 118 / 696).max(80);
-        let padding = (avatar / 13).max(5);
-        let tile = avatar + padding * 2;
-        let password_height = (height * 26 / 768).max(24);
+        // AuthUX's selected credential uses a 190px frame with a 126px
+        // picture aperture at 96 DPI, rather than the 80px account-list tile.
+        let tile = 190.min(height / 3);
+        let padding = 4;
+        let password_height = (height * 30 / 768).max(26);
         Self {
-            avatar,
             tile,
             tile_y: height * 31 / 100,
             user_y: height * 55 / 100,
             padding,
-            password_width: (height * 34 / 100).max(210),
+            password_width: (height * 225 / 768).max(200),
             password_height,
             password_y: height * 61 / 100,
             bottom_y: height.saturating_sub(password_height + height / 28),
@@ -97,50 +105,33 @@ struct LogonAssets {
     fonts: font_view::FontPack,
     avatar: Image,
     cursor: Image,
-    flag: Image,
+    brand: Image,
+    tile: Image,
+    edit: [Image;3],
+    submit: [Image;3],
     ease: Image,
     power: Image,
-    wallpaper: Image,
+    wallpaper: Surface,
 }
 
-struct Credentials {
-    password: [u8; MAX_PASSWORD],
-    length: usize,
-}
+use nt61_desktop::login::PasswordEntry as Credentials;
 
 fn decoded_wallpaper() -> Option<Image> {
     png::decode_png(WALLPAPER_PNG).ok()
 }
 
-impl Credentials {
-    fn new() -> Self {
-        Self {
-            password: [0; MAX_PASSWORD],
-            length: 0,
-        }
-    }
-
-    fn append(&mut self, byte: u8) {
-        if self.length < MAX_PASSWORD {
-            self.password[self.length] = byte;
-            self.length += 1;
-        }
-    }
-
-    fn backspace(&mut self) {
-        self.length = self.length.saturating_sub(1);
-    }
-
-    fn clear(&mut self) {
-        self.length = 0;
-    }
-
-    fn as_str(&self) -> Option<&str> {
-        str::from_utf8(&self.password[..self.length]).ok()
-    }
+fn decoded_button_bitmap(bytes: &[u8]) -> Option<Image> {
+    let decoded = bmp::decode_bmp(bytes).ok()?;
+    Some(Image {
+        width: decoded.width,
+        height: decoded.height,
+        pixels: decoded.pixels,
+    })
 }
 
+
 fn logonui_main() -> ! {
+    arch::debug_str("[LOGONUI] startup\r\n");
     let mut framebuffer = arch::DesktopFramebufferInfo::default();
     arch::desktop_info(&mut framebuffer);
     if framebuffer.width == 0 || framebuffer.height == 0 {
@@ -149,22 +140,26 @@ fn logonui_main() -> ! {
         }
     }
 
+    arch::debug_str("[LOGONUI] framebuffer ready\r\n");
     let assets = LogonAssets::load(framebuffer.width, framebuffer.height);
     let mut credentials = Credentials::new();
-    let mut authentication = AuthenticationProvider::new();
     let layout = Layout::new(framebuffer.width, framebuffer.height);
     let mut controls = build_login_controls(framebuffer.width, framebuffer.height, &layout);
     let mut frame = Surface::new(framebuffer.width, framebuffer.height);
     let mut frame_rgba = alloc::vec![0u8; frame.pixels().len() * 4];
+    let mut cursor_frame = frame.clone();
+    let mut authentication_failed = false;
+    let mut notice = None;
     if let Some(screen) = assets.as_ref() {
         screen.draw(&framebuffer, &mut frame, &credentials, false, &controls);
+        cursor_frame.copy_from(&frame);
         draw_login_cursor(
             screen,
-            &mut frame,
+            &mut cursor_frame,
             (framebuffer.width / 2) as i32,
             (framebuffer.height / 2) as i32,
         );
-        present_surface_with(&frame, &mut frame_rgba);
+        present_surface_with(&cursor_frame, &mut frame_rgba);
     } else {
         arch::debug_str("[LOGONUI] assets failed\r\n");
         draw_fallback_screen(&framebuffer);
@@ -177,10 +172,17 @@ fn logonui_main() -> ! {
     loop {
         let mut key = 0u8;
         let mut mouse = arch::DesktopMouseState::default();
-        let mut failed = false;
         let mut redraw = false;
+        let mut submit = false;
+        let old_cursor = (cursor_x, cursor_y);
+        let key_pending = unsafe { arch::poll_key(&mut key) == 1 };
         let mouse_pending = unsafe { arch::poll_mouse(&mut mouse) != 0 };
+        if !key_pending && !mouse_pending {
+            core::hint::spin_loop();
+            continue;
+        }
         if mouse_pending {
+            let old_controls = (controls.hot(), controls.focus(), controls.pressed());
             cursor_x = mouse.x.clamp(0, framebuffer.width.saturating_sub(1) as i32);
             cursor_y = mouse
                 .y
@@ -193,63 +195,115 @@ fn logonui_main() -> ! {
                 Some(PointerAction::Move)
             };
             if let Some(action) = action {
-                if let Some(event) = controls.route_pointer(action, mouse.x, mouse.y) {
-                    if let ControlEvent::Activated(_) = event {
-                        let password = credentials.as_str().unwrap_or(" ");
-                        if authentication
-                            .authenticate(USER_NAME, password)
-                            .map(|authentication| authentication.user == USER_NAME)
-                            .unwrap_or(false)
-                        {
-                            arch::exit_process(0);
+                if let Some(event) = controls.route_pointer(action, cursor_x, cursor_y) {
+                    match event {
+                        ControlEvent::Activated(CONTROL_SUBMIT) => submit = true,
+                        ControlEvent::Activated(CONTROL_EASE) => {
+                            notice =
+                                Some("Accessibility services are not available in this session.");
+                            redraw = true;
                         }
-                        credentials.clear();
-                        failed = true;
+                        ControlEvent::Activated(CONTROL_POWER) => {
+                            notice = Some("Session power services are not available.");
+                            redraw = true;
+                        }
+                        _ => {}
                     }
                 }
             }
-            redraw = true;
+            redraw |= old_controls != (controls.hot(), controls.focus(), controls.pressed());
             previous_buttons = mouse.buttons;
         }
-        unsafe {
-            if arch::poll_key(&mut key) == 0 {
-                key = arch::wait_key(&mut key) as u8;
-            }
+        let mut key_redraw = false;
+        if key_pending {
+            key_redraw = match controls.route_key(key) {
+                Some(ControlEvent::Submit | ControlEvent::Activated(CONTROL_SUBMIT)) => {
+                    submit = true;
+                    true
+                }
+                Some(ControlEvent::Activated(CONTROL_EASE)) => {
+                    notice = Some("Accessibility services are not available in this session.");
+                    true
+                }
+                Some(ControlEvent::Activated(CONTROL_POWER)) => {
+                    notice = Some("Session power services are not available.");
+                    true
+                }
+                Some(ControlEvent::Cancel) => {
+                    notice = None;
+                    true
+                }
+                Some(ControlEvent::TextChanged(CONTROL_PASSWORD)) => {
+                    authentication_failed = false;
+                    notice = None;
+                    match key {
+                        8 | 127 => credentials.backspace(),
+                        byte if (0x20..=0x7e).contains(&byte) => credentials.append(byte),
+                        _ => {}
+                    }
+                    true
+                }
+                Some(ControlEvent::FocusChanged(_)) => true,
+                _ => false,
+            };
         }
 
-        let key_redraw = match controls.route_key(key) {
-            Some(ControlEvent::Submit) => {
-                let password = credentials.as_str().unwrap_or(" ");
-                if authentication
-                    .authenticate(USER_NAME, password)
-                    .map(|authentication| authentication.user == USER_NAME)
-                    .unwrap_or(false)
-                {
-                    arch::exit_process(0);
-                }
-                credentials.clear();
-                failed = true;
-                true
-            }
-            Some(ControlEvent::TextChanged(CONTROL_PASSWORD)) => {
-                match key {
-                    8 | 127 => credentials.backspace(),
-                    byte if (0x20..=0x7e).contains(&byte) => credentials.append(byte),
-                    _ => {}
-                }
-                true
-            }
-            Some(ControlEvent::FocusChanged(_)) => true,
-            _ => false,
-        };
+        if submit {
+            let password = credentials.as_str().unwrap_or(" ");
+            let authenticated = nt61_desktop::platform::services::logon(USER_NAME, password).is_ok();
+            credentials.clear();
+            if authenticated { arch::exit_process(0); }
+            authentication_failed = true;
+            notice = None;
+            redraw = true;
+        }
 
         if redraw || key_redraw {
             if let Some(screen) = assets.as_ref() {
-                screen.draw(&framebuffer, &mut frame, &credentials, failed, &controls);
-                draw_login_cursor(screen, &mut frame, cursor_x, cursor_y);
-                present_surface_with(&frame, &mut frame_rgba);
+                screen.draw(
+                    &framebuffer,
+                    &mut frame,
+                    &credentials,
+                    authentication_failed,
+                    &controls,
+                );
+                if let Some(message) = notice {
+                    screen.draw_centered(
+                        &mut frame,
+                        message,
+                        framebuffer.width,
+                        (layout.password_y + layout.password_height + layout.padding + 28) as i32,
+                        font_view::Ink::White,
+                    );
+                }
+                cursor_frame.copy_from(&frame);
+                draw_login_cursor(screen, &mut cursor_frame, cursor_x, cursor_y);
+                present_surface_with(&cursor_frame, &mut frame_rgba);
             } else {
                 draw_fallback_screen(&framebuffer);
+            }
+        } else if mouse_pending && old_cursor != (cursor_x, cursor_y) {
+            if let Some(screen) = assets.as_ref() {
+                let old_bounds = nt61_desktop::graphics::Rect::new(
+                    old_cursor.0,
+                    old_cursor.1,
+                    screen.cursor.width,
+                    screen.cursor.height,
+                );
+                cursor_frame.copy_region(&frame, old_bounds, old_cursor.0, old_cursor.1);
+                draw_login_cursor(screen, &mut cursor_frame, cursor_x, cursor_y);
+                // Convert and present just the old and new cursor rectangles.
+                present_surface_region(&cursor_frame, &mut frame_rgba, old_bounds);
+                present_surface_region(
+                    &cursor_frame,
+                    &mut frame_rgba,
+                    nt61_desktop::graphics::Rect::new(
+                        cursor_x,
+                        cursor_y,
+                        screen.cursor.width,
+                        screen.cursor.height,
+                    ),
+                );
             }
         }
     }
@@ -271,7 +325,7 @@ fn draw_login_cursor(screen: &LogonAssets, frame: &mut Surface, cursor_x: i32, c
 
 fn build_login_controls(width: u32, _height: u32, layout: &Layout) -> ControlTree {
     let mut tree = ControlTree::new();
-    let field_x = width.saturating_sub(layout.password_width) / 2;
+    let field_x = width.saturating_sub(layout.password_width + layout.padding + layout.password_height) / 2;
     let button_x = field_x + layout.password_width + layout.padding;
     tree.add(
         CONTROL_PASSWORD,
@@ -293,7 +347,7 @@ fn build_login_controls(width: u32, _height: u32, layout: &Layout) -> ControlTre
             layout.password_height,
         ),
     );
-    let ease_width = layout.password_height * 4 / 3;
+    let ease_width = layout.password_height;
     tree.add(
         CONTROL_EASE,
         ControlKind::Button,
@@ -304,7 +358,7 @@ fn build_login_controls(width: u32, _height: u32, layout: &Layout) -> ControlTre
             layout.password_height,
         ),
     );
-    let power_width = layout.password_height * 8 / 3;
+    let power_width = layout.password_height;
     tree.add(
         CONTROL_POWER,
         ControlKind::Button,
@@ -319,7 +373,7 @@ fn build_login_controls(width: u32, _height: u32, layout: &Layout) -> ControlTre
 }
 
 impl LogonAssets {
-    fn load(_width: u32, _height: u32) -> Option<Self> {
+    fn load(width: u32, height: u32) -> Option<Self> {
         let fonts = font_view::FontPack::new(16);
         let fonts = fonts?;
         arch::debug_str("[LOGONUI] asset fonts ok\r\n");
@@ -333,26 +387,39 @@ impl LogonAssets {
         let cursor = ico::decode_ico_preferred(CURSOR_CUR, 32).ok();
         let cursor = cursor?;
         arch::debug_str("[LOGONUI] asset cursor ok\r\n");
-        let flag = ico::decode_ico(FLAG_ICO).ok();
-        let flag = flag?;
+        let brand = decoded_button_bitmap(BRAND_BMP)?;
+        let tile = decoded_button_bitmap(TILE_BMP)?;
+        let edit = [decoded_button_bitmap(EDIT_BMP[0])?,decoded_button_bitmap(EDIT_BMP[1])?,decoded_button_bitmap(EDIT_BMP[2])?];
+        let submit = [decoded_button_bitmap(SUBMIT_BMP)?,decoded_button_bitmap(SUBMIT_HOVER_BMP)?,decoded_button_bitmap(SUBMIT_PRESSED_BMP)?];
         arch::debug_str("[LOGONUI] asset flag ok\r\n");
-        let ease = ico::decode_ico(EASE_ICO).ok();
+        let ease = decoded_button_bitmap(EASE_BMP);
         let ease = ease?;
         arch::debug_str("[LOGONUI] asset ease ok\r\n");
-        let power = ico::decode_ico(POWER_ICO).ok();
+        let power = decoded_button_bitmap(POWER_BMP);
         let power = power?;
         arch::debug_str("[LOGONUI] asset power ok\r\n");
         let wallpaper = decoded_wallpaper();
         let wallpaper = wallpaper?;
+        let pixels = cover_image(&wallpaper, width, height);
+        let mut background = Surface::try_new(width, height)?;
+        blit_rgba(
+            &mut background,
+            &pixels,
+            width as usize * 4,
+            nt61_desktop::graphics::Rect::new(0, 0, width, height),
+        );
         arch::debug_str("[LOGONUI] asset wallpaper ok\r\n");
         Some(Self {
             fonts,
             avatar,
             cursor,
-            flag,
+            brand,
+            tile,
+            edit,
+            submit,
             ease,
             power,
-            wallpaper,
+            wallpaper: background,
         })
     }
 
@@ -368,48 +435,15 @@ impl LogonAssets {
         let height = framebuffer.height;
         let layout = Layout::new(width, height);
 
-        let wallpaper = cover_image(&self.wallpaper, width, height);
-        blit_rgba(
-            frame,
-            &wallpaper,
-            width as usize * 4,
-            nt61_desktop::graphics::Rect::new(0, 0, width, height),
-        );
+        frame.copy_from(&self.wallpaper);
 
         let tile_x = width.saturating_sub(layout.tile) / 2;
-        aero::shadow(
-            frame,
-            nt61_desktop::graphics::Rect::new(
-                tile_x.saturating_sub(2) as i32,
-                layout.tile_y.saturating_sub(2) as i32,
-                layout.tile + 4,
-                layout.tile + 4,
-            ),
-            4,
-        );
-        aero::blend_rounded_rect(
-            frame,
-            nt61_desktop::graphics::Rect::new(
-                tile_x as i32,
-                layout.tile_y as i32,
-                layout.tile,
-                layout.tile,
-            ),
-            layout.avatar / 4,
-            0xE6EAF0FF,
-        );
-        let scaled_avatar = scale_rgba_bilinear(&self.avatar, layout.avatar, layout.avatar);
-        blit_rgba(
-            frame,
-            &scaled_avatar,
-            layout.avatar as usize * 4,
-            nt61_desktop::graphics::Rect::new(
-                (tile_x + layout.padding) as i32,
-                (layout.tile_y + layout.padding) as i32,
-                layout.avatar,
-                layout.avatar,
-            ),
-        );
+        // AuthUX's tile has a glass frame and a transparent picture aperture.
+        // Bitmap 12223's picture aperture occupies the central 126/190 pixels.
+        let picture = layout.tile * 126 / 190;
+        let inset = (layout.tile - picture) / 2;
+        self.draw_image(frame,&self.avatar,tile_x+inset,layout.tile_y+inset,picture);
+        self.draw_image(frame,&self.tile,tile_x,layout.tile_y,layout.tile);
 
         self.draw_centered_labelled(frame, USER_NAME, width, layout.user_y);
 
@@ -432,50 +466,22 @@ impl LogonAssets {
             password_width,
             password_height,
         );
-        aero::blend_rounded_rect(frame, field_bounds, 3, 0xF8FFFFFF);
-        aero::blend_rect(frame, field_bounds, 0xFF6C7A86);
-        fill_gradient(
-            frame,
-            nt61_desktop::graphics::Rect::new(
-                (field_x + 2) as i32,
-                (field_y + 2) as i32,
-                password_width.saturating_sub(4),
-                password_height.saturating_sub(4),
-            ),
-            0xFFFCFDFF,
-            0xFFEDF2F7,
-        );
+        let edit_state=if controls.focus()==CONTROL_PASSWORD {2}
+            else if controls.hot()==CONTROL_PASSWORD {1}else{0};
+        let image=&self.edit[edit_state];
+        nt61_desktop::graphics::blit::blit_nine_slice(frame,&image.pixels,
+            (image.width,image.height),field_bounds,4);
 
         let button = submit_layout.rect.width.min(submit_layout.rect.height);
         let button_x = submit_layout.rect.x as u32;
-        let button_bounds =
-            nt61_desktop::graphics::Rect::new(button_x as i32, field_y as i32, button, button);
-        aero::blend_rounded_rect(frame, button_bounds, button / 2, 0xF04B7AAB);
-        aero::blend_rounded_rect(
-            frame,
-            nt61_desktop::graphics::Rect::new(
-                (button_x + 1) as i32,
-                (field_y + 1) as i32,
-                button - 2,
-                button - 2,
-            ),
-            button / 2 - 1,
-            0xF06EB7EA,
-        );
-        aero::arrow_right(
-            frame,
-            nt61_desktop::graphics::Rect::new(
-                (button_x + button / 4) as i32,
-                (field_y + button / 4) as i32,
-                button / 2,
-                button / 2,
-            ),
-            0xFFFFFFFF,
-        );
+        let button_state=if controls.pressed()==CONTROL_SUBMIT {2}else if controls.hot()==CONTROL_SUBMIT || controls.focus()==CONTROL_SUBMIT {1}else{0};
+        self.draw_image(frame,&self.submit[button_state],button_x,field_y,button);
 
         let placeholder = "Password";
-        let empty = credentials.length == 0;
+        let empty = credentials.is_empty();
         let star_width = self.fonts.measure("*");
+        let visible = password_width.saturating_sub(20) / star_width.max(1);
+        let visible_length = (credentials.len() as u32).min(visible);
         if empty {
             self.fonts.draw_onto(
                 frame,
@@ -485,7 +491,7 @@ impl LogonAssets {
                 font_view::Ink::Black,
             );
         } else {
-            for index in 0..credentials.length as u32 {
+            for index in 0..visible_length {
                 self.fonts.draw_onto(
                     frame,
                     "*",
@@ -495,8 +501,8 @@ impl LogonAssets {
                 );
             }
         }
-        let caret_x = field_x + 8 + star_width * credentials.length as u32;
-        aero::blend_rect(
+        let caret_x = field_x + 8 + star_width * visible_length;
+        if controls.focus()==CONTROL_PASSWORD {aero::blend_rect(
             frame,
             nt61_desktop::graphics::Rect::new(
                 caret_x as i32,
@@ -505,7 +511,7 @@ impl LogonAssets {
                 password_height.saturating_sub(8),
             ),
             0xC0202020,
-        );
+        );}
 
         if authentication_failed {
             self.draw_centered(
@@ -525,6 +531,23 @@ impl LogonAssets {
             .control(CONTROL_POWER)
             .copied()
             .unwrap_or(password_layout);
+        for (id, bounds) in [
+            (CONTROL_EASE, ease_layout.rect),
+            (CONTROL_POWER, power_layout.rect),
+        ] {
+            if controls.hot() == id || controls.focus() == id {
+                aero::blend_rounded_rect(
+                    frame,
+                    bounds,
+                    4,
+                    if controls.pressed() == id {
+                        0x705994BE
+                    } else {
+                        0x60B7E4FF
+                    },
+                );
+            }
+        }
         self.draw_image(
             frame,
             &self.ease,
@@ -540,50 +563,8 @@ impl LogonAssets {
             power_layout.rect.width,
         );
 
-        let flag_size = layout.password_height;
-        let flag = scale_rgba_bilinear(&self.flag, flag_size, flag_size);
-        let brand_width = self.fonts.measure("Windows");
-        let suffix_width = self.fonts.measure(" 7 Ultimate");
-        let brand_x = width.saturating_sub(brand_width + suffix_width + flag_size + 4) / 2;
-        blit_rgba(
-            frame,
-            &flag,
-            flag_size as usize * 4,
-            nt61_desktop::graphics::Rect::new(
-                brand_x as i32,
-                layout.bottom_y as i32,
-                flag_size,
-                flag_size,
-            ),
-        );
-        self.fonts.draw_onto(
-            frame,
-            "Windows",
-            (brand_x + flag_size + 4) as i32,
-            (layout.bottom_y + flag_size / 4) as i32,
-            font_view::Ink::White,
-        );
-        self.fonts.draw_onto(
-            frame,
-            " 7 Ultimate",
-            (brand_x + flag_size + 4 + brand_width) as i32,
-            (layout.bottom_y + flag_size / 3) as i32,
-            font_view::Ink::White,
-        );
-
-        let cursor_x = width.saturating_sub(self.cursor.width as u32 + 8);
-        let cursor_y = height.saturating_sub(self.cursor.height as u32 + 8);
-        blit_rgba(
-            frame,
-            &self.cursor.pixels,
-            self.cursor.stride(),
-            nt61_desktop::graphics::Rect::new(
-                cursor_x as i32,
-                cursor_y as i32,
-                self.cursor.width as u32,
-                self.cursor.height as u32,
-            ),
-        );
+        let brand_width=(350*height/768).clamp(280,438).min(width);
+        self.draw_image(frame,&self.brand,width.saturating_sub(brand_width)/2,layout.bottom_y,brand_width);
     }
 
     fn draw_image(&self, frame: &mut Surface, image: &Image, x: u32, y: u32, target_width: u32) {
@@ -767,44 +748,48 @@ fn draw_fallback_screen(framebuffer: &arch::DesktopFramebufferInfo) {
     present_surface_with(&surface, &mut rgba);
 }
 
-fn fill_gradient(
-    surface: &mut Surface,
-    bounds: nt61_desktop::graphics::Rect,
-    top: u32,
-    bottom: u32,
-) {
-    for row in 0..bounds.height {
-        let scale = if bounds.height <= 1 {
-            0
-        } else {
-            row * 255 / bounds.height.saturating_sub(1)
-        };
-        let color = nt61_desktop::graphics::lerp_color(top, bottom, scale);
-        surface.fill_rect(bounds.x, bounds.y + row as i32, bounds.width, 1, color);
+fn present_surface_with(surface: &Surface, rgba: &mut [u8]) {
+    if let Some(damage) = nt61_desktop::graphics::present::update_rgba(surface, rgba) {
+        present_surface_region(surface, rgba, damage);
     }
 }
 
-fn present_surface_with(surface: &Surface, rgba: &mut [u8]) {
-    let pixels = surface.pixels();
-    if rgba.len() < pixels.len() * 4 {
+fn present_surface_region(
+    surface: &Surface,
+    rgba: &mut [u8],
+    bounds: nt61_desktop::graphics::Rect,
+) {
+    let stride = surface.width() as usize * 4;
+    if rgba.len() != surface.pixels().len() * 4 {
         return;
     }
-    for (target, color) in rgba.chunks_exact_mut(4).zip(pixels) {
-        target.copy_from_slice(&[
-            ((color >> 16) & 0xFF) as u8,
-            ((color >> 8) & 0xFF) as u8,
-            (color & 0xFF) as u8,
-            ((color >> 24) & 0xFF) as u8,
-        ]);
+    let Some(clip) = nt61_desktop::graphics::Rect::new(0, 0, surface.width(), surface.height())
+        .intersection(&bounds)
+    else {
+        return;
+    };
+    for y in clip.y as usize..clip.y as usize + clip.height as usize {
+        for x in clip.x as usize..clip.x as usize + clip.width as usize {
+            let index = y * surface.width() as usize + x;
+            let color = surface.pixels()[index];
+            rgba[index * 4..index * 4 + 4].copy_from_slice(&[
+                (color >> 16) as u8,
+                (color >> 8) as u8,
+                color as u8,
+                (color >> 24) as u8,
+            ]);
+        }
     }
+    // SAFETY: the clipped rectangle and every row are inside the staging buffer.
     unsafe {
         arch::draw_rgba(
-            rgba.as_ptr() as *const u8,
-            0,
-            0,
-            surface.width(),
-            surface.height(),
-            surface.width() as usize * 4,
+            rgba.as_ptr()
+                .add(clip.y as usize * stride + clip.x as usize * 4),
+            clip.x as u32,
+            clip.y as u32,
+            clip.width,
+            clip.height,
+            stride,
         );
     }
 }

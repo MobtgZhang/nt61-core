@@ -61,6 +61,15 @@ const SYSTEM: AccountEntry = AccountEntry {
     enabled: true,
 };
 
+/// Built-in local Administrator, RID 500. The requested default is enabled
+/// with an empty interactive password; groups such as Administrators are not users.
+const ADMINISTRATOR: AccountEntry = AccountEntry {
+    rid: 500,
+    sid: sid::with_authority_and_subs_arr([0,0,0,0,0,5],5,21,0,0,0,500,0,0,0),
+    kind: AccountKind::Administrators,
+    enabled: true,
+};
+
 const ADMINS: AccountEntry = AccountEntry {
     rid: 544,
     sid: sid::well_known(WellKnownSid::Administrators),
@@ -82,7 +91,7 @@ const NT61TEST: AccountEntry = AccountEntry {
     enabled: true,
 };
 
-const BUILTIN: &[AccountEntry] = &[SYSTEM, ADMINS, GUESTS, NT61TEST];
+const BUILTIN: &[AccountEntry] = &[SYSTEM, ADMINISTRATOR, ADMINS, GUESTS, NT61TEST];
 
 /// Runtime-created accounts. `Vec` is intentionally small and bounded by the
 /// caller; a real registry-backed SAM can replace this storage later.
@@ -144,6 +153,7 @@ pub fn lookup_by_name(name: &str) -> Option<AccountEntry> {
 }
 
 fn builtin_name(entry: &AccountEntry) -> &'static str {
+    if entry.rid == 500 { return "Administrator"; }
     match entry.kind {
         AccountKind::System => "SYSTEM",
         AccountKind::Administrators => "Administrators",
@@ -264,6 +274,14 @@ pub fn verify_runtime_password(name: &str, password: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// Interactive credential verification; never accepts a built-in group as a
+/// login account. Blank Administrator passwords are local-interactive only.
+pub fn verify_interactive_password(name: &str, password: &[u8]) -> bool {
+    let Some(account) = lookup_by_name(name).filter(|entry|entry.enabled) else {return false;};
+    if account.rid == 500 {return password.is_empty();}
+    verify_runtime_password(name,password)
+}
+
 fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     let mut diff = 0u8;
     for (left, right) in a.iter().zip(b.iter()) {
@@ -276,6 +294,17 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 mod tests {
     use super::*;
     use crate::se::sid::WellKnownSid;
+
+    #[test]
+    fn administrator_is_an_enabled_rid_500_user_with_empty_interactive_password() {
+        let user=lookup_by_name("administrator").unwrap();
+        assert_eq!(user.rid,500);assert!(user.enabled);
+        assert_eq!(user.sid.sub_authority_count,5);
+        assert!(verify_interactive_password("Administrator",b""));
+        assert!(!verify_interactive_password("Administrator",b"wrong"));
+        assert!(!verify_interactive_password("Administrators",b""));
+        assert!(!verify_runtime_password("Administrator",b""));
+    }
 
     #[test]
     fn lookup_system_by_name() {
