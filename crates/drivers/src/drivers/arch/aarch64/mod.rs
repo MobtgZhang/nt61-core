@@ -29,76 +29,13 @@ use crate::ke::sync::Spinlock;
 /// Cached probe result for the dispatch handlers (Spinlock for safe access).
 static CACHED_DEVICES: Spinlock<Option<VirtioDevices>> = Spinlock::new(None);
 
-/// # Safety
+/// Discover auxiliary devices without taking ownership of block queues.
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// IRP_MJ_READ handler for virtio-blk devices (dispatch callback).
-unsafe extern "C" fn virtio_blk_read(
-    _device: *mut crate::io::DeviceObject,
-    irp: *mut crate::io::Irp,
-) -> i32 {
-    let (offset, _count, buffer) = crate::io::dispatch::storage_request_parameters(irp);
-    let lba = offset / 512;
-    let mut guard = CACHED_DEVICES.lock();
-    let ctx = guard.as_mut().unwrap();
-    let dev = ctx.blk.first_mut().unwrap();
-    let transport = ctx.transports.get_mut(dev.transport_index()).unwrap();
-    if dev.read_sectors(transport, lba, core::slice::from_raw_parts_mut(buffer, 512)) {
-        crate::libs::ntdll::status::STATUS_SUCCESS
-    } else {
-        crate::libs::ntdll::status::STATUS_IO_DEVICE_ERROR
-    }
-}
-
 /// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// IRP_MJ_WRITE handler for virtio-blk devices (dispatch callback).
-unsafe extern "C" fn virtio_blk_write(
-    _device: *mut crate::io::DeviceObject,
-    irp: *mut crate::io::Irp,
-) -> i32 {
-    let (offset, _count, buffer) = crate::io::dispatch::storage_request_parameters(irp);
-    let lba = offset / 512;
-    let mut guard = CACHED_DEVICES.lock();
-    let ctx = guard.as_mut().unwrap();
-    let dev = ctx.blk.first_mut().unwrap();
-    let transport = ctx.transports.get_mut(dev.transport_index()).unwrap();
-    if dev.write_sectors(
-        transport,
-        lba,
-        core::slice::from_raw_parts(buffer as *const u8, 512),
-    ) {
-        crate::libs::ntdll::status::STATUS_SUCCESS
-    } else {
-        crate::libs::ntdll::status::STATUS_IO_DEVICE_ERROR
-    }
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Register virtio-blk devices into the storage dispatch registry.
+/// The architecture must map its PCI and MMIO windows before discovery.
+/// The common disk backend registers storage dispatch after discovery.
 pub unsafe fn register_dispatch() {
-    let driver = crate::io::allocate_driver(b"\\Driver\\virtio_blk");
-    if driver.is_null() {
-        return;
-    }
-    let mut table = crate::io::dispatch::DispatchTable::new();
-    table.major_functions[crate::io::major::IRP_MJ_READ as usize] = Some(virtio_blk_read);
-    table.major_functions[crate::io::major::IRP_MJ_WRITE as usize] = Some(virtio_blk_write);
-    table.install(driver);
-    let devices = probe_virtio_devices();
-    *CACHED_DEVICES.lock() = Some(devices);
-    let count = CACHED_DEVICES.lock().as_ref().unwrap().blk.len();
-    for slot in 0..count {
-        let device =
-            crate::io::create_device(driver, crate::io::DeviceType::Disk, b"\\Device\\VirtioDisk");
-        if device.is_null() {
-            continue;
-        }
-        crate::drivers::storage::io_dispatch::register_device(slot, device);
-    }
+    *CACHED_DEVICES.lock() = Some(probe_virtio_devices());
 }
 
 /// # Safety
@@ -107,9 +44,9 @@ pub unsafe fn register_dispatch() {
 /// Probe all virtio-mmio slots and initialise matching drivers.
 pub unsafe fn probe_virtio_devices() -> VirtioDevices {
     let mut transports = alloc::vec::Vec::new();
-    let mut blk = alloc::vec::Vec::new();
+    let blk = alloc::vec::Vec::new();
     let mut net = alloc::vec::Vec::new();
-    let mut gpu = alloc::vec::Vec::new();
+    let gpu = alloc::vec::Vec::new();
 
     for slot in 0..MMIO_SLOTS {
         let base = MMIO_BASE + (slot as u64) * MMIO_STRIDE;
@@ -120,14 +57,10 @@ pub unsafe fn probe_virtio_devices() -> VirtioDevices {
 
         match transport.device_id() {
             device_id::BLOCK => {
-                let idx = transports.len();
-                transports.push(transport);
-                let t = transports.last_mut().unwrap();
-                if let Some(dev) = crate::drivers::virtio::blk::VirtioBlk::probe(idx, t) {
-                    blk.push(dev);
+                    // The shared disk backend owns block queues and disk numbering.
                 }
-            }
-            device_id::NET => {
+                device_id::NET => {
+            if !nt61_boot_types::boot_options::active().network_enabled() { continue; }
                 let idx = transports.len();
                 transports.push(transport);
                 let t = transports.last_mut().unwrap();
@@ -136,13 +69,8 @@ pub unsafe fn probe_virtio_devices() -> VirtioDevices {
                 }
             }
             device_id::GPU => {
-                let idx = transports.len();
-                transports.push(transport);
-                let t = transports.last_mut().unwrap();
-                if let Some(dev) = crate::drivers::virtio::gpu::VirtioGpu::probe(idx, t) {
-                    gpu.push(dev);
+                    // BootVid owns scanout; do not reset its active queues here.
                 }
-            }
             _ => {
                 // Device type not yet supported; leave the slot idle.
             }

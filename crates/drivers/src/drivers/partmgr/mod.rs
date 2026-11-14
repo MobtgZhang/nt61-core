@@ -32,6 +32,7 @@ const MAX_PARTITIONS: usize = 16;
 const NAME_MAX: usize = 32;
 
 /// One partition record.
+#[derive(Clone)]
 pub struct Partition {
     pub valid: bool,
     /// `\Device\Harddisk0\Partition1`
@@ -96,6 +97,9 @@ const MBR_SIGNATURE: [u8; 2] = [0x55, 0xAA];
 /// device for each entry.
 pub fn init() {
     let _g = LOCK.lock();
+    // A rescan replaces the snapshot, including partitions that were removed.
+    unsafe { for slot in (*core::ptr::addr_of_mut!(PARTITIONS)).iter_mut() { *slot = Partition::new(); } }
+    TOTAL_PARTITIONS.store(0, Ordering::Relaxed);
     for i in 0..disk::disk_count() {
         let mut mbr = [0u8; 512];
         if disk::disk_read(i, 0, 512, &mut mbr) != 512 {
@@ -190,6 +194,7 @@ pub fn count() -> u32 {
 
 /// Look up a partition by its device-object path.
 pub fn find(name: &str) -> Option<Partition> {
+    let _g = LOCK.lock();
     unsafe {
         for slot in (*core::ptr::addr_of!(PARTITIONS)).iter() {
             if !slot.valid {
@@ -216,6 +221,7 @@ pub fn find(name: &str) -> Option<Partition> {
 
 /// Return all partition records (used by the smoke test).
 pub fn list_all() -> Vec<Partition> {
+    let _g = LOCK.lock();
     let mut out = Vec::new();
     unsafe {
         for slot in (*core::ptr::addr_of!(PARTITIONS)).iter() {

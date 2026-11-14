@@ -32,6 +32,7 @@ use crate::ke::sync::Spinlock;
 const MAX_VOLUMES: usize = 16;
 
 /// One volume.
+#[derive(Clone)]
 pub struct Volume {
     pub valid: bool,
     pub name: String,
@@ -137,14 +138,20 @@ fn itoa(mut v: u32) -> String {
     s
 }
 
-fn add_volume(name: String, disk: usize, lba: u64, sc: u64, sig: u32, fs: String) {
+fn add_volume(_name: String, disk: usize, lba: u64, sc: u64, sig: u32, fs: String) {
     unsafe {
-        for slot in (*core::ptr::addr_of_mut!(VOLUMES)).iter_mut() {
+        if let Some(slot) = (*core::ptr::addr_of_mut!(VOLUMES)).iter_mut().find(|v| v.valid && v.disk_index == disk && v.starting_lba == lba) {
+            slot.sector_count = sc;
+            slot.fs_signature = sig;
+            slot.fs_name = fs;
+            return;
+        }
+        for (index, slot) in (*core::ptr::addr_of_mut!(VOLUMES)).iter_mut().enumerate() {
             if slot.valid {
                 continue;
             }
             slot.valid = true;
-            slot.name = name.clone();
+            slot.name = format_volume_name(index as u32 + 1);
             slot.disk_index = disk;
             slot.starting_lba = lba;
             slot.sector_count = sc;
@@ -190,6 +197,7 @@ fn detect_fs(sec: &[u8]) -> (u32, String) {
 /// Return the volume that hosts `path`. For the bootstrap we
 /// just match on the first volume.
 pub fn first_volume() -> Option<Volume> {
+    let _g = LOCK.lock();
     unsafe {
         for slot in (*core::ptr::addr_of!(VOLUMES)).iter() {
             if !slot.valid {
@@ -213,8 +221,13 @@ pub fn first_volume() -> Option<Volume> {
 }
 
 pub fn list_all() -> Vec<Volume> {
-    // Return empty vec for smoke test to avoid heap allocation issues
-    Vec::new()
+    let _g = LOCK.lock();
+    // Keep slot indices stable across rescans; callers skip invalid slots.
+    unsafe {
+        let slots = &*core::ptr::addr_of!(VOLUMES);
+        let end = slots.iter().rposition(|v| v.valid).map_or(0, |i| i + 1);
+        slots[..end].to_vec()
+    }
 }
 
 pub fn count() -> u32 {
@@ -232,4 +245,22 @@ pub fn smoke_test() -> bool {
     }
     // kprintln!("  [VOLMGR SMOKE OK] volumes={}", vols.len());
     true
+}
+
+/// Refresh an offline disk without moving other disks' volume indices.
+pub fn refresh_disk(disk_index: usize) {
+    let partitions = partmgr::list_for_disk(disk_index);
+    {
+        let _g = LOCK.lock();
+        unsafe {
+            for slot in (*core::ptr::addr_of_mut!(VOLUMES)).iter_mut() {
+                if slot.valid && slot.disk_index == disk_index
+                    && !partitions.iter().any(|p| p.starting_offset == slot.starting_lba) {
+                    *slot = Volume::new();
+                    VOLUME_COUNT.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+    init();
 }

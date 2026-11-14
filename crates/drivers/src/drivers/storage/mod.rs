@@ -35,6 +35,7 @@ pub mod ata;
 pub mod atapi;
 pub mod ataport;
 pub mod disk;
+pub mod virtio_disk;
 pub mod nvme;
 pub mod scsi;
 pub mod storport;

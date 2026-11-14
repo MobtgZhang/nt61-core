@@ -77,6 +77,7 @@ static WRITE_COUNT: AtomicU32 = AtomicU32::new(0);
 /// `DiskInit` — enumerate the underlying storage and create one
 /// disk device per physical unit.
 pub fn init() {
+    crate::drivers::storage::virtio_disk::init();
     // Drive 0 (primary master) is the boot disk in QEMU.
     if ata::has_device(0) {
         add_disk("PhysicalDrive0", 0, ata::total_sectors(0));
@@ -342,22 +343,28 @@ impl crate::drivers::storage::disk::DiskBackend for X86DiskBackend {
     ///
     /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
     unsafe fn init(&self) {
-        init()
+        static INITIALIZED:core::sync::atomic::AtomicBool=core::sync::atomic::AtomicBool::new(false);
+        if !INITIALIZED.swap(true,Ordering::AcqRel){init();}
+        crate::drivers::partmgr::init();
+        for index in 0..self.disk_count(){crate::drivers::volmgr::refresh_disk(index);}
     }
 
     fn disk_count(&self) -> usize {
-        disk_count()
+        disk_count()+crate::drivers::storage::virtio_disk::count()
     }
 
     fn disk_read(&self, index: usize, offset: u64, byte_count: usize, buf: &mut [u8]) -> usize {
+        if index>=disk_count(){return if byte_count<=buf.len(){crate::drivers::storage::virtio_disk::read(index-disk_count(),offset,&mut buf[..byte_count])}else{0};}
         disk_read(index, offset, byte_count, buf)
     }
 
     fn disk_write(&self, index: usize, offset: u64, byte_count: usize, buf: &[u8]) -> usize {
+        if index>=disk_count(){return if byte_count<=buf.len(){crate::drivers::storage::virtio_disk::write(index-disk_count(),offset,&buf[..byte_count])}else{0};}
         disk_write(index, offset, byte_count, buf)
     }
 
     fn get_disk(&self, index: usize) -> Option<crate::drivers::storage::disk::DiskInfo> {
+        if index>=disk_count(){return crate::drivers::storage::virtio_disk::info(index-disk_count());}
         get_disk(index).map(|disk| crate::drivers::storage::disk::DiskInfo {
             sector_count: disk.sector_count,
         })

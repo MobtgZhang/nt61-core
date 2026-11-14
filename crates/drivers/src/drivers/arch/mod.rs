@@ -31,6 +31,9 @@ pub unsafe fn register_storage_backends() {
     riscv64::register_dispatch();
     #[cfg(target_arch = "loongarch64")]
     loongarch64::register_dispatch();
+    crate::drivers::storage::disk::register_backend(
+        &crate::drivers::storage::virtio_disk::VirtioDiskBackend,
+    );
     crate::rtl::klog::phase_trace_marker(711);
 }
 
@@ -402,7 +405,9 @@ pub fn storage_smoke_test() -> bool {
 pub fn init_machine_specific_drivers() {
     #[cfg(target_arch = "x86_64")]
     {
-        kdcom::init();
+        if nt61_boot_types::boot_options::active().has(nt61_boot_types::boot_options::BootOptions::DEBUG) {
+            kdcom::kd_init_system();
+        } else { kdcom::init(); }
         x86_64::pshed::init();
         crate::drivers::volsnap::init();
     }

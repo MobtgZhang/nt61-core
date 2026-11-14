@@ -267,7 +267,6 @@ impl PciTransport {
                 ) as u64;
                 continue;
             }
-            let struct_base = bar.base + struct_offset;
             // Some firmware assignments place the 64-bit BAR above
             // 4 GiB while its high config dword is not readable here.
             // Reassign the BAR to a conservative free region after the
@@ -324,6 +323,7 @@ impl PciTransport {
                 crate::hal::serial::write_hex_u64_always(bar.size);
                 crate::hal::serial::write_string_always("\r\n");
             }
+            let struct_base = bar.base.checked_add(struct_offset)?;
             crate::hal::serial::write_string_always("[VIRTIO-PCI] cap type=");
             crate::hal::serial::write_hex_u64_always(cfg_type as u64);
             crate::hal::serial::write_string_always(" bar=");
@@ -398,6 +398,10 @@ impl PciTransport {
         let (notify_base, notify_multiplier) = notify.unwrap();
         let isr_base = isr.unwrap();
         let device_base = device_cfg.unwrap();
+
+        // Firmware need not enable disks it did not boot from. The modern
+        // register window requires memory decoding, and virtqueues require DMA.
+        crate::hal::common::pci::enable_memory_bus_master(bus, device, function);
 
         Some(PciTransport {
             config_base,
@@ -551,7 +555,12 @@ impl PciTransport {
     /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
     pub unsafe fn reset(&mut self) {
         write_u8(self.common_base + COMMON_STATUS, 0);
-        while read_u8(self.common_base + COMMON_STATUS) != 0 {}
+        for _ in 0..1_000_000 {
+            if read_u8(self.common_base + COMMON_STATUS) == 0 {
+                return;
+            }
+            core::hint::spin_loop();
+        }
     }
 
     /// # Safety
