@@ -99,6 +99,11 @@ pub fn load_cmd_exe_from_disk() -> Result<core::mem::ManuallyDrop<alloc::vec::Ve
     //   NTFS  build → C: is NTFS
     //   EXT4  build → C: is ext2/ext4
     match crate::fs::detect_system_partition_type() {
+        crate::fs::FsType::Refs => {
+            let data = crate::fs::read_file_from_disk(CMD_EXE_DISK_PATH).ok_or("extension cmd.exe missing")?;
+            if !data.starts_with(b"MZ") { return Err("extension cmd.exe MZ mismatch"); }
+            return Ok(core::mem::ManuallyDrop::new(data));
+        }
         crate::fs::FsType::Fat32 => {
             if !crate::fs::fat32::is_mounted() {
                 boot_println!("[SAFE-CMD] System partition is FAT32 but no FAT32 fs is mounted");

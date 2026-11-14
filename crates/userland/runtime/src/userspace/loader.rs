@@ -80,6 +80,14 @@ impl UserProgramLoader {
         };
         let bytes: &[u8] = &image_storage;
 
+        // Cross-machine instructions require an owned translated context, never
+        // a native IRET/SRET entry point into guest x86 bytes.
+        let (header, _, _, _) = crate::loader::parse_headers(bytes).ok_or(STATUS_INVALID_IMAGE_FORMAT)?;
+        let native_machine = if cfg!(target_arch = "x86_64") { 0x8664 }
+            else if cfg!(target_arch = "aarch64") { 0xaa64 }
+            else if cfg!(target_arch = "loongarch64") { 0x6264 } else { 0x5064 };
+        if header.machine != native_machine { return Err(STATUS_INVALID_IMAGE_FORMAT); }
+
         // ---- 2. Run the complete PE pipeline and map the image ------
         let mapping = crate::loader::load_named_image_into_user_address_space(
             self.pml4_phys,
@@ -121,6 +129,70 @@ impl UserProgramLoader {
         let aligned = ((size + 0xFFF) & !0xFFF) as u32;
         vas::allocate_user_va(self.pml4_phys, 0, aligned) // PAGE_READWRITE
             .ok_or(STATUS_NO_MEMORY)
+    }
+}
+
+/// Load actual mounted-volume PE bytes for the portable guest executor. The
+/// returned context must be resumed in bounded quanta, not entered natively.
+pub fn load_translated_image(image_path: &str, command_line: &str, directory: &str)
+    -> Result<crate::arch::common::btl::pe::GuestImage, GuestLoadError> {
+    use crate::arch::common::btl::pe::{GuestImage, LinkError};
+    let bytes = read_guest_pe(image_path).map_err(GuestLoadError::Read)?;
+    let application_directory = image_path.rsplit_once('\\').map_or(directory, |(parent, _)| parent);
+    let mut resolver = VolumeLibraries { application_directory };
+    let mut image = GuestImage::load_linked(&bytes, &mut resolver).map_err(GuestLoadError::Link)?;
+    image.set_process_parameters(image_path, command_line, directory)
+        .map_err(|error| GuestLoadError::Link(LinkError::Image(error)))?;
+    Ok(image)
+}
+
+/// Retain the first loader failure instead of collapsing every missing API to
+/// STATUS_NOT_IMPLEMENTED. The console reports the same error as host probes.
+#[derive(Debug)]
+pub enum GuestLoadError {
+    Read(u32),
+    Link(crate::arch::common::btl::pe::LinkError),
+}
+impl GuestLoadError {
+    pub fn ntstatus(&self) -> u32 {
+        match self { Self::Read(status) => *status, Self::Link(error) => error.ntstatus() }
+    }
+}
+impl core::fmt::Display for GuestLoadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Read(status) => write!(f, "cannot read PE sections (0x{status:08X})"),
+            Self::Link(error) => core::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+fn read_guest_pe(path: &str) -> Result<alloc::vec::Vec<u8>, u32> {
+    use crate::arch::common::btl::pe::{read_image_file, ImageReadError, LinkError};
+    read_image_file(|offset, length| crate::fs::system_volume::read_at(path, offset, length))
+        .map_err(|error| match error {
+            ImageReadError::Read(status) => status,
+            ImageReadError::Image(error) => LinkError::Image(error).ntstatus(),
+        })
+}
+
+struct VolumeLibraries<'a> { application_directory: &'a str }
+impl crate::arch::common::btl::pe::ImportResolver for VolumeLibraries<'_> {
+    fn read_library(&mut self, name: &str, mode: crate::arch::common::btl::ir::DecodeMode)
+        -> Result<alloc::vec::Vec<u8>, u32> {
+        // A PE32 program must never bind to the host's 64-bit System32 DLLs.
+        let system = match mode {
+            crate::arch::common::btl::ir::DecodeMode::X86 => "C:\\Windows\\SysWOW64",
+            crate::arch::common::btl::ir::DecodeMode::X64 => "C:\\Windows\\System32",
+        };
+        for directory in [self.application_directory, system] {
+            match read_guest_pe(&alloc::format!("{directory}\\{name}")) {
+                Ok(bytes) => return Ok(bytes),
+                Err(0xc000_0034 | 0xc000_003a | 0xc000_000f) => continue,
+                Err(status) => return Err(status),
+            }
+        }
+        Err(0xc000_0135) // STATUS_DLL_NOT_FOUND
     }
 }
 
@@ -534,14 +606,14 @@ pub unsafe fn link_teb_to_peb(teb_va: u64, peb_va: u64) {
 /// Reserve the canonical user stack above `TEB_VA`, write a small
 /// startup frame, and return the initial user-mode RSP. The Windows
 /// x64 ABI requires RSP to be 16-byte aligned at the call site.
-pub fn build_user_stack(_pml4: u64, _teb_va: u64, _image_path: &str) -> Result<u64, NTSTATUS> {
+pub fn build_user_stack(pml4: u64, _teb_va: u64, _image_path: &str) -> Result<u64, NTSTATUS> {
     let pages = DEFAULT_USER_STACK_SIZE.div_ceil(0x1000);
     for index in 0..pages {
         let phys = crate::mm::pfn::allocate_pfn().ok_or(STATUS_NO_MEMORY)?;
         let phys = crate::mm::pte::pfn_to_phys(phys);
         let page_va = USER_STACK_TOP - index * 0x1000;
         let result =
-            vas::map_page_in_pml4(_pml4, page_va, phys, pte::PTE_P | pte::PTE_RW | pte::PTE_US);
+            vas::map_page_in_pml4(pml4, page_va, phys, pte::PTE_P | pte::PTE_RW | pte::PTE_US);
         if result != vas::MmStatus::Ok {
             return Err(STATUS_NO_MEMORY);
         }
