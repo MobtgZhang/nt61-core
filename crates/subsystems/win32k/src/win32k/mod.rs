@@ -53,16 +53,24 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 // Submodules
+pub mod bitmap;
 pub mod clipboard;
+pub mod clipping;
 pub mod dc;
 pub mod gdi_ops;
 pub mod message;
 pub mod objects;
 pub mod paint;
+pub mod path;
+pub mod polygon;
+pub mod raster;
 pub mod region;
+pub mod region_geometry;
+pub mod selection;
 pub mod surface;
 pub mod syscall;
 pub mod text;
+pub mod transforms;
 pub mod user_state;
 pub mod window;
 

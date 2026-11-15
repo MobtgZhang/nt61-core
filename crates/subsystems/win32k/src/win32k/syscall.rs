@@ -14,6 +14,15 @@
 
 extern crate alloc;
 
+pub use super::bitmap::*;
+
+pub use super::clipping::*;
+pub use super::dc::services::*;
+pub use super::path::services::*;
+pub use super::polygon::services::*;
+pub use super::region::services::*;
+pub use super::selection::*;
+pub use super::transforms::*;
 use crate::arch::common::syscall_frame::SyscallFrame;
 use crate::libs::win32k::objects::PenStyle;
 
@@ -189,15 +198,23 @@ pub extern "C" fn nt_gdi_bit_blt(frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_GDI_BIT_BLT: dest=0x{:x} ({}x{}) src=0x{:x} ({}x{}) rop=0x{:08x}",
     //         hdc_dest, x, y, hdc_src, src_x, src_y, rop);
 
-    // Get destination DC
-    if let Some(dst_dc) = crate::libs::win32k::dc::get_dc(hdc_dest) {
-        // Get source DC (optional for some operations)
-        let src_dc_opt = if hdc_src != 0 {
-            crate::libs::win32k::dc::get_dc(hdc_src)
-        } else {
-            None
+    let mut table = super::dc::get_dc_table();
+    let source = if hdc_src != 0 {
+        let Some(source) = table.get(hdc_src) else {
+            return 0;
         };
-
+        let mut snapshot = super::dc::DcObject::new();
+        snapshot.surface = source.surface;
+        snapshot.world_transform = source.world_transform;
+        snapshot.viewport_ext = source.viewport_ext;
+        snapshot.window_ext = source.window_ext;
+        snapshot.viewport_org = source.viewport_org;
+        snapshot.window_org = source.window_org;
+        Some(snapshot)
+    } else {
+        None
+    };
+    if let Some(dst_dc) = table.get(hdc_dest) {
         // Call the actual GDI bit_blt function
         let success = crate::libs::win32k::gdi_ops::gre_bit_blt(
             dst_dc,
@@ -205,7 +222,7 @@ pub extern "C" fn nt_gdi_bit_blt(frame: &SyscallFrame) -> u64 {
             y,
             width,
             height,
-            src_dc_opt.as_deref(),
+            source.as_ref(),
             src_x,
             src_y,
             rop,
@@ -243,7 +260,11 @@ pub extern "C" fn nt_gdi_select_object(frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_GDI_SELECT_BITMAP: hdc=0x{:x}, hgdiobj=0x{:016x}", hdc, hgdiobj);
 
     // Call the DC select object function
-    let result = crate::libs::win32k::dc::gre_select_object(hdc, hgdiobj);
+    let result = crate::libs::win32k::dc::select_typed_object(
+        hdc,
+        hgdiobj,
+        Some(super::objects::GdiObjectType::Bitmap),
+    );
     let _ = &result;
 
     // kprintln!("[win32k] NT_GDI_SELECT_BITMAP: returning 0x{:016x}", result);
@@ -295,30 +316,6 @@ pub extern "C" fn nt_gdi_stretch_blt(frame: &SyscallFrame) -> u64 {
     let _rop = frame.args[10] as u32;
     let _background_color = frame.args[11] as u32;
     0
-}
-
-/// NT_GDI_COMBINE_RGN - Combine two regions
-pub extern "C" fn nt_gdi_combine_rgn(frame: &SyscallFrame) -> u64 {
-    let hrgn_dest = unsafe { get_arg0(frame) };
-    let _ = &hrgn_dest;
-    let hrgn_src1 = unsafe { get_arg1(frame) };
-    let _ = &hrgn_src1;
-    let hrgn_src2 = unsafe { get_arg2(frame) };
-    let _ = &hrgn_src2;
-    let i_mode = unsafe { get_arg3(frame) };
-    let _ = &i_mode;
-
-    // kprintln!("[win32k] NT_GDI_COMBINE_RGN");
-
-    // Basic region combination. RGN_AND (1), RGN_OR (2), RGN_XOR (3),
-    // RGN_DIFF (4), RGN_COPY (5). Without persistent region objects we
-    // return the source region handle for RGN_COPY and 1 (SIMPLEREGION)
-    // for the boolean combinations.
-
-    match i_mode {
-        5 => hrgn_src1, // RGN_COPY
-        _ => 1,         // SIMPLEREGION for AND/OR/XOR/DIFF
-    }
 }
 
 /// NT_GDI_GET_DCOBJECT - Get DC object handle
@@ -387,23 +384,6 @@ pub extern "C" fn nt_gdi_ext_text_out(frame: &SyscallFrame) -> u64 {
     1 // TRUE
 }
 
-/// NT_GDI_SELECT_FONT - Select font into DC
-pub extern "C" fn nt_gdi_select_font(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let hfont = unsafe { get_arg1(frame) };
-    let _ = &hfont;
-
-    // kprintln!("[win32k] NT_GDI_SELECT_FONT");
-
-    // Font selection: return a pseudo-handle to represent the font.
-    if hfont != 0 {
-        hfont
-    } else {
-        0x0002_0001
-    } // default system font
-}
-
 /// NT_GDI_RESTORE_DC - Restore device context
 pub extern "C" fn nt_gdi_restore_dc(frame: &SyscallFrame) -> u64 {
     let hdc = unsafe { get_arg0(frame) };
@@ -437,84 +417,12 @@ pub extern "C" fn nt_gdi_save_dc(frame: &SyscallFrame) -> u64 {
     result as u64
 }
 
-/// NT_GDI_GET_DCDWORD - Get DC attribute
-pub extern "C" fn nt_gdi_get_dc_dword(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let attrib = unsafe { get_arg1(frame) };
-    let _ = &attrib;
-    let p_result = unsafe { get_arg2(frame) };
-    let _ = &p_result;
-
-    // kprintln!("[win32k] NT_GDI_GET_DCDWORD");
-
-    // GetDCDword: return the requested DC attribute.
-    // 0=OBJ_TYPE, 1=BK_COLOR, 2=TEXT_COLOR, 3=ROPE2, 4=FONT, 5=BRUSH
-    match attrib as u32 {
-        1 | 2 => 0x0000_0000, // white
-        3 => 0x0000_0010,     // R2_COPYPEN
-        _ => 0,
-    }
-}
-
 /// NT_GDI_LINE_TO - Draw line to position
 pub extern "C" fn nt_gdi_line_to(frame: &SyscallFrame) -> u64 {
-    unsafe {
-        let hdc = { get_arg0(frame) };
-        let _ = &hdc;
-        let x = { get_arg1(frame) as i32 };
-        let _ = &x;
-        let y = { get_arg2(frame) as i32 };
-        let _ = &y;
-
-        // kprintln!("[win32k] NT_GDI_LINE_TO: hdc=0x{:x} ({},{})", hdc, x, y);
-
-        // Get DC and draw line using MoveToEx + LineTo pattern
-        if let Some(dc) = crate::libs::win32k::dc::get_dc(hdc) {
-            // Get current pen position (DC maintains a current position)
-            // For now, just draw the line
-            let start_x = dc.cur_x;
-            let start_y = dc.cur_y;
-            let pen_color = if dc.pen != 0 {
-                crate::libs::win32k::objects::gdi_get_pen_color(dc.pen)
-            } else {
-                0
-            };
-
-            // Use the DC's surface
-            let surface = if dc.surface != 0 {
-                dc.surface as *mut crate::libs::win32k::surface::GdiSurface
-            } else {
-                crate::libs::win32k::surface::get_primary_surface()
-            };
-
-            if !surface.is_null() {
-                // Simple line drawing - use Bresenham's algorithm
-                let success = crate::libs::win32k::gdi_ops::draw_line(
-                    surface, start_x, start_y, x, y, pen_color,
-                );
-                let _ = &success;
-                // Update the DC's current position to the line end.
-                dc.cur_x = x;
-                dc.cur_y = y;
-                return if success { 1 } else { 0 };
-            }
-        }
-        0
-    }
-}
-
-/// NT_GDI_GET_APP_CLIP_BOX - Get application clip box
-pub extern "C" fn nt_gdi_get_app_clip_box(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let rect = unsafe { get_arg1(frame) };
-    let _ = &rect;
-
-    // kprintln!("[win32k] NT_GDI_GET_APP_CLIP_BOX");
-
-    // GetAppClipBox: return 0 (empty clip box).
-    0
+    let Some(mut dc) = super::dc::get_dc(frame.args[0]) else {
+        return 0;
+    };
+    super::gdi_ops::gre_line_to(&mut dc, frame.args[1] as i32, frame.args[2] as i32) as u64
 }
 
 /// NT_GDI_DO_PALETTE - Perform palette operation
@@ -738,8 +646,8 @@ pub extern "C" fn nt_gdi_pat_blt(frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_GDI_PAT_BLT: hdc=0x{:x}, ({}x{}) size={}x{}, rop=0x{:08x}",
     //         hdc, x, y, width, height, rop);
 
-    if let Some(dc) = crate::libs::win32k::dc::get_dc(hdc) {
-        let success = crate::libs::win32k::gdi_ops::gre_pat_blt(dc, x, y, width, height, rop);
+    if let Some(mut dc) = crate::libs::win32k::dc::get_dc(hdc) {
+        let success = crate::libs::win32k::gdi_ops::gre_pat_blt(&mut dc, x, y, width, height, rop);
         if success {
             1
         } else {
@@ -776,58 +684,6 @@ pub extern "C" fn nt_gdi_draw_stream(frame: &SyscallFrame) -> u64 {
 
     // DrawStream: return 1 for success (stream drawing is a no-op for now).
     1
-}
-
-/// NT_GDI_INVERT_RGN - Invert region
-pub extern "C" fn nt_gdi_invert_rgn(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let hrgn = unsafe { get_arg1(frame) };
-    let _ = &hrgn;
-
-    // kprintln!("[win32k] NT_GDI_INVERT_RGN");
-
-    // InvertRgn: invert the primary surface pixels.
-    let primary = super::surface::get_primary_surface();
-    if !primary.is_null() {
-        let surf = unsafe { &mut *primary };
-        for y in 0..surf.height {
-            for x in 0..surf.width {
-                if let Some(pixel) = surf.get_pixel(x, y) {
-                    surf.set_pixel(x, y, !pixel);
-                }
-            }
-        }
-    }
-    1 // SIMPLEREGION
-}
-
-/// NT_GDI_GET_RGN_BOX - Get region box
-pub extern "C" fn nt_gdi_get_rgn_box(frame: &SyscallFrame) -> u64 {
-    let hrgn = unsafe { get_arg0(frame) };
-    let _ = &hrgn;
-    let rect = unsafe { get_arg1(frame) };
-    let _ = &rect;
-
-    // kprintln!("[win32k] NT_GDI_GET_RGN_BOX");
-
-    // GetRgnBox: write primary surface bounds to the output rect.
-    let rect_ptr = rect as *mut i32;
-    if !rect_ptr.is_null() {
-        let primary = super::surface::get_primary_surface();
-        if !primary.is_null() {
-            let surf = unsafe { &*primary };
-            let mut rect_bytes = [0u8; 16];
-            rect_bytes[0..4].copy_from_slice(&0i32.to_le_bytes());
-            rect_bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
-            rect_bytes[8..12].copy_from_slice(&surf.width.to_le_bytes());
-            rect_bytes[12..16].copy_from_slice(&surf.height.to_le_bytes());
-            if crate::mm::user_copy::copy_to_user(rect, &rect_bytes).is_ok() {
-                return 1;
-            }
-        }
-    }
-    0 // NULLREGION
 }
 
 /// NT_GDI_MASK_BLT - Masked block transfer
@@ -869,27 +725,6 @@ pub extern "C" fn nt_gdi_get_nearest_color(frame: &SyscallFrame) -> u64 {
     cry
 }
 
-/// NT_GDI_TRANSFORM_POINTS - Transform points
-pub extern "C" fn nt_gdi_transform_points(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_TRANSFORM_POINTS");
-
-    // TransformPoints: return 0 for success (transform is identity).
-    0
-}
-
-/// NT_GDI_GET_DCPOINT - Get DC point
-pub extern "C" fn nt_gdi_get_dc_point(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_GET_DCPOINT");
-
-    // GetDCPoint: return surface dimensions.
-    let primary = super::surface::get_primary_surface();
-    if !primary.is_null() {
-        let surf = unsafe { &*primary };
-        return (surf.width as u64) << 32 | (surf.height as u64 & 0xFFFF);
-    }
-    0
-}
-
 /// NT_GDI_CREATE_DIBBRUSH - create DIB brush
 pub extern "C" fn nt_gdi_create_dib_brush(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_GDI_CREATE_DIBBRUSH");
@@ -912,108 +747,6 @@ pub extern "C" fn nt_gdi_dd_blt(_frame: &SyscallFrame) -> u64 {
 
     // DdBlt: return 1 (DDERR_OK equivalent).
     1
-}
-
-/// NT_GDI_OFFSET_RGN - offset region
-pub extern "C" fn nt_gdi_offset_rgn(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_OFFSET_RGN");
-
-    // OffsetRgn: return SIMPLEREGION.
-    1 // SIMPLEREGION
-}
-
-/// NT_GDI_FILL_RGN - Fill region
-pub extern "C" fn nt_gdi_fill_rgn(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let hrgn = unsafe { get_arg1(frame) };
-    let _ = &hrgn;
-    let hbrush = unsafe { get_arg2(frame) };
-    let _ = &hbrush;
-
-    // kprintln!("[win32k] NT_GDI_FILL_RGN: hdc=0x{:x}, hrgn=0x{:x}, hbrush=0x{:x}", hdc, hrgn, hbrush);
-
-    // FillRgn: clear the primary surface with the brush color.
-    let primary = super::surface::get_primary_surface();
-    if !primary.is_null() {
-        let surf = unsafe { &mut *primary };
-        surf.clear(0x0000_0000); // black fill
-        return 1;
-    }
-    0
-}
-
-/// NT_GDI_MODIFY_WORLD_TRANSFORM - Modify world transform
-pub extern "C" fn nt_gdi_modify_world_transform(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let xform = unsafe { get_arg1(frame) };
-    let _ = &xform;
-    let mode = unsafe { get_arg2(frame) };
-    let _ = &mode;
-
-    // kprintln!("[win32k] NT_GDI_MODIFY_WORLD_TRANSFORM: hdc=0x{:x}, xform=0x{:x}, mode=0x{:x}", hdc, xform, mode);
-
-    let mode = mode as u32;
-    if !(1..=4).contains(&mode) {
-        return 0;
-    }
-    if xform != 0 {
-        let transform: crate::libs::win32k::dc::Xform =
-            match crate::mm::user_copy::read_user_object(xform) {
-                Ok(transform) => transform,
-                Err(_) => return 0,
-            };
-        if !transform.m11.is_finite()
-            || !transform.m12.is_finite()
-            || !transform.m21.is_finite()
-            || !transform.m22.is_finite()
-            || !transform.dx.is_finite()
-            || !transform.dy.is_finite()
-        {
-            return 0;
-        }
-        if let Some(dc) = crate::libs::win32k::dc::get_dc(hdc) {
-            match mode {
-                1 => {
-                    dc.world_transform = crate::libs::win32k::dc::Xform::IDENTITY;
-                    dc.world_transform_valid = false;
-                }
-                4 => {
-                    dc.world_transform = transform;
-                    dc.world_transform_valid = true;
-                }
-                2 => {
-                    let old = dc.world_transform;
-                    dc.world_transform = crate::libs::win32k::dc::Xform {
-                        m11: old.m11 * transform.m11 + old.m12 * transform.m21,
-                        m12: old.m11 * transform.m12 + old.m12 * transform.m22,
-                        m21: old.m21 * transform.m11 + old.m22 * transform.m21,
-                        m22: old.m21 * transform.m12 + old.m22 * transform.m22,
-                        dx: old.m11 * transform.dx + old.m12 * transform.dy + old.dx,
-                        dy: old.m21 * transform.dx + old.m22 * transform.dy + old.dy,
-                    };
-                    dc.world_transform_valid = true;
-                }
-                3 => {
-                    let old = dc.world_transform;
-                    dc.world_transform = crate::libs::win32k::dc::Xform {
-                        m11: transform.m11 * old.m11 + transform.m12 * old.m21,
-                        m12: transform.m11 * old.m12 + transform.m12 * old.m22,
-                        m21: transform.m21 * old.m11 + transform.m22 * old.m21,
-                        m22: transform.m21 * old.m12 + transform.m22 * old.m22,
-                        dx: transform.m11 * old.dx + transform.m12 * old.dy + transform.dx,
-                        dy: transform.m21 * old.dx + transform.m22 * old.dy + transform.dy,
-                    };
-                    dc.world_transform_valid = true;
-                }
-                _ => return 0,
-            }
-            return 1;
-        }
-        return 0;
-    }
-    0
 }
 
 /// NT_GDI_OPEN_DCW - Open device context (wide)
@@ -1131,27 +864,6 @@ pub extern "C" fn nt_gdi_stretch_dibits_internal(_frame: &SyscallFrame) -> u64 {
     0
 }
 
-/// NT_GDI_CREATE_RECT_RGN - create rectangular region
-pub extern "C" fn nt_gdi_create_rect_rgn(frame: &SyscallFrame) -> u64 {
-    let x1 = unsafe { get_arg0(frame) };
-    let _ = &x1;
-    let y1 = unsafe { get_arg1(frame) };
-    let _ = &y1;
-    let x2 = unsafe { get_arg2(frame) };
-    let _ = &x2;
-    let y2 = unsafe { get_arg3(frame) };
-    let _ = &y2;
-
-    // kprintln!("[win32k] NT_GDI_CREATE_RECT_RGN");
-
-    // CreateRectRgn: return a pseudo-handle for a nonempty rect.
-    if x2 > x1 && y2 > y1 {
-        0x0003_0001
-    } else {
-        0
-    } // empty region
-}
-
 /// NT_GDI_GET_DIBITS_INTERNAL - Get DIB bits (internal)
 pub extern "C" fn nt_gdi_get_dibits_internal(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_GDI_GET_DIBITS_INTERNAL");
@@ -1165,14 +877,6 @@ pub extern "C" fn nt_gdi_delete_client_obj(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_GDI_DELETE_CLIENT_OBJ");
 
     0
-}
-
-/// NT_GDI_EXT_CREATE_REGION - Extended region creation
-pub extern "C" fn nt_gdi_ext_create_region(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_EXT_CREATE_REGION");
-
-    // ExtCreateRegion: return a pseudo-handle for the region.
-    0x0003_0002
 }
 
 /// NT_GDI_COMPUTE_XFORM_COEFFICIENTS - Compute transform coefficients
@@ -1206,8 +910,9 @@ pub extern "C" fn nt_gdi_rectangle(frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_GDI_RECTANGLE: hdc=0x{:x} ({},{})-({},{})", hdc, left, top, right, bottom);
 
     // Get DC and draw rectangle
-    if let Some(dc) = crate::libs::win32k::dc::get_dc(hdc) {
-        let success = crate::libs::win32k::gdi_ops::gre_rectangle(dc, left, top, right, bottom);
+    if let Some(mut dc) = crate::libs::win32k::dc::get_dc(hdc) {
+        let success =
+            crate::libs::win32k::gdi_ops::gre_rectangle(&mut dc, left, top, right, bottom);
         let _ = &success;
         if success {
             1
@@ -1225,14 +930,6 @@ pub extern "C" fn nt_gdi_set_layout(_frame: &SyscallFrame) -> u64 {
 
     // SetLayout: return 0 (previous layout, LAYOUT_RTL = 1).
     0
-}
-
-/// NT_GDI_EXCLUDE_CLIP_RECT - Exclude rectangle from clip region
-pub extern "C" fn nt_gdi_exclude_clip_rect(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_EXCLUDE_CLIP_RECT");
-
-    // ExcludeClipRect: return the clip complexity (SIMPLEREGION).
-    1
 }
 
 /// NT_GDI_CREATE_DIBSECTION - create DIB section
@@ -1329,40 +1026,6 @@ pub extern "C" fn nt_gdi_create_palette_internal(_frame: &SyscallFrame) -> u64 {
     0x0008_0001
 }
 
-/// NT_GDI_SET_BRUSH_ORG - Set brush origin
-pub extern "C" fn nt_gdi_set_brush_org(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_SET_BRUSH_ORG");
-
-    // SetBrushOrg: return 0 (previous brush origin = origin).
-    0
-}
-
-/// NT_GDI_SET_PIXEL - Set pixel
-pub extern "C" fn nt_gdi_set_pixel(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let x = unsafe { get_arg1(frame) };
-    let _ = &x;
-    let y = unsafe { get_arg2(frame) };
-    let _ = &y;
-    let color = unsafe { get_arg3(frame) };
-    let _ = &color;
-
-    // kprintln!("[win32k] NT_GDI_SET_PIXEL");
-
-    // SetPixel: write to the primary surface if the DC is the screen.
-    let primary = super::surface::get_primary_surface();
-    if !primary.is_null() {
-        let surf = unsafe { &mut *primary };
-        let x = unsafe { get_arg1(frame) } as i32;
-        let y = unsafe { get_arg2(frame) } as i32;
-        if x >= 0 && x < surf.width && y >= 0 && y < surf.height {
-            surf.set_pixel(x, y, color as u32);
-        }
-    }
-    0 // CLR_INVALID is actually 0xFFFFFFFF; 0 means success here
-}
-
 /// NT_GDI_CREATE_PATTERN_BRUSH_INTERNAL - create pattern brush (internal)
 pub extern "C" fn nt_gdi_create_pattern_brush_internal(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_GDI_CREATE_PATTERN_BRUSH_INTERNAL");
@@ -1388,11 +1051,13 @@ pub extern "C" fn nt_gdi_set_bitmap_bits(_frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_GDI_CREATE_SOLID_BRUSH - create solid brush
-pub extern "C" fn nt_gdi_create_solid_brush(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_CREATE_SOLID_BRUSH");
-
-    // CreateSolidBrush: return a pseudo-handle for the brush.
-    0x000A_0001
+pub extern "C" fn nt_gdi_create_solid_brush(frame: &SyscallFrame) -> u64 {
+    // The second native argument is a preallocated user handle. Its ownership
+    // protocol is not implemented; reject it rather than ignore the request.
+    if frame.args[1] != 0 {
+        return 0;
+    }
+    super::objects::gdi_create_solid_brush(frame.args[0] as u32)
 }
 
 /// NT_GDI_CREATE_CLIENT_OBJ - create client object
@@ -1401,40 +1066,6 @@ pub extern "C" fn nt_gdi_create_client_obj(_frame: &SyscallFrame) -> u64 {
 
     // CreateClientObj: return a pseudo-handle for the client object.
     0x000B_0001
-}
-
-/// NT_GDI_RECT_IN_REGION - Rectangle in region
-pub extern "C" fn nt_gdi_rect_in_region(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_RECT_IN_REGION");
-
-    // RectInRegion: return 1 (TRUE, rect is in region).
-    1
-}
-
-/// NT_GDI_GET_PIXEL - Get pixel color
-pub extern "C" fn nt_gdi_get_pixel(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let x = unsafe { get_arg1(frame) };
-    let _ = &x;
-    let y = unsafe { get_arg2(frame) };
-    let _ = &y;
-
-    // kprintln!("[win32k] NT_GDI_GET_PIXEL");
-
-    // GetPixel: read from the primary surface.
-    let primary = super::surface::get_primary_surface();
-    if !primary.is_null() {
-        let surf = unsafe { &*primary };
-        let x = unsafe { get_arg1(frame) } as i32;
-        let y = unsafe { get_arg2(frame) } as i32;
-        if x >= 0 && x < surf.width && y >= 0 && y < surf.height {
-            if let Some(pixel) = surf.get_pixel(x, y) {
-                return pixel as u64;
-            }
-        }
-    }
-    0xFFFF_FFFF // CLR_INVALID
 }
 
 // =============================================================================
@@ -1536,7 +1167,8 @@ pub extern "C" fn nt_user_create_window_ex(frame: &SyscallFrame) -> u64 {
     }
     let mut class_name_buf = [0u16; 64];
     let mut title_buf = [0u16; 256];
-    let class_length = match capture_user_large_unicode_string(class_name_ptr, &mut class_name_buf) {
+    let class_length = match capture_user_large_unicode_string(class_name_ptr, &mut class_name_buf)
+    {
         Ok(length) => length,
         Err(_) => return 0,
     };
@@ -4361,3 +3993,5 @@ pub extern "C" fn nt_user_unhook_win_event(frame: &SyscallFrame) -> u64 {
 
     crate::libs::win32k::user_state::remove_event_hook(h_win_event_hook) as u64
 }
+
+pub use super::raster::{nt_gdi_fill_rgn, nt_gdi_get_pixel, nt_gdi_invert_rgn, nt_gdi_set_pixel};

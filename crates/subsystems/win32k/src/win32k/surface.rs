@@ -60,29 +60,20 @@ impl GdiSurface {
         if width <= 0 || height == 0 {
             return None;
         }
-
-        // Calculate pitch (bytes per row, aligned to 4 bytes)
+        let height = height.checked_abs()?;
         let bits_per_pixel = match format {
-            PIXEL_FORMAT_1BPP => 1,
+            PIXEL_FORMAT_1BPP => 1usize,
             PIXEL_FORMAT_4BPP => 4,
             PIXEL_FORMAT_8BPP => 8,
             PIXEL_FORMAT_16BPP => 16,
             PIXEL_FORMAT_24BPP => 24,
             PIXEL_FORMAT_32BPP | PIXEL_FORMAT_32BPP_ARGB => 32,
-            _ => 32,
+            _ => return None,
         };
-        let _ = &bits_per_pixel;
-
-        let bytes_per_pixel = (bits_per_pixel + 7) / 8;
-
-        let _ = &bytes_per_pixel;
-        let _ = &bytes_per_pixel;
-        let row_bytes = ((width * bytes_per_pixel + 3) / 4) * 4;
-        let _ = &row_bytes;
-        let _ = &row_bytes;
-        let total_bytes = (row_bytes * height.abs()) as usize;
-        let _ = &total_bytes;
-        let _ = &total_bytes;
+        let row_bits = (width as usize).checked_mul(bits_per_pixel)?;
+        let row_bytes = row_bits.checked_add(31)?.checked_div(32)?.checked_mul(4)?;
+        let total_bytes = row_bytes.checked_mul(height as usize)?;
+        let row_bytes = i32::try_from(row_bytes).ok()?;
 
         // Allocate pixel buffer
         let bits = if total_bytes > 0 {
@@ -116,6 +107,10 @@ impl GdiSurface {
 
     /// Get pixel at (x, y) - 32bpp only
     pub fn get_pixel(&self, x: i32, y: i32) -> Option<u32> {
+        if self.format != PIXEL_FORMAT_32BPP && self.format != PIXEL_FORMAT_32BPP_ARGB {
+            return None;
+        }
+
         if x < 0 || x >= self.width || y < 0 || y >= self.height {
             return None;
         }
@@ -124,19 +119,23 @@ impl GdiSurface {
             return None;
         }
 
-        let offset = (y * self.pitch + x * 4) as isize;
+        let offset = y as usize * self.pitch as usize + x as usize * 4;
 
         let _ = &offset;
         let _ = &offset;
         unsafe {
             Some(core::ptr::read_unaligned(
-                self.bits.offset(offset) as *const u32
+                self.bits.add(offset) as *const u32
             ))
         }
     }
 
     /// Set pixel at (x, y) - 32bpp only
     pub fn set_pixel(&mut self, x: i32, y: i32, color: u32) -> bool {
+        if self.format != PIXEL_FORMAT_32BPP && self.format != PIXEL_FORMAT_32BPP_ARGB {
+            return false;
+        }
+
         if x < 0 || x >= self.width || y < 0 || y >= self.height {
             return false;
         }
@@ -145,12 +144,12 @@ impl GdiSurface {
             return false;
         }
 
-        let offset = (y * self.pitch + x * 4) as isize;
+        let offset = y as usize * self.pitch as usize + x as usize * 4;
 
         let _ = &offset;
         let _ = &offset;
         unsafe {
-            core::ptr::write_unaligned(self.bits.offset(offset) as *mut u32, color);
+            core::ptr::write_unaligned(self.bits.add(offset) as *mut u32, color);
         }
         true
     }

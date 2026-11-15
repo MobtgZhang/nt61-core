@@ -1,103 +1,48 @@
-//! Region and Clipping
-//
-//! Implements GDI regions for clipping and complex shape operations.
-//
-//! ## Windows 7 Region Architecture
-//
-//! Regions are stored as lists of rectangles. They support
-//! set operations: union, intersection, difference, xor.
-//
-//! Reference: ReactOS win32ss/gdi/region
+//! GDI region object operations. Handle validation and geometry access stay
+//! inside the GDI table lock, including when the destination aliases a source.
 
-extern crate alloc;
+use super::objects::{self, GdiHandleTable, GdiObjectType, GdiRegion, Rect};
+use super::region_geometry::Region;
+pub use super::region_geometry::{RegionCombineMode, RegionType};
 
-use crate::libs::win32k::objects::Rect;
-use alloc::boxed::Box;
+#[path = "region/services.rs"]
+pub mod services;
 
-/// Region combination modes
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum RegionCombineMode {
-    Copy = 0,
-    Union = 1,
-    Xor = 2,
-    Intersection = 3,
-    Difference = 4,
-}
-
-/// Region type (returned by CombineRgn)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum RegionType {
-    Null = 0,
-    Simple = 1,
-    Complex = 2,
-}
-
-/// Maximum rectangles in a region
-const MAX_RECTANGLES: usize = 256;
-
-/// Region object
-#[repr(C)]
-pub struct GdiRegionData {
-    pub count: i32,
-    pub extents: Rect,
-    pub rects: [Rect; MAX_RECTANGLES],
-}
-
-impl GdiRegionData {
-    pub fn new() -> Self {
-        Self {
-            count: 0,
-            extents: Rect::new(0, 0, 0, 0),
-            rects: [Rect::new(0, 0, 0, 0); MAX_RECTANGLES],
+pub(super) fn replace_geometry(handle: u64, geometry: Region) -> bool {
+    objects::with_handle_table(|table| {
+        let Some(pointer) = region_pointer(table, handle) else {
+            return false;
+        };
+        unsafe {
+            (*pointer).replace(geometry);
         }
+        true
+    })
+}
+
+fn region_pointer(table: &GdiHandleTable, handle: u64) -> Option<*mut GdiRegion> {
+    let entry = table.get(handle)?;
+    if entry.get_type()? != GdiObjectType::Region || entry.obj_ptr == 0 {
+        return None;
     }
+    Some(entry.obj_ptr as *mut GdiRegion)
 }
 
-impl Default for GdiRegionData {
-    fn default() -> Self {
-        Self::new()
+pub fn gre_create_rect_rgn(left: i32, top: i32, right: i32, bottom: i32) -> u64 {
+    objects::gdi_create_rect_rgn(left, top, right, bottom)
+}
+
+pub fn gre_create_rect_rgn_indirect(rect: &Rect) -> u64 {
+    gre_create_rect_rgn(rect.left, rect.top, rect.right, rect.bottom)
+}
+
+pub fn gre_delete_region(handle: u64) -> bool {
+    if objects::gdi_get_object_type(handle) != Some(GdiObjectType::Region) {
+        return false;
     }
+    objects::gdi_delete_object(handle)
 }
 
-/// Region handle wrapper
-pub struct RegionHandle {
-    pub data: Box<GdiRegionData>,
-}
-
-impl RegionHandle {
-    pub fn new() -> Self {
-        Self {
-            data: Box::new(GdiRegionData::new()),
-        }
-    }
-
-    pub fn from_rect(rect: &Rect) -> Self {
-        let mut region = Self::new();
-        region.data.count = 1;
-        region.data.extents = *rect;
-        region.data.rects[0] = *rect;
-        region
-    }
-}
-
-impl Default for RegionHandle {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// =============================================================================
-// Region Operations
-// =============================================================================
-
-/// Check if a rectangle is empty
-fn is_empty_rect(rect: &Rect) -> bool {
-    rect.left >= rect.right || rect.top >= rect.bottom
-}
-
-/// Check if rect A is contained in rect B
 pub fn rect_contains(outer: &Rect, inner: &Rect) -> bool {
     inner.left >= outer.left
         && inner.right <= outer.right
@@ -105,469 +50,152 @@ pub fn rect_contains(outer: &Rect, inner: &Rect) -> bool {
         && inner.bottom <= outer.bottom
 }
 
-/// Check if two rectangles intersect
-fn rects_intersect(a: &Rect, b: &Rect) -> bool {
-    !(a.right <= b.left || a.left >= b.right || a.bottom <= b.top || a.top >= b.bottom)
+pub fn rect_intersection(first: &Rect, second: &Rect) -> Option<Rect> {
+    first.intersect(second)
 }
 
-/// Compute intersection of two rectangles
-pub fn rect_intersection(a: &Rect, b: &Rect) -> Option<Rect> {
-    if !rects_intersect(a, b) {
-        return None;
-    }
-
-    Some(Rect::new(
-        a.left.max(b.left),
-        a.top.max(b.top),
-        a.right.min(b.right),
-        a.bottom.min(b.bottom),
-    ))
+pub fn rects_overlap(first: &Rect, second: &Rect) -> bool {
+    first.intersect(second).is_some()
 }
 
-/// create a simple rectangle region
-pub fn gre_create_rect_rgn(left: i32, top: i32, right: i32, bottom: i32) -> u64 {
-    let region = crate::libs::win32k::objects::gdi_create_rect_rgn(left, top, right, bottom);
-    let _ = &region;
-    // kprintln!("[win32k] gre_create_rect_rgn: ({},{})-({},{}) -> handle=0x{:016x}",
-    //               left, top, right, bottom, region);
-    region
+pub fn snapshot(handle: u64) -> Option<Region> {
+    objects::with_handle_table(|table| {
+        let pointer = region_pointer(table, handle)?;
+        // SAFETY: the table guard prevents deletion for this entire closure.
+        unsafe { (*pointer).geometry.try_clone().ok() }
+    })
 }
 
-/// create a region from a RECT structure
-pub fn gre_create_rect_rgn_indirect(rect: &Rect) -> u64 {
-    gre_create_rect_rgn(rect.left, rect.top, rect.right, rect.bottom)
-}
-
-/// Delete a region
-pub fn gre_delete_region(region: u64) -> bool {
-    // Region is handled as GDI object
-    let ok = crate::libs::win32k::objects::gdi_delete_object(region);
-    let _ = &region;
-    ok
-}
-
-// =============================================================================
-// Region Combination
-// =============================================================================
-
-/// Check if two rectangles overlap
-pub fn rects_overlap(a: &Rect, b: &Rect) -> bool {
-    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
-}
-
-/// Simple region union - add a rectangle to existing region
-pub fn add_rect_to_region(region: &mut GdiRegionData, rect: &Rect) {
-    if is_empty_rect(rect) {
-        return;
-    }
-
-    if region.count == 0 {
-        region.count = 1;
-        region.extents = *rect;
-        region.rects[0] = *rect;
-        return;
-    }
-
-    // Check if this rect can be merged with existing ones
-    let mut merged = false;
-    for i in 0..region.count as usize {
-        if rects_overlap(&region.rects[i], rect) {
-            // Merge by expanding the existing rect
-            region.rects[i].left = region.rects[i].left.min(rect.left);
-            region.rects[i].top = region.rects[i].top.min(rect.top);
-            region.rects[i].right = region.rects[i].right.max(rect.right);
-            region.rects[i].bottom = region.rects[i].bottom.max(rect.bottom);
-            merged = true;
-            break;
-        }
-    }
-
-    // If not merged, add as new rectangle
-    if !merged && region.count < MAX_RECTANGLES as i32 {
-        region.rects[region.count as usize] = *rect;
-        region.count += 1;
-    }
-
-    // Update extents
-    region.extents.left = region.extents.left.min(rect.left);
-    region.extents.top = region.extents.top.min(rect.top);
-    region.extents.right = region.extents.right.max(rect.right);
-    region.extents.bottom = region.extents.bottom.max(rect.bottom);
-}
-
-/// Compute the bounding box union of two regions
-fn compute_union_bounds(
-    r1: &crate::libs::win32k::objects::GdiRegion,
-    r2: &crate::libs::win32k::objects::GdiRegion,
-) -> Rect {
-    Rect::new(
-        r1.extents.left.min(r2.extents.left),
-        r1.extents.top.min(r2.extents.top),
-        r1.extents.right.max(r2.extents.right),
-        r1.extents.bottom.max(r2.extents.bottom),
-    )
-}
-
-/// Compute the intersection bounding box of two regions
-fn compute_intersection_bounds(
-    r1: &crate::libs::win32k::objects::GdiRegion,
-    r2: &crate::libs::win32k::objects::GdiRegion,
-) -> Option<Rect> {
-    let left = r1.extents.left.max(r2.extents.left);
-    let _ = &left;
-    let top = r1.extents.top.max(r2.extents.top);
-    let _ = &top;
-    let right = r1.extents.right.min(r2.extents.right);
-    let _ = &right;
-    let bottom = r1.extents.bottom.min(r2.extents.bottom);
-    let _ = &bottom;
-
-    if right > left && bottom > top {
-        Some(Rect::new(left, top, right, bottom))
-    } else {
-        None
-    }
-}
-
-/// Simple region intersection - keep only overlapping area
-pub fn intersect_region_with_rect(region: &mut GdiRegionData, rect: &Rect) {
-    if region.count == 0 {
-        return;
-    }
-
-    let mut new_count: i32 = 0;
-
-    for i in 0..region.count as usize {
-        if let Some(intersection) = rect_intersection(&region.rects[i], rect) {
-            if !is_empty_rect(&intersection) && new_count < MAX_RECTANGLES as i32 {
-                region.rects[new_count as usize] = intersection;
-                new_count += 1;
-            }
-        }
-    }
-
-    region.count = new_count;
-
-    // Recalculate extents
-    if new_count > 0 {
-        region.extents = region.rects[0];
-        for i in 1..new_count as usize {
-            region.extents.left = region.extents.left.min(region.rects[i].left);
-            region.extents.top = region.extents.top.min(region.rects[i].top);
-            region.extents.right = region.extents.right.max(region.rects[i].right);
-            region.extents.bottom = region.extents.bottom.max(region.rects[i].bottom);
-        }
-    }
-}
-
-/// Combine two regions using the specified mode.
-/// This implementation handles all four combine modes:
-/// - Copy: Copy src1 to dest
-/// - Union: Union of src1 and src2
-/// - Intersection: Intersection of src1 and src2
-/// - Difference: src1 minus src2
-/// - Xor: Union minus intersection
-pub fn gre_combine_rgn(
-    dest_handle: u64,
-    src1_handle: u64,
-    src2_handle: u64,
-    mode: RegionCombineMode,
-) -> i32 {
-    let dest_ptr = crate::libs::win32k::objects::gdi_get_object_ptr(dest_handle);
-    let _ = &dest_ptr;
-    let src1_ptr = crate::libs::win32k::objects::gdi_get_object_ptr(src1_handle);
-    let _ = &src1_ptr;
-    let src2_ptr = crate::libs::win32k::objects::gdi_get_object_ptr(src2_handle);
-    let _ = &src2_ptr;
-
-    // Both dest and src1 must be valid
-    let (dest_ptr, src1_ptr) = match (dest_ptr, src1_ptr) {
-        (Some(d), Some(s)) => (d, s),
-        _ => return RegionType::Null as i32,
-    };
-
-    let src1_region = unsafe { &*(src1_ptr as *const crate::libs::win32k::objects::GdiRegion) };
-    let _ = &src1_region;
-
-    match mode {
-        RegionCombineMode::Copy => {
-            // Copy src1 to dest
-            let dest_region =
-                unsafe { &mut *(dest_ptr as *mut crate::libs::win32k::objects::GdiRegion) };
-            let _ = &dest_region;
-            *dest_region = *src1_region;
-            // kprintln!("[win32k] gre_combine_rgn: Copy -> {}",
-            //                 if dest_region.num_rects > 0 { "Simple" } else { "Null" });
-        }
-        RegionCombineMode::Union => {
-            // Union of src1 and src2
-            let dest_region =
-                unsafe { &mut *(dest_ptr as *mut crate::libs::win32k::objects::GdiRegion) };
-            let _ = &dest_region;
-            *dest_region = *src1_region;
-
-            if let Some(src2) = src2_ptr {
-                let src2_region =
-                    unsafe { &*(src2 as *const crate::libs::win32k::objects::GdiRegion) };
-                let _ = &src2_region;
-                // Use proper bounding box union
-                dest_region.extents = compute_union_bounds(src1_region, src2_region);
-                dest_region.num_rects = 2; // Mark as potentially complex
-                                           // kprintln!("[win32k] gre_combine_rgn: Union -> bounds ({},{})-({},{})",
-                                           //                     dest_region.extents.left, dest_region.extents.top,
-                                           //                     dest_region.extents.right, dest_region.extents.bottom);
-            }
-        }
-        RegionCombineMode::Intersection => {
-            // Intersection of src1 and src2
-            let dest_region =
-                unsafe { &mut *(dest_ptr as *mut crate::libs::win32k::objects::GdiRegion) };
-            let _ = &dest_region;
-
-            if let Some(src2) = src2_ptr {
-                let src2_region =
-                    unsafe { &*(src2 as *const crate::libs::win32k::objects::GdiRegion) };
-                let _ = &src2_region;
-
-                if let Some(inter) = compute_intersection_bounds(src1_region, src2_region) {
-                    dest_region.extents = inter;
-                    dest_region.num_rects = 1;
-                    // kprintln!("[win32k] gre_combine_rgn: Intersection -> ({},{})-({},{})",
-                    //                         inter.left, inter.top, inter.right, inter.bottom);
-                } else {
-                    dest_region.num_rects = 0;
-                    // kprintln!("[win32k] gre_combine_rgn: Intersection -> Null (no overlap)");
-                }
+pub fn gre_combine_rgn(destination: u64, first: u64, second: u64, mode: RegionCombineMode) -> i32 {
+    objects::with_handle_table(|table| {
+        let Some(destination) = region_pointer(table, destination) else {
+            return 0;
+        };
+        let Some(first) = region_pointer(table, first) else {
+            return 0;
+        };
+        let result = unsafe {
+            if mode == RegionCombineMode::Copy {
+                (*first).geometry.try_clone()
             } else {
-                // src2 is null region
-                dest_region.num_rects = 0;
+                let Some(second) = region_pointer(table, second) else {
+                    return 0;
+                };
+                (*first).geometry.combine(&(*second).geometry, mode)
             }
+        };
+        let Ok(result) = result else { return 0 };
+        let complexity = result.complexity();
+        // All source borrows ended before this write, even for CombineRgn(r,r,r).
+        unsafe {
+            (*destination).replace(result);
         }
-        RegionCombineMode::Difference => {
-            // src1 minus src2: simplified to just use src1
-            // A full implementation would compute polygon difference
-            let dest_region =
-                unsafe { &mut *(dest_ptr as *mut crate::libs::win32k::objects::GdiRegion) };
-            let _ = &dest_region;
-            *dest_region = *src1_region;
-            // kprintln!("[win32k] gre_combine_rgn: Difference -> using src1 bounds");
-        }
-        RegionCombineMode::Xor => {
-            // XOR of src1 and src2: simplified using bounding boxes
-            // Full implementation would compute symmetric difference
-            let dest_region =
-                unsafe { &mut *(dest_ptr as *mut crate::libs::win32k::objects::GdiRegion) };
-            let _ = &dest_region;
-            *dest_region = *src1_region;
-
-            if let Some(src2) = src2_ptr {
-                let src2_region =
-                    unsafe { &*(src2 as *const crate::libs::win32k::objects::GdiRegion) };
-                let _ = &src2_region;
-                // Use bounding box union for XOR (approximation)
-                dest_region.extents = compute_union_bounds(src1_region, src2_region);
-                dest_region.num_rects = 2;
-                // kprintln!("[win32k] gre_combine_rgn: Xor -> union bounds ({},{})-({},{})",
-                //                     dest_region.extents.left, dest_region.extents.top,
-                //                     dest_region.extents.right, dest_region.extents.bottom);
-            }
-        }
-    }
-
-    // Return region type
-    let dest_region = unsafe { &*(dest_ptr as *const crate::libs::win32k::objects::GdiRegion) };
-    let _ = &dest_region;
-    if dest_region.num_rects == 0 {
-        RegionType::Null as i32
-    } else if dest_region.num_rects == 1 {
-        RegionType::Simple as i32
-    } else {
-        RegionType::Complex as i32
-    }
+        complexity
+    })
 }
 
-// =============================================================================
-// Region Queries
-// =============================================================================
-
-/// Check if two regions are equal
-pub fn gre_equal_rgn(region1: u64, region2: u64) -> bool {
-    let ptr1 = crate::libs::win32k::objects::gdi_get_object_ptr(region1);
-    let _ = &ptr1;
-    let ptr2 = crate::libs::win32k::objects::gdi_get_object_ptr(region2);
-    let _ = &ptr2;
-
-    if ptr1.is_none() || ptr2.is_none() {
-        return false;
-    }
-
-    let r1 = unsafe { &*(ptr1.unwrap() as *const crate::libs::win32k::objects::GdiRegion) };
-    let _ = &r1;
-    let r2 = unsafe { &*(ptr2.unwrap() as *const crate::libs::win32k::objects::GdiRegion) };
-    let _ = &r2;
-
-    r1.extents.left == r2.extents.left
-        && r1.extents.top == r2.extents.top
-        && r1.extents.right == r2.extents.right
-        && r1.extents.bottom == r2.extents.bottom
-        && r1.num_rects == r2.num_rects
+pub fn gre_equal_rgn(first: u64, second: u64) -> bool {
+    objects::with_handle_table(|table| {
+        let (Some(first), Some(second)) =
+            (region_pointer(table, first), region_pointer(table, second))
+        else {
+            return false;
+        };
+        unsafe { (*first).geometry == (*second).geometry }
+    })
 }
 
-/// Check if a point is in a region
-pub fn gre_pt_in_region(region: u64, x: i32, y: i32) -> bool {
-    let ptr = crate::libs::win32k::objects::gdi_get_object_ptr(region);
-    let _ = &ptr;
-    if ptr.is_none() {
+pub fn gre_pt_in_region(handle: u64, x: i32, y: i32) -> bool {
+    objects::with_handle_table(|table| {
+        region_pointer(table, handle)
+            .is_some_and(|pointer| unsafe { (*pointer).geometry.contains_point(x, y) })
+    })
+}
+
+pub fn gre_rect_in_region(handle: u64, rect: &Rect) -> bool {
+    objects::with_handle_table(|table| {
+        region_pointer(table, handle)
+            .is_some_and(|pointer| unsafe { (*pointer).geometry.intersects_rect(rect) })
+    })
+}
+
+pub fn gre_get_rgn_box(handle: u64, rect: &mut Rect) -> i32 {
+    objects::with_handle_table(|table| {
+        let Some(pointer) = region_pointer(table, handle) else {
+            return 0;
+        };
+        unsafe {
+            *rect = (*pointer).geometry.bounds();
+            (*pointer).geometry.complexity()
+        }
+    })
+}
+
+pub fn gre_offset_rgn(handle: u64, dx: i32, dy: i32) -> i32 {
+    objects::with_handle_table(|table| {
+        let Some(pointer) = region_pointer(table, handle) else {
+            return 0;
+        };
+        unsafe {
+            if (*pointer).geometry.offset(dx, dy).is_err() {
+                return 0;
+            }
+            (*pointer).extents = (*pointer).geometry.bounds();
+            (*pointer).geometry.complexity()
+        }
+    })
+}
+
+pub fn gre_set_rect_rgn(handle: u64, rect: Rect) -> bool {
+    let Ok(geometry) = Region::rectangle(rect) else {
         return false;
-    }
+    };
+    objects::with_handle_table(|table| {
+        let Some(pointer) = region_pointer(table, handle) else {
+            return false;
+        };
+        unsafe {
+            (*pointer).replace(geometry);
+        }
+        true
+    })
+}
 
-    let r = unsafe { &*(ptr.unwrap() as *const crate::libs::win32k::objects::GdiRegion) };
-    let _ = &r;
+/// Copy an application's clipping geometry into a DC.
+pub fn gre_select_clip_rgn(dc: u64, region: u64) -> i32 {
+    super::clipping::select_clip(dc, region, RegionCombineMode::Copy)
+}
 
-    // Check extents first
-    if x < r.extents.left || x >= r.extents.right || y < r.extents.top || y >= r.extents.bottom {
+pub fn gre_offset_dcorg(dc: u64, x: i32, y: i32) -> bool {
+    let Some(mut dc) = super::dc::get_dc(dc) else {
         return false;
-    }
-
-    // For simple regions, just check extents
-    // Full implementation would check all rectangles
+    };
+    let (Some(x), Some(y)) = (
+        dc.viewport_org.x.checked_add(x),
+        dc.viewport_org.y.checked_add(y),
+    ) else {
+        return false;
+    };
+    dc.viewport_org = super::dc::PointL::new(x, y);
     true
 }
 
-/// Check if a rectangle is in a region
-pub fn gre_rect_in_region(region: u64, rect: &Rect) -> bool {
-    let ptr = crate::libs::win32k::objects::gdi_get_object_ptr(region);
-    let _ = &ptr;
-    if ptr.is_none() {
-        return false;
-    }
-
-    let r = unsafe { &*(ptr.unwrap() as *const crate::libs::win32k::objects::GdiRegion) };
-    let _ = &r;
-
-    // Check if rect intersects region extents
-    rects_intersect(&r.extents, rect)
-}
-
-/// Get region bounds
-pub fn gre_get_rgn_box(region: u64, rect: &mut Rect) -> i32 {
-    let ptr = crate::libs::win32k::objects::gdi_get_object_ptr(region);
-    let _ = &ptr;
-    if ptr.is_none() {
-        return RegionType::Null as i32;
-    }
-
-    let r = unsafe { &*(ptr.unwrap() as *const crate::libs::win32k::objects::GdiRegion) };
-    let _ = &r;
-
-    *rect = r.extents;
-
-    if r.num_rects == 0 {
-        RegionType::Null as i32
-    } else if r.num_rects == 1 {
-        RegionType::Simple as i32
-    } else {
-        RegionType::Complex as i32
-    }
-}
-
-// =============================================================================
-// DC Clipping
-// =============================================================================
-
-/// Set the clip region of a DC
-pub fn gre_select_clip_rgn(dc: u64, region: u64) -> i32 {
-    // Get DC
-    if let Some(dc_obj) = crate::libs::win32k::dc::get_dc(dc) {
-        let _old_region = dc_obj.clip_region;
-        let _ = &_old_region;
-        dc_obj.clip_region = region;
-
-        if region == 0 {
-            return RegionType::Null as i32;
-        }
-
-        let mut rect = Rect::new(0, 0, 0, 0);
-        gre_get_rgn_box(region, &mut rect)
-    } else {
-        RegionType::Null as i32
-    }
-}
-
-/// Set DC origin
-pub fn gre_offset_dcorg(dc: u64, x: i32, y: i32) -> bool {
-    if let Some(dc_obj) = crate::libs::win32k::dc::get_dc(dc) {
-        dc_obj.viewport_org.x += x;
-        dc_obj.viewport_org.y += y;
-        true
-    } else {
-        false
-    }
-}
-
-/// Set clip rectangle
 pub fn gre_set_dcclipping(dc: u64, rect: &Rect) -> bool {
-    if let Some(dc_obj) = crate::libs::win32k::dc::get_dc(dc) {
-        dc_obj.region = if !is_empty_rect(rect) {
-            gre_create_rect_rgn(rect.left, rect.top, rect.right, rect.bottom)
-        } else {
-            0
-        };
-        true
-    } else {
-        false
-    }
+    let Ok(region) = Region::rectangle(*rect) else {
+        return false;
+    };
+    let Some(mut dc) = super::dc::get_dc(dc) else {
+        return false;
+    };
+    super::clipping::clip_with(&mut dc, Some(region), RegionCombineMode::Copy) != 0
 }
 
-// =============================================================================
-// ExtExclude - Exclude rectangle from region
-// =============================================================================
-
-/// Exclude a rectangle from a region
 pub fn gre_ext_exclude_clip_rect(dc: u64, left: i32, top: i32, right: i32, bottom: i32) -> i32 {
-    if let Some(dc_obj) = crate::libs::win32k::dc::get_dc(dc) {
-        let _exclude_rect = Rect::new(left, top, right, bottom);
-        let _ = &_exclude_rect;
-
-        if dc_obj.clip_region != 0 {
-            // create a new region with the rectangle excluded
-            // This is a simplified implementation
-            // Full implementation would split the region around the rectangle
-
-            let mut box_rect = Rect::new(0, 0, 0, 0);
-            let _current_type = gre_get_rgn_box(dc_obj.clip_region, &mut box_rect);
-            let _ = &_current_type;
-
-            // For simplicity, just clear the clip region
-            dc_obj.clip_region = 0;
-
-            return RegionType::Null as i32;
-        }
-
-        RegionType::Null as i32
-    } else {
-        RegionType::Null as i32
-    }
+    super::clipping::clip_rectangle(
+        dc,
+        Rect::new(left, top, right, bottom),
+        RegionCombineMode::Difference,
+    )
 }
 
-// =============================================================================
-// Debug
-// =============================================================================
-
-/// Dump region info
-pub fn dump_region_info(region: u64) {
-    let ptr = crate::libs::win32k::objects::gdi_get_object_ptr(region);
-    let _ = &ptr;
-    if ptr.is_none() {
-        // kprintln!("[win32k] Region 0x{:016x}: NULL", region);
-        return;
-    }
-
-    let r = unsafe { &*(ptr.unwrap() as *const crate::libs::win32k::objects::GdiRegion) };
-    let _ = &r;
-
-    // kprintln!("[win32k] Region 0x{:016x}:", region);
-    // kprintln!("  extents: ({},{})-({},{})",
-    //               r.extents.left, r.extents.top, r.extents.right, r.extents.bottom);
-    // kprintln!("  rectangles: {}", r.num_rects);
-}
+pub fn dump_region_info(_handle: u64) {}

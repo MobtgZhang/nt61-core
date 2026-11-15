@@ -11,42 +11,6 @@ use crate::libs::win32k::dc::DcObject;
 use crate::libs::win32k::surface::{GdiSurface, PIXEL_FORMAT_32BPP, PIXEL_FORMAT_32BPP_ARGB};
 use alloc::vec::Vec;
 
-/// Current pen position per DC, keyed by the DC address and validated against
-/// the DC surface handle. DcObject carries no field for the GDI current
-/// position, so it is tracked beside the DC in this table.
-static DC_CURRENT_POS: crate::ke::sync::Spinlock<Vec<(usize, u64, i32, i32)>> =
-    crate::ke::sync::Spinlock::new(Vec::new());
-
-fn dc_current_pos_key(dc: &DcObject) -> usize {
-    dc as *const DcObject as usize
-}
-
-fn set_dc_current_pos(dc: &DcObject, x: i32, y: i32) {
-    let key = dc_current_pos_key(dc);
-    let mut positions = DC_CURRENT_POS.lock();
-    if let Some(entry) = positions.iter_mut().find(|entry| entry.0 == key) {
-        entry.1 = dc.surface;
-        entry.2 = x;
-        entry.3 = y;
-    } else {
-        positions.push((key, dc.surface, x, y));
-    }
-}
-
-fn get_dc_current_pos(dc: &DcObject) -> (i32, i32) {
-    let key = dc_current_pos_key(dc);
-    let mut positions = DC_CURRENT_POS.lock();
-    if let Some(entry) = positions.iter_mut().find(|entry| entry.0 == key) {
-        if entry.1 == dc.surface {
-            return (entry.2, entry.3);
-        }
-        entry.1 = dc.surface;
-        entry.2 = 0;
-        entry.3 = 0;
-    }
-    (0, 0)
-}
-
 /// Raster operation codes
 pub const SRCCOPY: u32 = 0x00CC0020;
 pub const SRCPAINT: u32 = 0x00EE0086;
@@ -71,24 +35,7 @@ pub const WHITENESS: u32 = 0x00FF0062;
 /// Apply a raster operation to a single pixel
 #[inline(always)]
 pub fn apply_rop(dest: u32, src: u32, pat: u32, rop: u32) -> u32 {
-    match rop {
-        SRCCOPY => src,
-        SRCPAINT => dest | src,
-        SRCAND => dest & src,
-        SRCINVERT => dest ^ src,
-        SRCERASE => dest & !src,
-        NOTSRCCOPY => !src,
-        NOTSRCERASE => !(dest | src),
-        MERGECOPY => dest & pat,
-        MERGEPAINT => dest | !src,
-        PATCOPY => pat,
-        PATPAINT => dest | pat | !src,
-        PATINVERT => dest ^ pat,
-        DSTINVERT => !dest,
-        BLACKNESS => 0,
-        WHITENESS => 0x00FFFFFF,
-        _ => src,
-    }
+    super::raster::rop3(dest, src, pat, rop)
 }
 
 /// Apply SRCCOPY ROP (fast path)
@@ -145,265 +92,9 @@ pub fn gre_bit_blt(
     src_y: i32,
     rop: u32,
 ) -> bool {
-    if width == 0 || height == 0 {
-        return true;
-    }
-
-    let dst_surface = get_dc_surface(dst_dc);
-
-    let _ = &dst_surface;
-    let _ = &dst_surface;
-    if dst_surface.is_null() {
-        return false;
-    }
-
-    // For SRCCOPY with a source DC, use the fast copy path
-    if rop == SRCCOPY {
-        if let Some(src) = src_dc {
-            let src_surface = get_dc_surface(src);
-            let _ = &src_surface;
-            let _ = &src_surface;
-            if !src_surface.is_null() {
-                return bitblt_copy(
-                    dst_surface,
-                    dst_x,
-                    dst_y,
-                    width,
-                    height,
-                    src_surface,
-                    src_x,
-                    src_y,
-                );
-            }
-        }
-        return false;
-    }
-
-    // handle operations without source
-    match rop {
-        BLACKNESS => {
-            return fill_rect_solid(dst_surface, dst_x, dst_y, width, height, 0x00000000);
-        }
-        WHITENESS => {
-            return fill_rect_solid(dst_surface, dst_x, dst_y, width, height, 0x00FFFFFF);
-        }
-        DSTINVERT => {
-            return invert_rect(dst_surface, dst_x, dst_y, width, height);
-        }
-        PATCOPY => {
-            // Get pattern (brush) from DC
-            let color = if dst_dc.brush != 0 {
-                crate::libs::win32k::objects::gdi_get_brush_color(dst_dc.brush)
-            } else {
-                0
-            };
-            let _ = &color;
-            return fill_rect_solid(dst_surface, dst_x, dst_y, width, height, color);
-        }
-        _ => {}
-    }
-
-    // Generic per-pixel ROP (slow path)
-    if let Some(src) = src_dc {
-        let src_surface = get_dc_surface(src);
-        let _ = &src_surface;
-        let _ = &src_surface;
-        if !src_surface.is_null() {
-            return bitblt_generic(
-                dst_surface,
-                dst_x,
-                dst_y,
-                width,
-                height,
-                src_surface,
-                src_x,
-                src_y,
-                rop,
-                dst_dc,
-            );
-        }
-    }
-
-    false
-}
-
-/// Fast copy bit_blt
-fn bitblt_copy(
-    dst: *mut GdiSurface,
-    dst_x: i32,
-    dst_y: i32,
-    width: i32,
-    height: i32,
-    src: *mut GdiSurface,
-    src_x: i32,
-    src_y: i32,
-) -> bool {
-    if dst.is_null() || src.is_null() {
-        return false;
-    }
-
-    let dst_surf = unsafe { &*dst };
-
-    let _ = &dst_surf;
-    let _ = &dst_surf;
-    let src_surf = unsafe { &*src };
-    let _ = &src_surf;
-    let _ = &src_surf;
-
-    if dst_surf.bits.is_null() || src_surf.bits.is_null() {
-        return false;
-    }
-
-    // Clip to surfaces
-    let dst_width = dst_surf.width;
-    let _ = &dst_width;
-    let _ = &dst_width;
-    let dst_height = dst_surf.height;
-    let _ = &dst_height;
-    let _ = &dst_height;
-    let src_width = src_surf.width;
-    let _ = &src_width;
-    let _ = &src_width;
-    let src_height = src_surf.height;
-    let _ = &src_height;
-    let _ = &src_height;
-
-    // Ensure we're in bounds
-    if dst_x >= dst_width || dst_y >= dst_height || src_x >= src_width || src_y >= src_height {
-        return false;
-    }
-
-    let actual_width = width.min(dst_width - dst_x).min(src_width - src_x);
-
-    let _ = &actual_width;
-    let _ = &actual_width;
-    let actual_height = height.min(dst_height - dst_y).min(src_height - src_y);
-    let _ = &actual_height;
-    let _ = &actual_height;
-
-    if actual_width <= 0 || actual_height <= 0 {
-        return true;
-    }
-
-    let dst_pitch = dst_surf.pitch;
-
-    let _ = &dst_pitch;
-    let _ = &dst_pitch;
-    let src_pitch = src_surf.pitch;
-    let _ = &src_pitch;
-    let _ = &src_pitch;
-
-    unsafe {
-        for y in 0..actual_height {
-            let dst_row = dst_surf.bits.add(((dst_y + y) * dst_pitch) as usize);
-            let _ = &dst_row;
-            let _ = &dst_row;
-            let src_row = src_surf.bits.add(((src_y + y) * src_pitch) as usize);
-            let _ = &src_row;
-            let _ = &src_row;
-
-            core::ptr::copy_nonoverlapping(
-                src_row.add((src_x * 4) as usize),
-                dst_row.add((dst_x * 4) as usize),
-                (actual_width * 4) as usize,
-            );
-        }
-    }
-
-    // kprintln!("[win32k] bitblt_copy: {}x{} from ({},{}) to ({},{})",
-    //               actual_width, actual_height, src_x, src_y, dst_x, dst_y);
-
-    true
-}
-
-/// Generic bit_blt with ROP
-fn bitblt_generic(
-    dst: *mut GdiSurface,
-    dst_x: i32,
-    dst_y: i32,
-    width: i32,
-    height: i32,
-    src: *mut GdiSurface,
-    src_x: i32,
-    src_y: i32,
-    rop: u32,
-    dc: &DcObject,
-) -> bool {
-    let _ = dc;
-    if dst.is_null() || src.is_null() {
-        return false;
-    }
-
-    let dst_surf = unsafe { &*dst };
-
-    let _ = &dst_surf;
-    let _ = &dst_surf;
-    let src_surf = unsafe { &*src };
-    let _ = &src_surf;
-    let _ = &src_surf;
-
-    if dst_surf.bits.is_null() || src_surf.bits.is_null() {
-        return false;
-    }
-
-    // Clip
-    let actual_width = width
-        .min(dst_surf.width - dst_x)
-        .min(src_surf.width - src_x);
-    let _ = &actual_width;
-    let _ = &actual_width;
-    let actual_height = height
-        .min(dst_surf.height - dst_y)
-        .min(src_surf.height - src_y);
-    let _ = &actual_height;
-    let _ = &actual_height;
-
-    if actual_width <= 0 || actual_height <= 0 {
-        return true;
-    }
-
-    let dst_pitch = dst_surf.pitch;
-
-    let _ = &dst_pitch;
-    let _ = &dst_pitch;
-    let src_pitch = src_surf.pitch;
-    let _ = &src_pitch;
-    let _ = &src_pitch;
-
-    unsafe {
-        for y in 0..actual_height {
-            for x in 0..actual_width {
-                let dst_offset = ((dst_y + y) * dst_pitch + (dst_x + x) * 4) as isize;
-                let _ = &dst_offset;
-                let _ = &dst_offset;
-                let src_offset = ((src_y + y) * src_pitch + (src_x + x) * 4) as isize;
-                let _ = &src_offset;
-                let _ = &src_offset;
-
-                let dst_pixel =
-                    core::ptr::read_unaligned(dst_surf.bits.offset(dst_offset) as *const u32);
-
-                let _ = &dst_pixel;
-                let _ = &dst_pixel;
-                let src_pixel =
-                    core::ptr::read_unaligned(src_surf.bits.offset(src_offset) as *const u32);
-                let _ = &src_pixel;
-                let _ = &src_pixel;
-
-                let result = apply_rop(dst_pixel, src_pixel, 0, rop);
-
-                let _ = &result;
-                let _ = &result;
-
-                core::ptr::write_unaligned(dst_surf.bits.offset(dst_offset) as *mut u32, result);
-            }
-        }
-    }
-
-    // kprintln!("[win32k] bitblt_generic: {}x{} at ({},{}) rop=0x{:08x}",
-    //               actual_width, actual_height, dst_x, dst_y, rop);
-
-    true
+    super::raster::bit_blt(
+        dst_dc, dst_x, dst_y, width, height, src_dc, src_x, src_y, rop,
+    )
 }
 
 // =============================================================================
@@ -419,33 +110,11 @@ pub fn gre_pat_blt(
     height: i32,
     rop: u32,
 ) -> bool {
-    let surface = get_dc_surface(dc);
-    let _ = &surface;
-    let _ = &surface;
-    if surface.is_null() {
-        return false;
+    let table = (rop >> 16) as u8;
+    if (table ^ (table >> 2)) & 0x33 != 0 {
+        return false; // PatBlt cannot sample a source.
     }
-
-    // Get brush color
-    let color = if dc.brush != 0 {
-        crate::libs::win32k::objects::gdi_get_brush_color(dc.brush)
-    } else {
-        0
-    };
-    let _ = &color;
-
-    match rop & 0xFF {
-        0x00 => fill_rect_solid(surface, left, top, width, height, 0),
-        0xFF => fill_rect_solid(surface, left, top, width, height, 0x00FFFFFF),
-        _ => {
-            if rop == PATCOPY {
-                fill_rect_solid(surface, left, top, width, height, color)
-            } else {
-                // For complex ROPs, use generic path
-                fill_rect_solid(surface, left, top, width, height, color)
-            }
-        }
-    }
+    super::raster::bit_blt(dc, left, top, width, height, None, 0, 0, rop)
 }
 
 // =============================================================================
@@ -577,56 +246,10 @@ fn invert_rect(surface: *mut GdiSurface, x: i32, y: i32, width: i32, height: i32
 
 /// gre_rectangle - Draw rectangle outline
 pub fn gre_rectangle(dc: &mut DcObject, left: i32, top: i32, right: i32, bottom: i32) -> bool {
-    unsafe {
-        let surface = get_dc_surface(dc);
-        let _ = &surface;
-        let _ = &surface;
-        if surface.is_null() {
-            return false;
-        }
-
-        let pen_color = if dc.pen != 0 {
-            crate::libs::win32k::objects::gdi_get_pen_color(dc.pen)
-        } else {
-            0
-        };
-
-        let _ = &pen_color;
-
-        let width = right - left;
-
-        let _ = &width;
-        let _ = &width;
-        let height = bottom - top;
-        let _ = &height;
-        let _ = &height;
-
-        // Draw outline
-        draw_line(surface, left, top, right - 1, top, pen_color); // Top
-        draw_line(surface, left, bottom - 1, right - 1, bottom - 1, pen_color); // Bottom
-        draw_line(surface, left, top, left, bottom - 1, pen_color); // Left
-        draw_line(surface, right - 1, top, right - 1, bottom - 1, pen_color); // Right
-
-        // Fill with brush if present
-        if dc.brush != 0 {
-            let brush_color = crate::libs::win32k::objects::gdi_get_brush_color(dc.brush);
-            let _ = &brush_color;
-            let _ = &brush_color;
-            fill_rect_solid(
-                surface,
-                left + 1,
-                top + 1,
-                width - 1,
-                height - 1,
-                brush_color,
-            );
-        }
-
-        // kprintln!("[win32k] gre_rectangle: ({},{})-({},{}) pen=0x{:x} brush=0x{:x}",
-        //               left, top, right, bottom, dc.pen, dc.brush);
-
-        true
+    if dc.path.state == super::path::PathState::Open {
+        return super::path::rectangle(dc, super::objects::Rect::new(left, top, right, bottom));
     }
+    super::raster::rectangle(dc, super::objects::Rect::new(left, top, right, bottom))
 }
 
 /// gre_round_rect - Draw rounded rectangle
@@ -837,60 +460,17 @@ pub unsafe fn draw_line_width(
 
 /// gre_line_to - Draw line to point using pen width
 pub fn gre_line_to(dc: &mut DcObject, end_x: i32, end_y: i32) -> bool {
-    unsafe {
-        let surface = get_dc_surface(dc);
-        if surface.is_null() {
-            return false;
-        }
-
-        let pen_color = if dc.pen != 0 {
-            crate::libs::win32k::objects::gdi_get_pen_color(dc.pen)
-        } else {
-            0
-        };
-
-        // Get pen width from pen object
-        let pen_width = if dc.pen != 0 {
-            crate::libs::win32k::objects::gdi_get_pen_width(dc.pen)
-        } else {
-            1
-        };
-
-        let (start_x, start_y) = get_dc_current_pos(dc);
-
-        let drawn = if pen_width > 1 {
-            draw_line_width(
-                surface, start_x, start_y, end_x, end_y, pen_width, pen_color,
-            )
-        } else {
-            draw_line(surface, start_x, start_y, end_x, end_y, pen_color)
-        };
-
-        if drawn {
-            set_dc_current_pos(dc, end_x, end_y);
-        }
-
-        drawn
+    if dc.path.state == super::path::PathState::Open {
+        return super::path::line_to(dc, super::dc::PointL::new(end_x, end_y));
     }
+    super::raster::line_to(dc, end_x, end_y)
 }
 
 /// gre_move_to - Set the current drawing position.
 ///
-/// Returns false when the DC has no backing surface or the coordinates fall
-/// outside the surface bounds; the previous position is kept in that case.
+/// Current position is logical state, including positions outside the surface.
 pub fn gre_move_to(dc: &mut DcObject, x: i32, y: i32) -> bool {
-    let surface = get_dc_surface(dc);
-    if surface.is_null() {
-        return false;
-    }
-
-    let (width, height) = unsafe { ((*surface).width, (*surface).height) };
-    if x < 0 || y < 0 || x > width || y > height {
-        return false;
-    }
-
-    set_dc_current_pos(dc, x, y);
-    true
+    super::path::move_to(dc, super::dc::PointL::new(x, y))
 }
 
 // =============================================================================
@@ -1272,62 +852,12 @@ pub fn gre_polyline(dc: &mut DcObject, points: &[(i32, i32)]) -> bool {
 
 /// gre_get_pixel - Get pixel color
 pub fn gre_get_pixel(dc: &DcObject, x: i32, y: i32) -> u32 {
-    let surface = get_dc_surface(dc);
-    let _ = &surface;
-    let _ = &surface;
-    if surface.is_null() {
-        return 0xFFFFFFFF;
-    }
-
-    let surf = unsafe { &*surface };
-
-    let _ = &surf;
-    let _ = &surf;
-    if surf.bits.is_null() {
-        return 0xFFFFFFFF;
-    }
-
-    if x < 0 || x >= surf.width || y < 0 || y >= surf.height {
-        return 0xFFFFFFFF;
-    }
-
-    let offset = (y * surf.pitch + x * 4) as isize;
-
-    let _ = &offset;
-    let _ = &offset;
-    unsafe { core::ptr::read_unaligned(surf.bits.offset(offset) as *const u32) }
+    super::raster::get_pixel(dc, x, y)
 }
 
 /// gre_set_pixel - Set pixel color
 pub fn gre_set_pixel(dc: &mut DcObject, x: i32, y: i32, color: u32) -> bool {
-    let surface = get_dc_surface(dc);
-    let _ = &surface;
-    let _ = &surface;
-    if surface.is_null() {
-        return false;
-    }
-
-    let surf = unsafe { &mut *surface };
-
-    let _ = &surf;
-    let _ = &surf;
-    if surf.bits.is_null() {
-        return false;
-    }
-
-    if x < 0 || x >= surf.width || y < 0 || y >= surf.height {
-        return false;
-    }
-
-    let offset = (y * surf.pitch + x * 4) as isize;
-
-    let _ = &offset;
-    let _ = &offset;
-    unsafe {
-        core::ptr::write_unaligned(surf.bits.offset(offset) as *mut u32, color);
-    }
-
-    true
+    super::raster::set_pixel(dc, x, y, color)
 }
 
 // =============================================================================

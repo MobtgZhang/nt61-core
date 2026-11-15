@@ -41,8 +41,8 @@
 
 extern crate alloc;
 
+use super::region_geometry::Region;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 /// GDI object types (matches Windows GDIObjType)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +87,7 @@ pub struct GdiHandleEntry {
     /// Object type (1-11)
     pub obj_type: u8,
     /// Usage count
-    pub uses: u8,
+    pub uses: u32,
     /// flags
     pub flags: u8,
     /// Palette index
@@ -150,42 +150,34 @@ fn get_handle_prefix(obj_type: GdiObjectType) -> u32 {
 /// GDI handle table
 pub struct GdiHandleTable {
     entries: Vec<Option<GdiHandleEntry>>,
-    next_index: AtomicU64,
 }
 
 impl GdiHandleTable {
     pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
-            next_index: AtomicU64::new(1),
         }
     }
 
     /// Allocate a new GDI handle
     /// handle format: [31:16] = type prefix, [15:0] = index
     pub fn allocate(&mut self, obj_type: GdiObjectType, obj_ptr: u64, pid: u32) -> u64 {
-        let entry = GdiHandleEntry::new(obj_type, obj_ptr, pid);
-        let _ = &entry;
-        let prefix = get_handle_prefix(obj_type);
-        let _ = &prefix;
-
-        // Find a free slot first (recycling)
-        for (i, slot) in self.entries.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(entry);
-                return ((prefix as u64) << 16) | (i as u64);
-            }
+        // Do not recycle slots until generation bits are part of the ABI. A stale
+        // handle must never identify a later allocation of the same type.
+        let index = self.entries.len();
+        if index > u16::MAX as usize || self.entries.try_reserve(1).is_err() {
+            return 0;
         }
-
-        // No free slot, add new one
-        let index = self.next_index.fetch_add(1, Ordering::Relaxed) as usize;
-        let _ = &index;
-        self.entries.push(Some(entry));
-        ((prefix as u64) << 16) | (index as u64)
+        self.entries
+            .push(Some(GdiHandleEntry::new(obj_type, obj_ptr, pid)));
+        ((get_handle_prefix(obj_type) as u64) << 16) | index as u64
     }
 
     /// Get a handle entry - validates both index and type prefix
     pub fn get(&self, handle: u64) -> Option<&GdiHandleEntry> {
+        if handle > u32::MAX as u64 {
+            return None;
+        }
         let index = (handle & 0xFFFF) as usize;
         let _ = &index;
         if index < self.entries.len() {
@@ -210,6 +202,9 @@ impl GdiHandleTable {
 
     /// Get a mutable handle entry with validation
     pub fn get_mut(&mut self, handle: u64) -> Option<&mut GdiHandleEntry> {
+        if handle > u32::MAX as u64 {
+            return None;
+        }
         let index = (handle & 0xFFFF) as usize;
         let _ = &index;
         if index < self.entries.len() {
@@ -234,19 +229,17 @@ impl GdiHandleTable {
 
     /// Free a GDI handle
     pub fn free(&mut self, handle: u64) -> Option<GdiHandleEntry> {
-        let index = (handle & 0xFFFF) as usize;
-        let _ = &index;
-        if index < self.entries.len() {
-            self.entries[index].take()
-        } else {
-            None
-        }
+        self.get(handle)?;
+        self.entries[(handle & 0xFFFF) as usize].take()
     }
 
     /// Increment usage count
     pub fn add_ref(&mut self, handle: u64) -> bool {
         if let Some(entry) = self.get_mut(handle) {
-            entry.uses = entry.uses.saturating_add(1);
+            let Some(uses) = entry.uses.checked_add(1) else {
+                return false;
+            };
+            entry.uses = uses;
             true
         } else {
             false
@@ -270,44 +263,42 @@ impl Default for GdiHandleTable {
     }
 }
 
-// Global GDI handle table - protected by spinlock for thread safety.
-//
-// The inner table pointer is cached statically so `get_handle_table` can
-// return a `&'static mut` reference without leaking the spinlock-guard
-// lifetime. Initialisation is still serialised by the spinlock.
+// Keep the guard alive throughout each table operation. Region operations also
+// hold it while accessing the allocation, so deletion cannot invalidate a region
+// between handle validation and use.
 static GDI_HANDLE_TABLE: crate::ke::sync::Spinlock<Option<GdiHandleTable>> =
     crate::ke::sync::Spinlock::new(None);
-static mut GDI_TABLE_PTR: *mut GdiHandleTable = core::ptr::null_mut();
 
-fn get_handle_table() -> &'static mut GdiHandleTable {
-    let ptr = unsafe { GDI_TABLE_PTR };
-    let _ = &ptr;
-    if !ptr.is_null() {
-        return unsafe { &mut *ptr };
+struct HandleTableGuard(crate::ke::sync::SpinlockGuard<'static, Option<GdiHandleTable>>);
+
+impl core::ops::Deref for HandleTableGuard {
+    type Target = GdiHandleTable;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("GDI table initialized under its lock")
     }
-    let mut guard = GDI_HANDLE_TABLE.lock();
-    if guard.is_none() {
-        *guard = Some(GdiHandleTable::new());
-    }
-    let inner = guard.as_mut().unwrap() as *mut GdiHandleTable;
-    let _ = &inner;
-    unsafe {
-        GDI_TABLE_PTR = inner;
-    }
-    unsafe { &mut *inner }
 }
 
-/// Run a closure with the GDI handle table while holding the global spinlock.
-///
-/// This is the safe entry point for concurrent access: the lock is held
-/// for the duration of the closure, preventing simultaneous mutation.
-fn with_handle_table<R>(f: impl FnOnce(&mut GdiHandleTable) -> R) -> R {
+impl core::ops::DerefMut for HandleTableGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+            .as_mut()
+            .expect("GDI table initialized under its lock")
+    }
+}
+
+fn get_handle_table() -> HandleTableGuard {
     let mut guard = GDI_HANDLE_TABLE.lock();
     if guard.is_none() {
         *guard = Some(GdiHandleTable::new());
     }
-    let table = guard.as_mut().unwrap();
-    f(table)
+    HandleTableGuard(guard)
+}
+
+pub(super) fn with_handle_table<R>(f: impl FnOnce(&mut GdiHandleTable) -> R) -> R {
+    f(&mut get_handle_table())
 }
 
 // =============================================================================
@@ -531,6 +522,8 @@ pub struct GdiBitmap {
     pub bit_count: u16,
     pub format: u32,
     pub bits: *mut u8,
+    /// Application metadata, independent of the allocated pixel dimensions.
+    pub logical_dimensions: super::dc::SizeL,
 }
 
 impl GdiBitmap {
@@ -559,6 +552,7 @@ impl GdiBitmap {
             bit_count,
             format: 0,
             bits,
+            logical_dimensions: super::dc::SizeL::default(),
         })
     }
 }
@@ -654,7 +648,7 @@ impl Default for GdiPalette {
 
 /// RECT structure - unified definition for all win32k modules
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rect {
     pub left: i32,
     pub top: i32,
@@ -739,9 +733,9 @@ impl Rect {
     }
 }
 
-/// Region object
+/// Owned region geometry. The legacy header remains internal to win32k;
+/// RGNDATA serialization is explicit and never copies this allocation to users.
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub struct GdiRegion {
     pub type_: u8,
     pub uses: u8,
@@ -750,19 +744,27 @@ pub struct GdiRegion {
     pub size: u64,
     pub num_rects: i32,
     pub extents: Rect,
+    pub geometry: Region,
 }
 
 impl GdiRegion {
-    pub fn new_rect(rect: &Rect) -> Self {
+    pub fn new(geometry: Region) -> Self {
         Self {
             type_: GdiObjectType::Region as u8,
             uses: 0,
             flags: 0,
             palette: 0,
-            size: core::mem::size_of::<GdiRegion>() as u64,
-            num_rects: 1,
-            extents: *rect,
+            size: core::mem::size_of::<Self>() as u64,
+            num_rects: geometry.rectangles().len() as i32,
+            extents: geometry.bounds(),
+            geometry,
         }
+    }
+
+    pub fn replace(&mut self, geometry: Region) {
+        self.num_rects = geometry.rectangles().len() as i32;
+        self.extents = geometry.bounds();
+        self.geometry = geometry;
     }
 }
 
@@ -788,7 +790,7 @@ pub fn gdi_create_pen(style: PenStyle, width: i32, color: u32) -> u64 {
         *p = GdiPen::new(style, width, color);
     }
 
-    let handle_table = get_handle_table();
+    let mut handle_table = get_handle_table();
     let _ = &handle_table;
     let handle = handle_table.allocate(GdiObjectType::Pen, pen as u64, 0);
     let _ = &handle;
@@ -812,18 +814,21 @@ pub fn gdi_create_solid_brush(color: u32) -> u64 {
     }
 
     unsafe {
-        let b = &mut *(brush as *mut GdiBrush);
-        let _ = &b;
-        *b = GdiBrush::new_solid(color);
+        brush.cast::<GdiBrush>().write(GdiBrush::new_solid(color));
     }
 
-    let handle_table = get_handle_table();
+    let mut handle_table = get_handle_table();
     let _ = &handle_table;
     let handle = handle_table.allocate(GdiObjectType::Brush, brush as u64, 0);
     let _ = &handle;
 
     // kprintln!("[win32k] gdi_create_solid_brush: color=0x{:08x} -> handle=0x{:016x}", color, handle);
 
+    if handle == 0 {
+        unsafe {
+            let _ = crate::mm::pool::free(brush);
+        }
+    }
     handle
 }
 
@@ -845,7 +850,7 @@ pub fn gdi_create_hatch_brush(style: HatchStyle, color: u32) -> u64 {
         *b = GdiBrush::new_hatched(style, color);
     }
 
-    let handle_table = get_handle_table();
+    let mut handle_table = get_handle_table();
     let _ = &handle_table;
     let handle = handle_table.allocate(GdiObjectType::Brush, brush as u64, 0);
     let _ = &handle;
@@ -885,7 +890,7 @@ pub fn gdi_create_font(
         f.set_face_name(face_name);
     }
 
-    let handle_table = get_handle_table();
+    let mut handle_table = get_handle_table();
     let _ = &handle_table;
     let handle = handle_table.allocate(GdiObjectType::Font, font as u64, 0);
     let _ = &handle;
@@ -922,7 +927,7 @@ pub fn gdi_create_bitmap(width: i32, height: i32, bit_count: u16) -> u64 {
         *b = bitmap;
     }
 
-    let handle_table = get_handle_table();
+    let mut handle_table = get_handle_table();
     let _ = &handle_table;
     let handle = handle_table.allocate(GdiObjectType::Bitmap, bitmap_mem as u64, 0);
     let _ = &handle;
@@ -935,30 +940,34 @@ pub fn gdi_create_bitmap(width: i32, height: i32, bit_count: u16) -> u64 {
 
 /// create a region from a rectangle
 pub fn gdi_create_rect_rgn(left: i32, top: i32, right: i32, bottom: i32) -> u64 {
-    let region = crate::mm::pool::allocate(
+    match Region::rectangle(Rect::new(left, top, right, bottom)) {
+        Ok(geometry) => gdi_create_region(geometry),
+        Err(_) => 0,
+    }
+}
+
+pub(super) fn gdi_create_region(geometry: Region) -> u64 {
+    let allocation = crate::mm::pool::allocate(
         crate::mm::pool::PoolType::NonPaged,
         core::mem::size_of::<GdiRegion>(),
     );
-
-    if region.is_null() {
-        // kprintln!("[win32k] gdi_create_rect_rgn: failed to allocate memory");
+    if allocation.is_null() {
         return 0;
     }
-
+    // SAFETY: this is a fresh allocation of sufficient size and alignment.
     unsafe {
-        let r = &mut *(region as *mut GdiRegion);
-        let _ = &r;
-        *r = GdiRegion::new_rect(&Rect::new(left, top, right, bottom));
+        allocation
+            .cast::<GdiRegion>()
+            .write(GdiRegion::new(geometry));
     }
-
-    let handle_table = get_handle_table();
-    let _ = &handle_table;
-    let handle = handle_table.allocate(GdiObjectType::Region, region as u64, 0);
-    let _ = &handle;
-
-    // kprintln!("[win32k] gdi_create_rect_rgn: ({},{})-({},{}) -> handle=0x{:016x}",
-    //               left, top, right, bottom, handle);
-
+    let handle =
+        with_handle_table(|table| table.allocate(GdiObjectType::Region, allocation as u64, 0));
+    if handle == 0 {
+        unsafe {
+            core::ptr::drop_in_place(allocation.cast::<GdiRegion>());
+            let _ = crate::mm::pool::free(allocation);
+        }
+    }
     handle
 }
 
@@ -980,7 +989,7 @@ pub fn gdi_create_palette() -> u64 {
         *p = GdiPalette::new();
     }
 
-    let handle_table = get_handle_table();
+    let mut handle_table = get_handle_table();
     let _ = &handle_table;
     let handle = handle_table.allocate(GdiObjectType::Palette, palette as u64, 0);
     let _ = &handle;
@@ -1001,7 +1010,7 @@ pub fn gdi_delete_object(handle: u64) -> bool {
             return false;
         }
 
-        let handle_table = get_handle_table();
+        let mut handle_table = get_handle_table();
         let _ = &handle_table;
         let entry = match handle_table.get(handle) {
             Some(e) => e,
@@ -1011,6 +1020,9 @@ pub fn gdi_delete_object(handle: u64) -> bool {
             }
         };
 
+        if entry.uses != 0 {
+            return false;
+        }
         let obj_ptr = entry.obj_ptr;
         let _ = &obj_ptr;
         let obj_type = entry.get_type();
@@ -1038,6 +1050,7 @@ pub fn gdi_delete_object(handle: u64) -> bool {
                     let _ = crate::mm::pool::free(obj_ptr as *mut u8);
                 }
                 Some(GdiObjectType::Region) => {
+                    core::ptr::drop_in_place(obj_ptr as *mut GdiRegion);
                     let _ = crate::mm::pool::free(obj_ptr as *mut u8);
                 }
                 Some(GdiObjectType::Palette) => {
@@ -1215,14 +1228,46 @@ pub fn gdi_get_stock_object(object_type: i32) -> u64 {
 
 /// Select an object into a DC (increment usage)
 pub fn gdi_select_object(handle: u64) -> bool {
-    let handle_table = get_handle_table();
+    let mut handle_table = get_handle_table();
     let _ = &handle_table;
     handle_table.add_ref(handle)
 }
 
+/// Retains a selected object until its DC or saved state releases it. The
+/// reference is acquired while validating the handle under the same lock.
+pub struct ObjectReference {
+    handle: u64,
+    object_type: GdiObjectType,
+}
+
+impl ObjectReference {
+    pub fn acquire(handle: u64) -> Option<Self> {
+        with_handle_table(|table| {
+            let object_type = table.get(handle)?.get_type()?;
+            if !table.add_ref(handle) {
+                return None;
+            }
+            Some(Self {
+                handle,
+                object_type,
+            })
+        })
+    }
+
+    pub fn object_type(&self) -> GdiObjectType {
+        self.object_type
+    }
+}
+
+impl Drop for ObjectReference {
+    fn drop(&mut self) {
+        gdi_unselect_object(self.handle);
+    }
+}
+
 /// Unselect an object from a DC (decrement usage)
 pub fn gdi_unselect_object(handle: u64) {
-    let handle_table = get_handle_table();
+    let mut handle_table = get_handle_table();
     let _ = &handle_table;
     handle_table.release(handle);
 }

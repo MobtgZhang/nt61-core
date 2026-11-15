@@ -94,6 +94,18 @@ pub unsafe fn init_shadow_services() {
         };
     }
 
+    register!("NtGdiIntersectClipRect", nt_gdi_intersect_clip_rect, 5);
+    register!("NtGdiExtSelectClipRgn", nt_gdi_ext_select_clip_rgn, 3);
+    register!("NtGdiOffsetClipRgn", nt_gdi_offset_clip_rgn, 3);
+    register!("NtGdiSetMetaRgn", nt_gdi_set_meta_rgn, 1);
+    register!("NtGdiGetRandomRgn", nt_gdi_get_random_rgn, 3);
+    register!("NtGdiPtVisible", nt_gdi_pt_visible, 3);
+    register!("NtGdiRectVisible", nt_gdi_rect_visible, 2);
+    register!("NtGdiEqualRgn", nt_gdi_equal_rgn, 2);
+    register!("NtGdiPtInRegion", nt_gdi_pt_in_region, 3);
+    register!("NtGdiSetRectRgn", nt_gdi_set_rect_rgn, 5);
+    register!("NtGdiGetRegionData", nt_gdi_get_region_data, 3);
+
     register!("NtUserPeekMessage", nt_user_peek_message, 5);
     register!("NtUserCallOneParam", nt_user_call_one_param, 2);
     register!("NtUserGetKeyState", nt_user_get_key_state, 1);
@@ -187,6 +199,9 @@ pub unsafe fn init_shadow_services() {
         3
     );
     register!("NtGdiGetDCDword", nt_gdi_get_dc_dword, 3);
+    register!("NtGdiGetAndSetDCDword", nt_gdi_get_and_set_dc_dword, 4);
+    register!("NtGdiScaleViewportExtEx", nt_gdi_scale_viewport_ext_ex, 6);
+    register!("NtGdiScaleWindowExtEx", nt_gdi_scale_window_ext_ex, 6);
     register!("NtGdiLineTo", nt_gdi_line_to, 3);
     register!(
         "NtUserSystemParametersInfo",
@@ -260,6 +275,26 @@ pub unsafe fn init_shadow_services() {
     );
     register!("NtGdiGetNearestColor", nt_gdi_get_nearest_color, 2);
     register!("NtGdiTransformPoints", nt_gdi_transform_points, 5);
+    register!("NtGdiCombineTransform", nt_gdi_combine_transform, 3);
+    register!("NtGdiGetTransform", nt_gdi_get_transform, 3);
+    register!("NtGdiMoveTo", nt_gdi_move_to, 4);
+    register!("NtGdiBeginPath", nt_gdi_begin_path, 1);
+    register!("NtGdiEndPath", nt_gdi_end_path, 1);
+    register!("NtGdiAbortPath", nt_gdi_abort_path, 1);
+    register!("NtGdiCloseFigure", nt_gdi_close_figure, 1);
+    register!("NtGdiFlattenPath", nt_gdi_flatten_path, 1);
+    register!("NtGdiGetPath", nt_gdi_get_path, 4);
+    register!("NtGdiFillPath", nt_gdi_fill_path, 1);
+    register!("NtGdiStrokePath", nt_gdi_stroke_path, 1);
+    register!("NtGdiStrokeAndFillPath", nt_gdi_stroke_and_fill_path, 1);
+    register!("NtGdiPathToRegion", nt_gdi_path_to_region, 1);
+    register!("NtGdiSelectClipPath", nt_gdi_select_clip_path, 2);
+    register!("NtGdiPolyDraw", nt_gdi_poly_draw, 4);
+    register!("NtGdiPolyPolyDraw", nt_gdi_poly_poly_draw, 5);
+    register!("NtGdiGetMiterLimit", nt_gdi_get_miter_limit, 2);
+    register!("NtGdiSetMiterLimit", nt_gdi_set_miter_limit, 3);
+    register!("NtGdiSelectPen", nt_gdi_select_pen, 2);
+    register!("NtGdiSelectBrush", nt_gdi_select_brush, 2);
     register!("NtGdiGetDCPoint", nt_gdi_get_dc_point, 3);
     register!("NtGdiCreateDIBBrush", nt_gdi_create_dib_brush, 6);
     register!("NtGdiGetTextMetricsW", nt_gdi_get_text_metrics_w, 3);
@@ -406,6 +441,8 @@ pub unsafe fn init_shadow_services() {
     register!("NtUserTrackMouseEvent", nt_user_track_mouse_event, 1);
     register!("NtUserDestroyMenu", nt_user_destroy_menu, 1);
     register!("NtGdiGetBitmapBits", nt_gdi_get_bitmap_bits, 3);
+    register!("NtGdiGetBitmapDimension", nt_gdi_get_bitmap_dimension, 2);
+    register!("NtGdiSetBitmapDimension", nt_gdi_set_bitmap_dimension, 4);
     register!("NtUserConsoleControl", nt_user_console_control, 3);
     register!("NtUserSetActiveWindow", nt_user_set_active_window, 1);
     register!(
