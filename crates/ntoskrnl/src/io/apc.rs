@@ -70,6 +70,8 @@ pub struct IoApc {
     pub context: *mut (),
     pub io_status_block: *mut IoStatusBlock,
     pub inserted: bool,
+    // Completion APCs own this value after their originating IRP is freed.
+    owned_status: Option<IoStatusBlock>,
 }
 
 impl IoApc {
@@ -92,6 +94,7 @@ impl IoApc {
             context,
             io_status_block,
             inserted: false,
+            owned_status: None,
         }
     }
 }
@@ -170,6 +173,26 @@ pub fn insert_io_apc(
 ) -> bool {
     let apc = IoApc::new(mode, thread_id, routine, context, io_status_block);
 
+    enqueue_apc(apc)
+}
+
+/// Queue a snapshot whose storage stays alive until delivery or cancellation.
+/// The callback may read/write the IOSB during its invocation, but must not
+/// retain its pointer after returning. `context` remains caller-owned.
+pub fn insert_owned_io_apc(
+    thread_id: u64,
+    mode: ApcMode,
+    routine: Option<ApcRoutine>,
+    context: *mut (),
+    status: IoStatusBlock,
+) -> bool {
+    let mut apc = IoApc::new(mode, thread_id, routine, context, core::ptr::null_mut());
+    apc.owned_status = Some(status);
+    enqueue_apc(apc)
+}
+
+fn enqueue_apc(apc: IoApc) -> bool {
+    let thread_id = apc.thread_id;
     let mut queues = APC_QUEUES.lock();
 
     let queue = queues.iter_mut().find(|q| q.thread_id == thread_id);
@@ -197,10 +220,14 @@ pub fn deliver_user_apcs(thread_id: u64) -> usize {
         };
 
         match apc {
-            Some(apc) => {
+            Some(mut apc) => {
                 if let Some(routine) = apc.routine {
                     unsafe {
-                        routine(apc.context, apc.io_status_block, 0);
+                        let status = apc
+                            .owned_status
+                            .as_mut()
+                            .map_or(apc.io_status_block, |status| status as *mut _);
+                        routine(apc.context, status, 0);
                     }
                     delivered += 1;
                 }
@@ -223,10 +250,14 @@ pub fn deliver_kernel_apcs(thread_id: u64) -> usize {
         };
 
         match apc {
-            Some(apc) => {
+            Some(mut apc) => {
                 if let Some(routine) = apc.routine {
                     unsafe {
-                        routine(apc.context, apc.io_status_block, 0);
+                        let status = apc
+                            .owned_status
+                            .as_mut()
+                            .map_or(apc.io_status_block, |status| status as *mut _);
+                        routine(apc.context, status, 0);
                     }
                     delivered += 1;
                 }

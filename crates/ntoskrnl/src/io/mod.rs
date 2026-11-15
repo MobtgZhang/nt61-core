@@ -541,6 +541,8 @@ pub struct DeviceObject {
     /// Driver-defined device extension (wdm.h DeviceObject.DeviceExtension):
     /// opaque per-device context owned by the functional driver.
     pub device_extension: *mut (),
+    // Sole namespace handle owned by create_device; private, not WDM layout.
+    namespace_handle: u64,
 }
 
 impl DeviceObject {
@@ -568,6 +570,7 @@ impl DeviceObject {
             device_power_state: DevicePowerState::D0,
             power_flags: 0,
             device_extension: null_mut(),
+            namespace_handle: 0,
         }
     }
 
@@ -604,10 +607,11 @@ impl Default for DeviceObject {
 // Driver object
 // ---------------------------------------------------------------------------
 
-/// Dispatch function type for driver major functions.
+/// Private source-level dispatch type; this is not the native WDM ABI.
 pub type DriverDispatch =
     Option<unsafe extern "C" fn(device: *mut DeviceObject, irp: *mut Irp) -> i32>;
 
+/// Private I/O object. Its layout/calling convention differs from NT 6.1 WDM.
 #[repr(C)]
 pub struct DriverObject {
     pub device_object: *mut DeviceObject,
@@ -622,6 +626,7 @@ pub struct DriverObject {
     pub driver_start_io: Option<unsafe extern "C" fn(*mut DeviceObject)>,
     pub driver_unload: Option<unsafe extern "C" fn(*mut DriverObject)>,
     pub major_functions: [DriverDispatch; 28],
+    namespace_handle: u64,
 }
 
 impl DriverObject {
@@ -639,6 +644,7 @@ impl DriverObject {
             driver_start_io: None,
             driver_unload: None,
             major_functions: [None; 28],
+            namespace_handle: 0,
         }
     }
 }
@@ -918,16 +924,15 @@ pub unsafe fn io_complete_request(irp: *mut Irp, priority_boost: i32) {
             let thread_id =
                 crate::ke::scheduler::with_current_thread(|t| t.client_id.unique_thread)
                     .unwrap_or(0);
-            let _ = crate::io::apc::insert_io_apc(
+            let _ = crate::io::apc::insert_owned_io_apc(
                 thread_id,
                 crate::io::apc::ApcMode::KernelMode,
                 None,
                 (*irp).overlapped as *mut (),
-                // The IRP's `IoStatusBlock` and the APC module's
-                // `IoStatusBlock` are distinct types with the same
-                // field layout, so the raw-pointer cast reinterprets
-                // the address without changing the data.
-                core::ptr::addr_of_mut!((*irp).io_status) as *mut crate::io::apc::IoStatusBlock,
+                crate::io::apc::IoStatusBlock {
+                    status: (*irp).io_status.status,
+                    information: (*irp).io_status.information,
+                },
             );
         }
 
@@ -1016,11 +1021,9 @@ pub fn free_irp(irp: *mut Irp) {
             return;
         }
 
-        // Free the memory back to the pool
+        // Releasing storage is distinct from completing a request.
         let raw = irp as *mut u8;
         let _ = pool::free(raw);
-
-        IO_STATS.lock().irps_completed += 1;
     }
 }
 
@@ -1047,22 +1050,23 @@ pub fn allocate_driver(name: &[u8]) -> *mut DriverObject {
     // pointer. Store the name in the same pool block as the object, matching
     // `create_device`.
     let name_units = match core::str::from_utf8(name) {
-        Ok(s) => s.chars().count(),
+        Ok(s) => s.encode_utf16().count(),
         Err(_) => name.len(),
     };
+    if name_units > (u16::MAX as usize / 2) - 1 { return null_mut(); }
     let block_size = core::mem::size_of::<DriverObject>() + (name_units + 1) * 2;
     let raw = pool::allocate(pool::PoolType::NonPaged, block_size) as *mut DriverObject;
     if raw.is_null() {
         return null_mut();
     }
     unsafe {
-        core::ptr::write_bytes(raw as *mut u8, 0, block_size);
+        core::ptr::write(raw, DriverObject::new());
         let d = &mut (*raw);
         let name_buffer = (raw as *mut u8).add(core::mem::size_of::<DriverObject>()) as *mut u16;
         let mut written = 0usize;
         if let Ok(s) = core::str::from_utf8(name) {
-            for ch in s.chars().take(name_units) {
-                core::ptr::write(name_buffer.add(written), ch as u16);
+            for ch in s.encode_utf16() {
+                core::ptr::write(name_buffer.add(written), ch);
                 written += 1;
             }
         } else {
@@ -1087,68 +1091,43 @@ pub unsafe fn register_driver(driver: *mut DriverObject) -> bool {
     if driver.is_null() {
         return false;
     }
-    let mut list = DRIVER_LIST.lock();
-    for i in 0..MAX_DRIVERS {
-        if list[i].is_none() {
-            unsafe {
-                // Field-by-field write to avoid the UC-memory
-                // non-temporal-store fault that hits a 48-byte
-                // Option<driver_entry> copy.
-                let s = &mut list[i];
-                // discriminant: Some(1)
-                let raw = s as *mut Option<DriverEntry> as *mut u8;
-                core::ptr::write(raw, 1); // tag
-                let de = s.as_mut().unwrap();
-                de.driver = driver;
-                de.next = core::ptr::null_mut();
-                // Extract the driver name from the UnicodeString now (while
-                // we have the driver pointer) and store it in de.name.
-                let name_buf = (*driver).driver_name.buffer;
-                let name_len_units = ((*driver).driver_name.length as usize) / 2;
-                for j in 0..de.name.len() {
-                    if j < name_len_units {
-                        let ch = core::ptr::read_volatile(name_buf.add(j));
-                        de.name[j] = ch as u8;
-                    } else {
-                        de.name[j] = 0;
-                    }
-                }
-            }
-
-            // Get driver name from the driver object (extract from UnicodeString)
-            let driver_name_storage = unsafe {
-                let name_ptr = (*driver).driver_name.buffer;
-                let name_len = (*driver).driver_name.length as usize;
-                let mut name = [0u8; 64];
-                let mut name_len_out = 0usize;
-                if !name_ptr.is_null() && name_len > 0 {
-                    let max_chars = (name_len / 2).min(32);
-                    for j in 0..max_chars {
-                        let c = core::ptr::read_volatile(name_ptr.add(j));
-                        if c == 0 {
-                            break;
-                        }
-                        if name_len_out < 64 {
-                            name[name_len_out] = c as u8;
-                            name_len_out += 1;
-                        }
-                    }
-                }
-                (name, name_len_out)
-            };
-            let driver_name_slice = &driver_name_storage.0[..driver_name_storage.1];
-
-            drop(list);
-
-            // Register in object manager namespace if name is available
-            if !driver_name_slice.is_empty() {
-                register_driver_in_object_manager(driver, driver_name_slice);
-            }
-
-            return true;
-        }
+    let descriptor = &(*driver).driver_name;
+    let count = usize::from(descriptor.length) / 2;
+    if descriptor.buffer.is_null() || descriptor.length % 2 != 0
+        || descriptor.length > descriptor.maximum_length || count == 0 || count > 32
+    { return false; }
+    let mut name = [0u8; 32];
+    for (i, byte) in name.iter_mut().enumerate().take(count) {
+        let ch = *descriptor.buffer.add(i);
+        if ch == 0 || ch > 0x7f { return false; }
+        *byte = ch as u8;
     }
-    false
+    let mut list = DRIVER_LIST.lock();
+    if list.iter().flatten().any(|e| e.driver == driver || e.name == name) { return false; }
+    let Some(slot) = list.iter_mut().find(|e| e.is_none()) else { return false; };
+    *slot = Some(DriverEntry { name, driver, next: null_mut() });
+    (*driver).namespace_handle = register_driver_in_object_manager(driver, &name[..count]);
+    true
+}
+
+/// Remove a private driver from the bootstrap list and its owned OB namespace
+/// entry. The caller retains object/image storage. Existing OB users block it.
+///
+/// # Safety
+/// The caller owns `driver`, with no devices or concurrent registration changes.
+pub unsafe fn unregister_driver(driver: *mut DriverObject) -> bool {
+    if driver.is_null() || !(*driver).device_object.is_null() { return false; }
+    let mut list = DRIVER_LIST.lock();
+    if (*driver).namespace_handle != 0 {
+        if !crate::ob::remove_external_io_object((*driver).namespace_handle, driver.cast()) {
+            return false;
+        }
+        (*driver).namespace_handle = 0;
+    }
+    for entry in list.iter_mut() {
+        if entry.as_ref().is_some_and(|entry| entry.driver == driver) { *entry = None; }
+    }
+    true
 }
 
 /// Look up a registered driver by its ASCII name. Returns a pointer to
@@ -1173,11 +1152,12 @@ pub fn find_registered_driver(name: &[u8]) -> *mut DriverObject {
 }
 
 /// Register a driver object in the object manager namespace at \Driver\<name>
-fn register_driver_in_object_manager(driver: *mut DriverObject, driver_name: &[u8]) {
+fn register_driver_in_object_manager(driver: *mut DriverObject, driver_name: &[u8]) -> u64 {
     if driver.is_null() || driver_name.is_empty() {
-        return;
+        return 0;
     }
 
+    let driver_name = driver_name.strip_prefix(b"\\Driver\\").unwrap_or(driver_name);
     // create an object header for the driver
     let header = crate::ob::create_object(
         b"\\Driver",
@@ -1200,14 +1180,9 @@ fn register_driver_in_object_manager(driver: *mut DriverObject, driver_name: &[u
 
         // Insert into the namespace
         let handle = crate::ob::insert_object(b"\\Driver", header);
-        if handle != 0 {
-            // // kprintln!("[I/O] Registered driver {:x?} in OB namespace, handle={}",
-            // //                      driver_name, handle);
-        } else {
-            // // kprintln!("[I/O] WARNING: Failed to insert driver into OB namespace");
-        }
+        handle
     } else {
-        // // kprintln!("[I/O] WARNING: Failed to create OB header for driver");
+        0
     }
 }
 
@@ -1224,16 +1199,24 @@ pub unsafe fn create_device(
     // The name is stored in the same pool block as the device object so the
     // UnicodeString buffer has the same lifetime as the object itself.
     let name_units = match core::str::from_utf8(device_name) {
-        Ok(s) => s.chars().count(),
+        Ok(s) => s.encode_utf16().count(),
         Err(_) => device_name.len(),
     };
+    if driver.is_null() || name_units > (u16::MAX as usize / 2) - 1 { return null_mut(); }
+    let mut current = (*driver).device_object;
+    let mut count = 0;
+    while !current.is_null() {
+        count += 1;
+        if count >= MAX_DEVICES { return null_mut(); }
+        current = (*current).next_device;
+    }
     let block_size = core::mem::size_of::<DeviceObject>() + (name_units + 1) * 2;
     let raw = pool::allocate(pool::PoolType::NonPaged, block_size) as *mut DeviceObject;
     if raw.is_null() {
         return null_mut();
     }
     unsafe {
-        core::ptr::write_bytes(raw as *mut u8, 0, block_size);
+        core::ptr::write(raw, DeviceObject::new());
         (*raw).device_type = device_type;
         (*raw).driver_object = driver;
         (*raw).ref_count = AtomicU32::new(1);
@@ -1246,8 +1229,13 @@ pub unsafe fn create_device(
         let name_buffer = (raw as *mut u8).add(core::mem::size_of::<DeviceObject>()) as *mut u16;
         let mut written = 0usize;
         if let Ok(s) = core::str::from_utf8(device_name) {
-            for ch in s.chars().take(name_units) {
-                core::ptr::write(name_buffer.add(written), ch as u16);
+            for ch in s.encode_utf16() {
+                core::ptr::write(name_buffer.add(written), ch);
+                written += 1;
+            }
+        } else {
+            for &byte in device_name {
+                core::ptr::write(name_buffer.add(written), u16::from(byte));
                 written += 1;
             }
         }
@@ -1266,16 +1254,16 @@ pub unsafe fn create_device(
     // Register the device in the object manager namespace
     // Skip registration if OB is not initialized yet (during early boot)
     if !device_name.is_empty() && !device_name.iter().all(|&b| b == 0) {
-        register_device_in_object_manager(raw, device_name);
+        (*raw).namespace_handle = register_device_in_object_manager(raw, device_name);
     }
 
     raw
 }
 
 /// Register a device object in the object manager namespace at \Device\<name>
-fn register_device_in_object_manager(device: *mut DeviceObject, device_name: &[u8]) {
+fn register_device_in_object_manager(device: *mut DeviceObject, device_name: &[u8]) -> u64 {
     if device.is_null() {
-        return;
+        return 0;
     }
 
     // Extract just the device name (without \Device\ prefix)
@@ -1307,25 +1295,22 @@ fn register_device_in_object_manager(device: *mut DeviceObject, device_name: &[u
 
         // Insert into the namespace
         let handle = crate::ob::insert_object(b"\\Device", header);
-        if handle != 0 {
-            // // kprintln!("[I/O] Registered device {:?} in OB namespace, handle={}", name, handle);
-        } else {
-            // // kprintln!("[I/O] WARNING: Failed to insert device {:?} into OB namespace", name);
-        }
+        handle
     } else {
-        // // kprintln!("[I/O] WARNING: Failed to create OB header for device {:?}", name);
+        0
     }
 }
+
+mod device_lifecycle;
+pub use device_lifecycle::delete_device;
+
 
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// Attach one device above another.
 pub unsafe fn attach_device(above: *mut DeviceObject, below: *mut DeviceObject) {
-    unsafe {
-        (*above).attached_device = below;
-        (*below).attached_to = Some(above);
-    }
+    unsafe { dispatch::attach_device(above, below) }
 }
 
 /// Get I/O system counters snapshot.

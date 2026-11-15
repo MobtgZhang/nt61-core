@@ -32,7 +32,7 @@ pub unsafe fn get_next_stack_location(irp: *mut Irp) -> *mut IoStackLocation {
 
     unsafe {
         let current_loc = (*irp).current_location;
-        if current_loc == 0 {
+        if current_loc <= 1 || current_loc > (*irp).stack_count {
             return null_mut();
         }
 
@@ -86,6 +86,11 @@ pub unsafe fn copy_current_irp_stack_location_to_next(irp: *mut Irp) {
 
         if !current.is_null() && !next.is_null() {
             core::ptr::copy_nonoverlapping(current, next, 1);
+            // Completion ownership belongs to each stack location. Copying a
+            // higher driver's callback would invoke it twice on unwind.
+            (*next).completion_routine = None;
+            (*next).completion_context = null_mut();
+            (*next).control = 0;
         }
     }
 }
@@ -111,7 +116,8 @@ pub unsafe fn set_completion_routine(
             return;
         }
 
-        let mut control = (*stack).control;
+        let mut control =
+            (*stack).control & !(SL_INVOKE_ON_SUCCESS | SL_INVOKE_ON_ERROR | SL_INVOKE_ON_CANCEL);
 
         if invoke_on_success {
             control |= SL_INVOKE_ON_SUCCESS;

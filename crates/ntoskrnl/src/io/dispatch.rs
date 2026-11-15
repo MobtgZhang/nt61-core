@@ -1,26 +1,13 @@
 //! I/O Dispatch
 //
-//! Complete IRP dispatch framework aligned with NT 6.1 IoCallDriver
-//! semantics (wdm.h; "Windows Internals, 6th ed.", ch. 8):
-//!
-//! * A DispatchTable models a driver MajorFunction[28] array.
-//! * install() copies a table onto a DriverObject.
-//! * dispatch_irp is the IoCallDriver entry: it resolves the owning
-//!   DriverObject from the DeviceObject, reads the current
-//!   IoStackLocation major code, and calls the registered handler.
-//! * forward_irp_to_lower models IoForwardIrpToLower across the device
-//!   stack (DeviceObject::attached_device).
-//!
-//! Storage backends (AHCI, NVMe, virtio-blk, ramdisk) register
-//! READ/WRITE handlers through this table; the storage class layer
-//! sends sector I/O through dispatch_storage_request so no backend
-//! is bypassed by direct calls.
+//! Private source-level IRP routing. Major function numbers follow NT 6.1,
+//! but these object layouts and callbacks are not binary-compatible WDM.
 
 use core::ptr::null_mut;
 
 use super::{major, DeviceObject, DriverDispatch, IoParameters, Irp, ReadWriteParameters};
 use crate::libs::ntdll::status::{
-    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE, STATUS_SUCCESS,
+    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_NO_SUCH_DEVICE,
 };
 
 /// Number of major function slots (wdm.h IRP_MJ_MAXIMUM_FUNCTION + 1).
@@ -42,17 +29,10 @@ impl DispatchTable {
         }
     }
 
-    /// NT-style defaults: lifecycle majors succeed, data majors report
-    /// STATUS_INVALID_DEVICE_REQUEST (what an unimplemented handler in
-    /// NT would complete with).
+    /// Every major starts unimplemented. Lifecycle success requires a driver
+    /// handler, just as data transfer success does.
     pub const fn new() -> Self {
-        let mut table = Self::empty();
-        table.major_functions[major::IRP_MJ_CREATE as usize] = Some(default_create);
-        table.major_functions[major::IRP_MJ_CLOSE as usize] = Some(default_close);
-        table.major_functions[major::IRP_MJ_CLEANUP as usize] = Some(default_cleanup);
-        table.major_functions[major::IRP_MJ_FLUSH_BUFFERS as usize] = Some(default_flush_buffers);
-        table.major_functions[major::IRP_MJ_SHUTDOWN as usize] = Some(default_shutdown);
-        table
+        Self::empty()
     }
 
     /// # Safety
@@ -87,29 +67,10 @@ impl Default for DispatchTable {
 unsafe extern "C" fn complete_irp_with(irp: *mut Irp, status: i32) -> i32 {
     if !irp.is_null() {
         (*irp).io_status.status = status as u32;
+        (*irp).io_status.information = 0;
         super::io_complete_request(irp, 0);
     }
     status
-}
-
-unsafe extern "C" fn default_create(_device: *mut DeviceObject, irp: *mut Irp) -> i32 {
-    complete_irp_with(irp, STATUS_SUCCESS)
-}
-
-unsafe extern "C" fn default_close(_device: *mut DeviceObject, irp: *mut Irp) -> i32 {
-    complete_irp_with(irp, STATUS_SUCCESS)
-}
-
-unsafe extern "C" fn default_cleanup(_device: *mut DeviceObject, irp: *mut Irp) -> i32 {
-    complete_irp_with(irp, STATUS_SUCCESS)
-}
-
-unsafe extern "C" fn default_flush_buffers(_device: *mut DeviceObject, irp: *mut Irp) -> i32 {
-    complete_irp_with(irp, STATUS_SUCCESS)
-}
-
-unsafe extern "C" fn default_shutdown(_device: *mut DeviceObject, irp: *mut Irp) -> i32 {
-    complete_irp_with(irp, STATUS_SUCCESS)
 }
 
 // ---------------------------------------------------------------------------
@@ -122,13 +83,16 @@ unsafe extern "C" fn default_shutdown(_device: *mut DeviceObject, irp: *mut Irp)
 /// IoCallDriver: route an IRP to the device's driver using the current
 /// stack location's major function code.
 pub unsafe fn dispatch_irp(device: *mut DeviceObject, irp: *mut Irp) -> i32 {
-    if device.is_null() || irp.is_null() {
+    if irp.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    if device.is_null() {
+        return complete_irp_with(irp, STATUS_NO_SUCH_DEVICE);
     }
 
     let stack = (*irp).current_stack;
     if stack.is_null() {
-        return STATUS_INVALID_PARAMETER;
+        return complete_irp_with(irp, STATUS_INVALID_PARAMETER);
     }
 
     let major_code = (*stack).major_function as usize;
@@ -152,13 +116,33 @@ pub unsafe fn dispatch_irp(device: *mut DeviceObject, irp: *mut Irp) -> i32 {
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// The caller serializes attachment and device-list mutation. An existing
+/// attachment is never replaced; cyclic or overlong chains are rejected.
 /// Attach a lower device object onto a device stack
 /// (wdm.h IoAttachDeviceToDeviceStack).
 pub unsafe fn attach_device(device: *mut DeviceObject, lower: *mut DeviceObject) {
-    if device.is_null() || lower.is_null() {
+    if device.is_null() || lower.is_null() || device == lower
+        || !(*device).attached_device.is_null() || (*lower).attached_to.is_some()
+    {
+        return;
+    }
+    let mut current = lower;
+    let mut terminated = false;
+    for _ in 0..super::MAX_DEVICES {
+        if current.is_null() {
+            terminated = true;
+            break;
+        }
+        if current == device {
+            return;
+        }
+        current = (*current).attached_device;
+    }
+    if !terminated {
         return;
     }
     (*device).attached_device = lower;
+    (*lower).attached_to = Some(device);
 }
 
 /// # Safety
@@ -167,11 +151,17 @@ pub unsafe fn attach_device(device: *mut DeviceObject, lower: *mut DeviceObject)
 /// IoForwardIrpToLower: forward the IRP to the next lower device in
 /// the stack, keeping the same stack location parameters.
 pub unsafe fn forward_irp_to_lower(device: *mut DeviceObject, irp: *mut Irp) -> i32 {
-    if device.is_null() || irp.is_null() {
+    if irp.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    if device.is_null() {
+        return complete_irp_with(irp, STATUS_NO_SUCH_DEVICE);
     }
     let lower = (*device).attached_device;
     if lower.is_null() {
+        return complete_irp_with(irp, STATUS_INVALID_DEVICE_REQUEST);
+    }
+    if super::irp_stack::get_next_stack_location(irp).is_null() {
         return complete_irp_with(irp, STATUS_INVALID_DEVICE_REQUEST);
     }
     // IoForwardIrpToLower hands the IRP to the next driver using the

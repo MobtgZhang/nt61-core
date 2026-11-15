@@ -1,11 +1,6 @@
-//! Driver Loading and Initialization
+//! Lifecycle registry for caller-owned, statically mapped private drivers.
 //!
-//! Implements the NT driver loading subsystem, including:
-//! - Driver image loading from disk
-//! - Driver initialization (driver_entry)
-//! - Service start types (BOOT_START, SYSTEM_START, AUTO_START)
-//! - Driver database management
-//! - Driver unload support
+//! This is not a native WDM loader or a disk-backed PE/import resolver.
 
 use alloc::vec::Vec;
 use core::ptr::null_mut;
@@ -14,7 +9,6 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use super::DriverObject;
 use crate::ke::sync::Spinlock;
 use crate::libs::ntdll::status::*;
-use crate::mm::pool;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -97,12 +91,13 @@ fn ensure_registry(registry: &mut Vec<Option<DriverRegistryEntry>>) {
     }
 }
 
-/// # Safety
+/// Register a caller-owned private driver object. Objects with no initializer
+/// are already initialized (the bootstrap drivers use this form). This layout
+/// and its `extern "C"` callbacks are not the native Windows WDM ABI.
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Register an already-created driver object for loading by one of the
-/// `load_*_start_drivers` waves. The entry starts as `NotLoaded`; the
-/// wave matching its start type runs the driver's `DriverEntry`.
+/// # Safety
+/// The object and its counted UTF-16 name must remain valid until unregistered.
+/// The caller must serialize mutation of the object and its device list.
 pub unsafe fn register_start_type_driver(
     driver: *mut DriverObject,
     start_type: ServiceStartType,
@@ -110,25 +105,40 @@ pub unsafe fn register_start_type_driver(
     if driver.is_null() {
         return false;
     }
-
-    // Extract the driver name from the object's UnicodeString (UTF-16).
-    let mut name_buf = [0u8; 64];
-    unsafe {
-        let name_ptr = (*driver).driver_name.buffer;
-        let name_len_units = ((*driver).driver_name.length as usize).min(128);
-        for j in 0..name_len_units.min(64) {
-            let ch = core::ptr::read_volatile(name_ptr.add(j));
-            if ch == 0 {
-                break;
-            }
-            name_buf[j] = ch as u8;
-        }
+    let name = &(*driver).driver_name;
+    let units = usize::from(name.length) / 2;
+    if name.length % 2 != 0
+        || name.length > name.maximum_length
+        || name.buffer.is_null()
+        || units == 0
+        || units > 64
+    {
+        return false;
     }
-
-    let entry = DriverRegistryEntry::new(&name_buf, driver, start_type);
-
+    let mut name_buf = [0u8; 64];
+    for (j, byte) in name_buf.iter_mut().enumerate().take(units) {
+        let ch = *name.buffer.add(j);
+        // The registry's key is ASCII; do not silently alias/truncate UTF-16.
+        if ch == 0 || ch > 0x7f {
+            return false;
+        }
+        *byte = ch as u8;
+    }
     let mut registry = DRIVER_REGISTRY.lock();
     ensure_registry(&mut registry);
+    if registry
+        .iter()
+        .flatten()
+        .any(|e| e.driver_object == driver || e.name == name_buf)
+    {
+        return false;
+    }
+    let mut entry = DriverRegistryEntry::new(&name_buf, driver, start_type);
+    entry.image_base = (*driver).driver_start;
+    entry.image_size = (*driver).driver_size;
+    if (*driver).driver_init.is_none() && start_type != ServiceStartType::Disabled {
+        entry.load_state = DriverLoadState::Loaded;
+    }
     match registry.iter_mut().find(|e| e.is_none()) {
         Some(slot) => {
             *slot = Some(entry);
@@ -138,219 +148,258 @@ pub unsafe fn register_start_type_driver(
     }
 }
 
+/// Disk-backed PE driver loading is not implemented by this private registry.
+/// In particular an empty DriverObject is not an initialized image. Callers
+/// supplying an already mapped private driver use registration + initialization.
 pub fn load_driver(
-    driver_name: &[u8],
-    registry_path: &[u8],
-    start_type: ServiceStartType,
+    _driver_name: &[u8],
+    _registry_path: &[u8],
+    _start_type: ServiceStartType,
 ) -> *mut DriverObject {
-    unsafe {
-        let driver = super::allocate_driver(driver_name);
-        if driver.is_null() {
-            return null_mut();
-        }
-
-        let mut entry = DriverRegistryEntry::new(driver_name, driver, start_type);
-        entry.load_state = DriverLoadState::Loading;
-
-        let mut registry = DRIVER_REGISTRY.lock();
-        ensure_registry(&mut registry);
-        let slot = registry.iter_mut().find(|e| e.is_none());
-
-        if let Some(slot) = slot {
-            *slot = Some(entry.clone());
-        } else {
-            pool::free(driver as *mut u8);
-            return null_mut();
-        }
-
-        let init_status = if let Some(driver_init) = (*driver).driver_init {
-            let reg_path_ptr = registry_path.as_ptr() as *mut u16;
-            driver_init(driver, reg_path_ptr)
-        } else {
-            STATUS_SUCCESS as u32
-        };
-
-        if init_status != STATUS_SUCCESS as u32 {
-            entry.load_state = DriverLoadState::Failed;
-            if let Some(slot) = registry
-                .iter_mut()
-                .find(|e| e.as_ref().is_some_and(|e| e.driver_object == driver))
-            {
-                *slot = Some(entry);
-            }
-            return null_mut();
-        }
-
-        entry.load_state = DriverLoadState::Loaded;
-        if let Some(slot) = registry
-            .iter_mut()
-            .find(|e| e.as_ref().is_some_and(|e| e.driver_object == driver))
-        {
-            *slot = Some(entry);
-        }
-
-        driver
-    }
+    null_mut()
 }
 
-/// # Safety
+/// Run an already registered private initializer outside the registry lock.
+/// The optional private registry path is NUL-terminated UTF-16, not a WDM
+/// UNICODE_STRING. A failed initializer rolls back newly created devices when
+/// they are idle; any busy objects retain their caller-owned storage.
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// # Safety
+/// The caller owns the live driver object and serializes device-list changes.
+pub unsafe fn initialize_registered_driver(
+    driver: *mut DriverObject,
+    registry_path: &[u16],
+) -> i32 {
+    if driver.is_null() || (!registry_path.is_empty() && registry_path.last() != Some(&0)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let init = {
+        let mut registry = DRIVER_REGISTRY.lock();
+        let Some(entry) = registry
+            .iter_mut()
+            .flatten()
+            .find(|e| e.driver_object == driver)
+        else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        if entry.load_state != DriverLoadState::NotLoaded
+            || entry.start_type == ServiceStartType::Disabled
+        {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        let Some(init) = (*driver).driver_init else {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        };
+        entry.load_state = DriverLoadState::Loading;
+        init
+    };
+    initialize_reserved_driver(driver, registry_path, init)
+}
+
+// The Loading state pins the caller-owned object until this finishes.
+unsafe fn initialize_reserved_driver(
+    driver: *mut DriverObject,
+    registry_path: &[u16],
+    init: unsafe extern "C" fn(*mut DriverObject, *mut u16) -> u32,
+) -> i32 {
+    let original_devices = (*driver).device_object;
+    // A mutable copy accommodates this project's historical private callback
+    // signature without casting immutable byte storage to a UTF-16 pointer.
+    let mut path = registry_path.to_vec();
+    let path_ptr = if path.is_empty() {
+        null_mut()
+    } else {
+        path.as_mut_ptr()
+    };
+    let status = init(driver, path_ptr) as i32;
+    if status < 0 {
+        // DriverUnload is not called for a failed DriverEntry. Only new, idle
+        // devices are ours to roll back; never free an attached/in-use object.
+        let mut device = (*driver).device_object;
+        for _ in 0..super::MAX_DEVICES {
+            if device.is_null() || device == original_devices {
+                break;
+            }
+            let next = (*device).next_device;
+            let _ = super::delete_device(device);
+            device = next;
+        }
+    }
+    let mut registry = DRIVER_REGISTRY.lock();
+    if let Some(entry) = registry
+        .iter_mut()
+        .flatten()
+        .find(|e| e.driver_object == driver)
+    {
+        entry.load_state = if status >= 0 {
+            DriverLoadState::Loaded
+        } else {
+            DriverLoadState::Failed
+        };
+    }
+    status
+}
+
+/// Unregister a caller-owned private object after its unload callback deletes
+/// its devices. No callback runs with the registry lock held. Image/object
+/// storage remains owned by the registering caller, including on failure.
+/// Failed initialization can be unregistered once its devices are gone.
+///
+/// # Safety
+/// The caller owns the live driver and serializes device-list mutation.
 pub unsafe fn unload_driver(driver: *mut DriverObject) -> bool {
     if driver.is_null() {
         return false;
     }
-
-    let mut registry = DRIVER_REGISTRY.lock();
-
-    let entry_idx = registry
-        .iter()
-        .position(|e| e.as_ref().is_some_and(|e| e.driver_object == driver));
-
-    let entry_idx = match entry_idx {
-        Some(idx) => idx,
-        None => return false,
-    };
-
-    if let Some(Some(entry)) = registry.get(entry_idx) {
-        let refs = entry.ref_count.load(Ordering::Acquire);
-        if refs > 1 {
-            // Driver is still in use
+    let unload = {
+        let mut registry = DRIVER_REGISTRY.lock();
+        let Some(entry) = registry
+            .iter_mut()
+            .flatten()
+            .find(|e| e.driver_object == driver)
+        else {
+            return false;
+        };
+        if entry.ref_count.load(Ordering::Relaxed) != 1 {
             return false;
         }
+        let unload = match entry.load_state {
+            DriverLoadState::Loaded => {
+                let Some(callback) = (*driver).driver_unload else {
+                    return false;
+                };
+                Some(callback)
+            }
+            DriverLoadState::Failed | DriverLoadState::NotLoaded => {
+                if !(*driver).device_object.is_null() {
+                    return false;
+                }
+                None
+            }
+            _ => return false,
+        };
+        entry.load_state = DriverLoadState::Unloading;
+        unload
+    };
+    if let Some(unload) = unload {
+        unload(driver);
     }
-
-    unsafe {
-        if let Some(unload) = (*driver).driver_unload {
-            unload(driver);
-        }
+    let unregistered = (*driver).device_object.is_null() && super::unregister_driver(driver);
+    let mut registry = DRIVER_REGISTRY.lock();
+    let Some(index) = registry
+        .iter()
+        .position(|e| e.as_ref().is_some_and(|e| e.driver_object == driver))
+    else {
+        return false;
+    };
+    if !unregistered {
+        // Keep an inert record rather than expose partially unloaded callbacks.
+        registry[index].as_mut().unwrap().load_state = DriverLoadState::Failed;
+        return false;
     }
-
-    registry[entry_idx] = None;
-
-    pool::free(driver as *mut u8);
-
+    registry[index] = None;
     true
 }
 
 pub fn reference_driver(driver: *mut DriverObject) -> bool {
-    if driver.is_null() {
+    let mut registry = DRIVER_REGISTRY.lock();
+    let Some(entry) = registry
+        .iter_mut()
+        .flatten()
+        .find(|e| e.driver_object == driver)
+    else {
+        return false;
+    };
+    let refs = entry.ref_count.load(Ordering::Relaxed);
+    if entry.load_state != DriverLoadState::Loaded || refs == u32::MAX {
         return false;
     }
-
-    let mut registry = DRIVER_REGISTRY.lock();
-
-    if let Some(entry) = registry.iter_mut().find_map(|e| e.as_mut()) {
-        if entry.driver_object == driver {
-            entry.ref_count.fetch_add(1, Ordering::Release);
-            return true;
-        }
-    }
-
-    false
+    entry.ref_count.store(refs + 1, Ordering::Relaxed);
+    true
 }
 
 pub fn dereference_driver(driver: *mut DriverObject) -> bool {
-    if driver.is_null() {
+    let mut registry = DRIVER_REGISTRY.lock();
+    let Some(entry) = registry
+        .iter_mut()
+        .flatten()
+        .find(|e| e.driver_object == driver)
+    else {
+        return false;
+    };
+    let refs = entry.ref_count.load(Ordering::Relaxed);
+    // The registry owns the last reference; only unload can release it.
+    if refs <= 1 {
         return false;
     }
-
-    let mut registry = DRIVER_REGISTRY.lock();
-
-    if let Some(entry) = registry.iter_mut().find_map(|e| e.as_mut()) {
-        if entry.driver_object == driver {
-            let old = entry.ref_count.fetch_sub(1, Ordering::Release);
-            if old == 1 {
-                entry.load_state = DriverLoadState::Unloading;
-            }
-            return true;
-        }
-    }
-
-    false
+    entry.ref_count.store(refs - 1, Ordering::Relaxed);
+    true
 }
 
+/// Return a borrowed pointer; a user retaining it must acquire a reference.
 pub fn find_driver(name: &[u8]) -> *mut DriverObject {
     let registry = DRIVER_REGISTRY.lock();
-
-    for entry in registry.iter().filter_map(|e| e.as_ref()) {
-        let entry_name_len = entry.name.iter().position(|&b| b == 0).unwrap_or(64);
-        let entry_name = &entry.name[..entry_name_len];
-
-        if entry_name == name {
-            return entry.driver_object;
-        }
-    }
-
-    null_mut()
+    registry
+        .iter()
+        .flatten()
+        .find(|entry| {
+            let length = entry.name.iter().position(|&b| b == 0).unwrap_or(64);
+            entry.load_state == DriverLoadState::Loaded && &entry.name[..length] == name
+        })
+        .map_or(null_mut(), |entry| entry.driver_object)
 }
 
-/// Load every registered driver whose start type matches `wanted` and
-/// whose entry is still `NotLoaded`, running its `DriverEntry` (when
-/// the driver object carries one). Returns the number of drivers that
-/// initialized successfully. Image loading from disk (PE) is not part of
-/// this path; drivers registered here must already have a DriverObject.
 fn load_drivers_with_start_type(wanted: ServiceStartType) -> usize {
-    let mut loaded = 0usize;
-
-    let mut registry = DRIVER_REGISTRY.lock();
-    ensure_registry(&mut registry);
-
-    for slot in registry.iter_mut() {
-        let Some(entry) = slot else {
-            continue;
-        };
-        if entry.start_type != wanted || entry.load_state != DriverLoadState::NotLoaded {
-            continue;
-        }
-        let driver = entry.driver_object;
-        if driver.is_null() {
-            entry.load_state = DriverLoadState::Failed;
-            continue;
-        }
-
-        let init_status = unsafe {
-            match (*driver).driver_init {
-                Some(driver_init) => driver_init(driver, core::ptr::null_mut()),
-                None => STATUS_SUCCESS as u32,
-            }
-        };
-
-        if init_status == STATUS_SUCCESS as u32 {
-            entry.load_state = DriverLoadState::Loaded;
-            loaded += 1;
-        } else {
-            entry.load_state = DriverLoadState::Failed;
-        }
-    }
-
-    loaded
+    // Reserve all candidates under the registry lock so unload cannot remove
+    // an object between snapshotting its pointer and entering its callback.
+    let drivers: Vec<_> = {
+        let mut registry = DRIVER_REGISTRY.lock();
+        registry
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| {
+                if entry.start_type != wanted
+                    || entry.load_state != DriverLoadState::NotLoaded
+                    || wanted == ServiceStartType::Disabled
+                {
+                    return None;
+                }
+                let init = unsafe { (*entry.driver_object).driver_init }?;
+                entry.load_state = DriverLoadState::Loading;
+                Some((entry.driver_object, init))
+            })
+            .collect()
+    };
+    drivers
+        .into_iter()
+        .filter(|&(driver, init)| unsafe { initialize_reserved_driver(driver, &[], init) >= 0 })
+        .count()
 }
 
 pub fn load_boot_start_drivers() -> usize {
     load_drivers_with_start_type(ServiceStartType::BootStart)
 }
-
 pub fn load_system_start_drivers() -> usize {
     load_drivers_with_start_type(ServiceStartType::SystemStart)
 }
-
 pub fn load_auto_start_drivers() -> usize {
     load_drivers_with_start_type(ServiceStartType::AutoStart)
 }
-
 pub fn loaded_driver_count() -> usize {
-    let registry = DRIVER_REGISTRY.lock();
-    registry.iter().filter(|e| e.is_some()).count()
+    DRIVER_REGISTRY
+        .lock()
+        .iter()
+        .flatten()
+        .filter(|e| e.load_state == DriverLoadState::Loaded)
+        .count()
 }
 
-pub fn enumerate_drivers<F>(mut callback: F)
-where
-    F: FnMut(&DriverRegistryEntry) -> bool,
-{
-    let registry = DRIVER_REGISTRY.lock();
-
-    for entry in registry.iter().filter_map(|e| e.as_ref()) {
+/// Callbacks receive detached metadata snapshots and may reenter the registry.
+/// The snapshot's raw pointer is diagnostic only; it does not own a reference.
+pub fn enumerate_drivers<F: FnMut(&DriverRegistryEntry) -> bool>(mut callback: F) {
+    let entries: Vec<DriverRegistryEntry> =
+        DRIVER_REGISTRY.lock().iter().flatten().cloned().collect();
+    for entry in &entries {
         if !callback(entry) {
             break;
         }

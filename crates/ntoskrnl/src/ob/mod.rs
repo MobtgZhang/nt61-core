@@ -2057,6 +2057,39 @@ pub fn remove_object_by_name(path: &[u8]) -> bool {
     try_delete_object_locked(header)
 }
 
+/// Remove the sole namespace handle for a separately owned private I/O body.
+/// Refuse removal if any additional object references or handles exist. The
+/// body itself remains owned by the I/O manager and is never freed here.
+///
+/// # Safety
+/// The caller owns `body` and serializes its publication/deletion lifecycle.
+pub(crate) unsafe fn remove_external_io_object(handle: u64, body: *mut ()) -> bool {
+    let Some(slot) = handle.checked_sub(1).and_then(|v| usize::try_from(v).ok())
+    else { return false; };
+    if slot >= MAX_HANDLES || body.is_null() { return false; }
+    let _guard = OB_DELETE_LOCK.lock();
+    let header = {
+        let mut table = HANDLE_TABLE.lock();
+        if table.valid[slot] == 0 { return false; }
+        let header = table.slots[slot];
+        if header.is_null() || header.body() != body
+            || !matches!(header.type_index(), 30 | 31)
+            || header.ref_count() != 2 || header.handle_count() != 1
+            || header.is_deleting()
+        { return false; }
+        // One creation reference plus one reference from this sole handle.
+        // Detach the external body before the type-specific deletion callback.
+        (*header).body = null_mut();
+        (*header).ref_count.store(0, Ordering::Relaxed);
+        (*header).handle_count.store(0, Ordering::Relaxed);
+        table.valid[slot] = 0;
+        table.slots[slot] = null_mut();
+        HANDLE_TABLE_LIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
+        header
+    };
+    try_delete_object_locked(header)
+}
+
 /// Dereference an object.
 ///
 /// When the count reaches zero AND handle_count is zero, the object is

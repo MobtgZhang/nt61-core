@@ -133,6 +133,7 @@ pub fn run_tests() -> bool {
     stats.test("Driver Creation", test_driver_creation);
     stats.test("Driver Registration", test_driver_registration);
     stats.test("Driver Dispatch", test_driver_dispatch);
+    stats.test("Private Driver Lifecycle", test_private_driver_lifecycle);
 
     // Device Queue Tests
     stats.test("Queue Initialization", test_device_queue_init);
@@ -659,5 +660,63 @@ fn test_ioctl_request() -> bool {
         crate::io::free_irp(irp_ptr);
     }
 
+    true
+}
+
+/// Real pool + object-manager + private DriverEntry/Unload path. This is a
+/// kernel self-test (not evidence of native WDM binary compatibility).
+pub fn test_private_driver_lifecycle() -> bool {
+    use super::driver_loader::{self, ServiceStartType};
+    use crate::libs::ntdll::status::STATUS_INVALID_DEVICE_REQUEST;
+    unsafe extern "C" fn init(driver: *mut super::DriverObject, _: *mut u16) -> u32 {
+        let _ = driver_loader::loaded_driver_count(); // callback reentry
+        let device = super::create_device(driver, super::DeviceType::Unknown, b"Nt61LifeDevice");
+        if device.is_null() { return STATUS_INVALID_DEVICE_REQUEST as u32; }
+        1 // NT_SUCCESS includes informational success.
+    }
+    unsafe extern "C" fn unload(driver: *mut super::DriverObject) {
+        let _ = driver_loader::loaded_driver_count();
+        if !(*driver).device_object.is_null() { let _ = super::delete_device((*driver).device_object); }
+    }
+    unsafe extern "C" fn failed_init(driver: *mut super::DriverObject, _: *mut u16) -> u32 {
+        let _ = super::create_device(driver, super::DeviceType::Unknown, b"Nt61FailDevice");
+        STATUS_INVALID_DEVICE_REQUEST as u32
+    }
+    unsafe {
+        let driver = super::allocate_driver(b"Nt61LifeDriver");
+        if driver.is_null() { return false; }
+        (*driver).driver_init = Some(init);
+        (*driver).driver_unload = Some(unload);
+        if !super::register_driver(driver)
+            || !driver_loader::register_start_type_driver(driver, ServiceStartType::DemandStart)
+        { return false; }
+        if driver_loader::initialize_registered_driver(driver, &[]) != 1 { return false; }
+        let head = (*driver).device_object;
+        if head.is_null() { return false; }
+        // An independent OB reference prevents destruction and name reuse.
+        let header = crate::ob::lookup_object(b"\\Device\\Nt61LifeDevice");
+        if header.is_null() || crate::ob::reference_object(header) == 0 { return false; }
+        if super::delete_device(head) { return false; }
+        crate::ob::dereference_object(header);
+        if !driver_loader::reference_driver(driver) || driver_loader::unload_driver(driver)
+            || !driver_loader::dereference_driver(driver) || !driver_loader::unload_driver(driver)
+            || !(*driver).device_object.is_null()
+            || !crate::ob::lookup_object(b"\\Device\\Nt61LifeDevice").is_null()
+            || !crate::ob::lookup_object(b"\\Driver\\Nt61LifeDriver").is_null()
+            || !super::find_registered_driver(b"Nt61LifeDriver").is_null()
+        { return false; }
+        let _ = crate::mm::pool::free(driver.cast());
+
+        let failed = super::allocate_driver(b"Nt61FailDriver");
+        if failed.is_null() { return false; }
+        (*failed).driver_init = Some(failed_init);
+        if !driver_loader::register_start_type_driver(failed, ServiceStartType::DemandStart)
+            || driver_loader::initialize_registered_driver(failed, &[]) != STATUS_INVALID_DEVICE_REQUEST
+            || !(*failed).device_object.is_null()
+            || !crate::ob::lookup_object(b"\\Device\\Nt61FailDevice").is_null()
+            || !driver_loader::unload_driver(failed)
+        { return false; }
+        let _ = crate::mm::pool::free(failed.cast());
+    }
     true
 }
