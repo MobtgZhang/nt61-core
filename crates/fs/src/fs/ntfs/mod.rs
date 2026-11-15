@@ -4308,82 +4308,60 @@ fn fill_volume_metadata(ntfs: &mut NtfsFileSystem, total_sectors: u64, sectors_p
     }
 }
 
-/// Count free clusters by scanning the $Bitmap data on disk.
-///
-/// Mirrors the allocation walk in `allocate_cluster_ntfs`: the LCN of a
-/// data cluster is its position in the $Bitmap stream, and each bitmap
-/// cluster covers `cluster_size * 8` data clusters. Unreadable sectors
-/// are counted as used (conservative, matching the allocator, which
-/// refuses to allocate from a bitmap it cannot read).
-fn count_free_clusters(ntfs: &NtfsFileSystem, total_clusters: u64) -> u64 {
-    unsafe {
-        let Some(bitmap_record) = read_mft_record(&ntfs.ntfs_data, system_records::BITMAP) else {
-            return 0;
-        };
-        let Some(data_offset) =
-            find_attribute_in_record(&bitmap_record, AttributeHeader::TYPE_DATA)
-        else {
-            return 0;
-        };
-        if data_offset + 8 > bitmap_record.len() {
-            return 0;
-        }
-        if bitmap_record[data_offset + 8] == 0 {
-            // $Bitmap is always non-resident on a real NTFS volume.
-            return 0;
-        }
-        let data_runs_offset = u16::from_le_bytes([
-            bitmap_record[data_offset + 0x20],
-            bitmap_record[data_offset + 0x21],
-        ]) as usize;
-        if data_runs_offset == 0 || data_offset + data_runs_offset > bitmap_record.len() {
-            return 0;
-        }
-        let run_list = &bitmap_record[data_offset + data_runs_offset..];
-        let mut runs = [(0u64, 0u64); 64];
-        let num_runs = parse_run_list(run_list, &mut runs);
-        if num_runs == 0 {
-            return 0;
-        }
+/// Query live allocation state instead of the mount-time cache. A set bit in
+/// $Bitmap means allocated; bits beyond the volume end are padding.
+pub fn query_space_bytes(ntfs: &NtfsFileSystem) -> Option<(u64, u64)> {
+    let clusters = ntfs.base.total_clusters;
+    let size = u64::from(ntfs.ntfs_data.cluster_size);
+    if clusters == 0 || size == 0 { return None; }
+    let free = count_free_clusters_checked(ntfs, clusters)?;
+    Some((clusters.checked_mul(size)?, free.checked_mul(size)?))
+}
 
-        let bytes_per_cluster = ntfs.ntfs_data.cluster_size as u64;
-        let sectors_per_cluster = (bytes_per_cluster / 512).max(1);
-        let mut free = 0u64;
-        let mut bits_covered = 0u64;
-        'outer: for &(start_cluster, length) in runs[..num_runs].iter() {
-            for cluster_in_run in 0..length {
-                let bitmap_cluster = start_cluster + cluster_in_run;
-                let first_sector = cluster_to_sector(bitmap_cluster, ntfs.ntfs_data.cluster_size);
-                for sector_index in 0..sectors_per_cluster {
-                    let mut sector_buf = [0u8; 512];
-                    let read_ok = if let Some(device_id) = ntfs.ntfs_data.device_id {
-                        crate::drivers::storage::block::read_block(
-                            device_id,
-                            first_sector + sector_index,
-                            &mut sector_buf,
-                        )
-                    } else {
-                        read_sector(
-                            core::ptr::null_mut(),
-                            first_sector + sector_index,
-                            &mut sector_buf,
-                        )
-                        .is_ok()
-                    };
-                    if read_ok {
-                        for &byte in sector_buf.iter() {
-                            free += byte.count_ones() as u64;
-                        }
-                    }
-                    bits_covered += 512 * 8;
-                    if bits_covered >= total_clusters {
-                        break 'outer;
-                    }
-                }
-            }
+fn count_free_clusters(ntfs: &NtfsFileSystem, total_clusters: u64) -> u64 {
+    count_free_clusters_checked(ntfs, total_clusters).unwrap_or(0)
+}
+
+fn count_free_clusters_checked(ntfs: &NtfsFileSystem, total_clusters: u64) -> Option<u64> {
+    let record = read_mft_record(&ntfs.ntfs_data, system_records::BITMAP)?;
+    let at = find_attribute_in_record(&record, AttributeHeader::TYPE_DATA)?;
+    let header = record.get(at..at.checked_add(24)?)?;
+    let length = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+    let attribute = record.get(at..at.checked_add(length)?)?;
+    let mut free = 0u64;
+    let mut covered = 0u64;
+    let mut count = |bytes: &[u8]| {
+        for &byte in bytes {
+            let bits = total_clusters.saturating_sub(covered).min(8) as u32;
+            if bits == 0 { break; }
+            let mask = ((1u16 << bits) - 1) as u8;
+            free += u64::from((!byte & mask).count_ones());
+            covered += u64::from(bits);
         }
-        free.min(total_clusters)
+        covered == total_clusters
+    };
+    if header[8] == 0 {
+        let size = u32::from_le_bytes(header[16..20].try_into().ok()?) as usize;
+        let offset = u16::from_le_bytes(header[20..22].try_into().ok()?) as usize;
+        return count(attribute.get(offset..offset.checked_add(size)?)?).then_some(free);
     }
+    let cluster_size = u64::from(ntfs.ntfs_data.cluster_size);
+    if cluster_size == 0 || !cluster_size.is_multiple_of(512) { return None; }
+    let offset = u16::from_le_bytes(attribute.get(32..34)?.try_into().ok()?) as usize;
+    if offset < 64 { return None; }
+    let mut runs = [(0, 0); 64];
+    let run_count = parse_run_list(attribute.get(offset..)?, &mut runs);
+    for &(lcn, clusters) in &runs[..run_count] {
+        let first = ntfs.ntfs_data.hidden_sectors.checked_add(lcn.checked_mul(cluster_size / 512)?)?;
+        for index in 0..clusters.checked_mul(cluster_size / 512)? {
+            let mut sector = [0u8; 512];
+            if !read_mounted_sector(&ntfs.ntfs_data, first.checked_add(index)?, &mut sector) {
+                return None;
+            }
+            if count(&sector) { return Some(free); }
+        }
+    }
+    None
 }
 
 /// Read the resident $VOLUME_INFORMATION volume label into `out`.

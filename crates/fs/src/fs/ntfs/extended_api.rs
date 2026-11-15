@@ -479,11 +479,7 @@ pub fn attach_journal(features: &mut VolumeFeatures, max_records: usize) {
 // Volume information (Windows 7 `GetVolumeInformationW` surface)
 // ---------------------------------------------------------------------------
 
-/// Cached volume space usage for the mounted NTFS volume.
-///
-/// Free space is derived from the `$Bitmap` (LCN bitmap) cluster count
-/// recorded on the VCB at mount time; `GetVolumeInformationW` reports the
-/// same numbers through `lpTotalClusters` / `lpFreeClusters`.
+/// Current volume space usage from the mounted NTFS allocation bitmap.
 pub struct NtfsSpaceUsage {
     pub total_kb: u64,
     pub free_kb: u64,
@@ -495,13 +491,11 @@ pub fn get_space_usage() -> Option<NtfsSpaceUsage> {
     if !fs.ntfs_data.mounted {
         return None;
     }
-    let cluster_size = fs.ntfs_data.cluster_size.max(1) as u64;
-    let total = fs.base.total_clusters;
-    let free = fs.base.free_clusters;
+    let (total, free) = super::query_space_bytes(fs)?;
     Some(NtfsSpaceUsage {
-        total_kb: total.saturating_mul(cluster_size) / 1024,
-        free_kb: free.saturating_mul(cluster_size) / 1024,
-        used_kb: total.saturating_sub(free).saturating_mul(cluster_size) / 1024,
+        total_kb: total / 1024,
+        free_kb: free / 1024,
+        used_kb: (total - free) / 1024,
     })
 }
 

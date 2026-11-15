@@ -23,6 +23,12 @@ fn execute(request:&mut Request)->Result<Vec<u8>,u32>{
             }
             Ok(output)
         },
+        VOLUME_SPACE => {
+            let (total, free) = crate::fs::system_volume::space(path)?;
+            let mut bytes = total.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&free.to_le_bytes());
+            Ok(bytes)
+        }
         READ=>crate::fs::system_volume::read(path),
         READ_AT=>{
             if request.capacity<12 {return Err(STATUS_INVALID_PARAMETER);}

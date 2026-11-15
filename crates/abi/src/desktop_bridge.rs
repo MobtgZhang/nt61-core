@@ -24,6 +24,8 @@ pub const PROCESSES: u32 = 11;
 /// Reply: the same 12 bytes, Win32 exit code u32, then UTF-8 output.
 /// No global interactive state; simultaneous consoles cannot steal one another's focus.
 pub const DISKPART:u32=12;
+/// Mounted volume allocation: total bytes u64, free bytes u64, little endian.
+pub const VOLUME_SPACE: u32 = 13;
 pub const DISKPART_HEADER:usize=16;
 pub const PROCESS_HEADER: usize = 36;
 pub const MAX_PROCESSES: usize = 4096;

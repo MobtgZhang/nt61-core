@@ -68,6 +68,20 @@ fn parent_leaf(path:&str)->Result<(&str,&str),u32>{
     Ok((if parent=="C:" {"C:\\"}else{parent},leaf))
 }
 
+/// Current allocation totals from the mounted system volume, in bytes.
+/// Never derive free space from directory lengths or the RAM mirror size.
+pub fn space(path: &str) -> Result<(u64, u64), u32> {
+    normalize(path)?;
+    let _guard = VolumeGuard::acquire()?;
+    match super::detect_system_partition_type() {
+        FsType::Ntfs => {
+            let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+            ntfs::query_space_bytes(fs).ok_or(IO_ERROR)
+        }
+        _ => Err(UNSUPPORTED),
+    }
+}
+
 pub fn list(path:&str)->Result<Vec<Entry>,u32>{
     let path=normalize(path)?;
     let _guard=VolumeGuard::acquire()?;

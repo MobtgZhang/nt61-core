@@ -313,6 +313,9 @@ fn encode_single_run(cluster_count: u64, lcn_delta: u64) -> Vec<u8> {
     let mut run = vec![header];
     run.extend_from_slice(&cc_bytes[..cc_len]);
     run.extend_from_slice(&lcn_bytes[..lcn_len]);
+    // The next byte belongs to this attribute's mapping pairs, not the next
+    // MFT attribute. Readers must encounter an explicit end of the run list.
+    run.push(0);
     run
 }
 
@@ -2148,6 +2151,12 @@ impl FsBackend for NtfsImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_data_run_has_explicit_terminator_and_positive_signed_offset() {
+        assert_eq!(encode_single_run(4, 0xbba2), [0x31, 4, 0xa2, 0xbb, 0, 0]);
+        assert_eq!(encode_single_run(1, 10), [0x11, 1, 10, 0]);
+    }
 
     #[test]
     fn volume_bitmap_reserves_metadata_data_and_padding() {

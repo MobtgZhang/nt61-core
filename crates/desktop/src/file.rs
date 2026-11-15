@@ -52,9 +52,29 @@ pub struct FileSystem {
     backend: Option<Backend>,
     loaded_directories: Vec<u32>,
     pub last_error: Option<u32>,
+    pub volume_space: Option<VolumeSpace>,
     pub shell_icons: Option<alloc::sync::Arc<crate::shell_resources::ShellIcons>>,
     pub resource_error: Option<u32>,
     resources_attempted: bool,
+}
+
+/// Allocation counts supplied by the mounted provider; unavailable is distinct
+/// from an empty volume. Free bytes must never exceed total bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VolumeSpace {
+    pub total: u64,
+    pub free: u64,
+}
+impl VolumeSpace {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 16 { return None; }
+        let total = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+        let free = u64::from_le_bytes(bytes[8..].try_into().ok()?);
+        (total > 0 && free <= total).then_some(Self { total, free })
+    }
+    pub fn used_width(self, width: u32) -> u32 {
+        ((u128::from(self.total - self.free) * u128::from(width)) / u128::from(self.total)) as u32
+    }
 }
 
 /// Win32 shell component rules (NTFS itself also supports other namespaces).
@@ -81,6 +101,7 @@ impl FileSystem {
             backend: None,
             loaded_directories: Vec::new(),
             last_error: None,
+            volume_space: None,
             shell_icons: None,
             resource_error: None,
             resources_attempted: false,
@@ -105,7 +126,12 @@ impl FileSystem {
     /// Mount only after an actual directory request succeeds. A failed mount
     /// leaves no invented Windows/Users hierarchy behind.
     pub fn mounted(backend:Backend)->Result<Self,u32>{
-        let mut files=Self::new();files.backend=Some(backend);files.load_directory(1)?;Ok(files)
+        let mut files=Self::new();files.backend=Some(backend);files.load_directory(1)?;files.refresh_volume_space();Ok(files)
+    }
+    pub fn refresh_volume_space(&mut self) {
+        self.volume_space = self.backend
+            .and_then(|backend| (backend.0)(abi::VOLUME_SPACE, "C:\\", &[]).ok())
+            .and_then(|bytes| VolumeSpace::decode(&bytes));
     }
     pub fn is_mounted(&self)->bool{self.backend.is_some()}
     fn request(&mut self,operation:u32,path:&str,data:&[u8])->Result<Vec<u8>,u32>{
@@ -808,5 +834,22 @@ mod tests {
             filesystem.node(link).unwrap().target.as_deref(),
             Some("C:\\Windows\\System32\\notepad.exe")
         );
+    }
+}
+
+#[cfg(test)]
+mod volume_space_tests {
+    use super::*;
+    #[test]
+    fn space_counts_validate_provider_and_scale_without_overflow() {
+        let mut bytes = 1000u64.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&250u64.to_le_bytes());
+        let space = VolumeSpace::decode(&bytes).unwrap();
+        assert_eq!(space.used_width(200), 150);
+        assert!(VolumeSpace::decode(&bytes[..15]).is_none());
+        bytes[8..].copy_from_slice(&1001u64.to_le_bytes());
+        assert!(VolumeSpace::decode(&bytes).is_none());
+        assert!(VolumeSpace::decode(&[0;16]).is_none());
+        assert_eq!(VolumeSpace { total: u64::MAX, free: 0 }.used_width(u32::MAX), u32::MAX);
     }
 }
