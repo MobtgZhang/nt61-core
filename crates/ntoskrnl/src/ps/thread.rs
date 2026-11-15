@@ -190,8 +190,30 @@ pub struct Kthread {
     // padding field rather than left as implicit trailing padding
     // (which would be invisible to debuggers and could cause subtle
     // `sizeof` mismatches with hand-written assembly code).
-    _pad_to_end: [u8; 0x380 - 0x274],
+    _dispatch_alignment: u32,
+    /// Private scheduler state occupies reserved bytes, preserving the
+    /// offsets and total size of KTHREAD and KthreadContext.
+    pub dispatch_context: ThreadDispatchContext,
+    _pad_to_end: [u8; 0x380 - 0x274 - 52],
 }
+
+/// CPU state which must follow a suspended kernel stack across a switch.
+/// Interrupt enable is restored by the scheduling caller on resumption;
+/// fresh thread entry starts with interrupts disabled.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ThreadDispatchContext {
+    pub active_root: u64,
+    pub system_root: u64,
+    pub user_root: u64,
+    pub user_rsp: u64,
+    pub kernel_stack: u64,
+    pub irql: u8,
+    pub initialized: bool,
+    _padding: [u8; 6],
+}
+
+const _: () = assert!(core::mem::size_of::<ThreadDispatchContext>() == 48);
 
 /// Windows 7 x64 documented KTHREAD size (0x360 bytes). The actual
 /// compiled size at the current field layout is 0x380 — the 0x20-byte
@@ -1501,6 +1523,7 @@ pub fn create_idle_thread(cpu_id: u32) -> Option<&'static mut Ethread> {
 pub unsafe fn terminate(thread: *mut Ethread, _exit_code: u32) {
     unsafe {
         (*thread).exit_time = crate::ke::time::get_system_time() as i64;
+        crate::libs::ntdll::file::abandon_mutants((*thread).client_id.unique_thread);
         (*thread).kthread.state = KThreadState::Terminated;
         (*thread).kthread.header.signal_state = 1;
 
@@ -1712,6 +1735,7 @@ pub unsafe fn ps_terminate_system_thread(ethread: *mut Ethread, _exit_code: u32)
     }
     unsafe {
         (*ethread).exit_time = crate::ke::time::get_system_time() as i64;
+        crate::libs::ntdll::file::abandon_mutants((*ethread).client_id.unique_thread);
         (*ethread).kthread.state = KThreadState::Terminated;
         (*ethread).kthread.header.signal_state = 1;
         crate::ke::scheduler::remove_ready(ethread);

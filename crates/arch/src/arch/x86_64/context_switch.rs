@@ -121,6 +121,9 @@ global_asm!(
     "    mov rdi, [rsp]",
     "    mov rax, [rsp + 8]",
     "    add rsp, 16",
+    // New stacks have no suspended scheduler guard to restore IF.
+    // The scheduler has already published the thread, root and TSS.
+    "    sti",
     "    call rax",
     "    ud2",
 );

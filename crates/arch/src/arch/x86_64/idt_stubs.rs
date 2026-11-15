@@ -261,7 +261,11 @@ global_asm!(
     "  mov rcx, rax",                      // Windows ABI arg1: syscall number
     "  mov rdx, rsp",                      // Windows ABI arg2: &TrapFrame
     "  sub rsp, 0x20",                     // Win64 shadow space
+    // The complete user frame is now on this thread's kernel stack.
+    // Native waits require clock IRQs while dispatch is in progress.
+    "  sti",
     "  call syscall_dispatch",
+    "  cli",                              // protect the return frame and swapgs
     "  add rsp, 0x20",
     // Pop the fifteen GPR slots. Slot 0 is omitted because the
     // dispatcher's return value replaces the user syscall number.
@@ -280,11 +284,9 @@ global_asm!(
     "  pop r13",                           // slot 12
     "  pop r14",                           // slot 13
     "  pop r15",                           // slot 14
-    // Discard vector, error code, RIP, CS, RFLAGS, RSP, and SS.
-    // SYSEXIT/SYSRET reloads these from RCX/R11 and the fixed user
-    // RSP saved in the per-CPU area.
-    "  add rsp, 0x38",                     // seven remaining slots
-    "  mov rsp, gs:[0x0]",                 // restore user RSP
+    // Recover RSP from this thread's frame. The per-CPU scratch slot
+    // may have been used by another thread while this syscall waited.
+    "  mov rsp, [rsp + 0x28]",             // vector/error/RIP/CS/RFLAGS precede RSP
     "  swapgs",
     // Validate RCX before SYSRET.  A non-canonical return RIP would
     // fault at CPL0.  Redirect an invalid value to user address zero

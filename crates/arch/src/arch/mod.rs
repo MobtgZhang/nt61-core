@@ -226,22 +226,9 @@ pub fn start_smp() {
     let ap_count = riscv64::smp::cpu_count();
     #[cfg(not(target_arch = "riscv64"))]
     let ap_count = common::smp::cpu_count();
-    let mut n = ap_count;
-    let mut digits = [0u8; 10];
-    let mut len = 0;
-    if n == 0 {
-        digits[len] = b'0';
-        len += 1;
-    } else {
-        while n > 0 && len < 10 {
-            digits[len] = b'0' + (n % 10) as u8;
-            n /= 10;
-            len += 1;
-        }
-    }
-    crate::arch::boot::early_write_str(b"[SMP] cpu_count=");
-    crate::arch::boot::early_write_str(&digits[..len]);
-    crate::arch::boot::early_write_str(b"\r\n");
+    // Emit one UART transaction so concurrent AP startup cannot splice
+    // the count into another processor's diagnostic line.
+    crate::hal::serial::write_string_always(&alloc::format!("[SMP] cpu_count={}\r\n", ap_count));
 
     // The architecture implementation is responsible for scheduling PRCB
     // allocation before AP entry, because only it knows the true CPU count.
@@ -976,7 +963,6 @@ pub fn enable_interrupts() {
     unsafe {
         asm!("csrsi sstatus, 0x2");
     }
-    INTERRUPTS_ENABLED.store(true, core::sync::atomic::Ordering::Release);
 }
 
 /// Disable maskable interrupts on the current CPU.
@@ -1001,7 +987,6 @@ pub fn disable_interrupts() {
     unsafe {
         asm!("csrci sstatus, 0x2");
     }
-    INTERRUPTS_ENABLED.store(false, core::sync::atomic::Ordering::Release);
 }
 
 /// CRITICAL-004: Enable maskable interrupts once.
@@ -1027,11 +1012,9 @@ pub fn disable_interrupts() {
 static INTERRUPTS_READY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Tracks whether `enable_interrupts_once` has already executed
-/// the `sti` instruction. Separate from INTERRUPTS_READY so the
-/// two meanings ("safe to enable" vs "already enabled") do not
-/// collide.
-static INTERRUPTS_ENABLED: core::sync::atomic::AtomicBool =
+/// Boot-time enable gate. This is deliberately separate from the CPU's
+/// interrupt mask: trap entry and return change that mask in assembly.
+static INTERRUPTS_ENABLED_ONCE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Mark that it is now safe to deliver IRQs on the current CPU.
@@ -1047,19 +1030,49 @@ pub fn interrupts_ready() -> bool {
     INTERRUPTS_READY.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Returns true if maskable interrupts are currently enabled (the
-/// sti state mirrored by INTERRUPTS_ENABLED). Console readers use
-/// this to choose between parking on the input event (an
-/// interrupt-driven wait) and continuing the polled-IO loop (the
-/// masked-IRQ Safe Mode path has no wake source at all).
+/// Read the interrupt mask of the calling CPU. A global software mirror
+/// cannot observe interrupt/trap entry and can make a spinlock re-enable
+/// interrupts inside an ISR, or disable them permanently after SYSRET.
+#[cfg(any(target_os = "none", target_os = "uefi"))]
 pub fn interrupts_enabled() -> bool {
-    INTERRUPTS_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+    #[cfg(target_arch = "x86_64")]
+    { hardware_interrupts_enabled() }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mask: u64;
+        // SAFETY: DAIF is readable at the kernel's EL1 privilege level.
+        unsafe { asm!("mrs {}, daif", out(reg) mask, options(nomem, nostack, preserves_flags)); }
+        mask & (1 << 7) == 0
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let status: u64;
+        // SAFETY: the kernel runs in supervisor mode.
+        unsafe { asm!("csrr {}, sstatus", out(reg) status, options(nomem, nostack)); }
+        status & 2 != 0
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        let mode: u64;
+        // SAFETY: the kernel runs at PLV0 and may read CRMD.
+        unsafe { asm!("csrrd {}, 0x0", out(reg) mode, options(nomem, nostack)); }
+        mode & 4 != 0
+    }
+}
+
+/// Host tools link pure loader/PE helpers from the kernel crate. Their locks
+/// must never attempt CLI/STI merely because userspace RFLAGS.IF is set;
+/// interrupt masking is owned by the host OS in these builds.
+#[cfg(not(any(target_os = "none", target_os = "uefi")))]
+pub fn interrupts_enabled() -> bool {
+    false
 }
 
 #[cfg(target_arch = "x86_64")]
 pub fn hardware_interrupts_enabled() -> bool {
     let rflags: u64;
-    unsafe { core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nostack)) };
+    // SAFETY: PUSHFQ/POP are balanced and only inspect this CPU's flags.
+    unsafe { core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(preserves_flags)) };
     rflags & 0x200 != 0
 }
 
@@ -1075,7 +1088,7 @@ pub fn enable_interrupts_once() -> bool {
     use core::sync::atomic::Ordering;
     // Only flip the gate on the first caller; treat every later
     // invocation as a no-op that reports the underlying state.
-    if INTERRUPTS_ENABLED
+    if INTERRUPTS_ENABLED_ONCE
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
@@ -1086,7 +1099,7 @@ pub fn enable_interrupts_once() -> bool {
             // Roll back the gate so a subsequent caller that
             // arrives after `mark_interrupts_ready` can still
             // emit the `sti`.
-            INTERRUPTS_ENABLED.store(false, Ordering::Release);
+            INTERRUPTS_ENABLED_ONCE.store(false, Ordering::Release);
             false
         }
     } else if INTERRUPTS_READY.load(Ordering::Acquire) {

@@ -1451,13 +1451,12 @@ pub unsafe fn remove_ready(thread: *mut Ethread) -> bool {
 /// cache locality and scalability. The per-CPU dispatcher lock is
 /// used instead of the global SCHEDULER lock to reduce contention.
 ///
-/// NOTE: this function is *not* safe to call from inside the
-/// syscall path. The syscall path returns to user mode by
-/// `sysretq`, which is incompatible with `swap_context`'s
-/// `ret`-based return. The Phase 0 bring-up uses this function
-/// from a kernel-mode caller (e.g. the idle loop) only. Calling
-/// it from a Ring 3 syscall will produce undefined behaviour.
+/// A suspended syscall resumes on its saved kernel stack, completes
+/// dispatch, then returns through its own user trap frame. Interrupts
+/// stay masked from selection through the stack swap; per-thread CPU
+/// state is published before execution transfers to the incoming stack.
 pub fn schedule() -> bool {
+    let _interrupts = DispatchInterrupts::mask();
     // Use get_current_cpu() to get the real CPU ID from GS base
     let cpu = get_current_cpu();
 
@@ -1604,7 +1603,7 @@ pub fn schedule() -> bool {
                     if (*cur).kthread.state == KThreadState::Running {
                         let prio = ((*cur).kthread.priority as i32).clamp(0, 31) as usize;
                         if let Some(ref mut prcb) = scheduler.prcb_mut(cpu) {
-                            if lock_ready_queue(cpu, prio).is_some() {
+                            if let Some(_queue_guard) = lock_ready_queue(cpu, prio) {
                                 let entry_ptr = core::ptr::addr_of_mut!(
                                     (*cur).kthread.global_thread_list_entry
                                 ) as *mut ListEntry;
@@ -1640,6 +1639,7 @@ pub fn schedule() -> bool {
             unsafe {
                 (*next_thread).kthread.state = KThreadState::Running;
                 if new_rsp != 0 {
+                    publish_switch_context(current, next_thread);
                     match current {
                         Some(cur) => {
                             crate::arch::swap_context(
@@ -1662,6 +1662,71 @@ pub fn schedule() -> bool {
     false
 }
 
+/// The guard stays on the outgoing stack, so resumption restores the
+/// interrupt mask of that caller (including a caller inside an ISR).
+struct DispatchInterrupts(bool);
+
+impl DispatchInterrupts {
+    fn mask() -> Self {
+        let enabled = crate::arch::interrupts_enabled();
+        crate::arch::disable_interrupts();
+        Self(enabled)
+    }
+}
+
+impl Drop for DispatchInterrupts {
+    fn drop(&mut self) {
+        if self.0 {
+            crate::arch::enable_interrupts();
+        }
+    }
+}
+
+/// # Safety
+/// Both ETHREADs and the incoming kernel stack must remain live. Local
+/// interrupts are disabled and no scheduler lock is held.
+unsafe fn publish_switch_context(current: Option<*mut Ethread>, next: *mut Ethread) {
+    use crate::arch::common::percpu;
+    let root = crate::arch::read_current_page_root();
+    if let Some(area) = percpu::try_get_current() {
+        if let Some(current) = current {
+            let saved = &mut (*current).kthread.dispatch_context;
+            saved.active_root = root;
+            saved.system_root = area.system_pml4;
+            saved.user_root = area.user_pml4;
+            saved.user_rsp = area.user_rsp;
+            saved.kernel_stack = area.kernel_rsp;
+            saved.irql = irql::get_current_irql() as u8;
+            saved.initialized = true;
+        }
+    }
+    let mut incoming = (*next).kthread.dispatch_context;
+    let process = (*next).threads_process;
+    if !incoming.initialized {
+        let system_root = percpu::try_get_current().map_or(root, |area| {
+            if area.system_pml4 == 0 { root } else { area.system_pml4 }
+        });
+        let process_root = if process.is_null() { 0 } else { (*process).pml4_phys };
+        incoming.active_root = if process_root == 0 { system_root } else { process_root };
+        incoming.system_root = system_root;
+        incoming.user_root = process_root;
+        incoming.user_rsp = (*next).kthread.context.user_rsp;
+        incoming.kernel_stack = (*next).kthread.kernel_stack;
+        incoming.irql = Irql::Passive as u8;
+    }
+    percpu::set_current_thread(next);
+    percpu::set_current_process(process);
+    percpu::set_user_rsp(incoming.user_rsp);
+    percpu::set_kernel_stack(incoming.kernel_stack);
+    percpu::set_address_space_roots(incoming.system_root, incoming.user_root);
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::tss::set_rsp0(incoming.kernel_stack);
+    if incoming.active_root != 0 && incoming.active_root != root {
+        crate::arch::load_page_root(incoming.active_root >> 12);
+    }
+    irql::lower_irql(Irql::from(incoming.irql));
+}
+
 /// Phase 0: tick handler called by the timer ISR. Decrements
 /// the current thread's quantum and, when it reaches zero,
 /// triggers a reschedule.
@@ -1676,6 +1741,7 @@ pub fn tick() {
 
         // Advance the authoritative clock once per tick.
         crate::ke::time::advance_tick();
+        crate::libs::ntdll::file::tick_timers();
 
         // Use get_current_cpu() to get the real CPU ID from GS base
         let cpu = get_current_cpu();
