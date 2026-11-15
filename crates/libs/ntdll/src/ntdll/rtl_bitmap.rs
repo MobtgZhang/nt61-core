@@ -36,7 +36,7 @@ pub unsafe extern "C" fn rtl_initialize_bit_map(
     bitmap_buffer: *mut u32,
     size_of_bit_map: u32,
 ) {
-    if bitmap_header.is_null() || bitmap_buffer.is_null() {
+    if bitmap_header.is_null() {
         return;
     }
     (*bitmap_header).size_of_bit_map = size_of_bit_map;
@@ -130,43 +130,7 @@ pub unsafe extern "C" fn rtl_find_clear_bits(
     if bitmap_header.is_null() {
         return 0xFFFF_FFFF;
     }
-    let bm = &*bitmap_header;
-    let start = hint_index.min(bm.size_of_bit_map);
-
-    let mut count = 0u32;
-    let mut start_pos = 0xFFFF_FFFF;
-
-    for i in start..bm.size_of_bit_map {
-        if rtl_test_bit(bitmap_header, i) == 0 {
-            if count == 0 {
-                start_pos = i;
-            }
-            count += 1;
-            if count == number_to_find {
-                return start_pos;
-            }
-        } else {
-            count = 0;
-            start_pos = 0xFFFF_FFFF;
-        }
-    }
-
-    for i in 0..start {
-        if rtl_test_bit(bitmap_header, i) == 0 {
-            if count == 0 {
-                start_pos = i;
-            }
-            count += 1;
-            if count == number_to_find {
-                return start_pos;
-            }
-        } else {
-            count = 0;
-            start_pos = 0xFFFF_FFFF;
-        }
-    }
-
-    0xFFFF_FFFF
+    find_bits(&*bitmap_header, number_to_find, hint_index, false)
 }
 
 /// # Safety
@@ -180,28 +144,59 @@ pub unsafe extern "C" fn rtl_find_set_bits(
     if bitmap_header.is_null() {
         return 0xFFFF_FFFF;
     }
-    let bm = &*bitmap_header;
-    let start = hint_index.min(bm.size_of_bit_map);
+    find_bits(&*bitmap_header, number_to_find, hint_index, true)
+}
 
-    let mut count = 0u32;
-    let mut start_pos = 0xFFFF_FFFF;
+/// Search ordered, linear ranges. A second pass may cross the hint but must
+/// never join the last bit of the bitmap to bit zero.
+///
+/// # Safety
+/// `bitmap.buffer` must address ceil(size_of_bit_map / 32) initialized ULONGs.
+unsafe fn find_bits(bitmap: &RtlBitmap, count: u32, hint: u32, set: bool) -> u32 {
+    let size = bitmap.size_of_bit_map;
+    let hint = if hint < size { hint } else { 0 };
+    // NT 6.1.7601's zero-count path does not inspect the backing buffer and
+    // returns a byte-aligned hint (RVA 0xd7f95 / 0xd7e0b in the supplied kernel).
+    if count == 0 {
+        return hint & !7;
+    }
+    if count > size {
+        return u32::MAX;
+    }
+    let first = find_bits_in_range(bitmap, count, hint, size, set);
+    if first != u32::MAX || hint == 0 {
+        return first;
+    }
+    // A run beginning before the hint can extend beyond it. The original
+    // backscan includes up to count bits after the hint, capped at bitmap end.
+    let end = hint.saturating_add(count).min(size);
+    find_bits_in_range(bitmap, count, 0, end, set)
+}
 
-    for i in start..bm.size_of_bit_map {
-        if rtl_test_bit(bitmap_header, i) != 0 {
-            if count == 0 {
-                start_pos = i;
-            }
-            count += 1;
-            if count == number_to_find {
-                return start_pos;
+/// # Safety
+/// `start <= end <= size_of_bit_map` and the bitmap buffer is valid.
+unsafe fn find_bits_in_range(
+    bitmap: &RtlBitmap,
+    count: u32,
+    start: u32,
+    end: u32,
+    set: bool,
+) -> u32 {
+    let mut run = 0;
+    for bit in start..end {
+        // SAFETY: The caller supplies a ULONG-aligned buffer covering every
+        // logical bit. Division indexes only the word containing this bit.
+        let word = unsafe { bitmap.buffer.add((bit / 32) as usize).read() };
+        if ((word >> (bit % 32)) & 1 != 0) == set {
+            run += 1;
+            if run == count {
+                return bit + 1 - count;
             }
         } else {
-            count = 0;
-            start_pos = 0xFFFF_FFFF;
+            run = 0;
         }
     }
-
-    0xFFFF_FFFF
+    u32::MAX
 }
 
 /// # Safety

@@ -40,6 +40,7 @@ pub mod mm;
 pub mod ob;
 pub mod ps;
 pub mod rtl;
+pub mod native_exports;
 pub mod se;
 
 #[path = "kernel_main.rs"]

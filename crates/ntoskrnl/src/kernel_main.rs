@@ -82,6 +82,7 @@ pub use crate::hal::text_console as gui_log;
 /// init sequence. It follows the Windows 7 (NT 6.1) boot order.
 #[no_mangle]
 pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
+    crate::native_exports::retain();
     // EARLY DEBUG: write 'K' to serial BEFORE anything else. This
     // verifies that the kernel actually got jumped to and that the
     // serial hardware is responding.
