@@ -1,0 +1,12 @@
+{
+  "identity": "snipping_tool",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "5cc420f9240411b963dd2d36eaa83e33f31486a2e5c4e1d8b03f1dac8f54011c",
+  "upstream": {
+    "name": "screenshot",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/image/crop/materialicons/24px.svg",
+    "sha256": "7c855aaf5c6e16c665e7d9f5310d12e3bc552096e99850d4f4321338bce4a59d",
+    "png_sha256": "83788fa8c377e0839d1b515ba2bc85be1bf71674289d6e8a8404a92b98f4c695"
+  }
+}

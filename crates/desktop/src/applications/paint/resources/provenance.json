@@ -1,0 +1,12 @@
+{
+  "identity": "paint",
+  "source": "icon.svg",
+  "license": "MIT",
+  "sha256": "1b10eb0bef5221c6c958d9a5e0933853ad88687275667474ba16caf424c6f612",
+  "upstream": {
+    "name": "paint",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/image/palette/materialicons/24px.svg",
+    "sha256": "2b63469be9cdae9b250d533d25be336ac79f8d43d700463d071a0d30593a76c3",
+    "png_sha256": "92c3d8d767e47e42406e80aa2b5adaf5668619639e4e617b068dc67ef706fcfe"
+  }
+}

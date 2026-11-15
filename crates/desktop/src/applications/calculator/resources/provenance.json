@@ -1,0 +1,12 @@
+{
+  "identity": "calculator",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "3967c5a4144350bb8d49fcff7a61071014bb887500538309d63766a96ca46690",
+  "upstream": {
+    "name": "calculator",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/content/calculate/materialicons/24px.svg",
+    "sha256": "e169e65fa9d60d5712c4fcf5c6455bae69f36b698def5816765c1614425977a4",
+    "png_sha256": "93b8be31798d84e148091308294390354e73f95e08bac2320df55da8b2d670df"
+  }
+}

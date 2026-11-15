@@ -1,0 +1,12 @@
+{
+  "identity": "games_explorer",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "438220bef4122c4fbba03b6eb5782a0279e15ae49296a88766f7cbab09f3f00b",
+  "upstream": {
+    "name": "games",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/extension/materialicons/24px.svg",
+    "sha256": "ad6f33eb7c2f179557cb2177feb5d58d3cc1018cb6111055e1c05b4c8e6761dc",
+    "png_sha256": "a1f4f7f20a4cba265ad503fb6bcec2b1369da7948c824748dd805a9412f204a2"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "identity": "explorer",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "22737bdf271d2e45f16716e956da2c144ea96676445f8525fb7bc0a7176d9da7",
+  "upstream": {
+    "name": "folder",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/file/folder/materialicons/24px.svg",
+    "sha256": "f287ca4017ccbe8ff3c562acdd036a3ae88acb8637fb713f0c65b1b2f9a35b61",
+    "png_sha256": "c70ba9e710b96da1a6d5b8c5aedfaa26c68fd4ccb3ce61b65f4d15d2ca5febd4"
+  }
+}

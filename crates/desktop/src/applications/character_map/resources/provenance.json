@@ -1,0 +1,12 @@
+{
+  "identity": "character_map",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "bcf18937051989db84bb8b518317545bd19d112e45635637ce057f3f324affda",
+  "upstream": {
+    "name": "characters",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/editor/text_fields/materialicons/24px.svg",
+    "sha256": "67f06b2e1ca0f7b398c238e62342577122889e5e1ff4aa6d5e7ff7ed88f72361",
+    "png_sha256": "8b97ce28ef7d75d7275cd12865d802d604b31607d517f9be5292d34cf65c1034"
+  }
+}

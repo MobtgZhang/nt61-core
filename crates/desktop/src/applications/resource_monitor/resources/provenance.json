@@ -1,0 +1,12 @@
+{
+  "identity": "resource_monitor",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "729ffd789d75c01e6314045dd495b9ddbac5ad64ef333b17145642a0ed658583",
+  "upstream": {
+    "name": "tasks",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/assessment/materialicons/24px.svg",
+    "sha256": "818e0c78c0b1468f1c26f15f9b800c9aca8ddc6c7e9e13ad4145735e479b15bf",
+    "png_sha256": "5ec1b55bde99c32bab784d267a2d9d9cc7d7532127060f94902d4d42b1479717"
+  }
+}

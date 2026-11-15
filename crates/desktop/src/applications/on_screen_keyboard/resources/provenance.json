@@ -1,0 +1,12 @@
+{
+  "identity": "on_screen_keyboard",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "e1ec6e97f4496aa3520858d899ea5f0a3d9a285add6b9f1b44c762046fcc15de",
+  "upstream": {
+    "name": "keyboard",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/hardware/keyboard/materialicons/24px.svg",
+    "sha256": "22ad5a5d2fb0c78566cd6fa022544c5cdb6c8d71fefaef82dcd9c7918b57802b",
+    "png_sha256": "617e3c9c55f9e003d106c13176323765c5d6dc2ec88730397bcd3000b1a15b88"
+  }
+}

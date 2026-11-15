@@ -1,0 +1,12 @@
+{
+  "identity": "minesweeper",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "615e3fd4278819a93193a56ac0327a7f060c28cda877cd83e9b0c00135713b58",
+  "upstream": {
+    "name": "mines",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/maps/pest_control/materialicons/24px.svg",
+    "sha256": "07e1f43ebc6c819a53626f28164e269178e69411de81383647174aff1ffe7810",
+    "png_sha256": "1af2e78ef180fb18302613f21877349f95c7c3b6bd9ec10facb9b4fc532fac7b"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "identity": "magnifier",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "6ab78d25718fb0fe19db6d785b545beac8ba1869f5d4b1c025f625643baf06fd",
+  "upstream": {
+    "name": "magnifier",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/search/materialicons/24px.svg",
+    "sha256": "c25d4cdca9972ef7ed9f8e9f32553d0444afd6a7cf8cc6ca9eebf5b4073ef308",
+    "png_sha256": "11dcfa10aa0c353d1ec5e950f6531e886af8c5d6ae3bb39d894ad87664e9cce5"
+  }
+}

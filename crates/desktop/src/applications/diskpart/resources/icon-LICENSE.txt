@@ -1,0 +1,3 @@
+Original NT61 WordPad artwork. Copyright (c) 2026 NT61 contributors.
+Released under the MIT license; see repository LICENSE.
+No Microsoft or Document.Editor artwork is included.

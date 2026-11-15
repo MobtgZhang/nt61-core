@@ -1,0 +1,12 @@
+{
+  "identity": "command_prompt",
+  "source": "icon.svg",
+  "license": "MIT",
+  "sha256": "0e88be44d31a7f133f8651a0100348ccf372ef50f07e51e5da1a3d85510f50d0",
+  "upstream": {
+    "name": "run",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/av/play_arrow/materialicons/24px.svg",
+    "sha256": "39d601c1d4199c5cadddf5f96a1f57157147d1eedc7a147cdadc29805c6d5fea",
+    "png_sha256": "fa41a0075b8f06205901694603925cab79443d092ef31fec4ba206ba9d60e5f5"
+  }
+}

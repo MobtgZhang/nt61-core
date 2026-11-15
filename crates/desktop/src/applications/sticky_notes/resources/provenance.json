@@ -1,0 +1,12 @@
+{
+  "identity": "sticky_notes",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "06fd69c7d74e24e49644438af25e43880ebbad6fb183f772479078f4a12f0fd9",
+  "upstream": {
+    "name": "notes",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/action/sticky_note_2/materialicons/24px.svg",
+    "sha256": "86fdf41499c0d8ee5567c71a355e040dc5fa251a36e5198a016bb0484b6e3004",
+    "png_sha256": "b38056ee03ea00752eb3c1c59fef0d054083d284b27d08b4d28c31d07366add8"
+  }
+}

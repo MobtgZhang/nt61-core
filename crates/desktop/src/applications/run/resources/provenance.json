@@ -1,0 +1,12 @@
+{
+  "identity": "run",
+  "source": "icon.svg",
+  "license": "Apache-2.0",
+  "sha256": "afde7aa324c289d794eba73d881da6cad01aa846743bca05bb65b1a7429d6e9c",
+  "upstream": {
+    "name": "run",
+    "url": "https://raw.githubusercontent.com/google/material-design-icons/10ecc14790612ca8fd164e3f4ffe9c16fc50d5b7/src/av/play_arrow/materialicons/24px.svg",
+    "sha256": "39d601c1d4199c5cadddf5f96a1f57157147d1eedc7a147cdadc29805c6d5fea",
+    "png_sha256": "fa41a0075b8f06205901694603925cab79443d092ef31fec4ba206ba9d60e5f5"
+  }
+}
