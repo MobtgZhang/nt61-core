@@ -177,9 +177,14 @@ pub extern "C" fn nt_gdi_bit_blt(frame: &SyscallFrame) -> u64 {
     let _ = &src_x;
     let src_y = unsafe { get_arg7(frame) } as i32;
     let _ = &src_y;
-    // bit_blt has 9 parameters: the ninth (rop) is the fourth stack
-    // argument, so it must go through the probed stack accessor.
-    let rop = unsafe { get_stack_arg(frame, 4) } as u32;
+    // Native NtGdiBitBlt has eleven parameters. ROP remains slot eight;
+    // the final two are the background color and native operation flags.
+    let rop = frame.args[8] as u32;
+    let _background_color = frame.args[9] as u32;
+    if frame.args[10] as u32 != 0 {
+        // CAPTUREBLT/device synchronization flags are not implemented.
+        return 0;
+    }
 
     // kprintln!("[win32k] NT_GDI_BIT_BLT: dest=0x{:x} ({}x{}) src=0x{:x} ({}x{}) rop=0x{:08x}",
     //         hdc_dest, x, y, hdc_src, src_x, src_y, rop);
@@ -266,55 +271,30 @@ pub extern "C" fn nt_gdi_delete_object(frame: &SyscallFrame) -> u64 {
     }
 }
 
-/// NT_GDI_STRETCH_BLT - Stretch block transfer
+/// NtGdiStretchBlt has twelve parameters. The source DC is slot five,
+/// source extents are slots eight/nine, ROP is slot ten, and background
+/// color is slot eleven. A six-argument PatBlt interpretation is invalid.
 pub extern "C" fn nt_gdi_stretch_blt(frame: &SyscallFrame) -> u64 {
-    let hdc_dest = unsafe { get_arg0(frame) };
-    let _ = &hdc_dest;
-    let x_dest = unsafe { get_arg1(frame) };
-    let _ = &x_dest;
-    let y_dest = unsafe { get_arg2(frame) };
-    let _ = &y_dest;
-    let width_dest = unsafe { get_arg3(frame) };
-    let _ = &width_dest;
-    let height_dest = unsafe { get_arg4(frame) };
-    let _ = &height_dest;
-    let rop = unsafe { get_arg5(frame) };
-    let _ = &rop;
-
-    // kprintln!("[win32k] NT_GDI_STRETCH_BLT");
-
-    // Resolve destination surface from the DC. Use the primary surface
-    // as a stand-in for the DC's surface until per-process DC objects
-    // are tracked. The stretch_blt is then a scaled copy_bits.
-    let primary = super::surface::get_primary_surface();
-    if primary.is_null() {
-        return 1; // TRUE — nothing to blit onto; treat as success
-    }
-
-    // Clip to the primary surface bounds to avoid writing outside the
-    // framebuffer (a common source of crashes in naive blit code).
-    let (dst_w, dst_h) = {
-        let surf = unsafe { &*primary };
-        (surf.width as i64, surf.height as i64)
-    };
-    let x_dest_i = x_dest as i64;
-    let y_dest_i = y_dest as i64;
-    let width_i = width_dest as i64;
-    let height_i = height_dest as i64;
-    let x_end = x_dest_i.wrapping_add(width_i);
-    let y_end = y_dest_i.wrapping_add(height_i);
-    if x_dest_i < 0 || y_dest_i < 0 || x_end > dst_w || y_end > dst_h {
-        // Blit is partially or fully out of bounds — clip.
-        let x0 = x_dest_i.max(0);
-        let y0 = y_dest_i.max(0);
-        let x1 = x_end.min(dst_w);
-        let y1 = y_end.min(dst_h);
-        if x1 <= x0 || y1 <= y0 {
-            return 1; // nothing visible to draw
-        }
-    }
-
-    1 // TRUE
+    // The existing renderer has no stretch sampling implementation. In
+    // particular, returning success here used to discard the entire draw.
+    // Until scaling/ROP/clipping are implemented together, report FALSE.
+    let _destination = (
+        frame.args[0],
+        frame.args[1],
+        frame.args[2],
+        frame.args[3],
+        frame.args[4],
+    );
+    let _source = (
+        frame.args[5],
+        frame.args[6],
+        frame.args[7],
+        frame.args[8],
+        frame.args[9],
+    );
+    let _rop = frame.args[10] as u32;
+    let _background_color = frame.args[11] as u32;
+    0
 }
 
 /// NT_GDI_COMBINE_RGN - Combine two regions
@@ -1038,28 +1018,58 @@ pub extern "C" fn nt_gdi_modify_world_transform(frame: &SyscallFrame) -> u64 {
 
 /// NT_GDI_OPEN_DCW - Open device context (wide)
 pub extern "C" fn nt_gdi_open_dc_w(frame: &SyscallFrame) -> u64 {
-    let p_device_name = unsafe { get_arg0(frame) };
-    let _ = &p_device_name;
-    let p_log_ext = unsafe { get_arg1(frame) };
-    let _ = &p_log_ext;
-    let p_log_int = unsafe { get_arg2(frame) };
-    let _ = &p_log_int;
-    let usetty = unsafe { get_arg3(frame) };
-    let _ = &usetty;
-    // Additional args on stack
-    let drv_name = unsafe { get_stack_arg(frame, 4) };
-    let _ = &drv_name;
-    let desktop_name = unsafe { get_stack_arg(frame, 5) };
-    let _ = &desktop_name;
-    let video_mode = unsafe { get_stack_arg(frame, 6) };
-    let _ = &video_mode;
-    let flags = unsafe { get_stack_arg(frame, 7) };
-    let _ = &flags;
+    // Only a direct DC for the default display is supported. Device modes,
+    // output addresses, information DCs, printer/spooler state and the
+    // user-mode device output require implementations of their own.
+    if frame.args[1] != 0
+        || frame.args[2] != 0
+        || frame.args[3] as u32 != 0
+        || frame.args[4] as u32 == 0
+        || frame.args[5] != 0
+        || frame.args[6] != 0
+        || frame.args[7] != 0
+    {
+        return 0;
+    }
 
-    // kprintln!("[win32k] NT_GDI_OPEN_DCW: device=0x{:x}, drv=0x{:x}, desktop=0x{:x}",
-    //               p_device_name, drv_name, desktop_name);
+    if frame.args[0] != 0 {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct DeviceName {
+            length: u16,
+            maximum_length: u16,
+            reserved: u32,
+            buffer: u64,
+        }
+        // Native OpenDCW takes a UNICODE_STRING, not a NUL-terminated
+        // pointer or USER's LARGE_STRING. Accept only the DISPLAY alias;
+        // named adapters are not resolved by the current display manager.
+        let name: DeviceName = match crate::mm::user_copy::read_user_object(frame.args[0]) {
+            Ok(name) => name,
+            Err(_) => return 0,
+        };
+        let display = [0x44u16, 0x49, 0x53, 0x50, 0x4c, 0x41, 0x59];
+        if name.length != 14 || name.length > name.maximum_length || name.buffer == 0 {
+            return 0;
+        }
+        for (index, expected) in display.iter().enumerate() {
+            let source = match name.buffer.checked_add(index as u64 * 2) {
+                Some(source) => source,
+                None => return 0,
+            };
+            let mut unit = 0u16;
+            if crate::mm::user_copy::read_user(source, &mut unit).is_err() {
+                return 0;
+            }
+            if (0x61..=0x7a).contains(&unit) {
+                unit -= 0x20;
+            }
+            if unit != *expected {
+                return 0;
+            }
+        }
+    }
 
-    // Call create display DC - this is essentially what OpenDC does
     crate::libs::win32k::dc::gre_create_display_dc()
 }
 
@@ -1467,59 +1477,77 @@ pub extern "C" fn nt_user_get_dcex(frame: &SyscallFrame) -> u64 {
     dc
 }
 
-/// NT_USER_CREATE_WINDOW_EX - create window (extended)
-pub extern "C" fn nt_user_create_window_ex(frame: &SyscallFrame) -> u64 {
-    let ex_style = unsafe { get_arg0(frame) } as u32;
-    let _ = &ex_style;
-    let class_name_ptr = unsafe { get_arg1(frame) };
-    let _ = &class_name_ptr;
-    let window_name_ptr = unsafe { get_arg2(frame) };
-    let _ = &window_name_ptr;
-    let style = unsafe { get_arg3(frame) } as u32;
-    let _ = &style;
-    let x = unsafe { get_arg4(frame) } as i32;
-    let _ = &x;
-    let y = unsafe { get_arg5(frame) } as i32;
-    let _ = &y;
-    let width = unsafe { get_arg6(frame) } as i32;
-    let _ = &width;
-    let height = unsafe { get_arg7(frame) } as i32;
-    let _ = &height;
-    // create_window_ex_w parameters 9-12 (parent, hMenu, hInstance, lParam)
-    // are stack arguments 4-7; they must be read through the probed
-    // accessor rather than by dereferencing the raw user RSP.
-    let parent = unsafe { get_stack_arg(frame, 4) };
-    let menu = unsafe { get_stack_arg(frame, 5) };
-    let _ = &menu;
-    let instance = unsafe { get_stack_arg(frame, 6) };
-    let _ = &instance;
-    let param = unsafe { get_stack_arg(frame, 7) };
-    let _ = &param;
-
-    // kprintln!("[win32k] NT_USER_CREATE_WINDOW_EX: ex_style=0x{:08x}, style=0x{:08x}, pos=({},{}) size={}x{}",
-    //         ex_style, style, x, y, width, height);
-
-    // read class name from user memory
-    let mut class_name_buf = [0u16; 64];
-    if class_name_ptr != 0 {
-        // Unvalidated scan: an unterminated user string walks off the
-        // user page into kernel memory. Probe the whole range first.
-        if unsafe { capture_user_unicode_string(class_name_ptr, 63, &mut class_name_buf) }.is_err()
-        {
-            return 0;
-        }
+/// Capture the counted LARGE_UNICODE_STRING used by native USER services.
+/// The high bit of MaximumLength denotes an ANSI buffer, which this path
+/// does not yet convert. Reject it rather than interpreting bytes as UTF-16.
+fn capture_user_large_unicode_string(address: u64, dst: &mut [u16]) -> Result<usize, i32> {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct LargeString {
+        length: u32,
+        maximum_length_and_ansi: u32,
+        buffer: u64,
     }
-
-    // read window title from user memory
-    let mut title_buf = [0u16; 256];
-    if window_name_ptr != 0
-        && unsafe { capture_user_unicode_string(window_name_ptr, 255, &mut title_buf) }.is_err()
+    if address == 0 {
+        return Ok(0);
+    }
+    let header: LargeString = crate::mm::user_copy::read_user_object(address)?;
+    let maximum = header.maximum_length_and_ansi & 0x7fff_ffff;
+    let chars = header.length as usize / 2;
+    if header.maximum_length_and_ansi & 0x8000_0000 != 0
+        || header.length & 1 != 0
+        || header.length > maximum
+        || chars >= dst.len()
     {
+        return Err(crate::libs::ntdll::status::STATUS_INVALID_PARAMETER);
+    }
+    for (index, unit) in dst[..chars].iter_mut().enumerate() {
+        let source = header
+            .buffer
+            .checked_add(index as u64 * 2)
+            .ok_or(crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION)?;
+        crate::mm::user_copy::read_user(source, unit)?;
+    }
+    dst[chars] = 0;
+    Ok(chars)
+}
+
+/// NtUserCreateWindowEx uses fifteen native parameters, including a class
+/// version between the class and title. Its strings are counted descriptors,
+/// unlike the twelve-parameter CreateWindowExW Win32 wrapper.
+pub extern "C" fn nt_user_create_window_ex(frame: &SyscallFrame) -> u64 {
+    let ex_style = frame.args[0] as u32;
+    let class_name_ptr = frame.args[1];
+    let class_version_ptr = frame.args[2];
+    let window_name_ptr = frame.args[3];
+    let style = frame.args[4] as u32;
+    let x = frame.args[5] as i32;
+    let y = frame.args[6] as i32;
+    let width = frame.args[7] as i32;
+    let height = frame.args[8] as i32;
+    let parent = frame.args[9];
+    let menu = frame.args[10];
+
+    // Class atoms, instance/class-version resolution, creation callbacks and
+    // the activation-context parameter remain unsupported by this manager.
+    // Do not turn an integer atom into a user pointer.
+    if class_name_ptr <= 0xffff || class_version_ptr > 0xffff {
+        return 0;
+    }
+    let mut class_name_buf = [0u16; 64];
+    let mut title_buf = [0u16; 256];
+    let class_length = match capture_user_large_unicode_string(class_name_ptr, &mut class_name_buf) {
+        Ok(length) => length,
+        Err(_) => return 0,
+    };
+    if class_length == 0 || class_name_buf[0] == 0 {
+        return 0;
+    }
+    if capture_user_large_unicode_string(window_name_ptr, &mut title_buf).is_err() {
         return 0;
     }
 
-    // create the window using the window manager
-    let hwnd = crate::libs::win32k::window::create_window_internal(
+    crate::libs::win32k::window::create_window_internal(
         &class_name_buf,
         &title_buf,
         style,
@@ -1529,11 +1557,10 @@ pub extern "C" fn nt_user_create_window_ex(frame: &SyscallFrame) -> u64 {
         width,
         height,
         if parent != 0 { Some(parent) } else { None },
-        0, // wndproc - default
+        0,
         menu as u32,
-    );
-
-    hwnd.unwrap_or_default()
+    )
+    .unwrap_or_default()
 }
 
 /// NT_USER_DESTROY_WINDOW - Destroy window
