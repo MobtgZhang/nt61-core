@@ -505,6 +505,7 @@ pub fn init(boot_info: &BootInfo) {
         (boot_info.ntoskrnl_image_base, boot_info.ntoskrnl_image_size),
         (boot_info.hal_image_base, boot_info.hal_image_size),
         (boot_info.bootvid_image_base, boot_info.bootvid_image_size),
+        (boot_info.kernel_stack_base, boot_info.kernel_stack_size),
         // A BLT-only firmware GPU uses a RAM framebuffer until the kernel
         // display driver takes over. It is live memory, never a free page.
         (boot_info.framebuffer_base, boot_info.framebuffer_size),
@@ -532,6 +533,8 @@ pub fn init(boot_info: &BootInfo) {
             boot_info.ntoskrnl_image_size,
         );
     }
+
+    crate::mm::vas::reserve_boot_stack(boot_info.kernel_stack_base, boot_info.kernel_stack_size);
 
     // The FDT can describe a broad RAM bank, while UEFI exposes reserved,
     // ACPI, NVS and MMIO holes inside that bank. Reserve those holes before

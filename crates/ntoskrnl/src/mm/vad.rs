@@ -628,6 +628,26 @@ impl VadTree {
         Ok(())
     }
 
+    /// Run a short operation while the containing VAD remains locked. Fault
+    /// handlers use this to keep commitment/protection valid through install.
+    pub fn with_entry<R>(&self, addr: u64, callback: impl FnOnce(&VadEntry) -> R) -> Option<R> {
+        let guard = self.root.lock();
+        let mut node = *guard;
+        let vpn = addr >> 12;
+        while !node.is_null() {
+            // SAFETY: the tree lock keeps this linked node alive.
+            let entry = unsafe { &*node };
+            if vpn < entry.starting_vpn {
+                node = entry.left;
+            } else if vpn > entry.ending_vpn {
+                node = entry.right;
+            } else {
+                return Some(callback(entry));
+            }
+        }
+        None
+    }
+
     /// Find VAD containing the given virtual address.
     pub fn find(&self, addr: u64) -> Option<*mut VadEntry> {
         let root_guard = self.root.lock();

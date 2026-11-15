@@ -22,6 +22,7 @@
 
 use core::arch::asm;
 use core::ptr;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::mm::pfn;
 use crate::mm::pte::pfn_to_phys;
@@ -88,8 +89,7 @@ struct IdentityPageTables([[u64; 512]; IDENTITY_PT_POOL_PAGES]);
 
 static mut IDENTITY_PT_POOL: IdentityPageTables =
     IdentityPageTables([[0; 512]; IDENTITY_PT_POOL_PAGES]);
-static mut IDENTITY_PT_USED: usize = 0;
-static mut IDENTITY_PT_ALLOCATED: usize = 0;
+static IDENTITY_PT_USED: AtomicUsize = AtomicUsize::new(0);
 
 const MAX_IDENTITY_RANGES: usize = 128;
 static IDENTITY_MAPPED_RANGES: crate::ke::sync::Spinlock<(
@@ -109,30 +109,34 @@ pub fn reset_bootstrap_identity_pool() {
             0,
             core::mem::size_of::<[[u64; 512]; IDENTITY_PT_POOL_PAGES]>(),
         );
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(IDENTITY_PT_USED), 0);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(IDENTITY_PT_ALLOCATED), 0);
+        // This reset runs before secondary harts are started.
+        IDENTITY_PT_USED.store(0, Ordering::Relaxed);
     }
 }
 
 fn alloc_identity_pt() -> Option<u64> {
-    let used = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(IDENTITY_PT_USED)) };
-    if used >= IDENTITY_PT_POOL_PAGES {
-        // Once the PFN database is online, the full RAM identity
-        // window has already been installed. Dynamic page-table pages
-        // are therefore safely writable while their own descriptor is
-        // being created.
-        let pfn = pfn::allocate_pfn()?;
-        let pa = pfn_to_phys(pfn);
-        unsafe {
-            core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE as usize);
+    // Page tables may be built concurrently on several harts. Reserve a
+    // unique pool slot before zeroing it; a volatile load/store pair lets
+    // two address spaces receive and overwrite the same table page.
+    let slot = IDENTITY_PT_USED.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+        (used < IDENTITY_PT_POOL_PAGES).then_some(used + 1)
+    });
+    let used = match slot {
+        Ok(used) => used,
+        Err(_) => {
+            // Once the PFN database is online, the full RAM identity
+            // window is installed and dynamic table pages are writable.
+            let pfn = pfn::allocate_pfn()?;
+            let pa = pfn_to_phys(pfn);
+            unsafe {
+                core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE as usize);
+            }
+            return Some(pa);
         }
-        return Some(pa);
-    }
+    };
     let pool_base = core::ptr::addr_of!(IDENTITY_PT_POOL) as u64;
     let pa = pool_base + (used as u64) * PAGE_SIZE;
     unsafe {
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(IDENTITY_PT_USED), used + 1);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(IDENTITY_PT_ALLOCATED), used + 1);
         core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE as usize);
     }
     Some(pa)
@@ -249,7 +253,7 @@ unsafe fn identity_leaf_pte_for_at(root_phys: u64, va: u64) -> *mut u64 {
 struct PageAlignedTable([u64; 512]);
 
 static mut ROOT_TABLE: PageAlignedTable = PageAlignedTable([0; 512]);
-static mut ROOT_PHYS: u64 = 0;
+static ROOT_PHYS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the active root-table physical address from the satp CSR.
 ///
@@ -274,26 +278,21 @@ fn current_satp_root_phys() -> u64 {
 }
 
 pub fn root_phys() -> u64 {
-    let mirrored = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(ROOT_PHYS)) };
-    if mirrored != 0 {
-        return mirrored;
+    // SATP is hart-local. ROOT_PHYS is only a bootstrap fallback and
+    // cannot describe the current address space after APs start or a
+    // process switches roots. Walking another hart's mirrored root can
+    // redirect physical aliases and overwrite live page tables.
+    let active = current_satp_root_phys();
+    if active != 0 {
+        return active;
     }
-    // Early boot (before paging::init()): the MMU may already be
-    // translating through a firmware-installed root table. Fall back
-    // to it so that early identity mappings land in the table that is
-    // actually in use, instead of dereferencing a null root.
-    current_satp_root_phys()
+    ROOT_PHYS.load(Ordering::Relaxed)
 }
 
-/// Publish the hardware root PA to the fast software mirror.
-///
-/// The noreturn Ring-3 entry path bypasses `load_page_root`, so it must
-/// update this cache explicitly before the SATP write. Otherwise trap
-/// diagnostics report the stale system root.
+/// Publish a root PA to the bootstrap mirror. Once translation is enabled,
+/// root readers use the hart-local SATP register instead of this shared value.
 pub fn publish_root_phys(pa: u64) {
-    unsafe {
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(ROOT_PHYS), pa);
-    }
+    ROOT_PHYS.store(pa, Ordering::Relaxed);
 }
 
 pub fn read_page_root_phys() -> u64 {
@@ -892,7 +891,7 @@ pub unsafe fn load_page_root(pml4_pfn: u64) {
     );
     asm!("csrw satp, {}", in(reg) satp, options(nostack));
     asm!("sfence.vma", options(nostack));
-    core::ptr::write_volatile(core::ptr::addr_of_mut!(ROOT_PHYS), pa);
+    ROOT_PHYS.store(pa, Ordering::Relaxed);
     if (saved_sstatus & 2) != 0 {
         asm!("csrsi sstatus, 2", options(nostack));
     }
@@ -1218,7 +1217,7 @@ pub fn identity_map_region(pa: u64, size: u64) -> bool {
         let l1_pte = unsafe { identity_l1_pte_for_at(root, cur) };
         if l1_pte.is_null() {
             let used =
-                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(IDENTITY_PT_ALLOCATED)) };
+                IDENTITY_PT_USED.load(Ordering::Relaxed);
             crate::hal::serial::write_string_always("[RVPGT] identity l1 fail cur=");
             crate::hal::serial::write_hex_u64_always(cur);
             crate::hal::serial::write_string_always(" root=");
@@ -1249,7 +1248,7 @@ pub fn identity_map_region(pa: u64, size: u64) -> bool {
         let pte = unsafe { identity_leaf_pte_for_at(root, cur) };
         if pte.is_null() {
             let used =
-                unsafe { core::ptr::read_volatile(core::ptr::addr_of!(IDENTITY_PT_ALLOCATED)) };
+                IDENTITY_PT_USED.load(Ordering::Relaxed);
             crate::hal::serial::write_string_always("[RVPGT] identity leaf fail cur=");
             crate::hal::serial::write_hex_u64_always(cur);
             crate::hal::serial::write_string_always(" root=");
@@ -1284,7 +1283,7 @@ pub fn init() {
         // which adopts TTBR1 rather than rebuilding the tables.
         let active = current_satp_root_phys();
         if active != 0 {
-            core::ptr::write_volatile(core::ptr::addr_of_mut!(ROOT_PHYS), active);
+            ROOT_PHYS.store(active, Ordering::Relaxed);
             return;
         }
         core::ptr::write_bytes(
@@ -1292,9 +1291,103 @@ pub fn init() {
             0,
             core::mem::size_of::<PageAlignedTable>(),
         );
-        core::ptr::write_volatile(
-            core::ptr::addr_of_mut!(ROOT_PHYS),
-            core::ptr::addr_of!(ROOT_TABLE) as u64,
-        );
+        ROOT_PHYS.store(core::ptr::addr_of!(ROOT_TABLE) as u64, Ordering::Relaxed);
     }
+}
+
+// Native fault-only leaf access. Walks without allocating, and preserves
+// nonzero invalid descriptors so the fault engine cannot erase backing state.
+unsafe fn fault_leaf_ptr(va: u64) -> Option<(*mut u64, bool)> {
+    let mut table = root_phys() as *mut u64;
+    if table.is_null() {
+        return None;
+    }
+    for shift in [30, 21, 12] {
+        let slot = table.add(((va >> shift) & 0x1ff) as usize);
+        let raw = core::ptr::read_volatile(slot);
+        if raw == 0 {
+            return None;
+        }
+        if !is_valid(raw) || is_leaf(raw) || shift == 12 {
+            let aligned = pte_pa(raw) & ((1u64 << shift) - 1) == 0;
+            return Some((
+                slot,
+                is_valid(raw) && is_leaf(raw) && aligned && raw >> 54 == 0,
+            ));
+        }
+        // U/A/D and high reserved bits are illegal in an Sv39 nonleaf.
+        if raw & (16 | 64 | 128) != 0 || raw >> 54 != 0 || pte_pa(raw) == 0 {
+            return Some((slot, false));
+        }
+        table = pte_pa(raw) as *mut u64;
+    }
+    None
+}
+
+pub fn fault_leaf(va: u64) -> u64 {
+    unsafe {
+        fault_leaf_ptr(va).map_or(0, |(slot, leaf)| {
+            if leaf {
+                core::ptr::read_volatile(slot)
+            } else {
+                2
+            }
+        })
+    }
+}
+
+/// Compare-and-update only the descriptor observed by the fault handler.
+/// Never widens permissions or overwrites a concurrent mapping.
+pub fn fault_update_leaf(va: u64, expected: u64, updated: u64) -> bool {
+    unsafe {
+        let Some((slot, true)) = fault_leaf_ptr(va) else {
+            return false;
+        };
+        let atomic = &*slot.cast::<core::sync::atomic::AtomicU64>();
+        if atomic
+            .compare_exchange(
+                expected,
+                updated,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        asm!("sfence.vma {}, zero", in(reg) va, options(nostack));
+        true
+    }
+}
+
+/// Install an anonymous page only into an empty native leaf. Returns None on
+/// table allocation failure, Some(false) if another descriptor owns the slot.
+pub fn fault_install_page(va: u64, pa: u64, flags: u64) -> Option<bool> {
+    unsafe {
+        if fault_leaf(va) != 0 {
+            return Some(false);
+        }
+        let slot = leaf_pte_for_at(root_phys(), va);
+        if slot.is_null() {
+            return None;
+        }
+        let atomic = &*slot.cast::<core::sync::atomic::AtomicU64>();
+        let installed = atomic
+            .compare_exchange(
+                0,
+                make_pte(pa, flags),
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        if installed {
+            asm!("sfence.vma {}, zero", in(reg) va, options(nostack));
+        }
+        Some(installed)
+    }
+}
+
+/// Native root currently serving lower-half user addresses.
+pub fn fault_root() -> u64 {
+    root_phys()
 }

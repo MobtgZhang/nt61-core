@@ -343,6 +343,24 @@ fn handle_irq() {
 /// handle a user-mode page fault.
 fn handle_user_page_fault(tf: &mut TrapFrame, is_instruction: bool) {
     let far = tf.far_el1;
+    let fsc = tf.esr_el1 & 0x3f;
+    // Only translation, access-flag and permission aborts are page faults.
+    // Alignment, external aborts and invalid FAR values cannot be repaired.
+    if (0x04..=0x0f).contains(&fsc) && tf.esr_el1 & (1 << 10) == 0 {
+        let write = !is_instruction && tf.esr_el1 & (1 << 6) != 0;
+        let access = crate::mm::access_fault::AccessFlags {
+            read: !write && !is_instruction,
+            write,
+            execute: is_instruction,
+            user: true,
+            reserved_bit: false,
+            instruction_fetch: is_instruction,
+        };
+        if crate::mm::access_fault::handle(far, access) == crate::mm::access_fault::FaultStatus::Handled
+        {
+            return;
+        }
+    }
     let elr = tf.elr_el1;
     crate::hal::serial::write_string_always("[USER-FAULT] kind=");
     crate::hal::serial::write_string_always(if is_instruction {

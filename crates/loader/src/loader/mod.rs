@@ -6,6 +6,8 @@
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+mod fixed_base;
+
 /// DOS header
 #[repr(C)]
 pub struct DosHeader {
@@ -304,50 +306,7 @@ impl Default for LoaderResult {
 
 /// Load PE image into memory
 pub fn load_pe(image: &[u8]) -> Option<LoaderResult> {
-    // Verify DOS header
-    if image.len() < 64 {
-        return None;
-    }
-
-    let dos = unsafe { core::ptr::read_unaligned(image.as_ptr() as *const DosHeader) };
-    if !dos.is_valid() {
-        return None;
-    }
-
-    // Find PE header
-    let pe_offset = dos.e_lfanew as usize;
-    if pe_offset + 4 > image.len() {
-        return None;
-    }
-
-    // Verify PE signature
-    let signature = u32::from_le_bytes([
-        image[pe_offset],
-        image[pe_offset + 1],
-        image[pe_offset + 2],
-        image[pe_offset + 3],
-    ]);
-
-    if signature != PE_SIGNATURE {
-        return None;
-    }
-
-    // Parse file header
-    let file_header_offset = pe_offset + 4;
-    if file_header_offset + 20 > image.len() {
-        return None;
-    }
-
-    // Check optional header magic
-    let optional_header_offset = file_header_offset + 20;
-    if optional_header_offset + 2 > image.len() {
-        return None;
-    }
-
-    let opt_magic = u16::from_le_bytes([
-        image[optional_header_offset],
-        image[optional_header_offset + 1],
-    ]);
+    let (_, _, opt_magic, optional_header_offset) = parse_headers(image)?;
 
     let mut result = LoaderResult::new();
 
@@ -378,7 +337,9 @@ pub fn load_pe(image: &[u8]) -> Option<LoaderResult> {
                     image.as_ptr().add(optional_header_offset) as *const OptionalHeader64
                 )
             };
-            result.entry_point = opt.image_base + opt.address_of_entry_point as u64;
+            result.entry_point = opt
+                .image_base
+                .checked_add(opt.address_of_entry_point as u64)?;
             result.image_base = opt.image_base;
             result.image_size = opt.size_of_image as u64;
             result.subsystem = opt.subsystem;
@@ -392,28 +353,11 @@ pub fn load_pe(image: &[u8]) -> Option<LoaderResult> {
 
 /// Get section headers from PE image (simplified)
 pub fn get_sections(image: &[u8], output: &mut [SectionHeader]) -> usize {
-    // Find PE header
-    let pe_offset = if image.len() < 64 {
+    let Some((file_header, optional_header_size, _, optional_offset)) = parse_headers(image) else {
         return 0;
-    } else {
-        let dos = unsafe { core::ptr::read_unaligned(image.as_ptr() as *const DosHeader) };
-        if !dos.is_valid() {
-            return 0;
-        }
-        dos.e_lfanew as usize
     };
-
-    if pe_offset + 24 > image.len() {
-        return 0;
-    }
-
-    let file_header = unsafe {
-        core::ptr::read_unaligned(image.as_ptr().add(pe_offset + 4) as *const FileHeader)
-    };
-    let num_sections = file_header.number_of_sections.min(output.len() as u16);
-    let optional_header_size = file_header.size_of_optional_header;
-
-    let sections_offset = pe_offset + 24 + optional_header_size as usize;
+    let num_sections = (file_header.number_of_sections as usize).min(output.len());
+    let sections_offset = optional_offset + optional_header_size;
 
     for i in 0..num_sections as usize {
         let offset = sections_offset + i * 40;
@@ -426,7 +370,7 @@ pub fn get_sections(image: &[u8], output: &mut [SectionHeader]) -> usize {
         output[i] = section;
     }
 
-    num_sections as usize
+    num_sections
 }
 
 // =====================================================================
@@ -568,8 +512,8 @@ pub fn parse_headers(image: &[u8]) -> Option<(FileHeader, usize, u16, usize)> {
     if !dos.is_valid() {
         return None;
     }
-    let pe_off = dos.e_lfanew as usize;
-    if pe_off + 24 > image.len() {
+    let pe_off = usize::try_from(dos.e_lfanew).ok()?;
+    if pe_off < 64 || pe_off.checked_add(24)? > image.len() {
         return None;
     }
     if &image[pe_off..pe_off + 4] != b"PE\0\0" {
@@ -587,6 +531,22 @@ pub fn parse_headers(image: &[u8]) -> Option<(FileHeader, usize, u16, usize)> {
         return None;
     }
     let opt_size = file_hdr.size_of_optional_header as usize;
+    let minimum = if magic == 0x20b { 0x70 } else { 0x60 };
+    if opt_size < minimum || opt_off.checked_add(opt_size)? > image.len() {
+        return None;
+    }
+    let count_offset = opt_off + minimum - 4;
+    let directory_count =
+        u32::from_le_bytes(image.get(count_offset..count_offset + 4)?.try_into().ok()?) as usize;
+    if directory_count > (opt_size - minimum) / 8 {
+        return None;
+    }
+    let section_end = opt_off
+        .checked_add(opt_size)?
+        .checked_add((file_hdr.number_of_sections as usize).checked_mul(40)?)?;
+    if section_end > image.len() {
+        return None;
+    }
     Some((file_hdr, opt_size, magic, opt_off))
 }
 
@@ -598,8 +558,13 @@ pub fn read_data_directory_pe32plus(image: &[u8], opt_off: usize, i: usize) -> (
     // PE32+ optional header layout (we are looking at the
     // "NumberOfRvaAndSizes" field, then 16 directories of
     // (u64 rva, u64 size) starting at offset 0x70 from opt_off).
-    let num_rva_off = opt_off + 0x6C;
-    if num_rva_off + 4 > image.len() {
+    let Some(num_rva_off) = opt_off.checked_add(0x6C) else {
+        return (0, 0);
+    };
+    if num_rva_off
+        .checked_add(4)
+        .map_or(true, |end| end > image.len())
+    {
         return (0, 0);
     }
     let num_rva = u32::from_le_bytes([
@@ -608,11 +573,23 @@ pub fn read_data_directory_pe32plus(image: &[u8], opt_off: usize, i: usize) -> (
         image[num_rva_off + 2],
         image[num_rva_off + 3],
     ]);
-    if i as u32 >= num_rva {
+    if i >= num_rva as usize {
         return (0, 0);
     }
-    let dir_off = opt_off + 0x70 + i * 8;
-    if dir_off + 8 > image.len() {
+    let Some(dir_off) = i
+        .checked_mul(8)
+        .and_then(|n| opt_off.checked_add(0x70)?.checked_add(n))
+    else {
+        return (0, 0);
+    };
+    let Some((_, opt_size, 0x20b, parsed_off)) = parse_headers(image) else {
+        return (0, 0);
+    };
+    if parsed_off != opt_off
+        || dir_off
+            .checked_add(8)
+            .map_or(true, |end| end > opt_off + opt_size)
+    {
         return (0, 0);
     }
     let rva = u32::from_le_bytes([
@@ -636,8 +613,13 @@ pub fn read_data_directory_pe32plus(image: &[u8], opt_off: usize, i: usize) -> (
 pub fn read_data_directory_pe32(image: &[u8], opt_off: usize, i: usize) -> (u32, u32) {
     // PE32 optional header has NumberOfRvaAndSizes at offset 0x5C,
     // and directories start at offset 0x60.
-    let num_rva_off = opt_off + 0x5C;
-    if num_rva_off + 4 > image.len() {
+    let Some(num_rva_off) = opt_off.checked_add(0x5C) else {
+        return (0, 0);
+    };
+    if num_rva_off
+        .checked_add(4)
+        .map_or(true, |end| end > image.len())
+    {
         return (0, 0);
     }
     let num_rva = u32::from_le_bytes([
@@ -646,11 +628,23 @@ pub fn read_data_directory_pe32(image: &[u8], opt_off: usize, i: usize) -> (u32,
         image[num_rva_off + 2],
         image[num_rva_off + 3],
     ]);
-    if i as u32 >= num_rva {
+    if i >= num_rva as usize {
         return (0, 0);
     }
-    let dir_off = opt_off + 0x60 + i * 8;
-    if dir_off + 8 > image.len() {
+    let Some(dir_off) = i
+        .checked_mul(8)
+        .and_then(|n| opt_off.checked_add(0x60)?.checked_add(n))
+    else {
+        return (0, 0);
+    };
+    let Some((_, opt_size, 0x10b, parsed_off)) = parse_headers(image) else {
+        return (0, 0);
+    };
+    if parsed_off != opt_off
+        || dir_off
+            .checked_add(8)
+            .map_or(true, |end| end > opt_off + opt_size)
+    {
         return (0, 0);
     }
     let rva = u32::from_le_bytes([
@@ -671,7 +665,7 @@ pub fn read_data_directory_pe32(image: &[u8], opt_off: usize, i: usize) -> (u32,
 /// read the PE32+ optional header fields we need: `image_base`,
 /// `size_of_image`, `address_of_entry_point`, `subsystem`.
 fn read_opt64(image: &[u8], opt_off: usize) -> Option<(u64, u32, u32, u16)> {
-    if opt_off + 0x40 > image.len() {
+    if opt_off.checked_add(0x70)? > image.len() {
         return None;
     }
     let aep = u32::from_le_bytes([
@@ -865,7 +859,7 @@ pub fn load_image_full(
         name: String::from(name),
         image_base: actual_base,
         image_size: size_of_image as u64,
-        entry_point: actual_base + aep as u64,
+        entry_point: actual_base.checked_add(aep as u64)?,
         subsystem,
         is_kernel: subsystem == 1, // IMAGE_SUBSYSTEM_NATIVE
         bytes: img,
@@ -874,7 +868,7 @@ pub fn load_image_full(
     // Apply base relocations if we landed at a different address
     // than the preferred base.
     if actual_base != image_base {
-        let delta = (actual_base as i64) - (image_base as i64);
+        let delta = actual_base.wrapping_sub(image_base) as i64;
         apply_base_relocations(&mut loaded, bytes, delta);
     }
 
@@ -2052,20 +2046,28 @@ fn load_raw_image_into_user_address_space(
         return None;
     }
 
-    // Keep a valid preferred base: statically linked ELF-to-PE desktop
-    // images contain absolute pointers and do not carry PE relocations.
-    // Only images outside Sv39's low 256-GiB user range need rebasing.
+    // The raw RISC-V path loads fixed-address images. Statically linked
+    // ELF-to-PE desktop images contain absolute function pointers without
+    // PE fixups, so choosing another base would leave those pointers at
+    // their linked addresses. Reject unsupported bases before allocating
+    // pages; a generic PE relocation helper cannot prove RISC-V instruction
+    // and data fixups are complete.
     let preferred_base = preferred_image_base;
     #[cfg(target_arch = "riscv64")]
-    let image_base = if preferred_base != 0
-        && preferred_base.checked_add(size_of_image as u64)? <= (1u64 << 38)
-    {
-        preferred_base
-    } else {
-        ntoskrnl::mm::vas::DEFAULT_USER_IMAGE_BASE
+    let image_base = {
+        let Some(base) = fixed_base::riscv64_user_image_base(preferred_base, size_of_image as u64) else {
+            ntoskrnl::hal::serial::write_string_always("K:raw-rv-fixed-base-invalid\r\n");
+            return None;
+        };
+        base
     };
     #[cfg(not(target_arch = "riscv64"))]
     let image_base = preferred_image_base;
+    // Check the complete extent before allocating or installing any leaf.
+    // A low firmware stack may occupy a native PE's preferred user VA.
+    if !ntoskrnl::mm::vas::user_mapping_available(image_base, size_of_image as u64) {
+        return None;
+    }
     // The base delta the relocations must absorb. On x86_64 this is
     // normally zero (the image lands at its preferred base in a fresh
     // per-process address space), but a non-zero delta is not an
@@ -2137,7 +2139,8 @@ fn load_raw_image_into_user_address_space(
         image[opt_off + 0x3D],
         image[opt_off + 0x3E],
         image[opt_off + 0x3F],
-    ]) as usize).min(size_of_image as usize);
+    ]) as usize)
+        .min(size_of_image as usize);
     for i in 0..file_hdr.number_of_sections as usize {
         let sh_off = sect_off.checked_add(i.checked_mul(40)?)?;
         if sh_off.checked_add(40)? > image.len() {
@@ -2347,6 +2350,10 @@ fn map_prebuilt_image_into_user_address_space(
     // be mapped into a user PML4.
     if image_base >= 0x0000_8000_0000_0000 {
         ntoskrnl::hal::serial::write_string_always("K:mapf-noncanon\r\n");
+        return None;
+    }
+    if !ntoskrnl::mm::vas::user_mapping_available(image_base, size_of_image as u64) {
+        ntoskrnl::hal::serial::write_string_always("K:mapf-kernel-collision\r\n");
         return None;
     }
     let (file_hdr, _opt_size, magic, opt_off) = match parse_headers(prebuilt) {
@@ -2688,6 +2695,8 @@ mod tests {
         image[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
         image[0x40..0x44].copy_from_slice(b"PE\0\0");
         let opt = 0x58usize; // PE signature + COFF file header
+        image[0x54..0x56].copy_from_slice(&0xe0u16.to_le_bytes());
+        image[opt + 0x5c..opt + 0x60].copy_from_slice(&16u32.to_le_bytes());
         image[opt..opt + 2].copy_from_slice(&0x10B_u16.to_le_bytes());
         image[opt + 0x02] = 14; // MajorLinkerVersion
         image[opt + 0x03] = 0; // MinorLinkerVersion

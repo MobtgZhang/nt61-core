@@ -1,7 +1,7 @@
 //! LoongArch 64 paging
 //
 //! Five-level page table. Kernel VAs live in the low half (VA63 ==
-//! 0) and are walked through PGDL (CSR 0x15); `enter_first_user_thread`
+//! 0) and are walked through PGDL (CSR 0x19); `enter_first_user_thread`
 //! switches PGDL to the user root, so PGDL — not PGDH — is always the
 //! operative root. The TLB-refill stub reads the active root from
 //! PGDL (CSR 0x19), which `load_page_root`, `init` and
@@ -143,7 +143,7 @@ impl PageTableEntry {
         (self.value & 2) != 0
     }
     pub fn user(&self) -> bool {
-        (self.value & 4) != 0
+        (self.value & PTE_PLV_USER) == PTE_PLV_USER
     }
     pub fn frame(&self) -> u64 {
         self.value & 0x000F_FFFF_FFFF_F000
@@ -169,8 +169,10 @@ const PTE_PFN_SHIFT: u64 = PAGE_SHIFT - 12 + 12;
 const PTE_PFN_END_SHIFT: u64 = 48;
 const PTE_PFN_MASK: u64 = (!0u64 << PTE_PFN_SHIFT) & ((1u64 << PTE_PFN_END_SHIFT) - 1);
 
+#[path = "leaf_descriptor.rs"]
+mod leaf_descriptor;
+
 fn make_pte_loong(pa: u64, flags: u64) -> u64 {
-    let pfn = (pa & PAGE_MASK) >> PAGE_SHIFT;
     // Portable callers pass x86-style PTE bits.  Do not let native LoongArch
     // permission bit values alias into PLV or PAGE flags; translate them here
     // in one place.
@@ -180,16 +182,7 @@ fn make_pte_loong(pa: u64, flags: u64) -> u64 {
     let not_executable = flags
         & (crate::mm::pte::PTE_NX | crate::arch::common::paging::PageFlags::NO_EXECUTE.bits())
         != 0;
-    let pte = ((pfn << PTE_PFN_SHIFT) & PTE_PFN_MASK)
-        | PTE_V
-        | PTE_D
-        | PTE_CACHE_CC
-        | PTE_G
-        | PTE_PRESENT
-        | if writable { PTE_W | PTE_MODIFIED } else { 0 }
-        | if not_executable { PTE_NX_LOONG } else { 0 }
-        | if user { PTE_PLV_USER } else { 0 };
-    pte
+    leaf_descriptor::encode(pa, writable, user, not_executable)
 }
 fn is_valid_loong(e: u64) -> bool {
     (e & PTE_V) != 0
@@ -238,11 +231,11 @@ fn with_interrupts_disabled<T>(operation: impl FnOnce() -> T) -> T {
 
     let masked = crmd & !CRMD_IE;
     unsafe {
-        core::arch::asm!("csrwr {}, 0x0", in(reg) masked, options(nostack));
+        core::arch::asm!("csrwr {}, 0x0", inout(reg) masked => _, options(nostack));
     }
     let result = operation();
     unsafe {
-        core::arch::asm!("csrwr {}, 0x0", in(reg) crmd, options(nostack));
+        core::arch::asm!("csrwr {}, 0x0", inout(reg) crmd => _, options(nostack));
     }
     result
 }
@@ -550,7 +543,7 @@ pub unsafe fn load_page_root(pml4_pfn: u64) {
     asm!("csrrd {}, 0x0", out(reg) crmd, options(nostack));
     crmd &= !(1u64 << 3); // clear DA (mutually exclusive with PG)
     crmd |= 1u64 << 4; // set PG
-    asm!("csrwr {}, 0x0", in(reg) crmd, options(nostack));
+    asm!("csrwr {}, 0x0", inout(reg) crmd => _, options(nostack));
 }
 
 /// Install the running image and current stack in the destination root.
@@ -560,23 +553,43 @@ pub unsafe fn load_page_root(pml4_pfn: u64) {
 /// the kernel image and switch-time stack must be present before the switch.
 fn prepare_switch_mappings(root_pfn: u64) {
     const KERNEL_CODE: u64 = crate::mm::pte::PTE_P | crate::mm::pte::PTE_RW;
-
-    let return_address: u64;
-    unsafe {
-        asm!("move {}, $ra", out(reg) return_address, options(nostack));
-    }
-    let image_start = return_address & !(16 * 1024 * 1024 - 1);
-    let image_end = image_start + 18 * 1024 * 1024;
-    for page in (image_start..image_end).step_by(PAGE_SIZE as usize) {
+    // Switch-time guards fill holes only. Existing leaves belong to the
+    // destination address space; preserve both their PA and permissions.
+    // Broad stack guards and framebuffer aliases can overlap user mappings.
+    let map_guard_page = |page: u64| -> bool {
+        if page_is_mapped_in_root(root_pfn, page) {
+            return true;
+        }
         let pa = if paging_enabled() {
-            match translate_virt(page) {
-                Some(pa) => pa & PAGE_MASK,
-                None => page,
-            }
+            translate_virt(page).unwrap_or(page) & PAGE_MASK
         } else {
             page
         };
-        if !map_page_in_root(root_pfn, page, pa, KERNEL_CODE) {
+        map_page_in_root(root_pfn, page, pa, KERNEL_CODE)
+    };
+
+    // The standalone disk kernel can be much larger than its text segment.
+    // In particular, the active root and allocator state live near the end
+    // of .bss. A fixed window around $ra leaves those globals unmapped as
+    // soon as CRMD.PG is set. Use the loader's complete mapped-image range.
+    // Linker bounds cover early callers before BootInfo has been published.
+    extern "C" {
+        static __image_start: u8;
+        static __image_end: u8;
+    }
+    let (image_base, image_size) = crate::arch::kernel_image_range();
+    let image_end = image_base.checked_add(image_size);
+    let (image_start, image_end) = match image_end {
+        Some(end) if image_base != 0 && image_size != 0 && end > image_base => {
+            (image_base & PAGE_MASK, end)
+        }
+        _ => (
+            core::ptr::addr_of!(__image_start) as u64 & PAGE_MASK,
+            core::ptr::addr_of!(__image_end) as u64,
+        ),
+    };
+    for page in (image_start..image_end).step_by(PAGE_SIZE as usize) {
+        if !map_guard_page(page) {
             crate::hal::serial::write_string_always(&alloc::format!(
                 "[LAPGROOT] kernel map failed at {:x}\r\n",
                 page
@@ -588,15 +601,7 @@ fn prepare_switch_mappings(root_pfn: u64) {
     // vector page, but a process root is private and must not depend on
     // a later allocator call while the current root may be unmapped.
     let vec_va = crate::arch::loongarch64::idt::vector_page_va();
-    let vec_pa = if paging_enabled() {
-        match translate_virt(vec_va) {
-            Some(pa) => pa & PAGE_MASK,
-            None => vec_va,
-        }
-    } else {
-        vec_va
-    };
-    if !map_page_in_root(root_pfn, vec_va, vec_pa, KERNEL_CODE) {
+    if !map_guard_page(vec_va) {
         crate::hal::serial::write_string_always(&alloc::format!(
             "[LAPGROOT] vector map failed at {:x}\r\n",
             vec_va
@@ -611,27 +616,15 @@ fn prepare_switch_mappings(root_pfn: u64) {
     }
     for index in 0..512u64 {
         let page = (stack_pointer - index * PAGE_SIZE) & PAGE_MASK;
-        let pa = if paging_enabled() {
-            match translate_virt(page) {
-                Some(pa) => pa & PAGE_MASK,
-                None => page,
-            }
-        } else {
-            page
-        };
-        map_page_in_root(root_pfn, page, pa, KERNEL_CODE);
+        // This conservative guard extends beyond the actual kernel stack.
+        // A user image can legitimately own part of that surrounding VA
+        // range (e.g. LogonUI's 64 MiB .bss). Do not replace an existing
+        // user leaf with a supervisor identity alias on every root switch.
+        map_guard_page(page);
     }
     for index in 1..512u64 {
         let page = (stack_pointer.wrapping_add(index * PAGE_SIZE)) & PAGE_MASK;
-        let pa = if paging_enabled() {
-            match translate_virt(page) {
-                Some(pa) => pa & PAGE_MASK,
-                None => page,
-            }
-        } else {
-            page
-        };
-        map_page_in_root(root_pfn, page, pa, KERNEL_CODE);
+        map_guard_page(page);
     }
 
     // Keep the kernel heap visible in every process context.  The heap
@@ -645,15 +638,7 @@ fn prepare_switch_mappings(root_pfn: u64) {
             .min(0x0000_FFFF_FFFF_FFFF);
         let mut page = heap_start;
         while page < heap_end {
-            let pa = if paging_enabled() {
-                match translate_virt(page) {
-                    Some(pa) => pa & PAGE_MASK,
-                    None => page,
-                }
-            } else {
-                page
-            };
-            if !map_page_in_root(root_pfn, page, pa, KERNEL_CODE) {
+            if !map_guard_page(page) {
                 crate::hal::serial::write_string_always(&alloc::format!(
                     "[LAPGROOT] kernel heap map failed at {:x}\r\n",
                     page
@@ -669,15 +654,7 @@ fn prepare_switch_mappings(root_pfn: u64) {
         let mut page = fb.address & PAGE_MASK;
         let fb_end = fb.address + fb_size;
         while page < fb_end {
-            let pa = if paging_enabled() {
-                match translate_virt(page) {
-                    Some(pa) => pa & PAGE_MASK,
-                    None => page,
-                }
-            } else {
-                page
-            };
-            map_page_in_root(root_pfn, page, pa, KERNEL_CODE);
+            map_guard_page(page);
             page += PAGE_SIZE;
         }
     }
@@ -698,17 +675,19 @@ pub fn mmio_virt(pa: u64) -> u64 {
 /// to wipe it; taking an exception then re-faults on the vector
 /// itself (PIF at ERA=EENTRY) and hangs the CPU.
 pub fn ensure_vector_page_mapped() -> bool {
+    // A direct-mode instruction fetch uses the vector's physical address and
+    // does not consult PGDL/PGDH. Their stale firmware values must not be walked
+    // with our page-table geometry before the kernel enables its own root.
+    if !paging_enabled() {
+        return true;
+    }
     let va = crate::arch::loongarch64::idt::vector_page_va();
     if page_is_mapped_in_root(read_page_root_pfn(), va) {
         return true;
     }
-    let pa = if paging_enabled() {
-        match translate_virt(va) {
-            Some(pa) => pa & PAGE_MASK,
-            None => va,
-        }
-    } else {
-        va
+    let pa = match translate_virt(va) {
+        Some(pa) => pa & PAGE_MASK,
+        None => va,
     };
     const VEC_FLAGS: u64 = crate::mm::pte::PTE_P | crate::mm::pte::PTE_RW;
     map_page(va, pa, VEC_FLAGS)
@@ -878,4 +857,99 @@ pub fn init() {
         let root_pa2 = core::ptr::addr_of!(state.root.0) as u64;
         asm!("csrwr {0}, 0x19", inout(reg) root_pa2 => _, options(nostack));
     }
+}
+
+// Native fault-only leaf access. Walks without allocating, and preserves
+// nonzero invalid descriptors so the fault engine cannot erase backing state.
+unsafe fn fault_leaf_ptr(va: u64) -> Option<(*mut u64, bool)> {
+    let mut table = root_phys() as *mut u64;
+    if table.is_null() {
+        return None;
+    }
+    for shift in [48, 39, 30, 21, 12] {
+        let slot = table.add(((va >> shift) & 0x1ff) as usize);
+        let raw = core::ptr::read_volatile(slot);
+        if raw == 0 {
+            return None;
+        }
+        if shift == 12 {
+            return Some((slot, true));
+        }
+        // Directory entries in this five-level configuration are bare PAs.
+        if raw & !PTE_PFN_MASK != 0 || table_pa_loong(raw) == 0 {
+            return Some((slot, false));
+        }
+        table = table_pa_loong(raw) as *mut u64;
+    }
+    None
+}
+
+pub fn fault_leaf(va: u64) -> u64 {
+    unsafe {
+        fault_leaf_ptr(va).map_or(0, |(slot, leaf)| {
+            if leaf {
+                core::ptr::read_volatile(slot)
+            } else {
+                2
+            }
+        })
+    }
+}
+
+/// Compare-and-update only the descriptor observed by the fault handler.
+/// Never widens permissions or overwrites a concurrent mapping.
+pub fn fault_update_leaf(va: u64, expected: u64, updated: u64) -> bool {
+    let _state = PAGING_STATE.lock();
+    unsafe {
+        let Some((slot, true)) = fault_leaf_ptr(va) else {
+            return false;
+        };
+        let atomic = &*slot.cast::<core::sync::atomic::AtomicU64>();
+        if atomic
+            .compare_exchange(
+                expected,
+                updated,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        crate::arch::loongarch64::tlb::flush_page(va);
+        true
+    }
+}
+
+/// Install an anonymous page only into an empty native leaf. Returns None on
+/// table allocation failure, Some(false) if another descriptor owns the slot.
+pub fn fault_install_page(va: u64, pa: u64, flags: u64) -> Option<bool> {
+    let _state = PAGING_STATE.lock();
+    unsafe {
+        if fault_leaf(va) != 0 {
+            return Some(false);
+        }
+        let slot = leaf_pte_for(va);
+        if slot.is_null() {
+            return None;
+        }
+        let atomic = &*slot.cast::<core::sync::atomic::AtomicU64>();
+        let installed = atomic
+            .compare_exchange(
+                0,
+                make_pte_loong(pa, flags),
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        if installed {
+            crate::arch::loongarch64::tlb::flush_page(va);
+        }
+        Some(installed)
+    }
+}
+
+/// Native root currently serving lower-half user addresses.
+pub fn fault_root() -> u64 {
+    root_phys()
 }

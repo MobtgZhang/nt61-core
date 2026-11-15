@@ -75,6 +75,7 @@ pub enum FaultStatus {
 ///
 /// This function is called from the page fault handler with interrupts
 /// disabled. It walks the page table to resolve the fault.
+#[cfg(target_arch = "x86_64")]
 pub fn handle(va: u64, access: AccessFlags) -> FaultStatus {
     // Canonicalise: anything above 0x0000_7FFF_FFFF_FFFF and below
     // 0xFFFF_8000_0000_0000 is a non-canonical hole. The CPU should
@@ -99,6 +100,15 @@ pub fn handle(va: u64, access: AccessFlags) -> FaultStatus {
     let pte = unsafe { *pte_ptr };
     resolve_pte(pte, va, pte_ptr, access)
 }
+
+// Native formats are walked by their ISA implementations. Only the x86 path
+// below interprets NT MMPTE software states.
+#[cfg(not(target_arch = "x86_64"))]
+mod native_policy;
+#[cfg(not(target_arch = "x86_64"))]
+mod native;
+#[cfg(not(target_arch = "x86_64"))]
+pub use native::handle;
 
 /// Walk the page table for a user VA using direct physical access.
 /// Uses the PML4 at current_root() (physical address).

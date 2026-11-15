@@ -72,19 +72,13 @@ impl PageTableEntry {
 /// * Page descriptor: bits[1:0] = 0b11, bits[54:2] = physical address.
 /// * Table descriptor: bits[1:0] = 0b11, bits[47:12] = next table
 ///   address (a block descriptor is 0b01 for 4 KiB pages).
+#[path = "leaf_descriptor.rs"]
+mod leaf_descriptor;
+
 fn make_page_desc(pa: u64, pte_flags: u64) -> u64 {
-    // aarch64 with 4 KiB granule: block/page descriptors occupy
-    // bits [47:12] for the address.
-    //
-    // bit 10 = AF (Access Flag) MUST be 1; if the hardware has
-    // Access Flag checking enabled (TCR_EL1.HA or per-page) and
-    // AF=0 on the leaf, the first write triggers an Access Flag
-    // Fault (DFSC=0x10 + level).
-    //
-    // bit 54 = UXN, bit 53 = PXN — both 0 (RW, executable) for
-    // kernel data pages; we never execute from the heap/pool.
-    (pa & 0x0000_FFFF_FFFF_F000) | (pte_flags & 0xFFF) | 0x3 | (1u64 << 10)
+    leaf_descriptor::encode(pa, pte_flags)
 }
+
 fn is_valid_page(e: u64) -> bool {
     (e & 0x3) == 0x1 || (e & 0x3) == 0x3
 }
@@ -325,15 +319,11 @@ fn split_block_attrs(desc: u64) -> u64 {
 fn arch_flags_for(flags: u64) -> u64 {
     let user_access =
         flags & (crate::mm::pte::PTE_US | crate::arch::common::paging::PageFlags::USER.bits()) != 0;
-    if user_access {
-        if flags & crate::mm::pte::PTE_RW != 0 {
-            super::paging_enhanced::flags::USER_DATA
-        } else {
-            super::paging_enhanced::flags::USER_CODE
-        }
-    } else {
-        super::paging_enhanced::flags::KERNEL_DATA
-    }
+    leaf_descriptor::attributes(
+        user_access,
+        flags & crate::mm::pte::PTE_RW != 0,
+        flags & crate::mm::pte::PTE_NX != 0,
+    )
 }
 
 /// Walk an arbitrary page-table root and return a writable pointer to
@@ -902,4 +892,104 @@ pub fn identity_map_region(pa: u64, size: u64) -> bool {
 
     flush_tlb();
     true
+}
+
+// Native fault-only leaf access. Walks without allocating, and preserves
+// nonzero invalid descriptors so the fault engine cannot erase backing state.
+unsafe fn fault_leaf_ptr(va: u64) -> Option<(*mut u64, bool)> {
+    let mut table = current_l0_phys() as *mut u64;
+    if table.is_null() {
+        return None;
+    }
+    for shift in [39, 30, 21, 12] {
+        let slot = table.add(((va >> shift) & 0x1ff) as usize);
+        let raw = core::ptr::read_volatile(slot);
+        if raw == 0 {
+            return None;
+        }
+        if shift == 12 {
+            return Some((slot, raw & 3 == 3));
+        }
+        if raw & 3 != 3 {
+            return Some((slot, shift != 39 && raw & 3 == 1));
+        }
+        let next = raw & 0x0000_ffff_ffff_f000;
+        if next == 0 {
+            return Some((slot, false));
+        }
+        table = next as *mut u64;
+    }
+    None
+}
+
+pub fn fault_leaf(va: u64) -> u64 {
+    unsafe {
+        fault_leaf_ptr(va).map_or(0, |(slot, leaf)| {
+            if leaf {
+                core::ptr::read_volatile(slot)
+            } else {
+                2
+            }
+        })
+    }
+}
+
+/// Compare-and-update only the descriptor observed by the fault handler.
+/// Never widens permissions or overwrites a concurrent mapping.
+pub fn fault_update_leaf(va: u64, expected: u64, updated: u64) -> bool {
+    unsafe {
+        let Some((slot, true)) = fault_leaf_ptr(va) else {
+            return false;
+        };
+        let atomic = &*slot.cast::<core::sync::atomic::AtomicU64>();
+        if atomic
+            .compare_exchange(
+                expected,
+                updated,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        asm!("dsb ishst", options(nostack));
+        asm!("tlbi vae1is, {}", in(reg) (va >> 12) & 0x0000_0fff_ffff_ffff, options(nostack));
+        asm!("dsb ish", "isb", options(nostack));
+        true
+    }
+}
+
+/// Install an anonymous page only into an empty native leaf. Returns None on
+/// table allocation failure, Some(false) if another descriptor owns the slot.
+pub fn fault_install_page(va: u64, pa: u64, flags: u64) -> Option<bool> {
+    unsafe {
+        if fault_leaf(va) != 0 {
+            return Some(false);
+        }
+        let slot = leaf_pte_ptr_for(va);
+        if slot.is_null() {
+            return None;
+        }
+        let atomic = &*slot.cast::<core::sync::atomic::AtomicU64>();
+        let installed = atomic
+            .compare_exchange(
+                0,
+                make_page_desc(pa, arch_flags_for(flags)),
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        if installed {
+            asm!("dsb ishst", options(nostack));
+            asm!("tlbi vae1is, {}", in(reg) (va >> 12) & 0x0000_0fff_ffff_ffff, options(nostack));
+            asm!("dsb ish", "isb", options(nostack));
+        }
+        Some(installed)
+    }
+}
+
+/// Native root currently serving lower-half user addresses.
+pub fn fault_root() -> u64 {
+    current_l0_phys()
 }

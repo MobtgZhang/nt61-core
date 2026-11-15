@@ -37,6 +37,31 @@ use crate::mm::vad::VadTree;
 // Locally-defined constants that duplicate these are removed below.
 pub use crate::mm::constants::*;
 
+#[path = "user_mapping_range.rs"]
+mod user_mapping_range;
+static BOOT_STACK_BASE: AtomicU64 = AtomicU64::new(0);
+static BOOT_STACK_SIZE: AtomicU64 = AtomicU64::new(0);
+
+pub fn reserve_boot_stack(base: u64, size: u64) {
+    BOOT_STACK_BASE.store(base, Ordering::Release);
+    BOOT_STACK_SIZE.store(size, Ordering::Release);
+}
+
+pub fn user_mapping_available(base: u64, size: u64) -> bool {
+    let limit = if cfg!(target_arch = "riscv64") { 1u64 << 38 } else { 1u64 << 47 };
+    if !user_mapping_range::user_extent(base, size, limit) {
+        return false;
+    }
+    let image = crate::arch::kernel_image_range();
+    let heap = crate::mm::heap::KERNEL_HEAP.configured_region()
+        .map_or((0, 0), |(base, size)| (base as u64, size as u64));
+    user_mapping_range::available(base, size, &[
+        image, heap,
+        (BOOT_STACK_BASE.load(Ordering::Acquire), BOOT_STACK_SIZE.load(Ordering::Acquire)),
+    ])
+}
+
+
 /// Index into the PML4 for the self-map slot.
 pub const MI_SELF_MAP_INDEX: usize = 0x1ED;
 
@@ -1140,6 +1165,9 @@ pub fn debug_read_user_pte(pml4_phys: u64, va: u64) -> u64 {
 }
 
 pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatus {
+    if flags & PTE_US != 0 && !user_mapping_available(va, PAGE_SIZE as u64) {
+        return MmStatus::InvalidAddress;
+    }
     if pml4_phys == 0 || va & 0xFFF != 0 || pa & 0xFFF != 0 {
         return MmStatus::InvalidAddress;
     }
@@ -1417,8 +1445,13 @@ pub fn map_user_pages(pml4_phys: u64, va: u64, size: u64, flags: u64) -> MmStatu
     if size == 0 {
         return MmStatus::Ok;
     }
-    let mut cur = va & !0xFFFu64;
-    let end = (va + size + 0xFFF) & !0xFFFu64;
+    if !user_mapping_available(va, size) {
+        return MmStatus::InvalidAddress;
+    }
+    let (mut cur, end) = match user_mapping_range::page_extent(va, size) {
+        Some(range) => range,
+        None => return MmStatus::InvalidAddress,
+    };
     while cur < end {
         let pa = match alloc_zeroed_page() {
             Some(p) => p,
@@ -1446,9 +1479,17 @@ pub fn map_user_phys_range(
     if size == 0 {
         return MmStatus::Ok;
     }
-    let mut cur = va & !0xFFFu64;
-    let mut pa = phys_base & !0xFFFu64;
-    let end = (va + size + 0xFFF) & !0xFFFu64;
+    if !user_mapping_available(va, size) {
+        return MmStatus::InvalidAddress;
+    }
+    let (mut cur, end) = match user_mapping_range::page_extent(va, size) {
+        Some(range) => range,
+        None => return MmStatus::InvalidAddress,
+    };
+    let (mut pa, _) = match user_mapping_range::physical_extent(va, size, phys_base) {
+        Some(range) => range,
+        None => return MmStatus::InvalidAddress,
+    };
     while cur < end {
         let r = map_page_in_pml4(pml4_phys, cur, pa, flags);
         if r != MmStatus::Ok {

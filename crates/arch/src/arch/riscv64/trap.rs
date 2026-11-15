@@ -302,7 +302,7 @@ pub extern "C" fn riscv64_trap_dispatch(frame: *mut TrapFrame) {
                 let is_write = matches!(kind, TrapKind::StorePageFault);
                 let is_inst = matches!(kind, TrapKind::InstructionPageFault);
                 let access = crate::mm::access_fault::AccessFlags {
-                    read: !is_write,
+                    read: !is_write && !is_inst,
                     write: is_write,
                     execute: is_inst,
                     user: is_user,

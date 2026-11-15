@@ -211,7 +211,7 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
                 TrapKind::PageInvalidFetch | TrapKind::PageNotExecutable
             );
             let access = crate::mm::access_fault::AccessFlags {
-                read: !is_write,
+                read: !is_write && !is_inst,
                 write: is_write,
                 execute: is_inst,
                 user: context.prmd & 3 == 3,

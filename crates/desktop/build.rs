@@ -1,6 +1,15 @@
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 fn main() {
+    // lld defaults to a 64 KiB ELF base on these targets. The PE wrapper
+    // needs a separate aligned header area below the first LOAD segment;
+    // at that default it produces ImageBase=0, which the user mapper
+    // correctly refuses. Choose the link address here so absolute data
+    // pointers and the PE's preferred address stay in agreement.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    if matches!(target_arch.as_str(), "riscv64" | "loongarch64") {
+        println!("cargo:rustc-link-arg=--image-base=0x200000");
+    }
     let path = "../../docs/desktop/win7-metrics.toml";
     println!("cargo:rerun-if-changed={path}");
     let source = fs::read_to_string(path).expect("desktop metrics");
