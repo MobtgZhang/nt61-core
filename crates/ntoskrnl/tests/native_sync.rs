@@ -2,6 +2,8 @@
 //! a host. Memory probes and the clock are supplied by the host fixture.
 #![allow(dead_code, non_camel_case_types)]
 extern crate alloc;
+#[path = "native_sync/alert_cases.rs"]
+mod alert_cases;
 #[path = "native_sync/kernel32.rs"]
 mod kernel32;
 #[path = "native_sync/ntdll.rs"]
@@ -66,15 +68,23 @@ pub mod ke {
 pub mod ps {
     pub mod thread {
         pub struct Thread {
+            pub user_alert: crate::ntdll::alert_state::UserAlertState,
             pub client_id: ClientId,
         }
         pub struct ClientId {
             pub unique_process: u64,
             pub unique_thread: u64,
         }
-        std::thread_local! { static CURRENT: core::cell::UnsafeCell<Thread> = const { core::cell::UnsafeCell::new(Thread { client_id: ClientId { unique_process: 100, unique_thread: 701 } }) }; }
+        std::thread_local! { static CURRENT: core::cell::UnsafeCell<Thread> = const { core::cell::UnsafeCell::new(Thread { user_alert: crate::ntdll::alert_state::UserAlertState::new(), client_id: ClientId { unique_process: 100, unique_thread: 701 } }) }; }
         pub fn get_current_ethread() -> *mut Thread {
             CURRENT.with(|current| current.get())
+        }
+        pub fn find_thread_by_tid(tid: u64) -> Option<*mut Thread> {
+            let thread = get_current_ethread();
+            (unsafe { (*thread).client_id.unique_thread } == tid).then_some(thread)
+        }
+        pub fn with_thread_user_alert(tid: u64, operation: impl FnOnce(&crate::ntdll::alert_state::UserAlertState) -> i32) -> Option<i32> {
+            find_thread_by_tid(tid).map(|thread| operation(unsafe { &(*thread).user_alert }))
         }
         pub fn set_tid(tid: u64) {
             CURRENT.with(|current| unsafe { (*current.get()).client_id.unique_thread = tid });
@@ -92,6 +102,7 @@ pub mod arch {
 }
 pub mod mm {
     pub mod user_copy {
+        std::thread_local! { pub static FAIL_WRITE: core::cell::Cell<u64> = const { core::cell::Cell::new(0) }; }
         pub fn probe_user_write(address: u64, _: usize) -> Result<(), i32> {
             if address < 0x1000 {
                 Err(0xc0000005u32 as i32)
@@ -105,6 +116,7 @@ pub mod mm {
         }
         pub fn write_user_object<T: Copy>(address: u64, value: &T) -> Result<(), i32> {
             probe_user_write(address, core::mem::size_of::<T>())?;
+            if FAIL_WRITE.with(|value| value.get() == address) { return Err(0xc0000005u32 as i32); }
             unsafe {
                 (address as *mut T).write_unaligned(*value);
             }
@@ -137,6 +149,8 @@ fn state_guard() -> std::sync::MutexGuard<'static, ()> {
     ke::time::CLOCK.with(|clock| clock.set((100_000, 0)));
     ke::scheduler::ADVANCE_ON_YIELD.with(|delta| delta.set(0));
     ps::thread::set_tid(701);
+    ntdll::alert::take_current_alert();
+    mm::user_copy::FAIL_WRITE.with(|value| value.set(0));
     guard
 }
 fn pending(
@@ -145,7 +159,7 @@ fn pending(
     tid: u64,
     timeout: Option<i64>,
 ) -> ntdll::file::QueuedWait {
-    match ntdll::file::begin_wait(handles, all, 100, tid, timeout).unwrap() {
+    match ntdll::file::begin_wait(handles, all, 100, tid, timeout, None).unwrap() {
         ntdll::file::WaitStart::Pending(wait) => wait,
         ntdll::file::WaitStart::Complete(status) => panic!("unexpected completion {status:#x}"),
     }
@@ -274,7 +288,7 @@ fn timer_wrappers_share_state_and_validate_arguments() {
     let due = -100_000i64;
     unsafe {
         assert_eq!(
-            nt_create_timer(&mut timer, 0, core::ptr::null_mut(), 1),
+            nt_create_timer(&mut timer, 0x1f0003, core::ptr::null_mut(), 1),
             STATUS_SUCCESS
         );
         assert_eq!(
@@ -340,7 +354,7 @@ fn timer_wrappers_share_state_and_validate_arguments() {
         // the fixed capacity and used to exhaust it permanently.
         for _ in 0..128 {
             assert_eq!(
-                nt_create_timer(&mut timer, 0, core::ptr::null_mut(), 0),
+                nt_create_timer(&mut timer, 0x1f0003, core::ptr::null_mut(), 0),
                 STATUS_SUCCESS
             );
             assert_eq!(nt_close_sync(timer), STATUS_SUCCESS);
@@ -581,6 +595,7 @@ fn mutant_recursion_ownership_aliases_and_abandonment() {
     let _guard = state_guard();
     use ntdll::file::*;
     ps::thread::set_tid(701);
+    ntdll::alert::take_current_alert();
     let mutant = create_mutant_kernel(true).unwrap();
     let alias = duplicate_sync_handle(mutant).unwrap();
     let event = create_event_kernel(0, true).unwrap();
@@ -615,6 +630,7 @@ fn mutant_recursion_ownership_aliases_and_abandonment() {
             STATUS_TIMEOUT
         );
         ps::thread::set_tid(701);
+    ntdll::alert::take_current_alert();
         assert_eq!(
             nt_query_mutant(
                 alias,
@@ -677,6 +693,7 @@ fn mutant_recursion_ownership_aliases_and_abandonment() {
         assert_eq!(nt_close_sync(alias), STATUS_SUCCESS);
         assert_eq!(nt_close_sync(event), STATUS_SUCCESS);
         ps::thread::set_tid(701);
+    ntdll::alert::take_current_alert();
     }
 }
 
@@ -1074,7 +1091,7 @@ fn wait_capacity_and_thread_cancellation_release_every_pin() {
         .map(|_| pending(&[event], false, 830, None))
         .collect();
     assert!(matches!(
-        ntdll::file::begin_wait(&[event], false, 100, 831, None),
+        ntdll::file::begin_wait(&[event], false, 100, 831, None, None),
         Err(STATUS_NO_MEMORY)
     ));
     ntdll::file::abandon_mutants(830);
@@ -1147,6 +1164,7 @@ fn signal_and_wait_validates_both_objects_and_preserves_signal_order() {
         STATUS_MUTEX_NOT_OWNED
     );
     ps::thread::set_tid(701);
+    ntdll::alert::take_current_alert();
     assert_eq!(
         signal_and_wait_kernel(mutant, target, 0, Some(0)),
         STATUS_TIMEOUT
@@ -1469,3 +1487,6 @@ fn concurrent_close_removes_a_handle_once() {
         1
     );
 }
+
+#[path = "native_sync/named_cases.rs"]
+mod named_cases;

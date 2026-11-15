@@ -115,8 +115,8 @@ pub fn release_semaphore(handle: HANDLE, release_count: i32) -> bool {
     unsafe { super::sync::nt_release_semaphore(handle, release_count as u32, ptr::null_mut()) >= 0 }
 }
 
-/// APC alert testing and delivery are not implemented by this compatibility helper.
+/// Test and consume the current thread's user alert. APC delivery remains separate.
 pub fn test_alert() -> bool {
-    false
+    super::alert::take_current_alert()
 }
 pub fn deliver_apcs() {}

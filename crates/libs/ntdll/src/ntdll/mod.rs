@@ -91,6 +91,8 @@ pub fn smoke_test() -> bool {
 }
 
 pub mod apc;
+pub mod alert;
+pub mod alert_state;
 pub mod exception;
 pub mod heap_safe;
 pub mod nt_extended;

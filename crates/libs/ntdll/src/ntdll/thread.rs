@@ -692,8 +692,8 @@ pub unsafe extern "C" fn nt_set_context_thread(
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// `nt_queue_apc_thread` — queue an Asynchronous Procedure Call to a thread.
-/// This is a simplified implementation that just validates the parameters.
+/// `nt_queue_apc_thread` — shares the native APC boundary. Delivery is explicitly
+/// unsupported until a user-return trampoline and context restoration exist.
 pub unsafe extern "C" fn nt_queue_apc_thread(
     thread_handle: HANDLE,
     apc_routine: PVOID,
@@ -701,31 +701,8 @@ pub unsafe extern "C" fn nt_queue_apc_thread(
     apc_argument2: PVOID,
     apc_argument3: PVOID,
 ) -> NTSTATUS {
-    if thread_handle.is_null() || apc_routine.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    let _ = (apc_argument1, apc_argument2, apc_argument3);
-
-    // Get the thread from handle
-    let _tid = if let Some(entry) = lookup_handle(thread_handle) {
-        if entry.kind == HandleKind::Thread {
-            entry.target
-        } else {
-            return STATUS_INVALID_HANDLE;
-        }
-    } else {
-        return STATUS_INVALID_HANDLE;
-    };
-
-    // In a full implementation, we would:
-    // 1. Allocate an APC object
-    // 2. Add it to the thread's APC queue
-    // 3. Signal the thread if it's waiting
-    // For now, just validate and return success
-    // crate::kprintln!("[APC] nt_queue_apc_thread queued to routine @ 0x{:016x}", apc_routine as u64);
-
-    STATUS_SUCCESS
+    // SAFETY: the APC boundary treats all arguments as untrusted scalar values.
+    unsafe { super::apc::nt_queue_apc_thread(thread_handle, apc_routine, apc_argument1, apc_argument2, apc_argument3) }
 }
 
 /// # Safety

@@ -23,6 +23,72 @@ fn bool_result(status: i32) -> BOOL {
     }
 }
 
+/// # Safety
+/// Name must be a readable, terminated caller-owned UTF-16 string.
+unsafe fn open_named_sync(
+    kind: crate::libs::ntdll::file::HandleKind,
+    access: DWORD,
+    inherit: BOOL,
+    name: LPCWSTR,
+) -> HANDLE {
+    // SAFETY: propagate the caller's trusted name contract.
+    match unsafe { crate::libs::ntdll::object::open_sync_win32(kind, access, inherit != 0, name) } {
+        Ok(handle) => handle,
+        Err(status) => {
+            set_last_error(nt_status_to_dos_error(status));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Open an event with the requested access and independent inheritance flag.
+///
+/// # Safety
+/// Name must be a readable, terminated caller-owned UTF-16 string.
+pub unsafe extern "C" fn open_event_w(access: DWORD, inherit: BOOL, name: LPCWSTR) -> HANDLE {
+    // SAFETY: propagate the caller's trusted name contract.
+    unsafe {
+        open_named_sync(
+            crate::libs::ntdll::file::HandleKind::Event,
+            access,
+            inherit,
+            name,
+        )
+    }
+}
+
+/// Open a mutex with the requested access and independent inheritance flag.
+///
+/// # Safety
+/// Name must be a readable, terminated caller-owned UTF-16 string.
+pub unsafe extern "C" fn open_mutex_w(access: DWORD, inherit: BOOL, name: LPCWSTR) -> HANDLE {
+    // SAFETY: propagate the caller's trusted name contract.
+    unsafe {
+        open_named_sync(
+            crate::libs::ntdll::file::HandleKind::Mutant,
+            access,
+            inherit,
+            name,
+        )
+    }
+}
+
+/// Open a semaphore with the requested access and independent inheritance flag.
+///
+/// # Safety
+/// Name must be a readable, terminated caller-owned UTF-16 string.
+pub unsafe extern "C" fn open_semaphore_w(access: DWORD, inherit: BOOL, name: LPCWSTR) -> HANDLE {
+    // SAFETY: propagate the caller's trusted name contract.
+    unsafe {
+        open_named_sync(
+            crate::libs::ntdll::file::HandleKind::Semaphore,
+            access,
+            inherit,
+            name,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
@@ -32,14 +98,20 @@ fn bool_result(status: i32) -> BOOL {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `create_event_w`.
 pub unsafe extern "C" fn create_event_w(
-    _security_attributes: *const u8,
+    security_attributes: *const u8,
     manual_reset: BOOL,
     initial_state: BOOL,
-    _name: LPCWSTR,
+    name: LPCWSTR,
 ) -> HANDLE {
     let event_type = if manual_reset != 0 { 0 } else { 1 };
-    match ntdll_sync::create_event_kernel(event_type, initial_state != 0) {
-        Ok(handle) => handle,
+    // SAFETY: this wrapper inherits the caller-owned pointer contract.
+    match unsafe {
+        ntdll_sync::create_event_win32(security_attributes, name, event_type, initial_state != 0)
+    } {
+        Ok((handle, status)) => {
+            set_last_error(nt_status_to_dos_error(status));
+            handle
+        }
         Err(status) => {
             set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
             ptr::null_mut()
@@ -76,12 +148,16 @@ pub unsafe extern "C" fn pulse_event(event: HANDLE) -> BOOL {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `create_mutex_w`.
 pub unsafe extern "C" fn create_mutex_w(
-    _security: *const u8,
+    security: *const u8,
     initial_owner: BOOL,
-    _name: LPCWSTR,
+    name: LPCWSTR,
 ) -> HANDLE {
-    match ntdll_sync::create_mutant_kernel(initial_owner != 0) {
-        Ok(handle) => handle,
+    // SAFETY: this wrapper inherits the caller-owned pointer contract.
+    match unsafe { ntdll_sync::create_mutant_win32(security, name, initial_owner != 0) } {
+        Ok((handle, status)) => {
+            set_last_error(nt_status_to_dos_error(status));
+            handle
+        }
         Err(status) => {
             set_last_error(nt_status_to_dos_error(status));
             ptr::null_mut()
@@ -106,13 +182,19 @@ pub unsafe extern "C" fn release_mutex(mutex: HANDLE) -> BOOL {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `create_semaphore_w`.
 pub unsafe extern "C" fn create_semaphore_w(
-    _security: *const u8,
+    security: *const u8,
     initial_count: DWORD,
     maximum_count: DWORD,
-    _name: LPCWSTR,
+    name: LPCWSTR,
 ) -> HANDLE {
-    match ntdll_sync::create_semaphore_kernel(initial_count, maximum_count) {
-        Ok(handle) => handle,
+    // SAFETY: this wrapper inherits the caller-owned pointer contract.
+    match unsafe {
+        ntdll_sync::create_semaphore_win32(security, name, initial_count, maximum_count)
+    } {
+        Ok((handle, status)) => {
+            set_last_error(nt_status_to_dos_error(status));
+            handle
+        }
         Err(status) => {
             set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
             ptr::null_mut()

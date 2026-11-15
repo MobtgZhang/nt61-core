@@ -16,3 +16,10 @@ pub mod string {
         core::ptr::null_mut()
     }
 }
+
+#[allow(unused_imports)]
+#[path = "../../../libs/ntdll/src/ntdll/object.rs"]
+pub mod object;
+
+#[path = "../../../libs/ntdll/src/ntdll/alert_state.rs"]
+pub mod alert_state;

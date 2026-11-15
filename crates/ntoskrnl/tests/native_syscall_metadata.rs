@@ -65,5 +65,5 @@ fn portable_adapters_use_the_shipped_argument_counts() {
         assert_eq!(count, metadata.arguments as usize, "{name}");
         checked += 1;
     }
-    assert_eq!(checked, 99);
+    assert_eq!(checked, 103);
 }

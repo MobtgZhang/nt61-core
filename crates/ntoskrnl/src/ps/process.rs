@@ -2176,17 +2176,18 @@ pub fn terminate_process(pid: u64, exit_code: i32) -> bool {
         let handle_table = process.object_table;
         let main_thread = process.main_thread;
 
+        // Registry readers may operate on the thread while holding its lock.
+        // Unpublish before freeing either allocation, so those readers finish
+        // before teardown can release their alert state and process storage.
+        let process_ptr = process as *mut Eprocess;
+        remove_process_from_list(pid);
+
         if !main_thread.is_null() {
             crate::mm::pool::free(main_thread as *mut u8);
         }
         if !handle_table.is_null() {
             crate::mm::pool::free(handle_table as *mut u8);
         }
-        // Remove the process before freeing it: list cleanup reads the
-        // EPROCESS PID and would otherwise dereference freed memory.
-        let process_ptr = process as *mut Eprocess;
-        remove_process_from_list(pid);
-
         if pml4_phys != 0 {
             crate::mm::pfn::free_pfn(pml4_phys >> 12);
         }

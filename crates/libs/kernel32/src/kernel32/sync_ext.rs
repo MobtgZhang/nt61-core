@@ -10,17 +10,47 @@ use crate::libs::ntdll::timer as ntdll_timer;
 use core::ptr;
 use core::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
+/// Open a timer, preserving the requested access and handle inheritance.
+///
+/// # Safety
+/// Name must be a readable, terminated caller-owned UTF-16 string.
+pub unsafe extern "C" fn open_waitable_timer_w(
+    access: u32,
+    inherit: BOOL,
+    name: LPCWSTR,
+) -> HANDLE {
+    // SAFETY: propagate the caller's trusted name contract.
+    match unsafe {
+        crate::libs::ntdll::object::open_sync_win32(
+            crate::libs::ntdll::file::HandleKind::Timer,
+            access,
+            inherit != 0,
+            name,
+        )
+    } {
+        Ok(handle) => handle,
+        Err(status) => {
+            set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
+            ptr::null_mut()
+        }
+    }
+}
+
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 pub unsafe extern "C" fn create_waitable_timer_w(
-    _security_attributes: *const u8,
+    security_attributes: *const u8,
     manual_reset: BOOL,
-    _name: LPCWSTR,
+    name: LPCWSTR,
 ) -> HANDLE {
     let timer_type = if manual_reset != 0 { 0 } else { 1 };
-    match ntdll_timer::create_timer_kernel(timer_type) {
-        Ok(handle) => handle,
+    // SAFETY: this wrapper inherits the caller-owned pointer contract.
+    match unsafe { ntdll_timer::create_timer_win32(security_attributes, name, timer_type) } {
+        Ok((handle, status)) => {
+            set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
+            handle
+        }
         Err(status) => {
             set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
             ptr::null_mut()

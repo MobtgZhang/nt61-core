@@ -74,6 +74,10 @@ portable_services! {
     ("NtMapViewOfSection", portable_nt_map_view_of_section, section::nt_map_view_of_section, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     ("NtNotifyChangeDirectoryFile", portable_nt_notify_change_directory_file, nt_extended::nt_notify_change_directory_file, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
     ("NtNotifyChangeKey", portable_nt_notify_change_key, registry::nt_notify_change_key, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    ("NtDuplicateObject", portable_nt_duplicate_object, object::nt_duplicate_object, [0, 1, 2, 3, 4, 5, 6]);
+    ("NtOpenEvent", portable_nt_open_event, sync::nt_open_event, [0, 1, 2]);
+    ("NtOpenMutant", portable_nt_open_mutant, sync::nt_open_mutant, [0, 1, 2]);
+    ("NtOpenSemaphore", portable_nt_open_semaphore, sync::nt_open_semaphore, [0, 1, 2]);
     ("NtOpenFile", portable_nt_open_file, file::nt_open_file, [0, 1, 2, 3, 4, 5]);
     ("NtOpenKey", portable_nt_open_key, registry::nt_open_key, [0, 1, 2]);
     ("NtOpenProcess", portable_nt_open_process, process::nt_open_process, [0, 1, 2, 3]);

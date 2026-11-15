@@ -10,11 +10,12 @@
 //! APIs.
 
 use super::file::{
-    alloc_dispatcher_handle, alloc_handle, free_handle, with_sync_handles, DispatcherState,
+    alloc_dispatcher_handle, alloc_handle, with_sync_access, with_sync_handles, DispatcherState,
     HandleKind, MutantState,
 };
 use super::status::{
-    STATUS_ACCESS_VIOLATION, STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+    STATUS_ACCESS_VIOLATION, STATUS_ALERTED, STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER,
+    STATUS_SUCCESS,
 };
 use super::types::{HANDLE, NTSTATUS};
 use crate::mm::user_copy::{
@@ -47,7 +48,7 @@ fn change_event(handle: HANDLE, previous: *mut u32, signaled: bool) -> NTSTATUS 
             return status;
         }
     }
-    with_sync_handles(&[handle], |entries| {
+    with_sync_access(handle, 2, |entries| {
         let entry = &mut entries[0];
         if entry.kind != HandleKind::Event {
             return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
@@ -80,18 +81,24 @@ pub unsafe extern "C" fn nt_create_event(
     if let Err(status) = probe_user_write(event_handle as u64, core::mem::size_of::<HANDLE>()) {
         return status;
     }
-    let _ = (desired_access, object_attributes);
+    super::object::create_native_sync(
+        event_handle,
+        desired_access,
+        object_attributes,
+        HandleKind::Event,
+        encode_event_state(event_type, initial_state != 0, event_type == 0),
+        DispatcherState::None,
+    )
+}
 
-    match create_event_kernel(event_type, initial_state != 0) {
-        Ok(handle) => match write_user_object(event_handle as u64, &handle) {
-            Ok(()) => STATUS_SUCCESS,
-            Err(status) => {
-                free_handle(handle);
-                status
-            }
-        },
-        Err(status) => status,
-    }
+/// # Safety
+/// The output and attributes are user addresses captured by the object layer.
+pub unsafe extern "C" fn nt_open_event(
+    output: *mut HANDLE,
+    access: u32,
+    attributes: *mut super::types::ObjectAttributes,
+) -> NTSTATUS {
+    super::object::open_native_sync(output, access, attributes, HandleKind::Event)
 }
 
 /// Create an unnamed event for trusted callers without routing a kernel pointer
@@ -176,18 +183,33 @@ pub unsafe extern "C" fn nt_create_mutant(
     if let Err(status) = probe_user_write(mutant_handle as u64, core::mem::size_of::<HANDLE>()) {
         return status;
     }
-    let _ = (desired_access, object_attributes);
-
-    match create_mutant_kernel(initial_owner != 0) {
-        Ok(handle) => match write_user_object(mutant_handle as u64, &handle) {
-            Ok(()) => STATUS_SUCCESS,
-            Err(status) => {
-                free_handle(handle);
-                status
-            }
-        },
-        Err(status) => status,
+    let (pid, tid) = current_client_id();
+    if initial_owner != 0 && tid == 0 {
+        return STATUS_INVALID_HANDLE;
     }
+    super::object::create_native_sync(
+        mutant_handle,
+        desired_access,
+        object_attributes,
+        HandleKind::Mutant,
+        0,
+        DispatcherState::Mutant(MutantState {
+            owner_thread: if initial_owner != 0 { tid } else { 0 },
+            owner_process: if initial_owner != 0 { pid } else { 0 },
+            depth: u32::from(initial_owner != 0),
+            abandoned: false,
+        }),
+    )
+}
+
+/// # Safety
+/// The output and attributes are user addresses captured by the object layer.
+pub unsafe extern "C" fn nt_open_mutant(
+    output: *mut HANDLE,
+    access: u32,
+    attributes: *mut super::types::ObjectAttributes,
+) -> NTSTATUS {
+    super::object::open_native_sync(output, access, attributes, HandleKind::Mutant)
 }
 
 /// Allocate an unnamed mutant for trusted callers.
@@ -252,7 +274,7 @@ pub unsafe extern "C" fn nt_release_mutant(
     .unwrap_or_else(|status| status)
 }
 
-fn current_client_id() -> (u64, u64) {
+pub(crate) fn current_client_id() -> (u64, u64) {
     let thread = crate::ps::thread::get_current_ethread();
     if thread.is_null() {
         return (0, 0);
@@ -314,7 +336,7 @@ pub unsafe extern "C" fn nt_query_event(
     if let Err(status) = query_output(information, length, 8, return_length) {
         return status;
     }
-    with_sync_handles(&[handle], |entries| {
+    with_sync_access(handle, 1, |entries| {
         let entry = &entries[0];
         if entry.kind != HandleKind::Event {
             return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
@@ -344,7 +366,7 @@ pub unsafe extern "C" fn nt_query_semaphore(
     if let Err(status) = query_output(information, length, 8, return_length) {
         return status;
     }
-    with_sync_handles(&[handle], |entries| {
+    with_sync_access(handle, 1, |entries| {
         let entry = &entries[0];
         if entry.kind != HandleKind::Semaphore {
             return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
@@ -377,7 +399,7 @@ pub unsafe extern "C" fn nt_query_mutant(
         return status;
     }
     let (_, tid) = current_client_id();
-    with_sync_handles(&[handle], |entries| {
+    with_sync_access(handle, 1, |entries| {
         if entries[0].kind != HandleKind::Mutant {
             return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
         }
@@ -419,17 +441,24 @@ pub unsafe extern "C" fn nt_create_semaphore(
     if let Err(status) = probe_user_write(semaphore_handle as u64, core::mem::size_of::<HANDLE>()) {
         return status;
     }
-    let _ = (desired_access, object_attributes);
-    match create_semaphore_kernel(initial_count, maximum_count) {
-        Ok(handle) => match write_user_object(semaphore_handle as u64, &handle) {
-            Ok(()) => STATUS_SUCCESS,
-            Err(status) => {
-                free_handle(handle);
-                status
-            }
-        },
-        Err(status) => status,
-    }
+    super::object::create_native_sync(
+        semaphore_handle,
+        desired_access,
+        object_attributes,
+        HandleKind::Semaphore,
+        (u64::from(maximum_count) << 32) | u64::from(initial_count),
+        DispatcherState::None,
+    )
+}
+
+/// # Safety
+/// The output and attributes are user addresses captured by the object layer.
+pub unsafe extern "C" fn nt_open_semaphore(
+    output: *mut HANDLE,
+    access: u32,
+    attributes: *mut super::types::ObjectAttributes,
+) -> NTSTATUS {
+    super::object::open_native_sync(output, access, attributes, HandleKind::Semaphore)
 }
 
 /// Create an unnamed semaphore for trusted callers.
@@ -465,7 +494,7 @@ pub unsafe extern "C" fn nt_release_semaphore(
             return status;
         }
     }
-    with_sync_handles(&[semaphore_handle], |entries| {
+    with_sync_access(semaphore_handle, 2, |entries| {
         let entry = &mut entries[0];
         if entry.kind != HandleKind::Semaphore {
             return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
@@ -652,11 +681,18 @@ pub fn nt_wait_for_multiple_objects_kernel(
     {
         return STATUS_INVALID_PARAMETER;
     }
-    let _ = alertable; // User APC delivery requires a user-return trampoline.
     let (pid, tid) = current_client_id();
-    complete_wait(super::file::begin_wait(
-        handles, wait_all, pid, tid, timeout,
-    ))
+    let start = super::alert::with_current_alert(|state| {
+        super::file::begin_wait(
+            handles,
+            wait_all,
+            pid,
+            tid,
+            timeout,
+            if alertable != 0 { state } else { None },
+        )
+    });
+    complete_wait(start)
 }
 
 fn complete_wait(start: Result<super::file::WaitStart, NTSTATUS>) -> NTSTATUS {
@@ -704,15 +740,23 @@ pub fn signal_and_wait_kernel(
     alertable: u8,
     timeout: Option<i64>,
 ) -> NTSTATUS {
-    let _ = alertable; // APC return trampoline is still required.
     let (pid, tid) = current_client_id();
-    complete_wait(super::file::signal_and_begin_wait(
-        signal, handle, pid, tid, timeout,
-    ))
+    let start = super::alert::with_current_alert(|state| {
+        super::file::signal_and_begin_wait(
+            signal,
+            handle,
+            pid,
+            tid,
+            timeout,
+            if alertable != 0 { state } else { None },
+        )
+    });
+    complete_wait(start)
 }
 
 /// Delay until an absolute NT wall time or a relative interrupt-time deadline,
-/// expressed in 100ns units. APC interruption is not yet implemented.
+/// expressed in 100ns units. User alerts interrupt alertable delays; APC
+/// interruption still requires a user-return trampoline.
 pub extern "C" fn nt_delay_execution(alertable: u8, interval: *mut i64) -> NTSTATUS {
     if interval.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -728,7 +772,9 @@ pub extern "C" fn nt_delay_execution(alertable: u8, interval: *mut i64) -> NTSTA
 
 /// Trusted-kernel entry point for `nt_delay_execution`.
 pub fn nt_delay_execution_kernel(alertable: u8, interval: i64) -> NTSTATUS {
-    let _ = alertable;
+    if alertable != 0 && super::alert::take_current_alert() {
+        return STATUS_ALERTED;
+    }
     if interval == 0 {
         crate::ke::scheduler::yield_();
         return STATUS_SUCCESS;
@@ -743,6 +789,9 @@ pub fn nt_delay_execution_kernel(alertable: u8, interval: i64) -> NTSTATUS {
         interval as u64
     };
     loop {
+        if alertable != 0 && super::alert::take_current_alert() {
+            return STATUS_ALERTED;
+        }
         let now = crate::ke::time::get_time_snapshot();
         if (if interval < 0 {
             now.interrupt_time
@@ -763,4 +812,72 @@ pub fn nt_delay_execution_kernel(alertable: u8, interval: i64) -> NTSTATUS {
 /// `NT_CLOSE` re-export for kernel32.
 pub unsafe extern "C" fn nt_close_sync(h: HANDLE) -> NTSTATUS {
     super::file::close_handle(h).map_or_else(|status| status, |_| STATUS_SUCCESS)
+}
+
+/// # Safety
+/// Name and security must be readable trusted Win32 arguments.
+pub unsafe fn create_event_win32(
+    security: *const u8,
+    name: *const u16,
+    event_type: u32,
+    signaled: bool,
+) -> Result<(HANDLE, NTSTATUS), NTSTATUS> {
+    let attributes = unsafe { super::object::win32_sync_attributes(security, name)? };
+    super::file::create_sync_handle(
+        HandleKind::Event,
+        encode_event_state(event_type, signaled, event_type == 0),
+        DispatcherState::None,
+        0x001f0003,
+        attributes,
+        true,
+    )
+}
+
+/// # Safety
+/// Name and security must be readable trusted Win32 arguments.
+pub unsafe fn create_mutant_win32(
+    security: *const u8,
+    name: *const u16,
+    owned: bool,
+) -> Result<(HANDLE, NTSTATUS), NTSTATUS> {
+    let attributes = unsafe { super::object::win32_sync_attributes(security, name)? };
+    let (pid, tid) = current_client_id();
+    if owned && tid == 0 {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    super::file::create_sync_handle(
+        HandleKind::Mutant,
+        0,
+        DispatcherState::Mutant(MutantState {
+            owner_thread: if owned { tid } else { 0 },
+            owner_process: if owned { pid } else { 0 },
+            depth: u32::from(owned),
+            abandoned: false,
+        }),
+        0x001f0001,
+        attributes,
+        true,
+    )
+}
+
+/// # Safety
+/// Name and security must be readable trusted Win32 arguments.
+pub unsafe fn create_semaphore_win32(
+    security: *const u8,
+    name: *const u16,
+    initial: u32,
+    maximum: u32,
+) -> Result<(HANDLE, NTSTATUS), NTSTATUS> {
+    if maximum == 0 || maximum > i32::MAX as u32 || initial > maximum {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let attributes = unsafe { super::object::win32_sync_attributes(security, name)? };
+    super::file::create_sync_handle(
+        HandleKind::Semaphore,
+        (u64::from(maximum) << 32) | u64::from(initial),
+        DispatcherState::None,
+        0x001f0003,
+        attributes,
+        true,
+    )
 }

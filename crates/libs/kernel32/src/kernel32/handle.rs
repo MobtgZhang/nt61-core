@@ -31,21 +31,40 @@ pub unsafe extern "C" fn close_handle(handle: HANDLE) -> BOOL {
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// `duplicate_handle` — the bootstrap always fails this
-/// because we do not own a real handle table.
+/// Duplicate a dispatcher handle in the current process, preserving shared
+/// signal state and storing inheritance/protection in independent slots.
 pub unsafe extern "C" fn duplicate_handle(
-    _source_process: HANDLE,
-    _source: HANDLE,
-    _target_process: HANDLE,
+    source_process: HANDLE,
+    source: HANDLE,
+    target_process: HANDLE,
     target: *mut HANDLE,
-    _desired_access: DWORD,
-    _inherit: i32,
-    _options: DWORD,
+    desired_access: DWORD,
+    inherit: i32,
+    options: DWORD,
 ) -> BOOL {
-    if !target.is_null() {
-        *target = core::ptr::null_mut();
+    if options & !3 != 0 {
+        return fail(status::STATUS_INVALID_PARAMETER);
     }
-    fail(status::STATUS_NOT_IMPLEMENTED)
+    if target.is_null() {
+        return fail(status::STATUS_INVALID_PARAMETER);
+    }
+    match object::duplicate_object_kernel(
+        source_process,
+        source,
+        target_process,
+        desired_access,
+        if inherit != 0 { 2 } else { 0 },
+        options,
+    ) {
+        Ok(handle) => {
+            // SAFETY: this trusted wrapper's caller supplies a writable HANDLE.
+            unsafe {
+                target.write_unaligned(handle);
+            }
+            TRUE
+        }
+        Err(error) => fail(error),
+    }
 }
 
 /// # Safety

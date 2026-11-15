@@ -57,9 +57,12 @@ fn struct_bytes<T>(value: &T) -> &[u8] {
 mod handles;
 pub use handles::handle_count;
 pub(crate) use handles::{
-    abandon_mutants, alloc_dispatcher_handle, alloc_handle, begin_wait, close_handle, free_handle,
-    handle_flags, lookup_handle, pulse_event, signal_and_begin_wait, tick_timers, update_handle_flags,
-    with_sync_handles, DispatcherState, HandleEntry, HandleKind, MutantState, TimerState, WaitStart,
+    alert_user_thread, take_user_alert, terminate_user_alert, thread_alert_target,
+    abandon_mutants, alloc_dispatcher_handle, alloc_handle, begin_wait, close_handle,
+    close_sync_handle, create_sync_handle, duplicate_sync_handle_with_access, free_handle,
+    handle_flags, lookup_handle, pulse_event, signal_and_begin_wait, sync_object_name, tick_timers,
+    update_handle_flags, with_sync_access, with_sync_handles, DispatcherState, HandleEntry,
+    HandleKind, MutantState, TimerState, WaitStart,
 };
 
 /// Resolve a client-side process handle to its kernel target id.
@@ -186,7 +189,9 @@ fn record_share_entry(handle: HANDLE, path: Vec<u16>, access: u32, share: u32) {
 }
 
 fn remove_share_entry(identity: u64) {
-    SHARE_TABLE.lock().retain(|entry| entry.identity != identity);
+    SHARE_TABLE
+        .lock()
+        .retain(|entry| entry.identity != identity);
 }
 
 /// Resolve a File handle to the NtfsHandle FCB the CREATE IRP produced,

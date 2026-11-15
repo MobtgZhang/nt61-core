@@ -27,6 +27,9 @@ pub unsafe extern "C" fn nt_query_object(
     length: u32,
     return_length: *mut u32,
 ) -> NTSTATUS {
+    if class == 1 {
+        return sync_objects::query_sync_name(handle, information, length, return_length);
+    }
     if class > 5 {
         return STATUS_INVALID_INFO_CLASS;
     }
@@ -90,3 +93,11 @@ pub unsafe extern "C" fn nt_set_information_object(
     let flags = u32::from(input[0] != 0) | (u32::from(input[1] != 0) << 1);
     set_handle_flags(handle, 3, flags).map_or_else(|status| status, |()| STATUS_SUCCESS)
 }
+
+#[path = "object_sync.rs"]
+mod sync_objects;
+pub(crate) use sync_objects::{
+    create_native_sync, equal_sync_name, map_sync_access, open_native_sync, open_sync_win32,
+    win32_sync_attributes, SyncAttributes,
+};
+pub use sync_objects::{duplicate_object_kernel, nt_duplicate_object};

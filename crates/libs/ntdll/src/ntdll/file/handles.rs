@@ -1,9 +1,11 @@
 //! Native handles reference shared objects; synchronization transactions hold
 //! the table lock across observation and consumption. Handle aliases therefore
 //! see the same signal/ownership state, and final close retires object metadata.
+use super::super::alert_state::UserAlertState;
 use super::super::status::{STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER};
 use super::super::types::{HANDLE, NTSTATUS};
 use crate::ke::sync::Spinlock;
+use alloc::vec::Vec;
 use core::ptr;
 
 const MAX_HANDLES: usize = 4096;
@@ -62,6 +64,7 @@ pub(crate) enum HandleKind {
 struct HandleSlot {
     object: usize,
     flags: u8,
+    access: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -77,6 +80,7 @@ struct HandleTable {
     slots: [Option<HandleSlot>; MAX_HANDLES],
     objects: [Option<HandleObject>; MAX_HANDLES],
     next_identity: u64,
+    names: Vec<(usize, Vec<u16>)>,
     waits: [Option<WaitRequest>; 256],
     next_wait_identity: u64,
     pending_waits: [u64; 4],
@@ -89,6 +93,7 @@ impl HandleTable {
             slots: [None; MAX_HANDLES],
             objects: [None; MAX_HANDLES],
             next_identity: 1,
+            names: Vec::new(),
             waits: [None; 256],
             next_wait_identity: 1,
             pending_waits: [0; 4],
@@ -107,62 +112,245 @@ pub(crate) fn alloc_dispatcher_handle(
     dispatcher: DispatcherState,
 ) -> HANDLE {
     let mut table = HANDLE_TABLE.lock();
-    let Some(slot) = table.slots.iter().position(Option::is_none) else {
-        return ptr::null_mut();
+    let access = match kind {
+        HandleKind::Event | HandleKind::Semaphore | HandleKind::Timer => 0x001f0003,
+        HandleKind::Mutant => 0x001f0001,
+        _ => u32::MAX,
     };
-    let Some(object) = table.objects.iter().position(Option::is_none) else {
-        return ptr::null_mut();
-    };
-    let identity = table.next_identity;
-    let Some(next) = identity.checked_add(1) else {
-        return ptr::null_mut();
-    };
-    table.next_identity = next;
-    table.objects[object] = Some(HandleObject {
-        entry: HandleEntry {
-            kind,
-            target,
-            identity,
-            dispatcher,
-        },
-        handles: 1,
-        waits: 0,
-    });
-    table.slots[slot] = Some(HandleSlot { object, flags: 0 });
-    if kind == HandleKind::Timer {
-        table.timers[object / 64] |= 1 << (object % 64);
+    table
+        .allocate(kind, target, dispatcher, access, 0)
+        .unwrap_or(ptr::null_mut())
+}
+
+impl HandleTable {
+    fn allocate(
+        &mut self,
+        kind: HandleKind,
+        target: u64,
+        dispatcher: DispatcherState,
+        access: u32,
+        flags: u8,
+    ) -> Result<HANDLE, NTSTATUS> {
+        use super::super::status::STATUS_NO_MEMORY;
+        let slot = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .ok_or(STATUS_NO_MEMORY)?;
+        let object = self
+            .objects
+            .iter()
+            .position(Option::is_none)
+            .ok_or(STATUS_NO_MEMORY)?;
+        let identity = self.next_identity;
+        self.next_identity = identity.checked_add(1).ok_or(STATUS_NO_MEMORY)?;
+        self.objects[object] = Some(HandleObject {
+            entry: HandleEntry {
+                kind,
+                target,
+                identity,
+                dispatcher,
+            },
+            handles: 1,
+            waits: 0,
+        });
+        self.slots[slot] = Some(HandleSlot {
+            object,
+            flags,
+            access,
+        });
+        if kind == HandleKind::Timer {
+            self.timers[object / 64] |= 1 << (object % 64);
+        }
+        Ok(encode_handle(slot))
     }
-    encode_handle(slot)
+
+    fn alias(&mut self, object: usize, access: u32, flags: u8) -> Result<HANDLE, NTSTATUS> {
+        let slot = self
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .ok_or(super::super::status::STATUS_NO_MEMORY)?;
+        self.objects[object]
+            .as_mut()
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .handles += 1;
+        self.slots[slot] = Some(HandleSlot {
+            object,
+            flags,
+            access,
+        });
+        Ok(encode_handle(slot))
+    }
+}
+
+/// Resolve a name and allocate the handle in one transaction. Names are weak
+/// namespace links: final handle close removes them even if a wait pins state.
+pub(crate) fn create_sync_handle(
+    kind: HandleKind,
+    target: u64,
+    dispatcher: DispatcherState,
+    access: u32,
+    attributes: super::super::object::SyncAttributes,
+    create: bool,
+) -> Result<(HANDLE, NTSTATUS), NTSTATUS> {
+    use super::super::status::*;
+    let mut table = HANDLE_TABLE.lock();
+    if let Some(name) = &attributes.name {
+        if let Some((object, _)) = table.names.iter().find(|(_, existing)| {
+            super::super::object::equal_sync_name(existing, name, attributes.case_insensitive)
+        }) {
+            let object = *object;
+            if table.objects[object]
+                .ok_or(STATUS_INVALID_HANDLE)?
+                .entry
+                .kind
+                != kind
+            {
+                return Err(STATUS_OBJECT_TYPE_MISMATCH);
+            }
+            if create && !attributes.open_if {
+                return Err(STATUS_OBJECT_NAME_COLLISION);
+            }
+            let handle = table.alias(object, access, attributes.flags)?;
+            return Ok((
+                handle,
+                if create {
+                    STATUS_OBJECT_NAME_EXISTS
+                } else {
+                    STATUS_SUCCESS
+                },
+            ));
+        }
+        if !create {
+            return Err(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        table.names.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
+    } else if !create {
+        return Err(STATUS_OBJECT_NAME_INVALID);
+    }
+    let handle = table.allocate(kind, target, dispatcher, access, attributes.flags)?;
+    if let Some(name) = attributes.name {
+        let object = table.slots[decode_handle(handle)]
+            .ok_or(STATUS_INVALID_HANDLE)?
+            .object;
+        table.names.push((object, name));
+    }
+    Ok((handle, STATUS_SUCCESS))
+}
+
+/// Check access while holding the dispatcher lock, preventing handle reuse
+/// between the check and state mutation.
+pub(crate) fn with_sync_access<T>(
+    handle: HANDLE,
+    access: u32,
+    operation: impl FnOnce(&mut [HandleEntry]) -> Result<T, NTSTATUS>,
+) -> Result<T, NTSTATUS> {
+    with_sync_handles_access(&[handle], access, operation)
 }
 
 /// Create an alias of a synchronization object, preserving its identity/state.
 /// Other object kinds have additional resource ownership contracts and must
 /// gain their own final-close integration before they can be aliased here.
 pub(crate) fn duplicate_sync_handle(handle: HANDLE) -> Result<HANDLE, NTSTATUS> {
+    duplicate_sync_handle_with_access(handle, 0, 0, 2)
+}
+
+/// Close-only duplication must validate the type under the same lock as close.
+/// Other resource kinds require their resource-specific teardown path.
+pub(crate) fn close_sync_handle(handle: HANDLE) -> Result<(), NTSTATUS> {
     let mut table = HANDLE_TABLE.lock();
-    let object = table
+    let slot = table
         .slots
         .get(decode_handle(handle))
         .and_then(|slot| *slot)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    let entry = table.objects[slot.object]
         .ok_or(STATUS_INVALID_HANDLE)?
-        .object;
-    let entry = table.objects[object].ok_or(STATUS_INVALID_HANDLE)?.entry;
+        .entry;
     if !matches!(
         entry.kind,
         HandleKind::Event | HandleKind::Semaphore | HandleKind::Mutant | HandleKind::Timer
     ) {
         return Err(super::super::status::STATUS_NOT_SUPPORTED);
     }
-    let slot = table
-        .slots
-        .iter()
-        .position(Option::is_none)
-        .ok_or(super::super::status::STATUS_NO_MEMORY)?;
-    if let Some(value) = &mut table.objects[object] {
-        value.handles += 1;
+    if slot.flags & 2 != 0 {
+        return Err(super::super::status::STATUS_HANDLE_NOT_CLOSABLE);
     }
-    table.slots[slot] = Some(HandleSlot { object, flags: 0 });
-    Ok(encode_handle(slot))
+    table.retire_sync_slot(decode_handle(handle), slot.object);
+    Ok(())
+}
+
+impl HandleTable {
+    fn retire_sync_slot(&mut self, slot: usize, object: usize) {
+        self.slots[slot] = None;
+        if let Some(value) = &mut self.objects[object] {
+            value.handles -= 1;
+        }
+        if self.objects[object].is_some_and(|value| value.handles == 0) {
+            self.names.retain(|(index, _)| *index != object);
+            if self.objects[object].is_some_and(|value| value.waits == 0) {
+                self.objects[object] = None;
+                self.timers[object / 64] &= !(1 << (object % 64));
+            }
+        }
+    }
+}
+
+/// Synchronization aliases have no independent resource teardown. Cross-process
+/// ownership and arbitrary access escalation require the security subsystem.
+pub(crate) fn duplicate_sync_handle_with_access(
+    handle: HANDLE,
+    desired_access: u32,
+    flags: u8,
+    options: u32,
+) -> Result<HANDLE, NTSTATUS> {
+    use super::super::status::*;
+    if options & !7 != 0 || flags & !3 != 0 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut table = HANDLE_TABLE.lock();
+    let source_index = decode_handle(handle);
+    let source = table
+        .slots
+        .get(source_index)
+        .and_then(|slot| *slot)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    let entry = table.objects[source.object]
+        .ok_or(STATUS_INVALID_HANDLE)?
+        .entry;
+    if !matches!(
+        entry.kind,
+        HandleKind::Event | HandleKind::Semaphore | HandleKind::Mutant | HandleKind::Timer
+    ) {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    if options & 1 != 0 && source.flags & 2 != 0 {
+        return Err(STATUS_HANDLE_NOT_CLOSABLE);
+    }
+    let result = (|| {
+        let access = if options & 2 != 0 {
+            source.access
+        } else {
+            super::super::object::map_sync_access(entry.kind, desired_access)?
+        };
+        if access & !source.access != 0 {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        let attributes = if options & 4 != 0 {
+            source.flags
+        } else {
+            flags
+        };
+        table.alias(source.object, access, attributes)
+    })();
+    // CLOSE_SOURCE applies even when access validation or target allocation
+    // fails. Only dispatcher objects reach this path, so final close has no
+    // external file/section resource teardown to run after unlocking.
+    if options & 1 != 0 {
+        table.retire_sync_slot(source_index, source.object);
+    }
+    result
 }
 
 pub(crate) fn free_handle(handle: HANDLE) -> bool {
@@ -183,6 +371,98 @@ pub(crate) fn handle_flags(handle: HANDLE) -> Result<u8, NTSTATUS> {
         .and_then(|slot| *slot)
         .map(|slot| slot.flags)
         .ok_or(STATUS_INVALID_HANDLE)
+}
+
+/// Resolve THREAD_SUSPEND_RESUME before releasing the handle-table lock. No
+/// operation later reuses the handle value, so close/reallocation cannot retarget
+/// this alert to an unrelated thread.
+pub(crate) fn thread_alert_target(handle: HANDLE) -> Result<u64, NTSTATUS> {
+    use super::super::status::*;
+    let table = HANDLE_TABLE.lock();
+    let slot = table
+        .slots
+        .get(decode_handle(handle))
+        .and_then(|slot| *slot)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    let object = table.objects[slot.object].ok_or(STATUS_INVALID_HANDLE)?;
+    if object.entry.kind != HandleKind::Thread {
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    if slot.access & 2 == 0 {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    Ok(object.entry.target)
+}
+
+/// Alert an already queued alertable wait immediately; otherwise retain one
+/// pending alert. Completed waits are never overwritten, and duplicate alerts
+/// coalesce. The state belongs to a live, allocated ETHREAD, not a TID bucket.
+pub(crate) fn alert_user_thread(tid: u64, state: &UserAlertState) -> NTSTATUS {
+    use super::super::status::*;
+    let mut table = HANDLE_TABLE.lock();
+    if state.terminated() {
+        return STATUS_THREAD_IS_TERMINATING;
+    }
+    if state.pending() {
+        return STATUS_SUCCESS;
+    }
+    for index in 0..table.waits.len() {
+        if table.waits[index]
+            .is_some_and(|wait| wait.tid == tid && wait.alertable && wait.result.is_none())
+        {
+            if let Some(wait) = &mut table.waits[index] {
+                wait.result = Some(STATUS_ALERTED);
+            }
+            table.pending_waits[index / 64] &= !(1 << (index % 64));
+            return STATUS_SUCCESS;
+        }
+    }
+    state.set();
+    STATUS_SUCCESS
+}
+
+pub(crate) fn take_user_alert(state: &UserAlertState) -> bool {
+    let _table = HANDLE_TABLE.lock();
+    state.take()
+}
+
+pub(crate) fn terminate_user_alert(state: &UserAlertState) {
+    let _table = HANDLE_TABLE.lock();
+    state.terminate();
+}
+
+/// Copy the name while the slot and its object identity are locked together.
+/// A concurrent close/reuse cannot make a query report another object's name.
+pub(crate) fn sync_object_name(handle: HANDLE) -> Result<Option<Vec<u16>>, NTSTATUS> {
+    use super::super::status::{STATUS_NOT_IMPLEMENTED, STATUS_NO_MEMORY};
+    let table = HANDLE_TABLE.lock();
+    let slot = table
+        .slots
+        .get(decode_handle(handle))
+        .and_then(|slot| *slot)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    let entry = table.objects[slot.object]
+        .ok_or(STATUS_INVALID_HANDLE)?
+        .entry;
+    if !matches!(
+        entry.kind,
+        HandleKind::Event | HandleKind::Semaphore | HandleKind::Mutant | HandleKind::Timer
+    ) {
+        return Err(STATUS_NOT_IMPLEMENTED);
+    }
+    table
+        .names
+        .iter()
+        .find(|(index, _)| *index == slot.object)
+        .map(|(_, name)| {
+            let mut result = Vec::new();
+            result
+                .try_reserve_exact(name.len())
+                .map_err(|_| STATUS_NO_MEMORY)?;
+            result.extend_from_slice(name);
+            Ok(result)
+        })
+        .transpose()
 }
 
 /// Both flag updates and close decisions serialize on the same table lock.
@@ -217,7 +497,12 @@ fn remove_handle(handle: HANDLE, protect: bool) -> Result<(HandleEntry, bool), N
     let object = table.objects[slot.object]
         .as_ref()
         .ok_or(STATUS_INVALID_HANDLE)?;
-    let retired = if object.handles == 0 && object.waits == 0 {
+    let last_handle = object.handles == 0;
+    let retire = last_handle && object.waits == 0;
+    if last_handle {
+        table.names.retain(|(index, _)| *index != slot.object);
+    }
+    let retired = if retire {
         table.timers[slot.object / 64] &= !(1 << (slot.object % 64));
         table.objects[slot.object].take().map(|object| object.entry)
     } else {
@@ -251,6 +536,14 @@ pub(crate) fn with_sync_handles<T>(
     handles: &[HANDLE],
     operation: impl FnOnce(&mut [HandleEntry]) -> Result<T, NTSTATUS>,
 ) -> Result<T, NTSTATUS> {
+    with_sync_handles_access(handles, 0, operation)
+}
+
+fn with_sync_handles_access<T>(
+    handles: &[HANDLE],
+    access: u32,
+    operation: impl FnOnce(&mut [HandleEntry]) -> Result<T, NTSTATUS>,
+) -> Result<T, NTSTATUS> {
     if handles.is_empty() || handles.len() > 64 {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -263,12 +556,15 @@ pub(crate) fn with_sync_handles<T>(
     }; 64];
     let mut objects = [0; 64];
     for (offset, &handle) in handles.iter().enumerate() {
-        let object = table
+        let slot = table
             .slots
             .get(decode_handle(handle))
             .and_then(|slot| *slot)
-            .ok_or(STATUS_INVALID_HANDLE)?
-            .object;
+            .ok_or(STATUS_INVALID_HANDLE)?;
+        if slot.access & access != access {
+            return Err(super::super::status::STATUS_ACCESS_DENIED);
+        }
+        let object = slot.object;
         entries[offset] = table.objects[object].ok_or(STATUS_INVALID_HANDLE)?.entry;
         objects[offset] = object;
     }
@@ -348,6 +644,7 @@ struct WaitRequest {
     all: bool,
     pid: u64,
     tid: u64,
+    alertable: bool,
     deadline: Option<(bool, u64)>, // absolute wall time, or relative uptime
     result: Option<NTSTATUS>,
 }
@@ -391,10 +688,11 @@ pub(crate) fn begin_wait(
     pid: u64,
     tid: u64,
     timeout: Option<i64>,
+    alert: Option<&UserAlertState>,
 ) -> Result<WaitStart, NTSTATUS> {
     let mut table = HANDLE_TABLE.lock();
     let wait = table.prepare_wait(handles, all, pid, tid, timeout)?;
-    table.start_wait(wait)
+    table.start_wait(wait, alert)
 }
 
 /// Validate both objects before signaling and registering the new wait under
@@ -405,6 +703,7 @@ pub(crate) fn signal_and_begin_wait(
     pid: u64,
     tid: u64,
     timeout: Option<i64>,
+    alert: Option<&UserAlertState>,
 ) -> Result<WaitStart, NTSTATUS> {
     use super::super::status::*;
     let mut table = HANDLE_TABLE.lock();
@@ -416,6 +715,10 @@ pub(crate) fn signal_and_begin_wait(
         .ok_or(STATUS_INVALID_HANDLE)?
         .object;
     let mut entry = table.objects[object].ok_or(STATUS_INVALID_HANDLE)?.entry;
+    let slot = table.slots[decode_handle(signal)].ok_or(STATUS_INVALID_HANDLE)?;
+    if matches!(entry.kind, HandleKind::Event | HandleKind::Semaphore) && slot.access & 2 == 0 {
+        return Err(STATUS_ACCESS_DENIED);
+    }
     match entry.kind {
         HandleKind::Event => entry.target |= 1,
         HandleKind::Semaphore => {
@@ -448,7 +751,7 @@ pub(crate) fn signal_and_begin_wait(
         object.entry = entry;
     }
     table.satisfy_waiters();
-    table.start_wait(wait)
+    table.start_wait(wait, alert)
 }
 
 impl HandleTable {
@@ -479,16 +782,20 @@ impl HandleTable {
             all,
             pid,
             tid,
+            alertable: false,
             deadline,
             result: None,
         };
         for (index, &handle) in handles.iter().enumerate() {
-            let object = self
+            let slot = self
                 .slots
                 .get(decode_handle(handle))
                 .and_then(|slot| *slot)
-                .ok_or(STATUS_INVALID_HANDLE)?
-                .object;
+                .ok_or(STATUS_INVALID_HANDLE)?;
+            if slot.access & 0x0010_0000 == 0 {
+                return Err(STATUS_ACCESS_DENIED);
+            }
+            let object = slot.object;
             if all && wait.objects[..index].contains(&object) {
                 return Err(STATUS_INVALID_PARAMETER);
             }
@@ -513,11 +820,29 @@ impl HandleTable {
         Ok(wait)
     }
 
-    fn start_wait(&mut self, mut wait: WaitRequest) -> Result<WaitStart, NTSTATUS> {
+    fn start_wait(
+        &mut self,
+        mut wait: WaitRequest,
+        alert: Option<&UserAlertState>,
+    ) -> Result<WaitStart, NTSTATUS> {
         use super::super::status::*;
         let now = crate::ke::time::get_time_snapshot();
-        if let Some(result) = self.try_satisfy(&wait, now.system_time, now.interrupt_time) {
+        if let Some(result) = self.try_satisfy(&wait, now.system_time, now.interrupt_time, false) {
             return Ok(WaitStart::Complete(result));
+        }
+        wait.alertable = alert.is_some();
+        if alert.is_some_and(UserAlertState::take) {
+            return Ok(WaitStart::Complete(STATUS_ALERTED));
+        }
+        if wait.deadline.is_some_and(|(absolute, deadline)| {
+            deadline
+                <= if absolute {
+                    now.system_time
+                } else {
+                    now.interrupt_time
+                }
+        }) {
+            return Ok(WaitStart::Complete(STATUS_TIMEOUT));
         }
         let slot = self
             .waits
@@ -544,7 +869,13 @@ impl HandleTable {
     }
 
     /// Observe every object first; a failing WaitAll consumes nothing.
-    fn try_satisfy(&mut self, wait: &WaitRequest, wall: u64, uptime: u64) -> Option<NTSTATUS> {
+    fn try_satisfy(
+        &mut self,
+        wait: &WaitRequest,
+        wall: u64,
+        uptime: u64,
+        check_timeout: bool,
+    ) -> Option<NTSTATUS> {
         use super::super::status::*;
         let mut selected = None;
         let mut all_ready = true;
@@ -578,9 +909,10 @@ impl HandleTable {
         } else {
             selected.is_none()
         } {
-            return if wait.deadline.is_some_and(|(absolute, deadline)| {
-                deadline <= if absolute { wall } else { uptime }
-            }) {
+            return if check_timeout
+                && wait.deadline.is_some_and(|(absolute, deadline)| {
+                    deadline <= if absolute { wall } else { uptime }
+                }) {
                 Some(STATUS_TIMEOUT)
             } else {
                 None
@@ -648,7 +980,7 @@ impl HandleTable {
                 let index = word * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 if let Some(wait) = self.waits[index] {
-                    let result = self.try_satisfy(&wait, wall, uptime);
+                    let result = self.try_satisfy(&wait, wall, uptime, true);
                     if result.is_some() {
                         self.pending_waits[word] &= !(1 << (index % 64));
                     }
@@ -694,6 +1026,9 @@ pub(crate) fn pulse_event(handle: HANDLE, previous: *mut u32) -> NTSTATUS {
     };
     if object.entry.kind != HandleKind::Event {
         return STATUS_OBJECT_TYPE_MISMATCH;
+    }
+    if slot.access & 2 == 0 {
+        return STATUS_ACCESS_DENIED;
     }
     if !previous.is_null() {
         if let Err(status) = crate::mm::user_copy::write_user_object(

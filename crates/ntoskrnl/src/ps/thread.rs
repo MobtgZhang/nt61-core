@@ -444,6 +444,9 @@ pub struct Ethread {
 
     /// Highest address of the 32-bit user stack (exclusive).
     pub wow64_stack_top: u32,
+
+    /// Project extension: user alerts serialized with native dispatcher waits.
+    pub user_alert: crate::libs::ntdll::alert_state::UserAlertState,
 }
 
 // Compile-time size validation for Windows 7 x64 compatibility.
@@ -1067,6 +1070,7 @@ impl Ethread {
             wow64_context32: None,
             wow64_start_address: 0,
             wow64_stack_top: 0,
+            user_alert: crate::libs::ntdll::alert_state::UserAlertState::new(),
         }
     }
 
@@ -1523,6 +1527,7 @@ pub fn create_idle_thread(cpu_id: u32) -> Option<&'static mut Ethread> {
 pub unsafe fn terminate(thread: *mut Ethread, _exit_code: u32) {
     unsafe {
         (*thread).exit_time = crate::ke::time::get_system_time() as i64;
+        crate::libs::ntdll::file::terminate_user_alert(&(*thread).user_alert);
         crate::libs::ntdll::file::abandon_mutants((*thread).client_id.unique_thread);
         (*thread).kthread.state = KThreadState::Terminated;
         (*thread).kthread.header.signal_state = 1;
@@ -1735,6 +1740,7 @@ pub unsafe fn ps_terminate_system_thread(ethread: *mut Ethread, _exit_code: u32)
     }
     unsafe {
         (*ethread).exit_time = crate::ke::time::get_system_time() as i64;
+        crate::libs::ntdll::file::terminate_user_alert(&(*ethread).user_alert);
         crate::libs::ntdll::file::abandon_mutants((*ethread).client_id.unique_thread);
         (*ethread).kthread.state = KThreadState::Terminated;
         (*ethread).kthread.header.signal_state = 1;
@@ -2083,6 +2089,28 @@ pub fn find_thread_by_tid(tid: u64) -> Option<*mut Ethread> {
 
         None
     }
+}
+
+/// Retain the process registry lock while accessing a thread's alert extension.
+/// The callback cannot schedule, retain the reference or reenter the registry.
+/// Teardown must remove a process from the registry before freeing its threads.
+pub(crate) fn with_thread_user_alert(
+    tid: u64,
+    operation: impl FnOnce(&crate::libs::ntdll::alert_state::UserAlertState) -> i32,
+) -> Option<i32> {
+    let list = crate::ps::process::get_process_list_ptr().lock();
+    for &process in &list.processes[..list.process_count] {
+        if process.is_null() { continue; }
+        // SAFETY: the registry lock pins listed process allocations. Thread
+        // termination can unlink an ETHREAD but does not free it; process
+        // teardown waits to remove the registry entry before freeing threads.
+        let thread = unsafe { crate::ps::process::find_thread_in_process(process, tid) };
+        if let Some(thread) = thread {
+            // SAFETY: the ETHREAD remains allocated while the registry is held.
+            return Some(operation(unsafe { &(*thread).user_alert }));
+        }
+    }
+    None
 }
 
 /// Build a security descriptor for a thread.

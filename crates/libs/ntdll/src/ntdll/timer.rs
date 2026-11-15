@@ -2,7 +2,7 @@
 //! Clock polling publishes expiration independently of queries. APC callbacks
 //! and wake-from-suspend remain unavailable and are rejected before mutation.
 use super::file::{
-    alloc_dispatcher_handle, with_sync_handles, DispatcherState, HandleKind, TimerState,
+    alloc_dispatcher_handle, with_sync_access, DispatcherState, HandleKind, TimerState,
 };
 use super::status::*;
 use super::types::{LargeInteger, HANDLE, NTSTATUS, PVOID};
@@ -82,20 +82,24 @@ pub unsafe extern "C" fn nt_create_timer(
     if let Err(status) = probe_user_write(timer_handle as u64, core::mem::size_of::<HANDLE>()) {
         return status;
     }
-    let _ = (desired_access, object_attributes);
-    match create_timer_kernel(timer_type) {
-        Ok(handle) => match write_user_object(timer_handle as u64, &handle) {
-            Ok(()) => STATUS_SUCCESS,
-            Err(status) => {
-                super::file::free_handle(handle);
-                status
-            }
-        },
-        Err(status) => status,
-    }
+    super::object::create_native_sync(
+        timer_handle,
+        desired_access,
+        object_attributes,
+        HandleKind::Timer,
+        0,
+        DispatcherState::Timer(TimerState {
+            timer_type,
+            deadline: 0,
+            absolute: false,
+            period_ms: 0,
+            signaled: false,
+            armed: false,
+        }),
+    )
 }
 
-/// Open a named timer. Namespace integration remains unavailable.
+/// Open an existing timer in the dispatcher namespace.
 ///
 /// # Safety
 /// Pointers belong to the calling user process.
@@ -104,14 +108,12 @@ pub unsafe extern "C" fn nt_open_timer(
     desired_access: u32,
     object_attributes: *mut super::types::ObjectAttributes,
 ) -> NTSTATUS {
-    if let Err(status) = probe_user_write(timer_handle as u64, core::mem::size_of::<HANDLE>()) {
-        return status;
-    }
-    if object_attributes.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let _ = desired_access;
-    STATUS_NOT_SUPPORTED
+    super::object::open_native_sync(
+        timer_handle,
+        desired_access,
+        object_attributes,
+        HandleKind::Timer,
+    )
 }
 
 pub type TimerApcRoutine = unsafe extern "C" fn(PVOID, u32, i32);
@@ -142,13 +144,21 @@ pub unsafe extern "C" fn nt_set_timer(
             return status;
         }
     }
-    change_timer(timer_handle, due, timer_apc_routine, timer_context, resume, period, |signaled| {
-        if previous_state.is_null() {
-            Ok(())
-        } else {
-            write_user_object(previous_state as u64, &u8::from(signaled))
-        }
-    })
+    change_timer(
+        timer_handle,
+        due,
+        timer_apc_routine,
+        timer_context,
+        resume,
+        period,
+        |signaled| {
+            if previous_state.is_null() {
+                Ok(())
+            } else {
+                write_user_object(previous_state as u64, &u8::from(signaled))
+            }
+        },
+    )
 }
 
 /// Trusted caller has already captured the 64-bit interval. No kernel address
@@ -161,7 +171,15 @@ pub fn set_timer_kernel(
     resume: u8,
     period: i32,
 ) -> NTSTATUS {
-    change_timer(timer_handle, due, timer_apc_routine, timer_context, resume, period, |_| Ok(()))
+    change_timer(
+        timer_handle,
+        due,
+        timer_apc_routine,
+        timer_context,
+        resume,
+        period,
+        |_| Ok(()),
+    )
 }
 
 fn change_timer(
@@ -176,7 +194,7 @@ fn change_timer(
     if period < 0 {
         return STATUS_INVALID_PARAMETER;
     }
-    with_sync_handles(&[timer_handle], |entries| {
+    with_sync_access(timer_handle, 2, |entries| {
         if entries[0].kind != HandleKind::Timer {
             return Err(STATUS_OBJECT_TYPE_MISMATCH);
         }
@@ -214,7 +232,7 @@ pub unsafe extern "C" fn nt_cancel_timer(timer_handle: HANDLE, current_state: *m
             return status;
         }
     }
-    with_sync_handles(&[timer_handle], |entries| {
+    with_sync_access(timer_handle, 2, |entries| {
         if entries[0].kind != HandleKind::Timer {
             return Err(STATUS_OBJECT_TYPE_MISMATCH);
         }
@@ -260,7 +278,7 @@ pub unsafe extern "C" fn nt_query_timer(
     if let Err(status) = super::sync::query_output(information, length, 16, return_length) {
         return status;
     }
-    with_sync_handles(&[handle], |entries| {
+    with_sync_access(handle, 1, |entries| {
         if entries[0].kind != HandleKind::Timer {
             return Err(STATUS_OBJECT_TYPE_MISMATCH);
         }
@@ -282,4 +300,29 @@ pub unsafe extern "C" fn nt_query_timer(
         super::sync::write_query_output(information, &bytes, return_length)
     })
     .unwrap_or_else(|status| status)
+}
+
+/// # Safety
+/// Name and security must be readable trusted Win32 arguments.
+pub unsafe fn create_timer_win32(
+    security: *const u8,
+    name: *const u16,
+    timer_type: u32,
+) -> Result<(HANDLE, NTSTATUS), NTSTATUS> {
+    let attributes = unsafe { super::object::win32_sync_attributes(security, name)? };
+    super::file::create_sync_handle(
+        HandleKind::Timer,
+        0,
+        DispatcherState::Timer(TimerState {
+            timer_type,
+            deadline: 0,
+            absolute: false,
+            period_ms: 0,
+            signaled: false,
+            armed: false,
+        }),
+        0x001f0003,
+        attributes,
+        true,
+    )
 }

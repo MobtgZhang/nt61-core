@@ -19,3 +19,11 @@ pub mod string {
 
 #[path = "../../../libs/ntdll/src/ntdll/section.rs"]
 pub mod section;
+
+#[path = "../../../libs/ntdll/src/ntdll/alert_state.rs"]
+pub mod alert_state;
+#[path = "../../../libs/ntdll/src/ntdll/alert.rs"]
+pub mod alert;
+
+#[path = "../../../libs/ntdll/src/ntdll/apc.rs"]
+pub mod apc;

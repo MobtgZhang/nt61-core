@@ -1,206 +1,59 @@
-//! ntdll — User-Mode APC (Asynchronous Procedure Call)
-//!
-//! User-mode APC queue management for Windows 7.
-//! APCs are callbacks executed in the context of a specific thread.
-//!
-//! APC Types:
-//! - User APC: Queued by nt_queue_apc_thread, executed when thread is alertable
-//! - Special User APC: Higher priority, for kernel use
-//!
-//! Note: This is separate from ke/apc.rs which handles kernel-mode APCs.
-//!
-//! References:
-//!   * Windows Internals 7th Ed. - Chapter 8
-//!   * MSDN Library "Windows 7" — Asynchronous Procedure Calls
-
+//! Native APC entry points. User callback delivery requires a return-to-user
+//! trampoline and context restoration. Unsupported delivery never invokes a
+//! user routine at kernel privilege or reports a discarded APC as queued.
+pub use super::alert::{nt_alert_thread, nt_test_alert};
 use super::file::{lookup_handle, HandleKind};
-use super::status::{STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
+use super::status::*;
 use super::types::{HANDLE, NTSTATUS, PVOID};
-use crate::ke::sync::Spinlock;
-use core::ptr;
+use crate::mm::user_copy::probe_user_write;
 
-pub type ApcRoutine = unsafe extern "C" fn(apc_context: PVOID);
-
-#[derive(Clone, Copy)]
-pub struct ApcEntry {
-    routine: ApcRoutine,
-    context: PVOID,
-    pub thread_id: u64,
-}
-
-impl ApcEntry {
-    pub const fn new() -> Self {
-        Self {
-            routine: dummy_apc_routine,
-            context: ptr::null_mut(),
-            thread_id: 0,
-        }
+fn validate_apc_thread(handle: HANDLE) -> Result<(), NTSTATUS> {
+    if handle as isize == -2 {
+        return if crate::ps::thread::get_current_ethread().is_null() {
+            Err(STATUS_INVALID_HANDLE)
+        } else {
+            Ok(())
+        };
     }
-}
-
-impl Default for ApcEntry {
-    fn default() -> Self {
-        Self::new()
+    match lookup_handle(handle) {
+        Some(entry) if entry.kind == HandleKind::Thread => Ok(()),
+        Some(_) => Err(STATUS_OBJECT_TYPE_MISMATCH),
+        None => Err(STATUS_INVALID_HANDLE),
     }
 }
 
 /// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe extern "C" fn dummy_apc_routine(_context: PVOID) {}
-
-const MAX_APCS_PER_THREAD: usize = 32;
-
-#[derive(Clone, Copy)]
-struct ThreadApcQueue {
-    apcs: [Option<ApcEntry>; MAX_APCS_PER_THREAD],
-    count: usize,
-}
-
-impl ThreadApcQueue {
-    const fn new() -> Self {
-        Self {
-            apcs: [None; MAX_APCS_PER_THREAD],
-            count: 0,
-        }
-    }
-
-    fn push(&mut self, entry: ApcEntry) -> bool {
-        if self.count >= MAX_APCS_PER_THREAD {
-            return false;
-        }
-        self.apcs[self.count] = Some(entry);
-        self.count += 1;
-        true
-    }
-
-    fn pop(&mut self) -> Option<ApcEntry> {
-        if self.count == 0 {
-            return None;
-        }
-        self.count -= 1;
-        self.apcs[self.count].take()
-    }
-}
-
-const MAX_THREADS: usize = 256;
-static APC_QUEUES: Spinlock<[ThreadApcQueue; MAX_THREADS]> =
-    Spinlock::new([ThreadApcQueue::new(); MAX_THREADS]);
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// All pointers are scalar user addresses; none are executed or dereferenced.
 pub unsafe extern "C" fn nt_queue_apc_thread(
-    thread_handle: HANDLE,
-    apc_routine: ApcRoutine,
-    apc_context: PVOID,
-    argument1: PVOID,
-    argument2: PVOID,
+    thread: HANDLE,
+    routine: PVOID,
+    _argument1: PVOID,
+    _argument2: PVOID,
+    _argument3: PVOID,
 ) -> NTSTATUS {
-    if thread_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
+    if let Err(status) = validate_apc_thread(thread) {
+        return status;
     }
-
-    let entry = match lookup_handle(thread_handle) {
-        Some(e) if e.kind == HandleKind::Thread => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    let thread_id = entry.target;
-    let _ = (argument1, argument2); // Not used in basic implementation
-
-    let apc_entry = ApcEntry {
-        routine: apc_routine,
-        context: apc_context,
-        thread_id,
-    };
-
-    let mut queues = APC_QUEUES.lock();
-    let queue_idx = (thread_id as usize) % MAX_THREADS;
-
-    if !queues[queue_idx].push(apc_entry) {
-        return STATUS_INVALID_PARAMETER; // Queue full
-    }
-
-    // 3. On next kernel->user transition, deliver APC
-
-    STATUS_SUCCESS
+    let _ = routine;
+    STATUS_NOT_IMPLEMENTED
 }
 
-/// - System is about to return to user mode
-pub fn deliver_pending_apcs() {
-    unsafe {
-        let thread_id = 1u64; // Bootstrap: assume thread 1
-
-        let mut queues = APC_QUEUES.lock();
-        let queue_idx = (thread_id as usize) % MAX_THREADS;
-        let queue = &mut queues[queue_idx];
-
-        while let Some(apc) = queue.pop() {
-            (apc.routine)(apc.context);
-        }
-    }
-}
-
-pub fn has_pending_apcs() -> bool {
-    let thread_id = 1u64; // Bootstrap
-
-    let queues = APC_QUEUES.lock();
-    let queue_idx = (thread_id as usize) % MAX_THREADS;
-    queues[queue_idx].count > 0
-}
-
-/// # Safety
+/// Alert-and-resume requires the scheduler's suspend counter and blocking state.
+/// No alert, output or scheduling side effect is committed while unavailable.
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe extern "C" fn nt_test_alert() -> NTSTATUS {
-    if has_pending_apcs() {
-        deliver_pending_apcs();
-        super::status::STATUS_ALERTED
-    } else {
-        STATUS_SUCCESS
-    }
-}
-
 /// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe extern "C" fn nt_alert_thread(thread_handle: HANDLE) -> NTSTATUS {
-    if thread_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    let entry = match lookup_handle(thread_handle) {
-        Some(e) if e.kind == HandleKind::Thread => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    let _thread_id = entry.target;
-
-    STATUS_SUCCESS
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// The optional output pointer belongs to the caller and is probed only.
 pub unsafe extern "C" fn nt_alert_resume_thread(
-    thread_handle: HANDLE,
+    thread: HANDLE,
     previous_suspend_count: *mut u32,
 ) -> NTSTATUS {
-    if thread_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    let entry = match lookup_handle(thread_handle) {
-        Some(e) if e.kind == HandleKind::Thread => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    let _thread_id = entry.target;
-
     if !previous_suspend_count.is_null() {
-        *previous_suspend_count = 0;
+        if let Err(status) = probe_user_write(previous_suspend_count as u64, 4) {
+            return status;
+        }
     }
-
-    STATUS_SUCCESS
+    if let Err(status) = validate_apc_thread(thread) {
+        return status;
+    }
+    STATUS_NOT_IMPLEMENTED
 }
