@@ -1,14 +1,9 @@
 //! LoongArch64 system call dispatch.
 //!
-//! Phase 1 rewrites the original empty stub to provide:
-//!   * The `TrapFrame` ABI consumed by `arch::loongarch64::trap`.
-//!   * A minimal `dispatch_syscall(frame: *mut TrapFrame)` that
-//!     reads syscall number from `$a7` and arguments from `$a0..$a5`,
-//!     dispatches against the NT service table, and stores the
-//!     return value back into `$a0` of the frame.
-//!
-//! Phase 2 extends this with full NT coverage; Phase 7 layers the
-//! x86-on-LA64 BTL on top.
+//! The trap frame supplies the service number in `$a7`, seven integer
+//! arguments in `$a0..$a6`, and trailing arguments on the user stack.
+//! Native and shadow services use the shared tables. Unsupported native
+//! services return `STATUS_NOT_IMPLEMENTED`; invalid numbers are rejected.
 
 use core::arch::asm;
 
@@ -160,19 +155,29 @@ pub unsafe extern "C" fn dispatch_syscall(frame: *mut TrapFrame) {
         a6 as usize,
         0,
     ];
-    let common_status = unsafe {
-        crate::ke::ssdt_common::dispatch_syscall_with_stack(
-            num as usize,
-            register_args,
-            crate::ke::ssdt_common::SEVEN_REGISTER_ARCHITECTURES,
-            stack_pointer as usize,
-        )
+    if (0x1000..=0x1FFF).contains(&num) {
+        let result = match crate::arch::common::syscall_frame::SyscallFrame::capture_shadow(
+            num,
+            &[a0, a1, a2, a3, a4, a5, a6],
+            stack_pointer as u64,
+        ) {
+            Ok(arguments) => {
+                crate::ke::shadow_ssdt::dispatch_shadow_service(num as u32, &arguments)
+            }
+            Err(status) => status as u32 as u64,
+        };
+        (*frame).a[0] = result;
+        (*frame).era = (*frame).era.wrapping_add(4);
+        return;
+    }
+    let common_arguments = crate::ke::ssdt_common::SyscallArguments {
+        register_args,
+        integer_register_count: crate::ke::ssdt_common::SEVEN_REGISTER_ARCHITECTURES,
+        stack_pointer: stack_pointer as usize,
     };
-    let common_result = if common_status == crate::ke::ssdt_common::STATUS_INVALID_SYSTEM_SERVICE {
-        None
-    } else {
-        Some(common_status)
-    };
+    // SAFETY: the trap stub supplied the captured integer registers and user SP.
+    let common_result =
+        unsafe { crate::ke::ssdt_common::try_dispatch(num as usize, &common_arguments) };
 
     let result = match common_result {
         Some(status) => status as u64,
@@ -185,28 +190,15 @@ pub unsafe extern "C" fn dispatch_syscall(frame: *mut TrapFrame) {
     (*frame).era = (*frame).era.wrapping_add(4);
 }
 
-/// Top-level handler. Phase 1 dispatches the subset of NT calls
-/// needed by the Phase 7 BTL bridge; everything else returns
-/// `STATUS_NOT_IMPLEMENTED`.
+/// Dispatch project extensions after the shared NT and win32k tables.
 fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     const SYS_EXIT_PROCESS_U64: u64 = crate::arch::common::cmd_host::SYS_EXIT_PROCESS as u64;
+    // Native services are dispatched through the common SSDT above. Never
+    // let an absent registration fall through to a placeholder success result.
+    if num < 0x0200 {
+        return crate::ke::ssdt_common::unregistered_service_status(num as usize) as u64;
+    }
     match num {
-        SYS_NT_CLOSE => {
-            // NT_CLOSE(handle) — Phase 1 returns success for any handle
-            // so test programs can complete the round-trip.
-            STATUS_SUCCESS
-        }
-        SYS_NT_DELAY_EXECUTION => {
-            // NT_DELAY_EXECUTION — busy-wait for `a1` 100-ns intervals.
-            // Used by Phase 6/7 tests for timing.
-            crate::arch::loongarch64::pit::busy_wait_100ns(a1);
-            STATUS_SUCCESS
-        }
-        SYS_NT_TERMINATE_PROCESS => STATUS_SUCCESS,
-        SYS_NT_QUERY_SYSTEM_INFORMATION => {
-            // Phase 1: return success with no data so callers can probe.
-            STATUS_SUCCESS
-        }
         SYS_PUTCHAR => crate::arch::common::cmd_host::putchar(a0 as u8),
         SYS_POLL_KEY => {
             if let Some(byte) = crate::arch::common::cmd_host::poll_key() {
@@ -265,10 +257,18 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         n if n == crate::arch::common::desktop_host::SYS_DESKTOP_POLL_KEY as u64 => unsafe {
             crate::arch::common::desktop_host::poll_key(a0 as *mut u8)
         },
-        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_TIME as u64 => crate::arch::common::desktop_host::shell_time(),
-        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_TICKS as u64 => crate::arch::common::desktop_host::shell_ticks(),
-        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_AUDIO as u64 => crate::arch::common::desktop_host::shell_audio(a0 as u64, a1 as u64),
-        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_DEVICES as u64 => crate::arch::common::desktop_host::shell_devices(),
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_TIME as u64 => {
+            crate::arch::common::desktop_host::shell_time()
+        }
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_TICKS as u64 => {
+            crate::arch::common::desktop_host::shell_ticks()
+        }
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_AUDIO as u64 => {
+            crate::arch::common::desktop_host::shell_audio(a0 as u64, a1 as u64)
+        }
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_DEVICES as u64 => {
+            crate::arch::common::desktop_host::shell_devices()
+        }
         n if n == crate::arch::common::desktop_host::SYS_DESKTOP_POLL_MOUSE as u64 => unsafe {
             crate::arch::common::desktop_host::poll_mouse(a0 as *mut _)
         },

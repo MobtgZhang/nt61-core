@@ -1,161 +1,454 @@
-//! System-call number definitions (Windows 7 x64 kernel).
+//! Complete Windows 7 SP1 x64 native service-number surface.
 //!
-//! Only the most commonly used calls are listed here — Phase 2
-//! extends the list as subsystems grow. The numbers match
-//! `ntoskrnl.exe` of Windows 7 (build 7601).
+//! All host architectures share these identities. Constants resolve against
+//! nt61-abi at compile time; they describe ABI coverage, not handler semantics.
 
-// Process / thread
-pub const NT_CREATE_PROCESS: u32 = 0x009F;
-pub const NT_CREATE_THREAD: u32 = 0x004B;
-pub const NT_CREATE_USER_PROCESS: u32 = 0x00AA;
-pub const NT_TERMINATE_PROCESS: u32 = 0x0029;
-pub const NT_TERMINATE_THREAD: u32 = 0x0050;
-pub const NT_OPEN_PROCESS: u32 = 0x0023;
-pub const NT_OPEN_THREAD: u32 = 0x00FE;
-pub const NT_QUERY_INFORMATION_PROCESS: u32 = 0x0016;
-pub const NT_SET_INFORMATION_PROCESS: u32 = 0x0019;
-pub const NT_QUERY_INFORMATION_THREAD: u32 = 0x0022;
-pub const NT_SET_INFORMATION_THREAD: u32 = 0x000A;
-pub const NT_SUSPEND_THREAD: u32 = 0x017B;
-pub const NT_RESUME_THREAD: u32 = 0x004F;
+const fn native_number(name: &str) -> u32 {
+    let entries = &nt61_abi::syscalls::NATIVE_SYSCALLS;
+    let wanted = name.as_bytes();
+    let mut index = 0;
+    while index < entries.len() {
+        let candidate = entries[index].name.as_bytes();
+        if candidate.len() == wanted.len() {
+            let mut offset = 0;
+            while offset < wanted.len() && candidate[offset] == wanted[offset] {
+                offset += 1;
+            }
+            if offset == wanted.len() {
+                return entries[index].number as u32;
+            }
+        }
+        index += 1;
+    }
+    panic!("native service is absent from the Windows 7 SP1 ABI");
+}
 
-// Virtual memory
-pub const NT_ALLOCATE_VIRTUAL_MEMORY: u32 = 0x0015;
-pub const NT_FREE_VIRTUAL_MEMORY: u32 = 0x001B;
-pub const NT_READ_VIRTUAL_MEMORY: u32 = 0x003C;
-pub const NT_WRITE_VIRTUAL_MEMORY: u32 = 0x0037;
-pub const NT_PROTECT_VIRTUAL_MEMORY: u32 = 0x004D;
-pub const NT_QUERY_VIRTUAL_MEMORY: u32 = 0x0020;
+macro_rules! native_numbers {
+    ($($constant:ident => $name:literal),+ $(,)?) => {
+        $(pub const $constant: u32 = native_number($name);)+
+        /// Complete native names and constants, for compatibility audits.
+        pub const NATIVE_NUMBERS: &[(&str, u32)] = &[$(($name, $constant)),+];
+    };
+}
 
-// File I/O
-pub const NT_CREATE_FILE: u32 = 0x0052;
-pub const NT_OPEN_FILE: u32 = 0x0030;
-pub const NT_READ_FILE: u32 = 0x0003;
-pub const NT_WRITE_FILE: u32 = 0x0005;
-pub const NT_CLOSE: u32 = 0x000C;
-pub const NT_QUERY_INFORMATION_FILE: u32 = 0x000E;
-pub const NT_SET_INFORMATION_FILE: u32 = 0x0024;
-pub const NT_QUERY_DIRECTORY_FILE: u32 = 0x0032;
-pub const NT_DELETE_FILE: u32 = 0x00B2;
-
-// Synchronisation
-pub const NT_CREATE_EVENT: u32 = 0x0045;
-pub const NT_OPEN_EVENT: u32 = 0x003D;
-pub const NT_WAIT_FOR_SINGLE_OBJECT: u32 = 0x0001;
-pub const NT_WAIT_FOR_MULTIPLE_OBJECTS: u32 = 0x0058;
-pub const NT_SET_EVENT: u32 = 0x000B;
-pub const NT_RESET_EVENT: u32 = 0x0141;
-pub const NT_CREATE_MUTANT: u32 = 0x009A;
-pub const NT_CREATE_SEMAPHORE: u32 = 0x00A3;
-pub const NT_CREATE_TIMER: u32 = 0x00A6;
-pub const NT_DELAY_EXECUTION: u32 = 0x0031;
-pub const NT_YIELD_EXECUTION: u32 = 0x0043;
-
-// Keyed events / fast locks
-pub const NT_CREATE_KEYED_EVENT: u32 = 0x0098;
-
-// Section / map
-pub const NT_CREATE_SECTION: u32 = 0x0047;
-pub const NT_OPEN_SECTION: u32 = 0x0034;
-pub const NT_MAP_VIEW_OF_SECTION: u32 = 0x0025;
-pub const NT_UNMAP_VIEW_OF_SECTION: u32 = 0x0027;
-
-// Registry
-pub const NT_CREATE_KEY: u32 = 0x001A;
-pub const NT_OPEN_KEY: u32 = 0x000F;
-pub const NT_QUERY_VALUE_KEY: u32 = 0x0014;
-pub const NT_SET_VALUE_KEY: u32 = 0x005D;
-pub const NT_ENUMERATE_VALUE_KEY: u32 = 0x0010;
-pub const NT_ENUMERATE_KEY: u32 = 0x002F;
-pub const NT_DELETE_KEY: u32 = 0x00B3;
-
-// Process / thread time
-pub const NT_QUERY_SYSTEM_TIME: u32 = 0x0057;
-pub const NT_QUERY_PERFORMANCE_COUNTER: u32 = 0x002E;
-pub const NT_SET_SYSTEM_TIME: u32 = 0x016E;
-
-// Information
-pub const NT_QUERY_SYSTEM_INFORMATION: u32 = 0x0033;
-
-// Misc
-pub const NT_TEST_ALERT: u32 = 0x017E;
-pub const NT_CONTINUE: u32 = 0x0040;
-pub const NT_RAISE_HARD_ERROR: u32 = 0x0130;
-pub const NT_ALERT_THREAD: u32 = 0x006A;
-pub const NT_ALERT_RESUME_THREAD: u32 = 0x0069;
-
-// Exit / shutdown
-pub const NT_SHUTDOWN_SYSTEM: u32 = 0x0174;
+native_numbers! {
+    NT_MAP_USER_PHYSICAL_PAGES_SCATTER => "NtMapUserPhysicalPagesScatter",
+    NT_WAIT_FOR_SINGLE_OBJECT => "NtWaitForSingleObject",
+    NT_CALLBACK_RETURN => "NtCallbackReturn",
+    NT_READ_FILE => "NtReadFile",
+    NT_DEVICE_IO_CONTROL_FILE => "NtDeviceIoControlFile",
+    NT_WRITE_FILE => "NtWriteFile",
+    NT_REMOVE_IO_COMPLETION => "NtRemoveIoCompletion",
+    NT_RELEASE_SEMAPHORE => "NtReleaseSemaphore",
+    NT_REPLY_WAIT_RECEIVE_PORT => "NtReplyWaitReceivePort",
+    NT_REPLY_PORT => "NtReplyPort",
+    NT_SET_INFORMATION_THREAD => "NtSetInformationThread",
+    NT_SET_EVENT => "NtSetEvent",
+    NT_CLOSE => "NtClose",
+    NT_QUERY_OBJECT => "NtQueryObject",
+    NT_QUERY_INFORMATION_FILE => "NtQueryInformationFile",
+    NT_OPEN_KEY => "NtOpenKey",
+    NT_ENUMERATE_VALUE_KEY => "NtEnumerateValueKey",
+    NT_FIND_ATOM => "NtFindAtom",
+    NT_QUERY_DEFAULT_LOCALE => "NtQueryDefaultLocale",
+    NT_QUERY_KEY => "NtQueryKey",
+    NT_QUERY_VALUE_KEY => "NtQueryValueKey",
+    NT_ALLOCATE_VIRTUAL_MEMORY => "NtAllocateVirtualMemory",
+    NT_QUERY_INFORMATION_PROCESS => "NtQueryInformationProcess",
+    NT_WAIT_FOR_MULTIPLE_OBJECTS32 => "NtWaitForMultipleObjects32",
+    NT_WRITE_FILE_GATHER => "NtWriteFileGather",
+    NT_SET_INFORMATION_PROCESS => "NtSetInformationProcess",
+    NT_CREATE_KEY => "NtCreateKey",
+    NT_FREE_VIRTUAL_MEMORY => "NtFreeVirtualMemory",
+    NT_IMPERSONATE_CLIENT_OF_PORT => "NtImpersonateClientOfPort",
+    NT_RELEASE_MUTANT => "NtReleaseMutant",
+    NT_QUERY_INFORMATION_TOKEN => "NtQueryInformationToken",
+    NT_REQUEST_WAIT_REPLY_PORT => "NtRequestWaitReplyPort",
+    NT_QUERY_VIRTUAL_MEMORY => "NtQueryVirtualMemory",
+    NT_OPEN_THREAD_TOKEN => "NtOpenThreadToken",
+    NT_QUERY_INFORMATION_THREAD => "NtQueryInformationThread",
+    NT_OPEN_PROCESS => "NtOpenProcess",
+    NT_SET_INFORMATION_FILE => "NtSetInformationFile",
+    NT_MAP_VIEW_OF_SECTION => "NtMapViewOfSection",
+    NT_ACCESS_CHECK_AND_AUDIT_ALARM => "NtAccessCheckAndAuditAlarm",
+    NT_UNMAP_VIEW_OF_SECTION => "NtUnmapViewOfSection",
+    NT_REPLY_WAIT_RECEIVE_PORT_EX => "NtReplyWaitReceivePortEx",
+    NT_TERMINATE_PROCESS => "NtTerminateProcess",
+    NT_SET_EVENT_BOOST_PRIORITY => "NtSetEventBoostPriority",
+    NT_READ_FILE_SCATTER => "NtReadFileScatter",
+    NT_OPEN_THREAD_TOKEN_EX => "NtOpenThreadTokenEx",
+    NT_OPEN_PROCESS_TOKEN_EX => "NtOpenProcessTokenEx",
+    NT_QUERY_PERFORMANCE_COUNTER => "NtQueryPerformanceCounter",
+    NT_ENUMERATE_KEY => "NtEnumerateKey",
+    NT_OPEN_FILE => "NtOpenFile",
+    NT_DELAY_EXECUTION => "NtDelayExecution",
+    NT_QUERY_DIRECTORY_FILE => "NtQueryDirectoryFile",
+    NT_QUERY_SYSTEM_INFORMATION => "NtQuerySystemInformation",
+    NT_OPEN_SECTION => "NtOpenSection",
+    NT_QUERY_TIMER => "NtQueryTimer",
+    NT_FS_CONTROL_FILE => "NtFsControlFile",
+    NT_WRITE_VIRTUAL_MEMORY => "NtWriteVirtualMemory",
+    NT_CLOSE_OBJECT_AUDIT_ALARM => "NtCloseObjectAuditAlarm",
+    NT_DUPLICATE_OBJECT => "NtDuplicateObject",
+    NT_QUERY_ATTRIBUTES_FILE => "NtQueryAttributesFile",
+    NT_CLEAR_EVENT => "NtClearEvent",
+    NT_READ_VIRTUAL_MEMORY => "NtReadVirtualMemory",
+    NT_OPEN_EVENT => "NtOpenEvent",
+    NT_ADJUST_PRIVILEGES_TOKEN => "NtAdjustPrivilegesToken",
+    NT_DUPLICATE_TOKEN => "NtDuplicateToken",
+    NT_CONTINUE => "NtContinue",
+    NT_QUERY_DEFAULT_UI_LANGUAGE => "NtQueryDefaultUILanguage",
+    NT_QUEUE_APC_THREAD => "NtQueueApcThread",
+    NT_YIELD_EXECUTION => "NtYieldExecution",
+    NT_ADD_ATOM => "NtAddAtom",
+    NT_CREATE_EVENT => "NtCreateEvent",
+    NT_QUERY_VOLUME_INFORMATION_FILE => "NtQueryVolumeInformationFile",
+    NT_CREATE_SECTION => "NtCreateSection",
+    NT_FLUSH_BUFFERS_FILE => "NtFlushBuffersFile",
+    NT_APPHELP_CACHE_CONTROL => "NtApphelpCacheControl",
+    NT_CREATE_PROCESS_EX => "NtCreateProcessEx",
+    NT_CREATE_THREAD => "NtCreateThread",
+    NT_IS_PROCESS_IN_JOB => "NtIsProcessInJob",
+    NT_PROTECT_VIRTUAL_MEMORY => "NtProtectVirtualMemory",
+    NT_QUERY_SECTION => "NtQuerySection",
+    NT_RESUME_THREAD => "NtResumeThread",
+    NT_TERMINATE_THREAD => "NtTerminateThread",
+    NT_READ_REQUEST_DATA => "NtReadRequestData",
+    NT_CREATE_FILE => "NtCreateFile",
+    NT_QUERY_EVENT => "NtQueryEvent",
+    NT_WRITE_REQUEST_DATA => "NtWriteRequestData",
+    NT_OPEN_DIRECTORY_OBJECT => "NtOpenDirectoryObject",
+    NT_ACCESS_CHECK_BY_TYPE_AND_AUDIT_ALARM => "NtAccessCheckByTypeAndAuditAlarm",
+    NT_QUERY_SYSTEM_TIME => "NtQuerySystemTime",
+    NT_WAIT_FOR_MULTIPLE_OBJECTS => "NtWaitForMultipleObjects",
+    NT_SET_INFORMATION_OBJECT => "NtSetInformationObject",
+    NT_CANCEL_IO_FILE => "NtCancelIoFile",
+    NT_TRACE_EVENT => "NtTraceEvent",
+    NT_POWER_INFORMATION => "NtPowerInformation",
+    NT_SET_VALUE_KEY => "NtSetValueKey",
+    NT_CANCEL_TIMER => "NtCancelTimer",
+    NT_SET_TIMER => "NtSetTimer",
+    NT_ACCEPT_CONNECT_PORT => "NtAcceptConnectPort",
+    NT_ACCESS_CHECK => "NtAccessCheck",
+    NT_ACCESS_CHECK_BY_TYPE => "NtAccessCheckByType",
+    NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST => "NtAccessCheckByTypeResultList",
+    NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST_AND_AUDIT_ALARM => "NtAccessCheckByTypeResultListAndAuditAlarm",
+    NT_ACCESS_CHECK_BY_TYPE_RESULT_LIST_AND_AUDIT_ALARM_BY_HANDLE => "NtAccessCheckByTypeResultListAndAuditAlarmByHandle",
+    NT_ADD_BOOT_ENTRY => "NtAddBootEntry",
+    NT_ADD_DRIVER_ENTRY => "NtAddDriverEntry",
+    NT_ADJUST_GROUPS_TOKEN => "NtAdjustGroupsToken",
+    NT_ALERT_RESUME_THREAD => "NtAlertResumeThread",
+    NT_ALERT_THREAD => "NtAlertThread",
+    NT_ALLOCATE_LOCALLY_UNIQUE_ID => "NtAllocateLocallyUniqueId",
+    NT_ALLOCATE_RESERVE_OBJECT => "NtAllocateReserveObject",
+    NT_ALLOCATE_USER_PHYSICAL_PAGES => "NtAllocateUserPhysicalPages",
+    NT_ALLOCATE_UUIDS => "NtAllocateUuids",
+    NT_ALPC_ACCEPT_CONNECT_PORT => "NtAlpcAcceptConnectPort",
+    NT_ALPC_CANCEL_MESSAGE => "NtAlpcCancelMessage",
+    NT_ALPC_CONNECT_PORT => "NtAlpcConnectPort",
+    NT_ALPC_CREATE_PORT => "NtAlpcCreatePort",
+    NT_ALPC_CREATE_PORT_SECTION => "NtAlpcCreatePortSection",
+    NT_ALPC_CREATE_RESOURCE_RESERVE => "NtAlpcCreateResourceReserve",
+    NT_ALPC_CREATE_SECTION_VIEW => "NtAlpcCreateSectionView",
+    NT_ALPC_CREATE_SECURITY_CONTEXT => "NtAlpcCreateSecurityContext",
+    NT_ALPC_DELETE_PORT_SECTION => "NtAlpcDeletePortSection",
+    NT_ALPC_DELETE_RESOURCE_RESERVE => "NtAlpcDeleteResourceReserve",
+    NT_ALPC_DELETE_SECTION_VIEW => "NtAlpcDeleteSectionView",
+    NT_ALPC_DELETE_SECURITY_CONTEXT => "NtAlpcDeleteSecurityContext",
+    NT_ALPC_DISCONNECT_PORT => "NtAlpcDisconnectPort",
+    NT_ALPC_IMPERSONATE_CLIENT_OF_PORT => "NtAlpcImpersonateClientOfPort",
+    NT_ALPC_OPEN_SENDER_PROCESS => "NtAlpcOpenSenderProcess",
+    NT_ALPC_OPEN_SENDER_THREAD => "NtAlpcOpenSenderThread",
+    NT_ALPC_QUERY_INFORMATION => "NtAlpcQueryInformation",
+    NT_ALPC_QUERY_INFORMATION_MESSAGE => "NtAlpcQueryInformationMessage",
+    NT_ALPC_REVOKE_SECURITY_CONTEXT => "NtAlpcRevokeSecurityContext",
+    NT_ALPC_SEND_WAIT_RECEIVE_PORT => "NtAlpcSendWaitReceivePort",
+    NT_ALPC_SET_INFORMATION => "NtAlpcSetInformation",
+    NT_ARE_MAPPED_FILES_THE_SAME => "NtAreMappedFilesTheSame",
+    NT_ASSIGN_PROCESS_TO_JOB_OBJECT => "NtAssignProcessToJobObject",
+    NT_CANCEL_IO_FILE_EX => "NtCancelIoFileEx",
+    NT_CANCEL_SYNCHRONOUS_IO_FILE => "NtCancelSynchronousIoFile",
+    NT_COMMIT_COMPLETE => "NtCommitComplete",
+    NT_COMMIT_ENLISTMENT => "NtCommitEnlistment",
+    NT_COMMIT_TRANSACTION => "NtCommitTransaction",
+    NT_COMPACT_KEYS => "NtCompactKeys",
+    NT_COMPARE_TOKENS => "NtCompareTokens",
+    NT_COMPLETE_CONNECT_PORT => "NtCompleteConnectPort",
+    NT_COMPRESS_KEY => "NtCompressKey",
+    NT_CONNECT_PORT => "NtConnectPort",
+    NT_CREATE_DEBUG_OBJECT => "NtCreateDebugObject",
+    NT_CREATE_DIRECTORY_OBJECT => "NtCreateDirectoryObject",
+    NT_CREATE_ENLISTMENT => "NtCreateEnlistment",
+    NT_CREATE_EVENT_PAIR => "NtCreateEventPair",
+    NT_CREATE_IO_COMPLETION => "NtCreateIoCompletion",
+    NT_CREATE_JOB_OBJECT => "NtCreateJobObject",
+    NT_CREATE_JOB_SET => "NtCreateJobSet",
+    NT_CREATE_KEY_TRANSACTED => "NtCreateKeyTransacted",
+    NT_CREATE_KEYED_EVENT => "NtCreateKeyedEvent",
+    NT_CREATE_MAILSLOT_FILE => "NtCreateMailslotFile",
+    NT_CREATE_MUTANT => "NtCreateMutant",
+    NT_CREATE_NAMED_PIPE_FILE => "NtCreateNamedPipeFile",
+    NT_CREATE_PAGING_FILE => "NtCreatePagingFile",
+    NT_CREATE_PORT => "NtCreatePort",
+    NT_CREATE_PRIVATE_NAMESPACE => "NtCreatePrivateNamespace",
+    NT_CREATE_PROCESS => "NtCreateProcess",
+    NT_CREATE_PROFILE => "NtCreateProfile",
+    NT_CREATE_PROFILE_EX => "NtCreateProfileEx",
+    NT_CREATE_RESOURCE_MANAGER => "NtCreateResourceManager",
+    NT_CREATE_SEMAPHORE => "NtCreateSemaphore",
+    NT_CREATE_SYMBOLIC_LINK_OBJECT => "NtCreateSymbolicLinkObject",
+    NT_CREATE_THREAD_EX => "NtCreateThreadEx",
+    NT_CREATE_TIMER => "NtCreateTimer",
+    NT_CREATE_TOKEN => "NtCreateToken",
+    NT_CREATE_TRANSACTION => "NtCreateTransaction",
+    NT_CREATE_TRANSACTION_MANAGER => "NtCreateTransactionManager",
+    NT_CREATE_USER_PROCESS => "NtCreateUserProcess",
+    NT_CREATE_WAITABLE_PORT => "NtCreateWaitablePort",
+    NT_CREATE_WORKER_FACTORY => "NtCreateWorkerFactory",
+    NT_DEBUG_ACTIVE_PROCESS => "NtDebugActiveProcess",
+    NT_DEBUG_CONTINUE => "NtDebugContinue",
+    NT_DELETE_ATOM => "NtDeleteAtom",
+    NT_DELETE_BOOT_ENTRY => "NtDeleteBootEntry",
+    NT_DELETE_DRIVER_ENTRY => "NtDeleteDriverEntry",
+    NT_DELETE_FILE => "NtDeleteFile",
+    NT_DELETE_KEY => "NtDeleteKey",
+    NT_DELETE_OBJECT_AUDIT_ALARM => "NtDeleteObjectAuditAlarm",
+    NT_DELETE_PRIVATE_NAMESPACE => "NtDeletePrivateNamespace",
+    NT_DELETE_VALUE_KEY => "NtDeleteValueKey",
+    NT_DISABLE_LAST_KNOWN_GOOD => "NtDisableLastKnownGood",
+    NT_DISPLAY_STRING => "NtDisplayString",
+    NT_DRAW_TEXT => "NtDrawText",
+    NT_ENABLE_LAST_KNOWN_GOOD => "NtEnableLastKnownGood",
+    NT_ENUMERATE_BOOT_ENTRIES => "NtEnumerateBootEntries",
+    NT_ENUMERATE_DRIVER_ENTRIES => "NtEnumerateDriverEntries",
+    NT_ENUMERATE_SYSTEM_ENVIRONMENT_VALUES_EX => "NtEnumerateSystemEnvironmentValuesEx",
+    NT_ENUMERATE_TRANSACTION_OBJECT => "NtEnumerateTransactionObject",
+    NT_EXTEND_SECTION => "NtExtendSection",
+    NT_FILTER_TOKEN => "NtFilterToken",
+    NT_FLUSH_INSTALL_UI_LANGUAGE => "NtFlushInstallUILanguage",
+    NT_FLUSH_INSTRUCTION_CACHE => "NtFlushInstructionCache",
+    NT_FLUSH_KEY => "NtFlushKey",
+    NT_FLUSH_PROCESS_WRITE_BUFFERS => "NtFlushProcessWriteBuffers",
+    NT_FLUSH_VIRTUAL_MEMORY => "NtFlushVirtualMemory",
+    NT_FLUSH_WRITE_BUFFER => "NtFlushWriteBuffer",
+    NT_FREE_USER_PHYSICAL_PAGES => "NtFreeUserPhysicalPages",
+    NT_FREEZE_REGISTRY => "NtFreezeRegistry",
+    NT_FREEZE_TRANSACTIONS => "NtFreezeTransactions",
+    NT_GET_CONTEXT_THREAD => "NtGetContextThread",
+    NT_GET_CURRENT_PROCESSOR_NUMBER => "NtGetCurrentProcessorNumber",
+    NT_GET_DEVICE_POWER_STATE => "NtGetDevicePowerState",
+    NT_GET_MUI_REGISTRY_INFO => "NtGetMUIRegistryInfo",
+    NT_GET_NEXT_PROCESS => "NtGetNextProcess",
+    NT_GET_NEXT_THREAD => "NtGetNextThread",
+    NT_GET_NLS_SECTION_PTR => "NtGetNlsSectionPtr",
+    NT_GET_NOTIFICATION_RESOURCE_MANAGER => "NtGetNotificationResourceManager",
+    NT_GET_PLUG_PLAY_EVENT => "NtGetPlugPlayEvent",
+    NT_GET_WRITE_WATCH => "NtGetWriteWatch",
+    NT_IMPERSONATE_ANONYMOUS_TOKEN => "NtImpersonateAnonymousToken",
+    NT_IMPERSONATE_THREAD => "NtImpersonateThread",
+    NT_INITIALIZE_NLS_FILES => "NtInitializeNlsFiles",
+    NT_INITIALIZE_REGISTRY => "NtInitializeRegistry",
+    NT_INITIATE_POWER_ACTION => "NtInitiatePowerAction",
+    NT_IS_SYSTEM_RESUME_AUTOMATIC => "NtIsSystemResumeAutomatic",
+    NT_IS_UI_LANGUAGE_COMITTED => "NtIsUILanguageComitted",
+    NT_LISTEN_PORT => "NtListenPort",
+    NT_LOAD_DRIVER => "NtLoadDriver",
+    NT_LOAD_KEY => "NtLoadKey",
+    NT_LOAD_KEY2 => "NtLoadKey2",
+    NT_LOAD_KEY_EX => "NtLoadKeyEx",
+    NT_LOCK_FILE => "NtLockFile",
+    NT_LOCK_PRODUCT_ACTIVATION_KEYS => "NtLockProductActivationKeys",
+    NT_LOCK_REGISTRY_KEY => "NtLockRegistryKey",
+    NT_LOCK_VIRTUAL_MEMORY => "NtLockVirtualMemory",
+    NT_MAKE_PERMANENT_OBJECT => "NtMakePermanentObject",
+    NT_MAKE_TEMPORARY_OBJECT => "NtMakeTemporaryObject",
+    NT_MAP_CMF_MODULE => "NtMapCMFModule",
+    NT_MAP_USER_PHYSICAL_PAGES => "NtMapUserPhysicalPages",
+    NT_MODIFY_BOOT_ENTRY => "NtModifyBootEntry",
+    NT_MODIFY_DRIVER_ENTRY => "NtModifyDriverEntry",
+    NT_NOTIFY_CHANGE_DIRECTORY_FILE => "NtNotifyChangeDirectoryFile",
+    NT_NOTIFY_CHANGE_KEY => "NtNotifyChangeKey",
+    NT_NOTIFY_CHANGE_MULTIPLE_KEYS => "NtNotifyChangeMultipleKeys",
+    NT_NOTIFY_CHANGE_SESSION => "NtNotifyChangeSession",
+    NT_OPEN_ENLISTMENT => "NtOpenEnlistment",
+    NT_OPEN_EVENT_PAIR => "NtOpenEventPair",
+    NT_OPEN_IO_COMPLETION => "NtOpenIoCompletion",
+    NT_OPEN_JOB_OBJECT => "NtOpenJobObject",
+    NT_OPEN_KEY_EX => "NtOpenKeyEx",
+    NT_OPEN_KEY_TRANSACTED => "NtOpenKeyTransacted",
+    NT_OPEN_KEY_TRANSACTED_EX => "NtOpenKeyTransactedEx",
+    NT_OPEN_KEYED_EVENT => "NtOpenKeyedEvent",
+    NT_OPEN_MUTANT => "NtOpenMutant",
+    NT_OPEN_OBJECT_AUDIT_ALARM => "NtOpenObjectAuditAlarm",
+    NT_OPEN_PRIVATE_NAMESPACE => "NtOpenPrivateNamespace",
+    NT_OPEN_PROCESS_TOKEN => "NtOpenProcessToken",
+    NT_OPEN_RESOURCE_MANAGER => "NtOpenResourceManager",
+    NT_OPEN_SEMAPHORE => "NtOpenSemaphore",
+    NT_OPEN_SESSION => "NtOpenSession",
+    NT_OPEN_SYMBOLIC_LINK_OBJECT => "NtOpenSymbolicLinkObject",
+    NT_OPEN_THREAD => "NtOpenThread",
+    NT_OPEN_TIMER => "NtOpenTimer",
+    NT_OPEN_TRANSACTION => "NtOpenTransaction",
+    NT_OPEN_TRANSACTION_MANAGER => "NtOpenTransactionManager",
+    NT_PLUG_PLAY_CONTROL => "NtPlugPlayControl",
+    NT_PRE_PREPARE_COMPLETE => "NtPrePrepareComplete",
+    NT_PRE_PREPARE_ENLISTMENT => "NtPrePrepareEnlistment",
+    NT_PREPARE_COMPLETE => "NtPrepareComplete",
+    NT_PREPARE_ENLISTMENT => "NtPrepareEnlistment",
+    NT_PRIVILEGE_CHECK => "NtPrivilegeCheck",
+    NT_PRIVILEGE_OBJECT_AUDIT_ALARM => "NtPrivilegeObjectAuditAlarm",
+    NT_PRIVILEGED_SERVICE_AUDIT_ALARM => "NtPrivilegedServiceAuditAlarm",
+    NT_PROPAGATION_COMPLETE => "NtPropagationComplete",
+    NT_PROPAGATION_FAILED => "NtPropagationFailed",
+    NT_PULSE_EVENT => "NtPulseEvent",
+    NT_QUERY_BOOT_ENTRY_ORDER => "NtQueryBootEntryOrder",
+    NT_QUERY_BOOT_OPTIONS => "NtQueryBootOptions",
+    NT_QUERY_DEBUG_FILTER_STATE => "NtQueryDebugFilterState",
+    NT_QUERY_DIRECTORY_OBJECT => "NtQueryDirectoryObject",
+    NT_QUERY_DRIVER_ENTRY_ORDER => "NtQueryDriverEntryOrder",
+    NT_QUERY_EA_FILE => "NtQueryEaFile",
+    NT_QUERY_FULL_ATTRIBUTES_FILE => "NtQueryFullAttributesFile",
+    NT_QUERY_INFORMATION_ATOM => "NtQueryInformationAtom",
+    NT_QUERY_INFORMATION_ENLISTMENT => "NtQueryInformationEnlistment",
+    NT_QUERY_INFORMATION_JOB_OBJECT => "NtQueryInformationJobObject",
+    NT_QUERY_INFORMATION_PORT => "NtQueryInformationPort",
+    NT_QUERY_INFORMATION_RESOURCE_MANAGER => "NtQueryInformationResourceManager",
+    NT_QUERY_INFORMATION_TRANSACTION => "NtQueryInformationTransaction",
+    NT_QUERY_INFORMATION_TRANSACTION_MANAGER => "NtQueryInformationTransactionManager",
+    NT_QUERY_INFORMATION_WORKER_FACTORY => "NtQueryInformationWorkerFactory",
+    NT_QUERY_INSTALL_UI_LANGUAGE => "NtQueryInstallUILanguage",
+    NT_QUERY_INTERVAL_PROFILE => "NtQueryIntervalProfile",
+    NT_QUERY_IO_COMPLETION => "NtQueryIoCompletion",
+    NT_QUERY_LICENSE_VALUE => "NtQueryLicenseValue",
+    NT_QUERY_MULTIPLE_VALUE_KEY => "NtQueryMultipleValueKey",
+    NT_QUERY_MUTANT => "NtQueryMutant",
+    NT_QUERY_OPEN_SUB_KEYS => "NtQueryOpenSubKeys",
+    NT_QUERY_OPEN_SUB_KEYS_EX => "NtQueryOpenSubKeysEx",
+    NT_QUERY_PORT_INFORMATION_PROCESS => "NtQueryPortInformationProcess",
+    NT_QUERY_QUOTA_INFORMATION_FILE => "NtQueryQuotaInformationFile",
+    NT_QUERY_SECURITY_ATTRIBUTES_TOKEN => "NtQuerySecurityAttributesToken",
+    NT_QUERY_SECURITY_OBJECT => "NtQuerySecurityObject",
+    NT_QUERY_SEMAPHORE => "NtQuerySemaphore",
+    NT_QUERY_SYMBOLIC_LINK_OBJECT => "NtQuerySymbolicLinkObject",
+    NT_QUERY_SYSTEM_ENVIRONMENT_VALUE => "NtQuerySystemEnvironmentValue",
+    NT_QUERY_SYSTEM_ENVIRONMENT_VALUE_EX => "NtQuerySystemEnvironmentValueEx",
+    NT_QUERY_SYSTEM_INFORMATION_EX => "NtQuerySystemInformationEx",
+    NT_QUERY_TIMER_RESOLUTION => "NtQueryTimerResolution",
+    NT_QUEUE_APC_THREAD_EX => "NtQueueApcThreadEx",
+    NT_RAISE_EXCEPTION => "NtRaiseException",
+    NT_RAISE_HARD_ERROR => "NtRaiseHardError",
+    NT_READ_ONLY_ENLISTMENT => "NtReadOnlyEnlistment",
+    NT_RECOVER_ENLISTMENT => "NtRecoverEnlistment",
+    NT_RECOVER_RESOURCE_MANAGER => "NtRecoverResourceManager",
+    NT_RECOVER_TRANSACTION_MANAGER => "NtRecoverTransactionManager",
+    NT_REGISTER_PROTOCOL_ADDRESS_INFORMATION => "NtRegisterProtocolAddressInformation",
+    NT_REGISTER_THREAD_TERMINATE_PORT => "NtRegisterThreadTerminatePort",
+    NT_RELEASE_KEYED_EVENT => "NtReleaseKeyedEvent",
+    NT_RELEASE_WORKER_FACTORY_WORKER => "NtReleaseWorkerFactoryWorker",
+    NT_REMOVE_IO_COMPLETION_EX => "NtRemoveIoCompletionEx",
+    NT_REMOVE_PROCESS_DEBUG => "NtRemoveProcessDebug",
+    NT_RENAME_KEY => "NtRenameKey",
+    NT_RENAME_TRANSACTION_MANAGER => "NtRenameTransactionManager",
+    NT_REPLACE_KEY => "NtReplaceKey",
+    NT_REPLACE_PARTITION_UNIT => "NtReplacePartitionUnit",
+    NT_REPLY_WAIT_REPLY_PORT => "NtReplyWaitReplyPort",
+    NT_REQUEST_PORT => "NtRequestPort",
+    NT_RESET_EVENT => "NtResetEvent",
+    NT_RESET_WRITE_WATCH => "NtResetWriteWatch",
+    NT_RESTORE_KEY => "NtRestoreKey",
+    NT_RESUME_PROCESS => "NtResumeProcess",
+    NT_ROLLBACK_COMPLETE => "NtRollbackComplete",
+    NT_ROLLBACK_ENLISTMENT => "NtRollbackEnlistment",
+    NT_ROLLBACK_TRANSACTION => "NtRollbackTransaction",
+    NT_ROLLFORWARD_TRANSACTION_MANAGER => "NtRollforwardTransactionManager",
+    NT_SAVE_KEY => "NtSaveKey",
+    NT_SAVE_KEY_EX => "NtSaveKeyEx",
+    NT_SAVE_MERGED_KEYS => "NtSaveMergedKeys",
+    NT_SECURE_CONNECT_PORT => "NtSecureConnectPort",
+    NT_SERIALIZE_BOOT => "NtSerializeBoot",
+    NT_SET_BOOT_ENTRY_ORDER => "NtSetBootEntryOrder",
+    NT_SET_BOOT_OPTIONS => "NtSetBootOptions",
+    NT_SET_CONTEXT_THREAD => "NtSetContextThread",
+    NT_SET_DEBUG_FILTER_STATE => "NtSetDebugFilterState",
+    NT_SET_DEFAULT_HARD_ERROR_PORT => "NtSetDefaultHardErrorPort",
+    NT_SET_DEFAULT_LOCALE => "NtSetDefaultLocale",
+    NT_SET_DEFAULT_UI_LANGUAGE => "NtSetDefaultUILanguage",
+    NT_SET_DRIVER_ENTRY_ORDER => "NtSetDriverEntryOrder",
+    NT_SET_EA_FILE => "NtSetEaFile",
+    NT_SET_HIGH_EVENT_PAIR => "NtSetHighEventPair",
+    NT_SET_HIGH_WAIT_LOW_EVENT_PAIR => "NtSetHighWaitLowEventPair",
+    NT_SET_INFORMATION_DEBUG_OBJECT => "NtSetInformationDebugObject",
+    NT_SET_INFORMATION_ENLISTMENT => "NtSetInformationEnlistment",
+    NT_SET_INFORMATION_JOB_OBJECT => "NtSetInformationJobObject",
+    NT_SET_INFORMATION_KEY => "NtSetInformationKey",
+    NT_SET_INFORMATION_RESOURCE_MANAGER => "NtSetInformationResourceManager",
+    NT_SET_INFORMATION_TOKEN => "NtSetInformationToken",
+    NT_SET_INFORMATION_TRANSACTION => "NtSetInformationTransaction",
+    NT_SET_INFORMATION_TRANSACTION_MANAGER => "NtSetInformationTransactionManager",
+    NT_SET_INFORMATION_WORKER_FACTORY => "NtSetInformationWorkerFactory",
+    NT_SET_INTERVAL_PROFILE => "NtSetIntervalProfile",
+    NT_SET_IO_COMPLETION => "NtSetIoCompletion",
+    NT_SET_IO_COMPLETION_EX => "NtSetIoCompletionEx",
+    NT_SET_LDT_ENTRIES => "NtSetLdtEntries",
+    NT_SET_LOW_EVENT_PAIR => "NtSetLowEventPair",
+    NT_SET_LOW_WAIT_HIGH_EVENT_PAIR => "NtSetLowWaitHighEventPair",
+    NT_SET_QUOTA_INFORMATION_FILE => "NtSetQuotaInformationFile",
+    NT_SET_SECURITY_OBJECT => "NtSetSecurityObject",
+    NT_SET_SYSTEM_ENVIRONMENT_VALUE => "NtSetSystemEnvironmentValue",
+    NT_SET_SYSTEM_ENVIRONMENT_VALUE_EX => "NtSetSystemEnvironmentValueEx",
+    NT_SET_SYSTEM_INFORMATION => "NtSetSystemInformation",
+    NT_SET_SYSTEM_POWER_STATE => "NtSetSystemPowerState",
+    NT_SET_SYSTEM_TIME => "NtSetSystemTime",
+    NT_SET_THREAD_EXECUTION_STATE => "NtSetThreadExecutionState",
+    NT_SET_TIMER_EX => "NtSetTimerEx",
+    NT_SET_TIMER_RESOLUTION => "NtSetTimerResolution",
+    NT_SET_UUID_SEED => "NtSetUuidSeed",
+    NT_SET_VOLUME_INFORMATION_FILE => "NtSetVolumeInformationFile",
+    NT_SHUTDOWN_SYSTEM => "NtShutdownSystem",
+    NT_SHUTDOWN_WORKER_FACTORY => "NtShutdownWorkerFactory",
+    NT_SIGNAL_AND_WAIT_FOR_SINGLE_OBJECT => "NtSignalAndWaitForSingleObject",
+    NT_SINGLE_PHASE_REJECT => "NtSinglePhaseReject",
+    NT_START_PROFILE => "NtStartProfile",
+    NT_STOP_PROFILE => "NtStopProfile",
+    NT_SUSPEND_PROCESS => "NtSuspendProcess",
+    NT_SUSPEND_THREAD => "NtSuspendThread",
+    NT_SYSTEM_DEBUG_CONTROL => "NtSystemDebugControl",
+    NT_TERMINATE_JOB_OBJECT => "NtTerminateJobObject",
+    NT_TEST_ALERT => "NtTestAlert",
+    NT_THAW_REGISTRY => "NtThawRegistry",
+    NT_THAW_TRANSACTIONS => "NtThawTransactions",
+    NT_TRACE_CONTROL => "NtTraceControl",
+    NT_TRANSLATE_FILE_PATH => "NtTranslateFilePath",
+    NT_UMS_THREAD_YIELD => "NtUmsThreadYield",
+    NT_UNLOAD_DRIVER => "NtUnloadDriver",
+    NT_UNLOAD_KEY => "NtUnloadKey",
+    NT_UNLOAD_KEY2 => "NtUnloadKey2",
+    NT_UNLOAD_KEY_EX => "NtUnloadKeyEx",
+    NT_UNLOCK_FILE => "NtUnlockFile",
+    NT_UNLOCK_VIRTUAL_MEMORY => "NtUnlockVirtualMemory",
+    NT_VDM_CONTROL => "NtVdmControl",
+    NT_WAIT_FOR_DEBUG_EVENT => "NtWaitForDebugEvent",
+    NT_WAIT_FOR_KEYED_EVENT => "NtWaitForKeyedEvent",
+    NT_WAIT_FOR_WORK_VIA_WORKER_FACTORY => "NtWaitForWorkViaWorkerFactory",
+    NT_WAIT_HIGH_EVENT_PAIR => "NtWaitHighEventPair",
+    NT_WAIT_LOW_EVENT_PAIR => "NtWaitLowEventPair",
+    NT_WORKER_FACTORY_WORKER_READY => "NtWorkerFactoryWorkerReady",
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn expected_number(name: &str) -> u32 {
-        crate::arch::x86_64::win7_sp1_syscalls::NATIVE_SYSCALLS
-            .iter()
-            .find(|entry| entry.name == name)
-            .map(|entry| u32::from(entry.number))
-            .unwrap_or_else(|| panic!("missing Windows 7 SP1 syscall: {name}"))
-    }
-
     #[test]
-    fn native_numbers_match_windows_7_sp1() {
-        const EXPECTED: [(&str, u32); 50] = [
-            ("NtAllocateVirtualMemory", NT_ALLOCATE_VIRTUAL_MEMORY),
-            ("NtAlertResumeThread", NT_ALERT_RESUME_THREAD),
-            ("NtAlertThread", NT_ALERT_THREAD),
-            ("NtClose", NT_CLOSE),
-            ("NtContinue", NT_CONTINUE),
-            ("NtCreateEvent", NT_CREATE_EVENT),
-            ("NtCreateFile", NT_CREATE_FILE),
-            ("NtCreateKey", NT_CREATE_KEY),
-            ("NtCreateKeyedEvent", NT_CREATE_KEYED_EVENT),
-            ("NtCreateMutant", NT_CREATE_MUTANT),
-            ("NtCreateProcess", NT_CREATE_PROCESS),
-            ("NtCreateSemaphore", NT_CREATE_SEMAPHORE),
-            ("NtCreateSection", NT_CREATE_SECTION),
-            ("NtCreateThread", NT_CREATE_THREAD),
-            ("NtCreateTimer", NT_CREATE_TIMER),
-            ("NtCreateUserProcess", NT_CREATE_USER_PROCESS),
-            ("NtDeleteFile", NT_DELETE_FILE),
-            ("NtDeleteKey", NT_DELETE_KEY),
-            ("NtDelayExecution", NT_DELAY_EXECUTION),
-            ("NtEnumerateKey", NT_ENUMERATE_KEY),
-            ("NtEnumerateValueKey", NT_ENUMERATE_VALUE_KEY),
-            ("NtFreeVirtualMemory", NT_FREE_VIRTUAL_MEMORY),
-            ("NtMapViewOfSection", NT_MAP_VIEW_OF_SECTION),
-            ("NtOpenEvent", NT_OPEN_EVENT),
-            ("NtOpenFile", NT_OPEN_FILE),
-            ("NtOpenKey", NT_OPEN_KEY),
-            ("NtOpenProcess", NT_OPEN_PROCESS),
-            ("NtOpenSection", NT_OPEN_SECTION),
-            ("NtOpenThread", NT_OPEN_THREAD),
-            ("NtProtectVirtualMemory", NT_PROTECT_VIRTUAL_MEMORY),
-            ("NtQueryDirectoryFile", NT_QUERY_DIRECTORY_FILE),
-            ("NtQueryInformationFile", NT_QUERY_INFORMATION_FILE),
-            ("NtQueryInformationProcess", NT_QUERY_INFORMATION_PROCESS),
-            ("NtQueryInformationThread", NT_QUERY_INFORMATION_THREAD),
-            ("NtQueryPerformanceCounter", NT_QUERY_PERFORMANCE_COUNTER),
-            ("NtQuerySystemInformation", NT_QUERY_SYSTEM_INFORMATION),
-            ("NtQuerySystemTime", NT_QUERY_SYSTEM_TIME),
-            ("NtQueryValueKey", NT_QUERY_VALUE_KEY),
-            ("NtQueryVirtualMemory", NT_QUERY_VIRTUAL_MEMORY),
-            ("NtReadFile", NT_READ_FILE),
-            ("NtReadVirtualMemory", NT_READ_VIRTUAL_MEMORY),
-            ("NtWriteFile", NT_WRITE_FILE),
-            ("NtResetEvent", NT_RESET_EVENT),
-            ("NtResumeThread", NT_RESUME_THREAD),
-            ("NtRaiseHardError", NT_RAISE_HARD_ERROR),
-            ("NtSetEvent", NT_SET_EVENT),
-            ("NtSetInformationFile", NT_SET_INFORMATION_FILE),
-            ("NtSetInformationProcess", NT_SET_INFORMATION_PROCESS),
-            ("NtSetInformationThread", NT_SET_INFORMATION_THREAD),
-            ("NtSetValueKey", NT_SET_VALUE_KEY),
-        ];
-
-        for (name, actual) in EXPECTED {
-            assert_eq!(actual, expected_number(name), "mismatch for {name}");
+    fn every_native_service_has_a_matching_user_constant() {
+        assert_eq!(
+            NATIVE_NUMBERS.len(),
+            nt61_abi::syscalls::NATIVE_SYSCALLS.len()
+        );
+        for (index, entry) in nt61_abi::syscalls::NATIVE_SYSCALLS.iter().enumerate() {
+            assert_eq!(NATIVE_NUMBERS[index], (entry.name, u32::from(entry.number)));
         }
+        assert_eq!(NT_WAIT_FOR_SINGLE_OBJECT, 1);
+        assert_eq!(NT_CREATE_FILE, 0x52);
+        assert_eq!(NT_CREATE_USER_PROCESS, 0xaa);
     }
 }

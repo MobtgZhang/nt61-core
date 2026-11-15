@@ -9,6 +9,7 @@ path = "src/lib.rs"
 test = false
 
 [dependencies]
+nt61-abi = { path = "../../abi" }
 nt61-boot-types = { path = "../../boot-types" }
 ntoskrnl = { path = "../../ntoskrnl" }
 hashbrown = "0.14"

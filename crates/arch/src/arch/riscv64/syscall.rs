@@ -5,13 +5,12 @@
 //!     for backward compatibility).
 //!   * `dispatch_syscall(frame)` reads the syscall number from
 //!     `$a7` (saved as `a7` in the trap frame) and arguments from
-//!     `$a0..$a5`, dispatches against the NT service table, and
+//!     `$a0..$a6` plus the user stack, dispatches the NT service table, and
 //!     stores the return value back into `$a0`.
 //!
-//! Phase 1 covers a small subset of NT calls; the rest return
-//! `STATUS_NOT_IMPLEMENTED` so test programs can still exit
-//! cleanly. Phase 3 expands the table with argument validation,
-//! memory-region probes, and SoC-aware timing helpers.
+//! Native services use the shared SSDT and Windows 7 SP1 identities.
+//! Unsupported shipped services return `STATUS_NOT_IMPLEMENTED`;
+//! numbers outside the native table return `STATUS_INVALID_SYSTEM_SERVICE`.
 
 use core::arch::asm;
 
@@ -133,19 +132,28 @@ pub unsafe extern "C" fn dispatch_syscall(frame: *mut TrapFrame) {
         a6 as usize,
         0,
     ];
-    let common_status = unsafe {
-        crate::ke::ssdt_common::dispatch_syscall_with_stack(
-            num as usize,
-            register_args,
-            crate::ke::ssdt_common::SEVEN_REGISTER_ARCHITECTURES,
-            stack_pointer,
-        )
+    if (0x1000..=0x1FFF).contains(&num) {
+        let result = match crate::arch::common::syscall_frame::SyscallFrame::capture_shadow(
+            num,
+            &[a0, a1, a2, a3, a4, a5, a6],
+            stack_pointer as u64,
+        ) {
+            Ok(arguments) => {
+                crate::ke::shadow_ssdt::dispatch_shadow_service(num as u32, &arguments)
+            }
+            Err(status) => status as u32 as u64,
+        };
+        (*frame).a0 = result;
+        return;
+    }
+    let common_arguments = crate::ke::ssdt_common::SyscallArguments {
+        register_args,
+        integer_register_count: crate::ke::ssdt_common::SEVEN_REGISTER_ARCHITECTURES,
+        stack_pointer: stack_pointer as usize,
     };
-    let common_result = if common_status == crate::ke::ssdt_common::STATUS_INVALID_SYSTEM_SERVICE {
-        None
-    } else {
-        Some(common_status)
-    };
+    // SAFETY: the trap stub supplied the captured integer registers and user SP.
+    let common_result =
+        unsafe { crate::ke::ssdt_common::try_dispatch(num as usize, &common_arguments) };
 
     let result = match common_result {
         Some(status) => status as u64,
@@ -160,101 +168,16 @@ pub unsafe extern "C" fn dispatch_syscall(frame: *mut TrapFrame) {
     }
 }
 
-/// Top-level handler. Phase 1 dispatches the subset of NT calls
-/// needed for smoke testing; everything else returns
-/// `STATUS_NOT_IMPLEMENTED`.
-///
-/// Phase 3 adds argument validation, simple probes for the
-/// memory-allocation services, and BTL-aware touch-up of
-/// instruction-cache flush on `ecall` for BTL guests. The
-/// argument slots that aren't used by a particular NT call are
-/// still passed so we can detect garbage.
+/// Dispatch project extensions after the shared NT and win32k tables.
+/// Unregistered native services fail explicitly before extension dispatch.
 fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     const SYS_EXIT_PROCESS_U64: u64 = crate::arch::common::cmd_host::SYS_EXIT_PROCESS as u64;
+    // Native services are dispatched through the common SSDT above. Never
+    // let an absent registration fall through to a placeholder success result.
+    if num < 0x0200 {
+        return crate::ke::ssdt_common::unregistered_service_status(num as usize) as u64;
+    }
     match num {
-        SYS_NT_CLOSE => {
-            // NT_CLOSE(handle) — Phase 1 returns success for any handle
-            // so test programs can complete the round-trip.
-            let _ = a0;
-            STATUS_SUCCESS
-        }
-        SYS_NT_DELAY_EXECUTION => {
-            // NT_DELAY_EXECUTION — busy-wait for `a1` 100-ns intervals.
-            crate::arch::riscv64::pit::busy_wait_100ns(a1);
-            STATUS_SUCCESS
-        }
-        SYS_NT_TERMINATE_PROCESS => {
-            let _ = (a0, a1);
-            STATUS_SUCCESS
-        }
-        SYS_NT_TERMINATE_THREAD => {
-            let _ = (a0, a1);
-            STATUS_SUCCESS
-        }
-        SYS_NT_QUERY_SYSTEM_INFORMATION => {
-            // Phase 1: return success with no data so callers can probe.
-            let _ = (a0, a1, a2, a3, a4, a5);
-            STATUS_SUCCESS
-        }
-        SYS_NT_QUERY_VIRTUAL_MEMORY => {
-            let status = unsafe {
-                crate::libs::ntdll::virtual_mem::nt_query_virtual_memory(
-                    a0 as crate::libs::ntdll::types::HANDLE,
-                    a1 as crate::libs::ntdll::types::PVOID,
-                    a2 as u32,
-                    a3 as crate::libs::ntdll::types::PVOID,
-                    a4 as crate::libs::ntdll::types::SizeT,
-                    a5 as *mut crate::libs::ntdll::types::SizeT,
-                )
-            };
-            status as u64
-        }
-        SYS_NT_PROTECT_VIRTUAL_MEMORY => {
-            let status = unsafe {
-                crate::libs::ntdll::virtual_mem::nt_protect_virtual_memory(
-                    a0 as crate::libs::ntdll::types::HANDLE,
-                    a1 as *mut crate::libs::ntdll::types::PVOID,
-                    a2 as *mut crate::libs::ntdll::types::SizeT,
-                    a3 as u32,
-                    a4 as *mut u32,
-                )
-            };
-            status as u64
-        }
-        SYS_NT_ALLOCATE_VIRTUAL_MEMORY => {
-            let status = unsafe {
-                crate::libs::ntdll::virtual_mem::nt_allocate_virtual_memory(
-                    a0 as crate::libs::ntdll::types::HANDLE,
-                    a1 as *mut crate::libs::ntdll::types::PVOID,
-                    a2 as crate::libs::ntdll::types::SizeT,
-                    a3 as *mut crate::libs::ntdll::types::SizeT,
-                    a4 as u32,
-                    a5 as u32,
-                )
-            };
-            status as u64
-        }
-        SYS_NT_FREE_VIRTUAL_MEMORY => {
-            let status = unsafe {
-                crate::libs::ntdll::virtual_mem::nt_free_virtual_memory(
-                    a0 as crate::libs::ntdll::types::HANDLE,
-                    a1 as *mut crate::libs::ntdll::types::PVOID,
-                    a2 as *mut crate::libs::ntdll::types::SizeT,
-                    a3 as u32,
-                )
-            };
-            status as u64
-        }
-        SYS_NT_FLUSH_INSTRUCTION_CACHE => {
-            // Flush a region of user-mode memory from the I-cache.
-            // For RV64 the relevant instruction is `fence.i`; the
-            // BTL module hooks into this call to ensure translated
-            // blocks are coherent with self-modifying code.
-            unsafe {
-                flush_icache_range(a1, a2);
-            }
-            STATUS_SUCCESS
-        }
         SYS_PUTCHAR => crate::arch::common::cmd_host::putchar(a0 as u8),
         SYS_POLL_KEY => {
             if let Some(byte) = crate::arch::common::cmd_host::poll_key() {
@@ -313,10 +236,18 @@ fn handle(num: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         n if n == crate::arch::common::desktop_host::SYS_DESKTOP_POLL_KEY as u64 => unsafe {
             crate::arch::common::desktop_host::poll_key(a0 as *mut u8)
         },
-        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_TIME as u64 => crate::arch::common::desktop_host::shell_time(),
-        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_TICKS as u64 => crate::arch::common::desktop_host::shell_ticks(),
-        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_AUDIO as u64 => crate::arch::common::desktop_host::shell_audio(a0 as u64, a1 as u64),
-        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_DEVICES as u64 => crate::arch::common::desktop_host::shell_devices(),
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_TIME as u64 => {
+            crate::arch::common::desktop_host::shell_time()
+        }
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_TICKS as u64 => {
+            crate::arch::common::desktop_host::shell_ticks()
+        }
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_AUDIO as u64 => {
+            crate::arch::common::desktop_host::shell_audio(a0 as u64, a1 as u64)
+        }
+        n if n == crate::arch::common::desktop_host::SYS_DESKTOP_DEVICES as u64 => {
+            crate::arch::common::desktop_host::shell_devices()
+        }
         n if n == crate::arch::common::desktop_host::SYS_DESKTOP_POLL_MOUSE as u64 => unsafe {
             crate::arch::common::desktop_host::poll_mouse(a0 as *mut _)
         },

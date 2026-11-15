@@ -12,8 +12,8 @@
 //! [`syscall_dispatch_with_tf`] defined here.
 //!
 //! The dispatch table currently implements a small but useful subset
-//! of the NT 6.1 native API; every unrecognised syscall returns
-//! `STATUS_NOT_IMPLEMENTED` (0xC0000002).
+//! of the NT 6.1 native API. Unsupported shipped services return
+//! `STATUS_NOT_IMPLEMENTED`; invalid service numbers are rejected.
 
 use super::trap::TrapFrame;
 
@@ -44,6 +44,9 @@ pub unsafe extern "C" fn syscall_dispatch_with_tf(syscall_num: u64, tf: *mut Tra
     let percpu = crate::arch::common::percpu::get_current();
     percpu.syscall_count = percpu.syscall_count.wrapping_add(1);
 
+    if syscall_num >= 0x2000 {
+        return STATUS_INVALID_SYSTEM_SERVICE;
+    }
     let tf_ref: &mut TrapFrame = &mut *tf;
     let register_args = [
         tf_ref.x0 as usize,
@@ -55,50 +58,35 @@ pub unsafe extern "C" fn syscall_dispatch_with_tf(syscall_num: u64, tf: *mut Tra
         tf_ref.x6 as usize,
         tf_ref.x7 as usize,
     ];
-    let common_status = unsafe {
-        crate::ke::ssdt_common::dispatch_syscall_with_stack(
-            syscall_num as usize,
-            register_args,
-            crate::ke::ssdt_common::INTEGER_REGISTER_ARGUMENTS,
-            tf_ref.sp as usize,
-        )
+    if (0x1000..=0x1FFF).contains(&syscall_num) {
+        let result = match crate::arch::common::syscall_frame::SyscallFrame::capture_shadow(
+            syscall_num,
+            &register_args.map(|value| value as u64),
+            tf_ref.sp,
+        ) {
+            Ok(arguments) => {
+                crate::ke::shadow_ssdt::dispatch_shadow_service(syscall_num as u32, &arguments)
+            }
+            Err(status) => status as u32 as u64,
+        };
+        return result;
+    }
+    let common_arguments = crate::ke::ssdt_common::SyscallArguments {
+        register_args,
+        integer_register_count: crate::ke::ssdt_common::INTEGER_REGISTER_ARGUMENTS,
+        stack_pointer: tf_ref.sp as usize,
     };
-    let common_result = if common_status == crate::ke::ssdt_common::STATUS_INVALID_SYSTEM_SERVICE {
-        None
-    } else {
-        Some(common_status)
-    };
+    // SAFETY: the trap stub supplied the captured integer registers and user SP.
+    let common_result =
+        unsafe { crate::ke::ssdt_common::try_dispatch(syscall_num as usize, &common_arguments) };
     if let Some(status) = common_result {
         return status as u64;
     }
 
+    if syscall_num < 0x0200 {
+        return crate::ke::ssdt_common::unregistered_service_status(syscall_num as usize) as u64;
+    }
     match syscall_num as u32 {
-        // Yield execution.
-        4 => 0, // STATUS_SUCCESS
-        8 => {
-            // NT_YIELD_EXECUTION equivalent: schedule another thread.
-            crate::arch::halt();
-            0
-        }
-        0x18 => {
-            // Stub: write a byte to serial (debug only).
-            let c = (tf_ref.x0 & 0xFF) as u8;
-            crate::hal::aarch64::serial::put_char(c);
-            0
-        }
-        0x19 => {
-            // Stub: read a byte from serial (debug only).
-            let c = crate::hal::aarch64::serial::try_get_char();
-            tf_ref.x0 = match c {
-                Some(b) => b as u64,
-                None => u64::MAX,
-            };
-            if c.is_some() {
-                0
-            } else {
-                STATUS_NO_DATA
-            } // STATUS_NO_DATA
-        }
         host::SYS_PUTCHAR => host::putchar((tf_ref.x0 & 0xFF) as u8),
         host::SYS_POLL_KEY => match host::poll_key() {
             Some(byte) => byte as u64,
@@ -165,14 +153,19 @@ pub unsafe extern "C" fn syscall_dispatch_with_tf(syscall_num: u64, tf: *mut Tra
     }
 }
 
-/// Legacy entry point used by tests / older callers. Provides a
-/// usable surface even when the full trap path is not yet wired up.
+/// Compatibility entry point uses the same trap-frame dispatcher.
+///
+/// # Safety
+/// `tf` must reference the saved SVC trap frame.
 #[no_mangle]
-pub extern "C" fn syscall_dispatch(syscall_num: u64, _tf: *mut TrapFrame) -> u64 {
-    match syscall_num as u32 {
-        0x18 => 0,
-        0x19 => 0,
-        4 | 8 => 0,
-        _ => 0xC000001Cu64, // STATUS_INVALID_SYSTEM_SERVICE
+pub unsafe extern "C" fn syscall_dispatch(syscall_num: u64, tf: *mut TrapFrame) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        syscall_dispatch_with_tf(syscall_num, tf)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = tf;
+        crate::ke::ssdt_common::unregistered_service_status(syscall_num as usize) as u64
     }
 }

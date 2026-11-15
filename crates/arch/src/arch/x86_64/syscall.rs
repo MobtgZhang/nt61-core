@@ -1,8 +1,8 @@
-//! x86_64 SYSCALL entry / dispatch — full NT 6.1 implementation.
+//! x86_64 SYSCALL entry and NT 6.1 service dispatch.
 //
 //! This module wires up the AMD64 SYSCALL/SYSRET mechanism for
-//! Ring 3 → Ring 0 transitions and dispatches every NT 6.1 native
-//! system call to the matching kernel handler.
+//! Ring 3 → Ring 0 transitions and routes implemented NT 6.1 services
+//! to kernel handlers. Unsupported services return an explicit status.
 //
 //! Architecture
 //! ------------
@@ -14,10 +14,10 @@
 //
 //! The `TrapFrame` Rust struct mirrors the on-stack layout. The
 //! fields are read by the dispatch code to extract the user-mode
-//! arguments (in the System V AMD64 ABI used by the Windows x64
-//! calling convention, the first 4 arguments are passed in
-//! RCX, RDX, R8, R9 and additional arguments are pushed onto
-//! the stack).
+//! arguments using the Windows x64 syscall ABI: R10, RDX, R8, and R9
+//! contain the first four arguments. The stub copies RCX into R10;
+//! argument five starts at user RSP+0x28 after the return address and
+//! four home slots.
 //
 //! Syscall numbers
 //! ---------------
@@ -42,6 +42,12 @@ use alloc::boxed::Box;
 /// User-controlled `SYS_FILE_READ` requests are capped so a Ring 3
 /// caller cannot force an unbounded kernel allocation.
 const SYS_FILE_READ_MAX_BYTES: u64 = 1 << 20;
+
+/// Serialize RTC/software-clock commits between concurrent native setters.
+/// This is distinct from ke::time's short clock-state lock; queries and clock
+/// interrupts remain free to run while the RTC transaction is in progress on
+/// another CPU. The kernel spinlock also prevents local interrupt reentry.
+static SYSTEM_TIME_SET_LOCK: crate::ke::sync::Spinlock<()> = crate::ke::sync::Spinlock::new(());
 
 // use crate::kprintln;
 
@@ -292,13 +298,22 @@ pub fn get_kernel_gs_base() -> u64 {
 //
 // The ntdll thunk is a normal function, so the caller's `call`
 // pushed a return address at [rsp]. The first stack argument is
-// therefore at [rsp + 8], not [rsp + 0]. (Shadow space lives
-// below the return address, at [rsp - 32 .. rsp - 8], so it is
-// not part of the argument area.)
+// at [rsp + 0x28], after the return address and the four home
+// slots at [rsp + 8 .. rsp + 0x20].
 
 /// offset of the first stack argument from the user RSP recorded
-/// in the trap frame: 8 bytes for the return address.
-const STACK_ARG_BASE: u64 = 8;
+/// in the trap frame: the return address plus four integer home slots.
+const STACK_ARG_BASE: u64 = 0x28;
+/// Project CMD/desktop extension thunks reserve only a return-address slot.
+const EXTENSION_STACK_ARG_BASE: u64 = 8;
+
+fn stack_arg_base(tf: &TrapFrame) -> u64 {
+    if (0x0200..0x1000).contains(&(tf.rax as u32)) {
+        EXTENSION_STACK_ARG_BASE
+    } else {
+        STACK_ARG_BASE
+    }
+}
 //
 // This is the convention that every `ntdll.dll` thunk on the
 // user-mode side uses; the kernel reads arguments back from
@@ -357,7 +372,9 @@ pub fn stack_arg(tf: &TrapFrame, n: usize) -> u64 {
 /// slot is not validated user memory.
 #[inline]
 fn read_stack_arg(tf: &TrapFrame, n: usize) -> Option<u64> {
-    let addr = tf.rsp.checked_add(STACK_ARG_BASE + n as u64 * 8)?;
+    let addr = tf
+        .rsp
+        .checked_add(stack_arg_base(tf).checked_add((n as u64).checked_mul(8)?)?)?;
     unsafe {
         if crate::arch::x86_64::syscall_validation::probe_for_read(addr as *const u8, 8).is_err() {
             return None;
@@ -396,18 +413,16 @@ fn clear_bad_stack_arg() {
 
 /// Validate the argument window the handler will read.
 ///
-/// The service number encodes the argument size in bits 16-31
-/// (bytes, i.e. parameter count * 8). Only the parameters beyond
-/// the four register arguments live on the user stack, so the
-/// window to probe is `(arg_size - 32)` bytes starting at the
-/// return-address slot. This mirrors what `KiSystemCall64` does
+/// Argument counts come from the original service-table metadata;
+/// service numbers do not encode them. Only parameters beyond the four
+/// register arguments live on the user stack, so the window to probe is
+/// `(arg_size - 32)` bytes starting at user RSP+0x28. This mirrors what `KiSystemCall64` does
 /// on Windows 7 x64: the parameter area is probed before the
 /// handler is allowed to touch it.
 fn validate_stack_args(tf: &TrapFrame, syscall_num: u32) -> i32 {
     let table_index = (syscall_num >> 12) & 0xF;
     let arg_size = if table_index == 1 {
-        // Shadow (win32k) services encode their stack argument count in
-        // the per-service table rather than bits 16-31 of the number.
+        // Shadow services have their own original per-service argument table.
         crate::ke::ssdt::get_shadow_argument_size(syscall_num) as usize
     } else {
         crate::ke::ssdt::get_argument_size(syscall_num) as usize
@@ -457,6 +472,13 @@ fn success() -> SyscallResult {
 /// `STATUS_ACCESS_VIOLATION` rather than faulting in Ring 0.
 fn dispatch(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
     clear_bad_stack_arg();
+    // Reject unknown service numbers before probing any caller memory.
+    if syscall_num >= 0x2000
+        || (syscall_num < 0x0200
+            && syscall_num as usize >= nt61_abi::syscall_metadata::NATIVE_SERVICE_METADATA.len())
+    {
+        return crate::libs::ntdll::status::STATUS_INVALID_SYSTEM_SERVICE as i64;
+    }
     let status = validate_stack_args(tf, syscall_num);
     if status != 0 {
         return status as SyscallResult;
@@ -475,7 +497,8 @@ fn dispatch(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
     }
 
     let result = dispatch_service(syscall_num, tf);
-    if BAD_STACK_ARG_BITMAP.load(Ordering::Acquire) != 0 {
+    let cpu = crate::arch::common::percpu::get_current_cpu_id();
+    if cpu < 32 && BAD_STACK_ARG_BITMAP.load(Ordering::Acquire) & (1u32 << cpu) != 0 {
         return crate::arch::x86_64::syscall_validation::STATUS_ACCESS_VIOLATION as SyscallResult;
     }
     result
@@ -483,7 +506,7 @@ fn dispatch(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
 
 /// Build the architecture-independent `SyscallArguments` from the
 /// x86_64 trap frame. The first four arguments live in R10, RDX, R8,
-/// and R9; arguments 4 through 7 are read from the user stack.
+/// and R9. Trailing stack arguments are probed lazily by the SSDT.
 fn build_ssdt_arguments(tf: &TrapFrame) -> crate::ke::ssdt_common::SyscallArguments {
     crate::ke::ssdt_common::SyscallArguments {
         register_args: [
@@ -491,13 +514,14 @@ fn build_ssdt_arguments(tf: &TrapFrame) -> crate::ke::ssdt_common::SyscallArgume
             arg1(tf) as usize,
             arg2(tf) as usize,
             arg3(tf) as usize,
-            stack_arg(tf, 0) as usize,
-            stack_arg(tf, 1) as usize,
-            stack_arg(tf, 2) as usize,
-            stack_arg(tf, 3) as usize,
+            0,
+            0,
+            0,
+            0,
         ],
-        integer_register_count: crate::ke::ssdt_common::INTEGER_REGISTER_ARGUMENTS,
-        stack_pointer: (tf.rsp + STACK_ARG_BASE + 4 * core::mem::size_of::<u64>() as u64) as usize,
+        integer_register_count: 4,
+        // Overflow must remain an invalid user address; never wrap to low memory.
+        stack_pointer: tf.rsp.checked_add(STACK_ARG_BASE).unwrap_or(u64::MAX) as usize,
     }
 }
 
@@ -516,20 +540,17 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
     let table_index = (syscall_num >> 12) & 0xF;
     if table_index == 0x1 {
         // Shadow SSDT (win32k.sys) service
-        let syscall_frame = ntoskrnl::arch::common::syscall_frame::SyscallFrame::from_args([
-            arg0(tf),
-            arg1(tf),
-            arg2(tf),
-            arg3(tf),
-            stack_arg(tf, 0),
-            stack_arg(tf, 1),
-            stack_arg(tf, 2),
-            stack_arg(tf, 3),
-            stack_arg(tf, 4),
-            stack_arg(tf, 5),
-            stack_arg(tf, 6),
-            stack_arg(tf, 7),
-        ]);
+        let count = (crate::ke::ssdt::get_shadow_argument_size(syscall_num) as usize / 8)
+            .min(crate::arch::common::syscall_frame::SYSCALL_ARGUMENT_COUNT);
+        let mut syscall_frame = ntoskrnl::arch::common::syscall_frame::SyscallFrame::default();
+        let registers = [arg0(tf), arg1(tf), arg2(tf), arg3(tf)];
+        syscall_frame.args[..count.min(4)].copy_from_slice(&registers[..count.min(4)]);
+        for index in 4..count {
+            syscall_frame.args[index] = match read_stack_arg(tf, index - 4) {
+                Some(value) => value,
+                None => return STATUS_ACCESS_VIOLATION as SyscallResult,
+            };
+        }
         let result =
             ntoskrnl::ke::shadow_ssdt::dispatch_shadow_service(syscall_num, &syscall_frame);
         return result as SyscallResult;
@@ -627,10 +648,6 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
                 arg3(tf) as u32,
             ) as i64
         },
-        nums::NT_TRIM_PROCESS_WORKING_SET => {
-            // NT_TRIM_PROCESS_WORKING_SET(handle, min_ws, max_ws)
-            crate::mm::working_set::mm_trim_process_working_set(arg0(tf), arg1(tf) as i64) as i64
-        }
 
         // ---- Virtual Memory ----
         nums::NT_ALLOCATE_VIRTUAL_MEMORY => unsafe {
@@ -885,17 +902,17 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
             crate::libs::ntdll::sync::nt_set_timer(
                 arg0(tf) as crate::libs::ntdll::types::HANDLE,
                 arg1(tf) as *const i64,
-                arg2(tf) as u32,
-                arg3(tf) as *const (),
-                arg4(tf) as *mut (),
-                arg5(tf) as u8,
-                stack_arg(tf, 0) as *mut crate::libs::ntdll::types::HANDLE,
+                arg2(tf) as PVOID,
+                arg3(tf) as PVOID,
+                arg4(tf) as u8,
+                arg5(tf) as i32,
+                stack_arg(tf, 2) as *mut u8,
             ) as i64
         },
         nums::NT_CANCEL_TIMER => unsafe {
             crate::libs::ntdll::sync::nt_cancel_timer(
                 arg0(tf) as crate::libs::ntdll::types::HANDLE,
-                arg1(tf) as *mut crate::libs::ntdll::types::HANDLE,
+                arg1(tf) as *mut u8,
             ) as i64
         },
         nums::NT_WAIT_FOR_SINGLE_OBJECT => unsafe {
@@ -1001,24 +1018,9 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
                 arg2(tf) as u32,
             ) as i64
         },
-        nums::NT_QUERY_SYSTEM_TIME => {
-            // Write the current wall-clock time as a 64-bit
-            // FILETIME (100-ns intervals since 1601-01-01 UTC).
-            let system_time = arg0(tf);
-            if !validate_write(system_time, 8) {
-                return crate::arch::x86_64::syscall_validation::STATUS_ACCESS_VIOLATION
-                    as SyscallResult;
-            }
-            let filetime = match crate::hal::cmos::hal_query_real_time_clock() {
-                Some(ref time) => crate::hal::x86_64::cmos::time_fields_to_100ns(time),
-                None => 0,
-            };
-            if crate::mm::user_copy::write_user(system_time, &filetime).is_err() {
-                return crate::arch::x86_64::syscall_validation::STATUS_ACCESS_VIOLATION
-                    as SyscallResult;
-            }
-            success()
-        }
+        nums::NT_QUERY_SYSTEM_TIME => unsafe {
+            crate::libs::ntdll::clock::nt_query_system_time(arg0(tf) as *mut i64) as i64
+        },
         nums::NT_SET_SYSTEM_TIME => {
             // NT semantics: arg0 points at the caller-provided 100-ns
             // FILETIME to program into the CMOS RTC; arg1, if non-null,
@@ -1040,13 +1042,11 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
                 Some(f) => f,
                 None => return STATUS_INVALID_PARAMETER as SyscallResult,
             };
-            // Capture the previous wall-clock time before overwriting
-            // the RTC so arg1 can be filled in.
+            // Serialize setters. The optional output is the software-clock
+            // snapshot before device I/O, not the RTC's whole-second value.
+            let _set_guard = SYSTEM_TIME_SET_LOCK.lock();
             if previous_time != 0 {
-                let previous = match crate::hal::cmos::hal_query_real_time_clock() {
-                    Some(ref t) => crate::hal::x86_64::cmos::time_fields_to_100ns(t),
-                    None => 0,
-                };
+                let previous = crate::ke::time::get_system_time();
                 if crate::mm::user_copy::write_user(previous_time, &previous).is_err() {
                     return STATUS_ACCESS_VIOLATION as SyscallResult;
                 }
@@ -1055,38 +1055,18 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
             // the HAL; report an honest device error instead of
             // pretending success when the CMOS is inaccessible.
             if crate::hal::cmos::hal_set_real_time_clock(&fields) {
+                crate::ke::time::set_system_time(requested);
                 success()
             } else {
                 STATUS_IO_DEVICE_ERROR as SyscallResult
             }
         }
-        nums::NT_QUERY_PERFORMANCE_COUNTER => {
-            // Write the TSC counter and (optionally) the TSC
-            // frequency so callers can convert to seconds.
-            let counter = arg0(tf);
-            let frequency = arg1(tf);
-            if !validate_write(counter, 8) {
-                return crate::arch::x86_64::syscall_validation::STATUS_ACCESS_VIOLATION
-                    as SyscallResult;
-            }
-            let value = unsafe { core::arch::x86_64::_rdtsc() };
-            if crate::mm::user_copy::write_user(counter, &value).is_err() {
-                return crate::arch::x86_64::syscall_validation::STATUS_ACCESS_VIOLATION
-                    as SyscallResult;
-            }
-            if frequency != 0 {
-                if !validate_write(frequency, 8) {
-                    return crate::arch::x86_64::syscall_validation::STATUS_ACCESS_VIOLATION
-                        as SyscallResult;
-                }
-                let hz = crate::hal::x86_64::pit::tsc_frequency_hz();
-                if crate::mm::user_copy::write_user(frequency, &hz).is_err() {
-                    return crate::arch::x86_64::syscall_validation::STATUS_ACCESS_VIOLATION
-                        as SyscallResult;
-                }
-            }
-            success()
-        }
+        nums::NT_QUERY_PERFORMANCE_COUNTER => unsafe {
+            crate::libs::ntdll::clock::nt_query_performance_counter(
+                arg0(tf) as *mut i64,
+                arg1(tf) as *mut i64,
+            ) as i64
+        },
 
         // ---- Thread ----
         nums::NT_OPEN_THREAD => unsafe {
@@ -1171,17 +1151,9 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
                 arg2(tf) as *mut ObjectAttributes,
             ) as i64
         },
-        nums::NT_QUERY_DIRECTORY_OBJECT => unsafe {
-            crate::libs::ntdll::ob_integration::nt_query_directory_object(
-                arg0(tf) as HANDLE,
-                arg1(tf) as *mut u8,
-                arg2(tf) as u32,
-                arg3(tf) as u32,
-                arg4(tf) as u32,
-                arg5(tf) as *mut u32,
-                stack_arg(tf, 0) as *mut u32,
-            ) as i64
-        },
+        // The existing directory helper has a different parameter layout and
+        // returns placeholder success; do not expose it through the native ABI.
+        nums::NT_QUERY_DIRECTORY_OBJECT => not_implemented(),
         nums::NT_QUERY_SECURITY_OBJECT => not_implemented(),
         nums::NT_SET_SECURITY_OBJECT => not_implemented(),
         nums::NT_DUPLICATE_OBJECT => not_implemented(),
@@ -1610,10 +1582,18 @@ fn dispatch_service(syscall_num: u32, tf: &TrapFrame) -> SyscallResult {
         crate::arch::common::desktop_host::SYS_DESKTOP_POLL_KEY => unsafe {
             crate::arch::common::desktop_host::poll_key(arg0(tf) as *mut u8) as i64
         },
-        crate::arch::common::desktop_host::SYS_DESKTOP_TIME => crate::arch::common::desktop_host::shell_time() as i64,
-        crate::arch::common::desktop_host::SYS_DESKTOP_TICKS => crate::arch::common::desktop_host::shell_ticks() as i64,
-        crate::arch::common::desktop_host::SYS_DESKTOP_AUDIO => crate::arch::common::desktop_host::shell_audio(arg0(tf) as u64, arg1(tf) as u64) as i64,
-        crate::arch::common::desktop_host::SYS_DESKTOP_DEVICES => crate::arch::common::desktop_host::shell_devices() as i64,
+        crate::arch::common::desktop_host::SYS_DESKTOP_TIME => {
+            crate::arch::common::desktop_host::shell_time() as i64
+        }
+        crate::arch::common::desktop_host::SYS_DESKTOP_TICKS => {
+            crate::arch::common::desktop_host::shell_ticks() as i64
+        }
+        crate::arch::common::desktop_host::SYS_DESKTOP_AUDIO => {
+            crate::arch::common::desktop_host::shell_audio(arg0(tf) as u64, arg1(tf) as u64) as i64
+        }
+        crate::arch::common::desktop_host::SYS_DESKTOP_DEVICES => {
+            crate::arch::common::desktop_host::shell_devices() as i64
+        }
         crate::arch::common::desktop_host::SYS_DESKTOP_POLL_MOUSE => unsafe {
             crate::arch::common::desktop_host::poll_mouse(arg0(tf) as *mut _) as i64
         },
@@ -1803,6 +1783,9 @@ fn validate_output(pointer: u64, length: usize) -> bool {
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 pub unsafe extern "win64" fn syscall_dispatch(syscall_num: u64, tf: *mut TrapFrame) -> u64 {
+    if syscall_num >= 0x2000 {
+        return crate::libs::ntdll::status::STATUS_INVALID_SYSTEM_SERVICE as u32 as u64;
+    }
     // CRITICAL: snapshot RAX/RCX/RDX/etc. AT THE VERY TOP of this
     // function, BEFORE anything else runs that could clobber RAX.
     //
@@ -2139,9 +2122,6 @@ pub mod syscall_numbers {
     pub const NT_SET_SYSTEM_INFORMATION: u32 = 0x016C;
     pub const NT_QUERY_SYSTEM_TIME: u32 = 0x0057;
     pub const NT_SET_SYSTEM_TIME: u32 = 0x016E;
-    pub const NT_QUERY_INTERRUPT_TIME: u32 = 0x0058;
-    pub const NT_SET_INTERRUPT_TIME: u32 = 0x0059;
-    pub const NT_QUERY_TICK_COUNT: u32 = 0x00A8;
     pub const NT_GET_CURRENT_PROCESSOR_NUMBER: u32 = 0x00CB;
     pub const NT_SHUTDOWN_SYSTEM: u32 = 0x0174;
     pub const NT_TEST_ALERT: u32 = 0x017E;
@@ -2194,7 +2174,6 @@ pub mod syscall_numbers {
     pub const NT_OPEN_THREAD_TOKEN: u32 = 0x0021;
     pub const NT_OPEN_THREAD_TOKEN_EX: u32 = 0x002C;
     pub const NT_IMPERSONATE_THREAD: u32 = 0x00D5;
-    pub const NT_REVERT_TO_SELF: u32 = 0x00D6;
     pub const NT_REGISTER_THREAD_TERMINATE_PORT: u32 = 0x0136;
     pub const NT_ALERT_THREAD: u32 = 0x006A;
     pub const NT_ALERT_RESUME_THREAD: u32 = 0x0069;
@@ -2230,7 +2209,6 @@ pub mod syscall_numbers {
     pub const NT_SET_INFORMATION_FILE: u32 = 0x0024;
     pub const NT_DELETE_FILE: u32 = 0x00B2;
     pub const NT_FLUSH_BUFFERS_FILE: u32 = 0x0048;
-    pub const NT_FLUSH_BUFFERS_FILE_EX: u32 = 0x00D2;
     pub const NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 0x0046;
     pub const NT_SET_VOLUME_INFORMATION_FILE: u32 = 0x0173;
     pub const NT_QUERY_DIRECTORY_FILE: u32 = 0x0032;
@@ -2317,8 +2295,6 @@ pub mod syscall_numbers {
     pub const NT_CREATE_KEY_TRANSACTED: u32 = 0x0097;
     pub const NT_OPEN_KEY_TRANSACTED: u32 = 0x00F3;
     pub const NT_OPEN_KEY_TRANSACTED_EX: u32 = 0x00F4;
-    pub const NT_DELETE_KEY_TRANSACTED: u32 = 0x00F3;
-    pub const NT_SET_VALUE_KEY_TRANSACTED: u32 = 0x0160;
     pub const NT_SET_INFORMATION_KEY: u32 = 0x015C;
     pub const NT_RENAME_KEY: u32 = 0x013B;
     pub const NT_QUERY_MULTIPLE_VALUE_KEY: u32 = 0x0120;
@@ -2366,12 +2342,10 @@ pub mod syscall_numbers {
     pub const NT_CONNECT_PORT: u32 = 0x008F;
     pub const NT_LISTEN_PORT: u32 = 0x00DB;
     pub const NT_ACCEPT_CONNECT_PORT: u32 = 0x0060;
-    pub const NT_SEND_WAIT_RECEIVE_PORT: u32 = 0x00AF;
     pub const NT_IMPERSONATE_CLIENT_OF_PORT: u32 = 0x001C;
     pub const NT_REPLY_WAIT_RECEIVE_PORT: u32 = 0x0008;
     pub const NT_REPLY_PORT: u32 = 0x0009;
     pub const NT_REPLY_WAIT_RECEIVE_PORT_EX: u32 = 0x0028;
-    pub const NT_CREATE_PORT_SECTION: u32 = 0x00BD;
     pub const NT_SECURE_CONNECT_PORT: u32 = 0x014C;
     pub const NT_QUERY_INFORMATION_PORT: u32 = 0x0117;
     pub const NT_REQUEST_PORT: u32 = 0x0140;
@@ -2388,8 +2362,6 @@ pub mod syscall_numbers {
     pub const NT_OPEN_JOB_OBJECT: u32 = 0x00F1;
     pub const NT_ASSIGN_PROCESS_TO_JOB_OBJECT: u32 = 0x0085;
     pub const NT_TERMINATE_JOB_OBJECT: u32 = 0x017D;
-    pub const NT_QUERY_JOB_INFORMATION: u32 = 0x0178;
-    pub const NT_SET_JOB_INFORMATION: u32 = 0x0179;
     pub const NT_QUERY_INFORMATION_JOB_OBJECT: u32 = 0x0116;
     pub const NT_SET_INFORMATION_JOB_OBJECT: u32 = 0x015B;
     pub const NT_IS_PROCESS_IN_JOB: u32 = 0x004C;
@@ -2401,11 +2373,7 @@ pub mod syscall_numbers {
     pub const NT_QUERY_DEFAULT_LOCALE: u32 = 0x0012;
     pub const NT_SET_DEFAULT_LOCALE: u32 = 0x0153;
     pub const NT_QUERY_DEFAULT_UILANGUAGE: u32 = 0x0041;
-    pub const NT_SET_DEFAULT_UILANGUAGE: u32 = 0x0189;
-    pub const NT_QUERY_DEFAULT_HARD_ERROR_MODE: u32 = 0x0108;
-    pub const NT_SET_DEFAULT_HARD_ERROR_MODE: u32 = 0x0187;
-    pub const NT_READ_ONLY_LOGON_SESSION_TREE: u32 = 0x0180;
-    pub const NT_VERIFY_SESSION: u32 = 0x0181;
+    pub const NT_SET_DEFAULT_UILANGUAGE: u32 = 0x0154;
 
     // =================================================================
     // Paging & Memory Management
@@ -2413,8 +2381,6 @@ pub mod syscall_numbers {
 
     pub const NT_CREATE_PAGING_FILE: u32 = 0x009C;
     pub const NT_INITIALIZE_REGISTRY: u32 = 0x00D7;
-    pub const NT_CREATE_PROCESS_STATE: u32 = 0x0166;
-    pub const NT_CREATE_PROCESS_STATE_CHANGE: u32 = 0x00BD;
 
     // =================================================================
     // User Processes
@@ -2435,7 +2401,6 @@ pub mod syscall_numbers {
     // =================================================================
 
     pub const NT_SET_LDT_ENTRIES: u32 = 0x0165;
-    pub const NT_SET_LDT_SIZE: u32 = 0x0168;
 
     // =================================================================
     // DLL & Process Loading
@@ -2453,7 +2418,6 @@ pub mod syscall_numbers {
     pub const NT_OPEN_TRANSACTION: u32 = 0x0100;
     pub const NT_COMMIT_TRANSACTION: u32 = 0x008A;
     pub const NT_ROLLBACK_TRANSACTION: u32 = 0x0147;
-    pub const NT_ENUMERATE_TRANSACTION: u32 = 0x0148;
     pub const NT_SET_INFORMATION_TRANSACTION: u32 = 0x015F;
     pub const NT_QUERY_INFORMATION_TRANSACTION: u32 = 0x0119;
     pub const NT_CREATE_TRANSACTION_MANAGER: u32 = 0x00A9;
@@ -2466,9 +2430,7 @@ pub mod syscall_numbers {
     // System Service Table Information
     // =================================================================
 
-    pub const NT_SET_SYSTEM_INFORMATION_EX: u32 = 0x012C;
     pub const NT_QUERY_SYSTEM_INFORMATION_EX: u32 = 0x012C;
-    pub const NT_TRIM_PROCESS_WORKING_SET: u32 = 0x0157;
 
     // =================================================================
     // Worker Factory
@@ -2497,19 +2459,15 @@ pub mod syscall_numbers {
     pub const NT_WAIT_FOR_DEBUG_EVENT: u32 = 0x018B;
     pub const NT_DEBUG_CONTINUE: u32 = 0x00AE;
     pub const NT_SET_INFORMATION_DEBUG_OBJECT: u32 = 0x0159;
-    pub const NT_QUERY_INFORMATION_DEBUG_OBJECT: u32 = 0x0125;
-    pub const NT_DEBUG_PRINT: u32 = 0x003D;
 
     // =================================================================
     // System environment
     // =================================================================
 
-    pub const NT_QUERY_SYSTEM_ENVIRONMENT: u32 = 0x0081;
     pub const NT_SET_SYSTEM_ENVIRONMENT_VALUE: u32 = 0x016A;
     pub const NT_SET_SYSTEM_ENVIRONMENT_VALUE_EX: u32 = 0x016B;
     pub const NT_ENUMERATE_BOOT_ENTRIES: u32 = 0x00BB;
     pub const NT_ENUMERATE_DRIVER_ENTRIES: u32 = 0x00BC;
-    pub const NT_ENUMERATE_DRIVER_PACKAGE: u32 = 0x01A9;
     pub const NT_ADD_BOOT_ENTRY: u32 = 0x0066;
     pub const NT_DELETE_BOOT_ENTRY: u32 = 0x00B0;
     pub const NT_MODIFY_BOOT_ENTRY: u32 = 0x00E8;
@@ -2534,7 +2492,6 @@ pub mod syscall_numbers {
     pub const NT_SET_THREAD_EXECUTION_STATE: u32 = 0x016F;
     pub const NT_GET_DEVICE_POWER_STATE: u32 = 0x00CC;
     pub const NT_IS_SYSTEM_RESUME_AUTOMATIC: u32 = 0x00D9;
-    pub const NT_REQUEST_WAKEUP_LATENCY: u32 = 0x0084;
     pub const NT_SET_INTERVAL_PROFILE: u32 = 0x0162;
     pub const NT_QUERY_INTERVAL_PROFILE: u32 = 0x011D;
 
@@ -2549,7 +2506,6 @@ pub mod syscall_numbers {
     pub const NT_QUERY_IO_COMPLETION: u32 = 0x011E;
     pub const NT_REMOVE_IO_COMPLETION: u32 = 0x0006;
     pub const NT_REMOVE_IO_COMPLETION_EX: u32 = 0x0139;
-    pub const NT_WAIT_FOR_ALERT_BY_THREAD_ID: u32 = 0x01A6;
 
     // =================================================================
     // Atom Table
@@ -2566,9 +2522,8 @@ pub mod syscall_numbers {
 
     pub const NT_INITIALIZE_NLS_FILES: u32 = 0x00D6;
     pub const NT_GET_NLS_SECTION_PTR: u32 = 0x00D0;
-    pub const NT_QUERY_INSTALL_UILANGUAGE: u32 = 0x007B;
-    pub const NT_IS_UILANGUAGE_COMMITTED: u32 = 0x00AA;
-    pub const NT_FLUSH_INSTALL_UILANGUAGE: u32 = 0x0053;
+    pub const NT_QUERY_INSTALL_UILANGUAGE: u32 = 0x011C;
+    pub const NT_FLUSH_INSTALL_UILANGUAGE: u32 = 0x00C1;
     pub const NT_SET_UUID_SEED: u32 = 0x0172;
 
     // =================================================================
@@ -2589,13 +2544,12 @@ pub mod syscall_numbers {
     pub const NT_UNLOAD_DRIVER: u32 = 0x0184;
     pub const NT_QUERY_SECTION: u32 = 0x004E;
     pub const NT_WAIT_HIGH_EVENT_PAIR: u32 = 0x018E;
-    pub const NT_WAIT_LOW_EVENT_PAIR: u32 = 0x00AA;
+    pub const NT_WAIT_LOW_EVENT_PAIR: u32 = 0x018F;
     pub const NT_SET_HIGH_EVENT_PAIR: u32 = 0x0157;
     pub const NT_SET_LOW_EVENT_PAIR: u32 = 0x0166;
     pub const NT_SET_HIGH_WAIT_LOW_EVENT_PAIR: u32 = 0x0158;
     pub const NT_SET_LOW_WAIT_HIGH_EVENT_PAIR: u32 = 0x0167;
     pub const NT_TRANSLATE_FILE_PATH: u32 = 0x0182;
-    pub const NT_START_SERVICE: u32 = 0x00EC;
 
     // =================================================================
     // APC

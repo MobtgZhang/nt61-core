@@ -17,14 +17,11 @@
 //! - `KeServiceDescriptorTableShadow`: Includes win32k services
 //
 //! ## Service Number Encoding
-//
-//! System service numbers are 32-bit values encoded as:
-//!   bits [31:16]: parameter count (number of bytes of arguments)
-//!   bits [15:12]: service table index (0 = win32k, 1 = native)
-//!   bits [11:0]: service offset in the table
-//
-//! On x64, the parameter count is encoded in bits 16-31, not 0-15.
-//
+//!
+//! Bits 12..15 select table 0 (native) or table 1 (win32k). The low
+//! 12 bits index that table. Argument counts belong to service metadata;
+//! Windows 7 does not encode them in the upper bits of the user number.
+//!
 //! ## Windows 7 x64 SSDT
 //
 //! On Windows 7 x64, the SSDT contains approximately 400+ native
@@ -36,11 +33,8 @@
 /// Maximum number of services in the SSDT
 pub const SSDT_MAX_SERVICES: usize = 512;
 
-/// Maximum argument size (in bytes) for a single service call. The argument
-/// size decoded by `get_argument_size()` is a byte count taken from a single
-/// byte of the service number, so 255 is both the architecture limit and the
-/// actual value checked by the syscall entry.
-pub const SSDT_MAX_ARGUMENT_SIZE: usize = u8::MAX as usize;
+/// Maximum argument bytes supported by the architecture-neutral frame.
+pub const SSDT_MAX_ARGUMENT_SIZE: usize = 17 * 8;
 
 /// Service table descriptor - describes a service table
 #[repr(C)]
@@ -113,11 +107,12 @@ pub fn get_service_descriptor_table() -> &'static KeServiceDescriptorTable {
     unsafe { &*core::ptr::addr_of!(KE_SERVICE_DESCRIPTOR_TABLE) }
 }
 
-/// Service argument count encoding
-/// On x64: bits 16-31 of the service number encode the argument size
+/// Native argument byte count from the original Windows 7 SP1 DLL metadata.
 #[inline(always)]
 pub fn get_argument_size(service_number: u32) -> u32 {
-    (service_number >> 16) & 0xFF
+    nt61_abi::syscall_metadata::NATIVE_SERVICE_METADATA
+        .get(service_number as usize)
+        .map_or(0, |service| service.arguments as u32 * 8)
 }
 
 /// Argument byte count for a Shadow SSDT (win32k) service.

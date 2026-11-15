@@ -124,23 +124,36 @@ pub unsafe fn syscall4(num: u32, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 /// Variable-arg syscall used by APIs with five or more parameters.
 #[inline(always)]
 pub unsafe fn syscall_varargs(num: u32, args: &[u64]) -> i64 {
-    // First 4 args go in r10, rdx, r8, r9 (per MS-x64 ABI).
-    let a0 = *args.first().unwrap_or(&0);
-    let a1 = *args.get(1).unwrap_or(&0);
-    let a2 = *args.get(2).unwrap_or(&0);
-    let a3 = *args.get(3).unwrap_or(&0);
-    let r: i64;
+    if args.len() > crate::arch::common::syscall_frame::SYSCALL_ARGUMENT_COUNT {
+        return 0xC000_000Du32 as i32 as i64;
+    }
+    let tail = args.get(4..).unwrap_or(&[]);
+    // Native Win7 stubs retain a return address and four home slots. The
+    // project's private services retain their historical one-slot prefix.
+    let stack_offset = if num < 0x200 || (0x1000..0x2000).contains(&num) {
+        40usize
+    } else {
+        8
+    };
+    let result: i64;
+    // SAFETY: reserve an outgoing frame below the SysV red zone, copy all
+    // trailing arguments, and restore RSP before returning to Rust. The
+    // bounded 13-slot tail cannot overlap compiler-owned red-zone locals.
     asm!(
+        "sub rsp, 384",
+        "add rdi, rsp",
+        "rep movsq",
         "syscall",
-        in("rax") num as u64,
-        in("r10") a0,
-        in("rdx") a1,
-        in("r8")  a2,
-        in("r9")  a3,
-        out("rcx") _,
+        "add rsp, 384",
+        inlateout("rax") num as u64 => result,
+        in("r10") args.first().copied().unwrap_or(0),
+        in("rdx") args.get(1).copied().unwrap_or(0),
+        in("r8") args.get(2).copied().unwrap_or(0),
+        in("r9") args.get(3).copied().unwrap_or(0),
+        inout("rsi") tail.as_ptr() => _,
+        inout("rdi") stack_offset => _,
+        inout("rcx") tail.len() => _,
         out("r11") _,
-        lateout("rax") r,
-        options(nostack),
     );
-    r
+    result
 }

@@ -19,35 +19,10 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// Maximum number of system calls supported
 pub const MAX_SYSCALLS: usize = 1024;
 
-/// Number of integer ABI slots used by the supported non-x86 architectures.
-pub const INTEGER_REGISTER_ARGUMENTS: usize = 8;
-
-/// Number of integer ABI slots used by RISC-V and LoongArch when the
-/// seventh register holds the syscall number.
-pub const SEVEN_REGISTER_ARCHITECTURES: usize = 7;
-
-/// Uniform argument context passed to every SSDT handler.
-///
-/// `register_args` holds the architecture-independent integer ABI slots.
-/// `stack_pointer` is the user-mode stack pointer captured by the trap
-/// stub; handlers for calls with more than six parameters read their
-/// trailing arguments from it.
-#[derive(Clone, Copy, Debug)]
-pub struct SyscallArguments {
-    pub register_args: [usize; INTEGER_REGISTER_ARGUMENTS],
-    pub integer_register_count: usize,
-    pub stack_pointer: usize,
-}
-
-impl Default for SyscallArguments {
-    fn default() -> Self {
-        Self {
-            register_args: [0; INTEGER_REGISTER_ARGUMENTS],
-            integer_register_count: INTEGER_REGISTER_ARGUMENTS,
-            stack_pointer: 0,
-        }
-    }
-}
+#[path = "ssdt_arguments.rs"]
+mod arguments;
+use arguments::{capture_register_arguments, read_argument};
+pub use arguments::{SyscallArguments, INTEGER_REGISTER_ARGUMENTS, SEVEN_REGISTER_ARCHITECTURES};
 
 /// System call handler function pointer type
 ///
@@ -115,6 +90,7 @@ impl Ssdt {
 
     /// Initialize the SSDT with the given capacity
     pub fn init(&self) {
+        self.entries.lock().fill(None);
         self.count.store(0, Ordering::Release);
     }
 
@@ -162,13 +138,20 @@ impl Ssdt {
         // The spinlock must be released before the handler runs —
         // any syscall that blocks, faults, or re-enters the SSDT
         // while the lock is held deadlocks the whole system.
-        let handler = {
+        let entry = {
             let entries = self.entries.lock();
-            entries[syscall_number].map(|e| e.handler)
+            entries[syscall_number]
         };
-        match handler {
-            Some(h) => h(arguments),
-            None => STATUS_INVALID_SYSTEM_SERVICE,
+        match entry {
+            Some(entry) => {
+                let captured = match capture_register_arguments(arguments, entry.arg_count as usize)
+                {
+                    Ok(captured) => captured,
+                    Err(status) => return status,
+                };
+                (entry.handler)(&captured)
+            }
+            None => unregistered_service_status(syscall_number),
         }
     }
 
@@ -195,11 +178,17 @@ static GLOBAL_SSDT: Ssdt = Ssdt::new();
 
 /// NTSTATUS codes
 pub const STATUS_SUCCESS: u32 = 0x00000000;
-// NT 6.1: the correct value is 0xC000000C. 0xC000001C is
-// STATUS_INVALID_PARAMETER variant territory, not the service
-// dispatch error.
-pub const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xC000000C;
+pub const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xC000001C;
 pub const STATUS_NOT_IMPLEMENTED: u32 = 0xC0000002;
+
+/// Distinguish an unsupported shipped service from a number outside the NT table.
+pub fn unregistered_service_status(number: usize) -> u32 {
+    if number < nt61_abi::syscall_metadata::NATIVE_SERVICE_METADATA.len() {
+        STATUS_NOT_IMPLEMENTED
+    } else {
+        STATUS_INVALID_SYSTEM_SERVICE
+    }
+}
 
 /// Registers the NT services shared by every architecture.
 ///
@@ -248,7 +237,9 @@ pub fn register_common_syscalls() {
         );
         let _ = register_syscall(0x0030, nt_open_file, 6, "NtOpenFile");
         let _ = register_syscall(0x0031, nt_delay_execution, 2, "NtDelayExecution");
-        let _ = register_syscall(0x004B, nt_create_thread, 9, "NtCreateThread");
+        // NtCreateThread's historical helper has nine arguments and a
+        // project-specific context layout; it is not the native eight-argument
+        // Windows contract. Keep that service unavailable until it is corrected.
         let _ = register_syscall(0x004F, nt_resume_thread, 2, "NtResumeThread");
         let _ = register_syscall(0x0050, nt_terminate_thread, 2, "NtTerminateThread");
         let _ = register_syscall(
@@ -423,19 +414,7 @@ fn read_trailing_arguments<const COUNT: usize>(
 }
 
 fn read_trailing_argument(arguments: &SyscallArguments, index: usize) -> Result<usize, u32> {
-    let register_index = index + 6;
-    if register_index < arguments.integer_register_count {
-        return Ok(arguments.register_args[register_index]);
-    }
-
-    let stack_index = register_index - arguments.integer_register_count;
-    let address = arguments
-        .stack_pointer
-        .wrapping_add(stack_index * core::mem::size_of::<usize>());
-    match crate::mm::user_copy::read_user_object::<usize>(address as u64) {
-        Ok(value) => Ok(value),
-        Err(status) => Err(status as u32),
-    }
+    read_argument(arguments, index + 6)
 }
 
 unsafe extern "C" fn nt_close(arguments: &SyscallArguments) -> u32 {
@@ -493,8 +472,12 @@ unsafe extern "C" fn nt_delay_execution(arguments: &SyscallArguments) -> u32 {
 unsafe extern "C" fn nt_create_thread(arguments: &SyscallArguments) -> u32 {
     let [thread_handle, desired_access, object_attributes, process_handle, client_id, start_context, start_routine, ..] =
         arguments.register_args;
-    let [stack_committed, stack_size] = match read_trailing_arguments(arguments) {
-        Ok(values) => values,
+    let stack_committed = match read_argument(arguments, 7) {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
+    let stack_size = match read_argument(arguments, 8) {
+        Ok(value) => value,
         Err(status) => return status,
     };
     let status = crate::libs::ntdll::thread::nt_create_thread(
@@ -599,11 +582,15 @@ unsafe extern "C" fn nt_create_file(arguments: &SyscallArguments) -> u32 {
     status as u32
 }
 
+#[path = "ssdt_portable.rs"]
+mod portable;
+
 /// Initialize the architecture-independent SSDT framework
 pub fn init() {
     GLOBAL_SSDT.init();
     crate::hal::serial::write_string("[SSDT] Architecture-independent framework initialized\r\n");
     register_common_syscalls();
+    portable::register_portable_services();
 }
 
 /// Register a system call in the global SSDT
@@ -634,14 +621,14 @@ pub unsafe fn dispatch_syscall(
 ) -> u32 {
     let arguments = SyscallArguments {
         register_args: [arg1, arg2, arg3, arg4, arg5, arg6, 0, 0],
-        integer_register_count: INTEGER_REGISTER_ARGUMENTS,
+        integer_register_count: 6,
         stack_pointer: 0,
     };
     GLOBAL_SSDT.dispatch(number, &arguments)
 }
 
 /// Dispatch a system call with the user stack pointer required by calls
-/// that pass more than six parameters.
+/// that pass more parameters than fit in their integer registers.
 ///
 /// # Safety
 /// Must be called from a valid syscall context and `stack_pointer` must

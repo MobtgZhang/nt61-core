@@ -26,6 +26,7 @@ pub mod desktop_bridge;
 pub mod error;
 pub mod gdi;
 pub mod structs;
+pub mod syscall_metadata;
 pub mod syscalls;
 pub mod types;
 pub mod winuser;

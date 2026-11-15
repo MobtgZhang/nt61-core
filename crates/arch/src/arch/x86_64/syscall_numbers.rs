@@ -33,9 +33,6 @@ pub const NT_QUERY_SYSTEM_INFORMATION: u32 = 0x0033;
 pub const NT_SET_SYSTEM_INFORMATION: u32 = 0x016C;
 pub const NT_QUERY_SYSTEM_TIME: u32 = 0x0057;
 pub const NT_SET_SYSTEM_TIME: u32 = 0x016E;
-pub const NT_QUERY_INTERRUPT_TIME: u32 = 0x0058;
-pub const NT_SET_INTERRUPT_TIME: u32 = 0x0059;
-pub const NT_QUERY_TICK_COUNT: u32 = 0x00A8;
 pub const NT_GET_CURRENT_PROCESSOR_NUMBER: u32 = 0x00CB;
 pub const NT_SHUTDOWN_SYSTEM: u32 = 0x0174;
 pub const NT_TEST_ALERT: u32 = 0x017E;
@@ -88,7 +85,6 @@ pub const NT_SET_CONTEXT_THREAD: u32 = 0x0150;
 pub const NT_OPEN_THREAD_TOKEN: u32 = 0x0021;
 pub const NT_OPEN_THREAD_TOKEN_EX: u32 = 0x002C;
 pub const NT_IMPERSONATE_THREAD: u32 = 0x00D5;
-pub const NT_REVERT_TO_SELF: u32 = 0x00D6;
 pub const NT_REGISTER_THREAD_TERMINATE_PORT: u32 = 0x0136;
 pub const NT_ALERT_THREAD: u32 = 0x006A;
 pub const NT_ALERT_RESUME_THREAD: u32 = 0x0069;
@@ -124,7 +120,6 @@ pub const NT_QUERY_INFORMATION_FILE: u32 = 0x000E;
 pub const NT_SET_INFORMATION_FILE: u32 = 0x0024;
 pub const NT_DELETE_FILE: u32 = 0x00B2;
 pub const NT_FLUSH_BUFFERS_FILE: u32 = 0x0048;
-pub const NT_FLUSH_BUFFERS_FILE_EX: u32 = 0x00D2;
 pub const NT_QUERY_VOLUME_INFORMATION_FILE: u32 = 0x0046;
 pub const NT_SET_VOLUME_INFORMATION_FILE: u32 = 0x0173;
 pub const NT_QUERY_DIRECTORY_FILE: u32 = 0x0032;
@@ -211,8 +206,6 @@ pub const NT_COMPRESS_KEY: u32 = 0x008E;
 pub const NT_CREATE_KEY_TRANSACTED: u32 = 0x0097;
 pub const NT_OPEN_KEY_TRANSACTED: u32 = 0x00F3;
 pub const NT_OPEN_KEY_TRANSACTED_EX: u32 = 0x00F4;
-pub const NT_DELETE_KEY_TRANSACTED: u32 = 0x00F3;
-pub const NT_SET_VALUE_KEY_TRANSACTED: u32 = 0x0160;
 pub const NT_SET_INFORMATION_KEY: u32 = 0x015C;
 pub const NT_RENAME_KEY: u32 = 0x013B;
 pub const NT_QUERY_MULTIPLE_VALUE_KEY: u32 = 0x0120;
@@ -260,12 +253,10 @@ pub const NT_CREATE_PORT: u32 = 0x009D;
 pub const NT_CONNECT_PORT: u32 = 0x008F;
 pub const NT_LISTEN_PORT: u32 = 0x00DB;
 pub const NT_ACCEPT_CONNECT_PORT: u32 = 0x0060;
-pub const NT_SEND_WAIT_RECEIVE_PORT: u32 = 0x00AF;
 pub const NT_IMPERSONATE_CLIENT_OF_PORT: u32 = 0x001C;
 pub const NT_REPLY_WAIT_RECEIVE_PORT: u32 = 0x0008;
 pub const NT_REPLY_PORT: u32 = 0x0009;
 pub const NT_REPLY_WAIT_RECEIVE_PORT_EX: u32 = 0x0028;
-pub const NT_CREATE_PORT_SECTION: u32 = 0x00BD;
 pub const NT_SECURE_CONNECT_PORT: u32 = 0x014C;
 pub const NT_QUERY_INFORMATION_PORT: u32 = 0x0117;
 pub const NT_REQUEST_PORT: u32 = 0x0140;
@@ -282,8 +273,6 @@ pub const NT_CREATE_JOB_OBJECT: u32 = 0x0095;
 pub const NT_OPEN_JOB_OBJECT: u32 = 0x00F1;
 pub const NT_ASSIGN_PROCESS_TO_JOB_OBJECT: u32 = 0x0085;
 pub const NT_TERMINATE_JOB_OBJECT: u32 = 0x017D;
-pub const NT_QUERY_JOB_INFORMATION: u32 = 0x0178;
-pub const NT_SET_JOB_INFORMATION: u32 = 0x0179;
 pub const NT_QUERY_INFORMATION_JOB_OBJECT: u32 = 0x0116;
 pub const NT_SET_INFORMATION_JOB_OBJECT: u32 = 0x015B;
 pub const NT_IS_PROCESS_IN_JOB: u32 = 0x004C;
@@ -295,11 +284,7 @@ pub const NT_IS_PROCESS_IN_JOB: u32 = 0x004C;
 pub const NT_QUERY_DEFAULT_LOCALE: u32 = 0x0012;
 pub const NT_SET_DEFAULT_LOCALE: u32 = 0x0153;
 pub const NT_QUERY_DEFAULT_UILANGUAGE: u32 = 0x0041;
-pub const NT_SET_DEFAULT_UILANGUAGE: u32 = 0x0189;
-pub const NT_QUERY_DEFAULT_HARD_ERROR_MODE: u32 = 0x0108;
-pub const NT_SET_DEFAULT_HARD_ERROR_MODE: u32 = 0x0187;
-pub const NT_READ_ONLY_LOGON_SESSION_TREE: u32 = 0x0180;
-pub const NT_VERIFY_SESSION: u32 = 0x0181;
+pub const NT_SET_DEFAULT_UILANGUAGE: u32 = 0x0154;
 
 // =================================================================
 // Paging & Memory Management
@@ -307,8 +292,6 @@ pub const NT_VERIFY_SESSION: u32 = 0x0181;
 
 pub const NT_CREATE_PAGING_FILE: u32 = 0x009C;
 pub const NT_INITIALIZE_REGISTRY: u32 = 0x00D7;
-pub const NT_CREATE_PROCESS_STATE: u32 = 0x0166;
-pub const NT_CREATE_PROCESS_STATE_CHANGE: u32 = 0x00BD;
 
 // =================================================================
 // User Processes
@@ -329,7 +312,6 @@ pub const NT_CONTINUE: u32 = 0x0040;
 // =================================================================
 
 pub const NT_SET_LDT_ENTRIES: u32 = 0x0165;
-pub const NT_SET_LDT_SIZE: u32 = 0x0168;
 
 // =================================================================
 // DLL & Process Loading
@@ -347,7 +329,6 @@ pub const NT_CREATE_TRANSACTION: u32 = 0x00A8;
 pub const NT_OPEN_TRANSACTION: u32 = 0x0100;
 pub const NT_COMMIT_TRANSACTION: u32 = 0x008A;
 pub const NT_ROLLBACK_TRANSACTION: u32 = 0x0147;
-pub const NT_ENUMERATE_TRANSACTION: u32 = 0x0148;
 pub const NT_SET_INFORMATION_TRANSACTION: u32 = 0x015F;
 pub const NT_QUERY_INFORMATION_TRANSACTION: u32 = 0x0119;
 pub const NT_CREATE_TRANSACTION_MANAGER: u32 = 0x00A9;
@@ -360,9 +341,7 @@ pub const NT_ENUMERATE_TRANSACTION_OBJECT: u32 = 0x00BE;
 // System Service Table Information
 // =================================================================
 
-pub const NT_SET_SYSTEM_INFORMATION_EX: u32 = 0x012C;
 pub const NT_QUERY_SYSTEM_INFORMATION_EX: u32 = 0x012C;
-pub const NT_TRIM_PROCESS_WORKING_SET: u32 = 0x0157;
 
 // =================================================================
 // Worker Factory
@@ -391,19 +370,15 @@ pub const NT_REMOVE_PROCESS_DEBUG: u32 = 0x013A;
 pub const NT_WAIT_FOR_DEBUG_EVENT: u32 = 0x018B;
 pub const NT_DEBUG_CONTINUE: u32 = 0x00AE;
 pub const NT_SET_INFORMATION_DEBUG_OBJECT: u32 = 0x0159;
-pub const NT_QUERY_INFORMATION_DEBUG_OBJECT: u32 = 0x0125;
-pub const NT_DEBUG_PRINT: u32 = 0x003D;
 
 // =================================================================
 // System environment
 // =================================================================
 
-pub const NT_QUERY_SYSTEM_ENVIRONMENT: u32 = 0x0081;
 pub const NT_SET_SYSTEM_ENVIRONMENT_VALUE: u32 = 0x016A;
 pub const NT_SET_SYSTEM_ENVIRONMENT_VALUE_EX: u32 = 0x016B;
 pub const NT_ENUMERATE_BOOT_ENTRIES: u32 = 0x00BB;
 pub const NT_ENUMERATE_DRIVER_ENTRIES: u32 = 0x00BC;
-pub const NT_ENUMERATE_DRIVER_PACKAGE: u32 = 0x01A9;
 pub const NT_ADD_BOOT_ENTRY: u32 = 0x0066;
 pub const NT_DELETE_BOOT_ENTRY: u32 = 0x00B0;
 pub const NT_MODIFY_BOOT_ENTRY: u32 = 0x00E8;
@@ -428,7 +403,6 @@ pub const NT_INITIATE_POWER_ACTION: u32 = 0x00D8;
 pub const NT_SET_THREAD_EXECUTION_STATE: u32 = 0x016F;
 pub const NT_GET_DEVICE_POWER_STATE: u32 = 0x00CC;
 pub const NT_IS_SYSTEM_RESUME_AUTOMATIC: u32 = 0x00D9;
-pub const NT_REQUEST_WAKEUP_LATENCY: u32 = 0x0084;
 pub const NT_SET_INTERVAL_PROFILE: u32 = 0x0162;
 pub const NT_QUERY_INTERVAL_PROFILE: u32 = 0x011D;
 
@@ -443,7 +417,6 @@ pub const NT_SET_IO_COMPLETION_EX: u32 = 0x0164;
 pub const NT_QUERY_IO_COMPLETION: u32 = 0x011E;
 pub const NT_REMOVE_IO_COMPLETION: u32 = 0x0006;
 pub const NT_REMOVE_IO_COMPLETION_EX: u32 = 0x0139;
-pub const NT_WAIT_FOR_ALERT_BY_THREAD_ID: u32 = 0x01A6;
 
 // =================================================================
 // Atom Table
@@ -460,9 +433,8 @@ pub const NT_FIND_ATOM: u32 = 0x0011;
 
 pub const NT_INITIALIZE_NLS_FILES: u32 = 0x00D6;
 pub const NT_GET_NLS_SECTION_PTR: u32 = 0x00D0;
-pub const NT_QUERY_INSTALL_UILANGUAGE: u32 = 0x007B;
-pub const NT_IS_UILANGUAGE_COMMITTED: u32 = 0x00AA;
-pub const NT_FLUSH_INSTALL_UILANGUAGE: u32 = 0x0053;
+pub const NT_QUERY_INSTALL_UILANGUAGE: u32 = 0x011C;
+pub const NT_FLUSH_INSTALL_UILANGUAGE: u32 = 0x00C1;
 pub const NT_SET_UUID_SEED: u32 = 0x0172;
 
 // =================================================================
@@ -483,13 +455,12 @@ pub const NT_LOAD_DRIVER: u32 = 0x00DC;
 pub const NT_UNLOAD_DRIVER: u32 = 0x0184;
 pub const NT_QUERY_SECTION: u32 = 0x004E;
 pub const NT_WAIT_HIGH_EVENT_PAIR: u32 = 0x018E;
-pub const NT_WAIT_LOW_EVENT_PAIR: u32 = 0x00AA;
+pub const NT_WAIT_LOW_EVENT_PAIR: u32 = 0x018F;
 pub const NT_SET_HIGH_EVENT_PAIR: u32 = 0x0157;
 pub const NT_SET_LOW_EVENT_PAIR: u32 = 0x0166;
 pub const NT_SET_HIGH_WAIT_LOW_EVENT_PAIR: u32 = 0x0158;
 pub const NT_SET_LOW_WAIT_HIGH_EVENT_PAIR: u32 = 0x0167;
 pub const NT_TRANSLATE_FILE_PATH: u32 = 0x0182;
-pub const NT_START_SERVICE: u32 = 0x00EC;
 
 // =================================================================
 // APC
