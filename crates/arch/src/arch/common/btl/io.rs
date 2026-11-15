@@ -17,9 +17,26 @@ pub const STD_ERROR: u64 = 0x18;
 
 /// Host operations receive owned, validated values rather than guest pointers.
 pub trait IoHost {
+    fn memory_status(&mut self) -> Result<nt61::MemoryStatus, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn processor_mask(&mut self) -> Result<u64, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn read_library(&mut self, _name: &str, _mode: super::ir::DecodeMode) -> Result<Vec<u8>, u32> {
+        Err(0xc000_0135)
+    }
     fn open_read(&mut self, path: &str) -> Result<(), u32>;
     fn read_at(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>, u32>;
     fn console_write(&mut self, bytes: &[u8]) -> Result<(), u32>;
+    /// NT wall time and monotonic uptime in 100-ns units respectively.
+    fn clocks(&mut self) -> Result<(u64, u64), u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    /// Captured NT interval in 100-ns units; never a guest address.
+    fn delay_execution(&mut self, _alertable: bool, _interval: i64) -> u32 {
+        nt61::STATUS_NOT_IMPLEMENTED
+    }
 }
 struct File {
     handle: u64,
@@ -55,6 +72,29 @@ impl<H: IoHost> IoServices<H> {
     ) -> Result<u32, u32> {
         let width = if abi == GuestAbi::X86_32 { 4 } else { 8 };
         match service {
+            Service::DelayExecution => {
+                let bytes = read(m, a[1], 8)?;
+                let interval = word(&bytes, 0, 8) as i64;
+                Ok(self.host.delay_execution(a[0] as u8 != 0, interval))
+            }
+            Service::QuerySystemTime => {
+                writable(m, a[0], 8)?;
+                let (wall, _) = self.host.clocks()?;
+                put(m, a[0], wall, 8)?;
+                Ok(0)
+            }
+            Service::QueryPerformanceCounter => {
+                writable(m, a[0], 8)?;
+                if a[1] != 0 {
+                    writable(m, a[1], 8)?;
+                }
+                let (_, monotonic) = self.host.clocks()?;
+                put(m, a[0], monotonic, 8)?;
+                if a[1] != 0 {
+                    put(m, a[1], 10_000_000, 8)?;
+                }
+                Ok(0)
+            }
             Service::CreateFile => {
                 // FILE_OPEN, synchronous read-only file, no EA or allocation hint.
                 if a[7] != 1 || a[4] != 0 || a[9] != 0 || a[10] != 0 {
@@ -190,6 +230,15 @@ impl<H: IoHost> IoServices<H> {
     }
 }
 impl<H: IoHost> GuestServices for IoServices<H> {
+    fn memory_status(&mut self) -> Result<nt61::MemoryStatus, u32> {
+        self.host.memory_status()
+    }
+    fn processor_mask(&mut self) -> Result<u64, u32> {
+        self.host.processor_mask()
+    }
+    fn read_library(&mut self, name: &str, mode: super::ir::DecodeMode) -> Result<Vec<u8>, u32> {
+        self.host.read_library(name, mode)
+    }
     fn call(
         &mut self,
         abi: GuestAbi,

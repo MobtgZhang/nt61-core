@@ -1,9 +1,8 @@
 //! Checked PE32/PE32+ memory for the portable execution backend.
 //!
 //! Guest imports are linked only to checked guest DLL mappings, never to host
-//! function pointers. Initial-thread executable TLS is supported; DLL
-//! initialization remains an explicit unsupported boundary. Images are loaded
-//! at their preferred base.
+//! function pointers. Static TLS and process-attach callbacks execute on the
+//! initial guest thread in dependency order. Images use their preferred bases.
 
 use super::{ir::DecodeMode, memory::GuestMemory, runtime::GuestThread};
 use alloc::{vec, vec::Vec};
@@ -16,6 +15,8 @@ mod source;
 pub use source::{read_image_file, ImageReadError};
 #[path = "pe/tls.rs"]
 mod tls;
+#[path = "win32.rs"]
+pub mod win32;
 
 const PAGE: usize = 4096;
 const READ: u8 = 1;
@@ -155,6 +156,8 @@ pub struct GuestImage {
     pub teb: u64,
     startup: Option<tls::Startup>,
     terminal: Option<ImageRunResult>,
+    pub win32: win32::Runtime,
+    module_metadata: Vec<ModuleMetadata>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,9 +185,7 @@ impl GuestImage {
             }
             if let Some(startup) = &mut self.startup {
                 if !startup.active() {
-                    if let Err(reason) =
-                        startup.begin(&mut self.thread, &mut self.memory, self.image_base)
-                    {
+                    if let Err(reason) = startup.begin(&mut self.thread, &mut self.memory) {
                         let result = ImageRunResult::Fault(reason);
                         self.terminal = Some(result);
                         return result;
@@ -197,8 +198,14 @@ impl GuestImage {
             let outcome = self.thread.run(&mut self.memory, remaining);
             remaining -= outcome.retired;
             if let Some(startup) = &mut self.startup {
-                if startup.complete(&mut self.thread, outcome.reason) {
-                    continue;
+                match startup.complete(&mut self.thread, outcome.reason) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(reason) => {
+                        let result = ImageRunResult::Fault(reason);
+                        self.terminal = Some(result);
+                        return result;
+                    }
                 }
             }
             match outcome.reason {
@@ -208,6 +215,22 @@ impl GuestImage {
                     } else {
                         GuestAbi::X86_64
                     };
+                    if number & 0xffff_0000 == win32::catalog::GATEWAY_BASE {
+                        match win32::dispatch(self, number, services) {
+                            Ok(win32::Outcome::Return(value)) => self.thread.context.set_reg(X86Reg::Rax, if abi == GuestAbi::X86_32 { value as u32 as u64 } else { value }),
+                            Ok(win32::Outcome::Exit(code)) => {
+                                let result = ImageRunResult::Exited(code);
+                                self.terminal = Some(result);
+                                return result;
+                            }
+                            Err(reason) => {
+                                let result = ImageRunResult::Fault(reason);
+                                self.terminal = Some(result);
+                                return result;
+                            }
+                        }
+                        continue;
+                    }
                     match super::nt61::dispatch(
                         abi,
                         number,
@@ -317,6 +340,12 @@ impl GuestImage {
         Ok(())
     }
 
+    /// Load a same-ISA guest DLL transactionally. New libraries with DLL
+    /// initialization or static TLS remain explicitly unsupported here.
+    pub fn load_library(&mut self, name: &str, resolver: &mut dyn ImportResolver) -> Result<u64, LinkError> {
+        link::load_library(self, name, resolver)
+    }
+
     /// Construct an isolated guest with no unresolved imports.
     pub fn load(file: &[u8]) -> Result<Self, LoadError> {
         let mapped = MappedImage::parse(file, false)?;
@@ -327,15 +356,19 @@ impl GuestImage {
     }
 
     /// Link normal imports to guest PE DLLs supplied by a filesystem resolver.
-    /// Delay imports remain guest code's responsibility. DLL initialization
-    /// and per-module TLS must be implemented before such DLLs can run.
+    /// Delay imports remain guest code's responsibility. Static TLS callbacks
+    /// and DLL_PROCESS_ATTACH execute before the executable's entry point.
     pub fn load_linked(file: &[u8], resolver: &mut dyn ImportResolver) -> Result<Self, LinkError> {
         link::load(file, resolver)
     }
 
-    fn from_mapped(mapped: MappedImage, libraries: Vec<Region>) -> Result<Self, LoadError> {
+    fn from_mapped(mapped: MappedImage, libraries: Vec<MappedImage>) -> Result<Self, LoadError> {
         let bad = LoadError::InvalidImage;
-        let tls = tls::Plan::parse(&mapped)?;
+        let initialization = tls::InitialThread::plan(&mapped, &libraries)?;
+        let mut module_metadata = Vec::new();
+        module_metadata.try_reserve_exact(libraries.len() + 1).map_err(|_| LoadError::OutOfMemory)?;
+        module_metadata.push(ModuleMetadata::from_image(&mapped));
+        module_metadata.extend(libraries.iter().map(ModuleMetadata::from_image));
         let MappedImage {
             region: image,
             mode,
@@ -366,7 +399,7 @@ impl GuestImage {
         {
             return Err(bad);
         }
-        regions.extend(libraries);
+        regions.extend(libraries.into_iter().map(|image| image.region));
         regions.sort_by_key(|region| region.base);
         if regions
             .windows(2)
@@ -419,11 +452,7 @@ impl GuestImage {
                 return Err(bad);
             }
         }
-        let startup = if let Some(tls) = tls {
-            Some(tls.install(&mut memory, &thread, teb)?)
-        } else {
-            None
-        };
+        let startup = initialization.install(&mut memory, &thread, teb)?;
         Ok(Self {
             thread,
             memory,
@@ -432,7 +461,36 @@ impl GuestImage {
             teb,
             startup,
             terminal: None,
+            win32: win32::Runtime::new(base),
+            module_metadata,
         })
+    }
+}
+
+/// Immutable loader metadata: guest writes to mapped headers must not replace
+/// the linker identity or directory bounds used by later dynamic loads.
+#[derive(Clone, Copy)]
+struct ModuleMetadata {
+    base: u64,
+    size: usize,
+    mode: DecodeMode,
+    entry: usize,
+    directories: [(u32, u32); 16],
+}
+impl ModuleMetadata {
+    fn from_image(image: &MappedImage) -> Self {
+        Self { base: image.region.base, size: image.region.bytes.len(), mode: image.mode,
+            entry: image.entry, directories: image.directories }
+    }
+    fn snapshot(&self, memory: &ImageMemory) -> Result<MappedImage, LoadError> {
+        let source = memory.regions.iter().find(|r| r.base == self.base && r.bytes.len() == self.size)
+            .ok_or(LoadError::InvalidImage)?;
+        let mut bytes = zeroed(source.bytes.len())?;
+        bytes.copy_from_slice(&source.bytes);
+        let mut permissions = zeroed(source.permissions.len())?;
+        permissions.copy_from_slice(&source.permissions);
+        Ok(MappedImage { region: Region { base: self.base, bytes, permissions },
+            mode: self.mode, entry: self.entry, directories: self.directories })
     }
 }
 

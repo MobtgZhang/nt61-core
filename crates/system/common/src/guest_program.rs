@@ -1,17 +1,55 @@
 //! Mounted-volume x86/x64 console PE execution using the portable backend.
 //! This is a bounded command invocation, not a substitute for a full Win32
-//! process (DLL initialization, GUI dispatch, SEH and guest thread creation
+//! process (GUI dispatch, SEH and guest thread creation
 //! remain separate). Normal imports link only to checked guest DLL code.
 use crate::arch::common::btl::{
     io::{IoHost, IoServices},
     pe::ImageRunResult,
+    runtime::StopReason,
 };
 use alloc::{format, string::String, vec::Vec};
 
 struct VolumeIo {
     output: fn(&[u8]),
+    application_directory: String,
 }
 impl IoHost for VolumeIo {
+    fn memory_status(&mut self) -> Result<crate::arch::common::btl::nt61::MemoryStatus, u32> {
+        Ok(crate::arch::common::btl::nt61::MemoryStatus {
+            physical_total: crate::mm::get_total_physical(),
+            physical_available: crate::mm::get_free_physical(),
+            paging_total: crate::mm::pagefile::get_total_pagefile_pages().saturating_mul(4096),
+            paging_available: crate::mm::pagefile::get_total_free_pagefile_pages()
+                .saturating_mul(4096),
+        })
+    }
+    fn processor_mask(&mut self) -> Result<u64, u32> {
+        let count = crate::arch::common::smp::cpu_count().min(64);
+        if count == 0 {
+            return Err(0xc0000001);
+        }
+        Ok(u64::MAX >> (64 - count))
+    }
+    fn clocks(&mut self) -> Result<(u64, u64), u32> {
+        Ok((
+            crate::ke::time::get_system_time(),
+            crate::ke::time::get_interrupt_time(),
+        ))
+    }
+    fn delay_execution(&mut self, alertable: bool, interval: i64) -> u32 {
+        crate::libs::ntdll::sync::nt_delay_execution_kernel(u8::from(alertable), interval) as u32
+    }
+    fn read_library(
+        &mut self,
+        name: &str,
+        mode: crate::arch::common::btl::ir::DecodeMode,
+    ) -> Result<Vec<u8>, u32> {
+        use crate::arch::common::btl::pe::ImportResolver;
+        crate::userspace::loader::VolumeLibraries {
+            application_directory: &self.application_directory,
+        }
+        .read_library(name, mode)
+    }
     fn open_read(&mut self, path: &str) -> Result<(), u32> {
         // This read validates file existence through the mounted FS without
         // loading its complete contents or opening directories as files.
@@ -93,16 +131,49 @@ pub fn try_execute(
                     return Some(status);
                 }
             };
-        let mut services = IoServices::new(VolumeIo { output });
+        let mut services = IoServices::new(VolumeIo {
+            output,
+            application_directory: candidate
+                .rsplit_once('\\')
+                .map_or(directory, |(parent, _)| parent)
+                .into(),
+        });
         // Bounded maintenance/desktop console execution. Every quantum lets
         // runnable kernel/desktop threads proceed; no global BTL lock is held.
-        for _ in 0..512 {
+        // The supplied Firefox SFX executes ~3.7M instructions just to unpack
+        // itself. Keep a finite bound while retaining a scheduler yield per quantum.
+        for _ in 0..4096 {
             match image.run(2048, &mut services) {
-                ImageRunResult::Exited(code) => return Some(code),
+                ImageRunResult::Exited(code) => {
+                    if !image.win32.failures.is_empty() {
+                        let diagnostic = format!(
+                            "[PE] Guest exited {code}; recent API failures: {:?}\r\n",
+                            image.win32.failures
+                        );
+                        crate::hal::serial::write_string_always(&diagnostic);
+                        output(diagnostic.as_bytes());
+                    }
+                    return Some(code);
+                }
                 ImageRunResult::Yielded => crate::ke::scheduler::yield_(),
                 ImageRunResult::Fault(reason) => {
-                    output(format!("Guest execution fault: {reason:?}.\r\n").as_bytes());
-                    return Some(0xc000001d);
+                    let status = match reason {
+                        StopReason::InitializationFailed { .. } => 0xc0000142,
+                        _ => 0xc000001d,
+                    };
+                    let api = image
+                        .win32
+                        .last_api
+                        .and_then(crate::arch::common::btl::pe::win32::catalog::resolve)
+                        .map(|api| format!("{}!{}", api.dll, api.name))
+                        .unwrap_or_default();
+                    let diagnostic = format!(
+                        "Guest execution fault in {candidate}: {reason:?}; API {api}; NTSTATUS 0x{status:08X}.\r\n"
+                    );
+                    crate::hal::serial::write_string_always("[PE] ");
+                    crate::hal::serial::write_string_always(&diagnostic);
+                    output(diagnostic.as_bytes());
+                    return Some(status);
                 }
             }
         }

@@ -1,13 +1,15 @@
 //! Bounded PE import/export linking into the isolated guest address space.
-//! A resolved address always names executable bytes of a same-ISA guest DLL.
+//! A resolved address names readable code or data in a same-ISA guest DLL;
+//! instruction fetch independently enforces executable page permissions.
 
-use super::{u16_at, u32_at, u64_at, GuestImage, LoadError, MappedImage, EXECUTE, READ};
+use super::{u16_at, u32_at, u64_at, GuestImage, LoadError, MappedImage, READ};
 use crate::arch::common::btl::ir::DecodeMode;
 use alloc::{format, string::String, vec::Vec};
 use core::fmt;
 
-const MAX_MODULES: usize = 32;
-const MAX_DEPTH: usize = 32;
+const MAX_MODULES: usize = 128;
+const MAX_DEPTH: usize = 64;
+const MAX_RELOCATIONS: usize = 1_048_576;
 const MAX_SYMBOLS: usize = 16_384;
 const MAX_MAPPED_BYTES: usize = 128 * 1024 * 1024;
 
@@ -108,6 +110,7 @@ impl fmt::Display for LinkError {
 struct Module {
     name: String,
     image: MappedImage,
+    dependencies: Vec<usize>,
 }
 struct Linker<'a> {
     resolver: &'a mut dyn ImportResolver,
@@ -115,6 +118,8 @@ struct Linker<'a> {
     mode: DecodeMode,
     mapped_bytes: usize,
     imports: usize,
+    occupied: Vec<(u64, u64)>,
+    dynamic: bool,
 }
 
 pub(super) fn load(
@@ -127,16 +132,143 @@ pub(super) fn load(
         mode: image.mode,
         mapped_bytes: image.region.bytes.len(),
         imports: 0,
+        occupied: Vec::new(),
+        dynamic: false,
         modules: alloc::vec![Module {
             name: String::new(),
-            image
+            image,
+            dependencies: Vec::new(),
         }],
     };
     linker.bind(0, 0)?;
-    let mut modules = linker.modules.into_iter();
-    let executable = modules.next().ok_or(LoadError::InvalidImage)?.image;
-    let libraries = modules.map(|module| module.image.region).collect();
-    GuestImage::from_mapped(executable, libraries).map_err(Into::into)
+    // Include forwarded-export dependencies, not just the order in which
+    // files happened to be read. Publish-before-bind permits import cycles;
+    // the visiting mark also prevents recursive initialization of a cycle.
+    fn visit(index: usize, modules: &[Module], marks: &mut [bool], order: &mut Vec<usize>) {
+        if marks[index] {
+            return;
+        }
+        marks[index] = true;
+        for &dependency in &modules[index].dependencies {
+            visit(dependency, modules, marks, order);
+        }
+        if index != 0 {
+            order.push(index);
+        }
+    }
+    let mut order = Vec::new();
+    visit(
+        0,
+        &linker.modules,
+        &mut alloc::vec![false; linker.modules.len()],
+        &mut order,
+    );
+    let mut modules: Vec<_> = linker.modules.into_iter().map(Some).collect();
+    let executable = modules[0].take().ok_or(LoadError::InvalidImage)?.image;
+    let mut libraries = Vec::new();
+    let mut identities = Vec::new();
+    for index in order {
+        let module = modules[index].take().ok_or(LoadError::InvalidImage)?;
+        identities.push((module.name, module.image.region.base));
+        libraries.push(module.image);
+    }
+    let mut image = GuestImage::from_mapped(executable, libraries)?;
+    image.win32.modules.extend(identities);
+    Ok(image)
+}
+
+/// Stage against checked copies of existing mappings. The live image is only
+/// extended after every dependency, export and initialization constraint passes.
+pub(super) fn load_library(
+    guest: &mut GuestImage,
+    name: &str,
+    resolver: &mut dyn ImportResolver,
+) -> Result<u64, LinkError> {
+    let name = canonical_module(name)?;
+    if let Some((_, base)) = guest.win32.modules.iter().find(|(n, _)| *n == name) {
+        return Ok(*base);
+    }
+    if guest.module_metadata.len() >= MAX_MODULES {
+        return Err(LinkError::LimitExceeded);
+    }
+    let mut linker = Linker {
+        resolver,
+        mode: guest.thread.context.mode,
+        mapped_bytes: 0,
+        imports: 0,
+        modules: Vec::new(),
+        occupied: Vec::new(),
+        dynamic: true,
+    };
+    linker
+        .modules
+        .try_reserve_exact(guest.module_metadata.len())
+        .map_err(|_| LoadError::OutOfMemory)?;
+    for meta in &guest.module_metadata {
+        linker.mapped_bytes = linker
+            .mapped_bytes
+            .checked_add(meta.size)
+            .ok_or(LinkError::LimitExceeded)?;
+        if linker.mapped_bytes > MAX_MAPPED_BYTES {
+            return Err(LinkError::LimitExceeded);
+        }
+        let name = guest
+            .win32
+            .modules
+            .iter()
+            .find(|(_, base)| *base == meta.base)
+            .map(|(name, _)| name.clone())
+            .ok_or(LoadError::InvalidImage)?;
+        linker.modules.push(Module {
+            name,
+            image: meta.snapshot(&guest.memory)?,
+            dependencies: Vec::new(),
+        });
+    }
+    linker
+        .occupied
+        .try_reserve_exact(guest.memory.regions.len())
+        .map_err(|_| LoadError::OutOfMemory)?;
+    for region in &guest.memory.regions {
+        linker.occupied.push((
+            region.base,
+            region
+                .base
+                .checked_add(region.bytes.len() as u64)
+                .ok_or(LoadError::InvalidImage)?,
+        ));
+    }
+    let existing = linker.modules.len();
+    let library = linker.library(&name, 0)?;
+    let handle = linker.modules[library].image.region.base;
+    let new_count = linker.modules.len() - existing;
+    guest
+        .memory
+        .regions
+        .try_reserve_exact(new_count)
+        .map_err(|_| LoadError::OutOfMemory)?;
+    guest
+        .module_metadata
+        .try_reserve_exact(new_count)
+        .map_err(|_| LoadError::OutOfMemory)?;
+    guest
+        .win32
+        .modules
+        .try_reserve_exact(new_count)
+        .map_err(|_| LoadError::OutOfMemory)?;
+    for module in linker.modules.into_iter().skip(existing) {
+        guest
+            .module_metadata
+            .push(super::ModuleMetadata::from_image(&module.image));
+        guest
+            .win32
+            .modules
+            .push((module.name, module.image.region.base));
+        guest.memory.regions.push(module.image.region);
+    }
+    guest.memory.regions.sort_by_key(|region| region.base);
+    guest.thread.invalidate_code();
+    Ok(handle)
 }
 
 fn canonical_module(name: &str) -> Result<String, LoadError> {
@@ -160,6 +292,110 @@ fn canonical_module(name: &str) -> Result<String, LoadError> {
 }
 
 impl MappedImage {
+    fn rebase(&mut self, base: u64) -> Result<(), LoadError> {
+        let bad = LoadError::InvalidImage;
+        let (rva, size) = self.directories[5];
+        if (rva, size) == (0, 0) && self.forwarders_only()? {
+            // API-set facade DLLs have no code, initialization, absolute data
+            // fixups or relocation directory: their exports are RVA strings.
+            self.region.base = base;
+            return Ok(());
+        }
+        if rva == 0
+            || size < 8
+            || base & 0xffff != 0
+            || (self.mode == DecodeMode::X86
+                && base
+                    .checked_add(self.region.bytes.len() as u64)
+                    .is_none_or(|end| end > 0x1_0000_0000))
+        {
+            return Err(bad);
+        }
+        // Validate the entire directory and targets before applying any fixup.
+        let directory = self.data(rva as usize, size as usize)?;
+        let mut cursor = 0;
+        let mut fixups = Vec::new();
+        while cursor < directory.len() {
+            let block = directory.get(cursor..).ok_or(bad)?;
+            let page = u32_at(block, 0)? as usize;
+            let length = u32_at(block, 4)? as usize;
+            if page & 0xfff != 0 || length < 8 || length & 1 != 0 || length > block.len() {
+                return Err(bad);
+            }
+            for at in (8..length).step_by(2) {
+                let entry = u16_at(block, at)?;
+                let width = match entry >> 12 {
+                    0 => continue,
+                    3 => 4,
+                    10 if self.mode == DecodeMode::X64 => 8,
+                    _ => return Err(bad),
+                };
+                let target = page.checked_add((entry & 0xfff) as usize).ok_or(bad)?;
+                self.data(target, width)?;
+                if fixups.len() >= MAX_RELOCATIONS {
+                    return Err(LoadError::ImageTooLarge);
+                }
+                fixups.try_reserve(1).map_err(|_| LoadError::OutOfMemory)?;
+                fixups.push((target, width));
+            }
+            cursor += length;
+        }
+        fixups.sort_unstable();
+        if fixups.windows(2).any(|p| p[0].0 + p[0].1 > p[1].0) {
+            return Err(bad);
+        }
+        let delta = base.wrapping_sub(self.region.base);
+        for (offset, width) in fixups {
+            if width == 4 {
+                let value = u32_at(&self.region.bytes, offset)?.wrapping_add(delta as u32);
+                self.region.bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            } else {
+                let value = u64_at(&self.region.bytes, offset)?.wrapping_add(delta);
+                self.region.bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        self.region.base = base;
+        Ok(())
+    }
+
+    fn forwarders_only(&self) -> Result<bool, LoadError> {
+        if self.entry != 0
+            || self.directories[1] != (0, 0)
+            || self.directories[9] != (0, 0)
+            || self.directories[10] != (0, 0)
+            || self
+                .region
+                .permissions
+                .iter()
+                .any(|p| p & super::WRITE != 0)
+        {
+            return Ok(false);
+        }
+        let (rva, size) = self.directories[0];
+        if rva == 0 || size < 40 {
+            return Ok(false);
+        }
+        let table = self.data(rva as usize, 40)?;
+        let count = u32_at(table, 20)? as usize;
+        if count == 0 || count > MAX_SYMBOLS {
+            return Ok(false);
+        }
+        let functions = self.data(u32_at(table, 28)? as usize, count * 4)?;
+        let end = (rva as usize)
+            .checked_add(size as usize)
+            .ok_or(LoadError::InvalidImage)?;
+        for i in 0..count {
+            let target = u32_at(functions, i * 4)? as usize;
+            if target != 0 {
+                if !(rva as usize..end).contains(&target) {
+                    return Ok(false);
+                }
+                self.string(target, (end - target).min(512))?;
+            }
+        }
+        Ok(true)
+    }
+
     fn data(&self, rva: usize, len: usize) -> Result<&[u8], LoadError> {
         let va = self
             .region
@@ -210,39 +446,95 @@ impl Linker<'_> {
                 name: name.clone(),
                 status,
             })?;
-        let image = MappedImage::parse(&file, true).map_err(|error| LinkError::LibraryImage {
-            name: name.clone(),
-            error,
-        })?;
+        let mut image =
+            MappedImage::parse(&file, true).map_err(|error| LinkError::LibraryImage {
+                name: name.clone(),
+                error,
+            })?;
         if image.mode != self.mode {
             return Err(LinkError::WrongMachine { name });
         }
-        if image.directories[9] != (0, 0) {
-            return Err(LinkError::LibraryImage {
-                name,
-                error: LoadError::TlsRequired,
-            });
-        }
-        // Silently skipping DllMain would make a correctly linked image broken.
-        if image.entry != 0 {
+        let tls = super::tls::Plan::parse(&image).map_err(|error| LinkError::LibraryImage {
+            name: name.clone(),
+            error,
+        })?;
+        if self.dynamic && (image.entry != 0 || tls.is_some()) {
             return Err(LinkError::InitializationRequired { name });
         }
-        let start = image.region.base;
-        let end = start + image.region.bytes.len() as u64;
-        if self.modules.iter().any(|module| {
-            let region = &module.image.region;
-            start < region.base + region.bytes.len() as u64 && region.base < end
-        }) {
-            return Err(LinkError::AddressConflict { name });
+        let conflicts = |start: u64, end: u64| {
+            self.modules.iter().any(|module| {
+                let region = &module.image.region;
+                start < region.base + region.bytes.len() as u64 && region.base < end
+            }) || self
+                .occupied
+                .iter()
+                .any(|&(base, limit)| start < limit && base < end)
+        };
+        if conflicts(
+            image.region.base,
+            image.region.base + image.region.bytes.len() as u64,
+        ) {
+            // Application DLLs often share a linker-default preferred base.
+            // Rebase only checked PE relocation records, never scan/patch words.
+            let mut base = if self.mode == DecodeMode::X86 {
+                0x4000_0000
+            } else {
+                0x2_0000_0000
+            };
+            while conflicts(base, base + image.region.bytes.len() as u64) {
+                base += (image.region.bytes.len() as u64 + 0xffff) & !0xffff;
+            }
+            if image.directories[5] == (0, 0) && !image.forwarders_only()? {
+                return Err(LinkError::AddressConflict { name });
+            }
+            image
+                .rebase(base)
+                .map_err(|error| LinkError::LibraryImage {
+                    name: name.clone(),
+                    error,
+                })?;
         }
+        // TLS pointers include absolute VAs and must be checked after rebasing.
+        super::tls::Plan::parse(&image).map_err(|error| LinkError::LibraryImage {
+            name: name.clone(),
+            error,
+        })?;
         self.mapped_bytes += image.region.bytes.len();
         if self.mapped_bytes > MAX_MAPPED_BYTES {
             return Err(LinkError::LimitExceeded);
         }
         let index = self.modules.len();
         // Publish before binding so ordinary circular imports terminate.
-        self.modules.push(Module { name, image });
-        self.bind(index, depth + 1)?;
+        self.modules.push(Module {
+            name,
+            image,
+            dependencies: Vec::new(),
+        });
+        self.bind(index, depth + 1).map_err(|error| match error {
+            LinkError::Image(error) => LinkError::LibraryImage {
+                name: self.modules[index].name.clone(),
+                error,
+            },
+            other => other,
+        })?;
+        if self.dynamic && self.modules[index].image.forwarders_only()? {
+            // Resolve a facade's bounded export slots now, so a later
+            // GetProcAddress has real mapped target modules available.
+            let image = &self.modules[index].image;
+            let table = image.data(image.directories[0].0 as usize, 40)?;
+            let base = u32_at(table, 16)?;
+            let count = u32_at(table, 20)?;
+            if count as usize > MAX_SYMBOLS {
+                return Err(LinkError::LimitExceeded);
+            }
+            for offset in 0..count {
+                let ordinal = base
+                    .checked_add(offset)
+                    .filter(|v| *v <= u16::MAX as u32)
+                    .ok_or(LoadError::InvalidImage)?;
+                self.export(index, &ImportSymbol::Ordinal(ordinal as u16), depth + 1)?;
+            }
+        }
         Ok(index)
     }
 
@@ -268,6 +560,7 @@ impl Linker<'_> {
             }
             let name = image.string(name_rva, 129)?;
             let library = self.library(&name, depth + 1)?;
+            self.modules[index].dependencies.push(library);
             self.thunks(
                 index,
                 library,
@@ -337,6 +630,22 @@ impl Linker<'_> {
         symbol: &ImportSymbol,
         depth: usize,
     ) -> Result<u64, LinkError> {
+        self.export_inner(index, symbol, depth)
+            .map_err(|error| match error {
+                LinkError::Image(error) => LinkError::LibraryImage {
+                    name: format!("{} export {:?}", self.modules[index].name, symbol),
+                    error,
+                },
+                other => other,
+            })
+    }
+
+    fn export_inner(
+        &mut self,
+        index: usize,
+        symbol: &ImportSymbol,
+        depth: usize,
+    ) -> Result<u64, LinkError> {
         if depth >= MAX_DEPTH {
             return Err(LinkError::LimitExceeded);
         }
@@ -394,6 +703,7 @@ impl Linker<'_> {
                 ImportSymbol::Name(String::from(function))
             };
             let library = self.library(name, depth + 1)?;
+            self.modules[index].dependencies.push(library);
             return self.export(library, &symbol, depth + 1);
         }
         let address = image
@@ -401,9 +711,48 @@ impl Linker<'_> {
             .base
             .checked_add(target as u64)
             .ok_or(LoadError::InvalidImage)?;
-        if image.region.range(address, 1, EXECUTE).is_none() {
+        // PE exports include data (for example MSVC's std::_Raise_handler).
+        // Linking validates a readable mapped address; execution separately
+        // enforces EXECUTE permissions when the guest actually fetches code.
+        if image.region.range(address, 1, READ).is_none() {
             return Err(LoadError::InvalidImage.into());
         }
         Ok(address)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relocation_fixup_limit_is_checked_before_applying_or_growing_without_bound() {
+        for mode in [DecodeMode::X86, DecodeMode::X64] {
+            let length = 8 + (MAX_RELOCATIONS + 1) * 2;
+            let mut region =
+                super::super::Region::new(0x4000_0000, 0x1000 + length, READ | super::super::WRITE)
+                    .unwrap();
+            region.bytes[..8].copy_from_slice(&0x12345678u64.to_le_bytes());
+            let block = &mut region.bytes[0x1000..];
+            block[4..8].copy_from_slice(&(length as u32).to_le_bytes());
+            let kind = if mode == DecodeMode::X86 {
+                0x3000u16
+            } else {
+                0xa000u16
+            };
+            for entry in block[8..].chunks_exact_mut(2) {
+                entry.copy_from_slice(&kind.to_le_bytes());
+            }
+            let mut image = MappedImage {
+                region,
+                mode,
+                entry: 0,
+                directories: [(0, 0); 16],
+            };
+            image.directories[5] = (0x1000, length as u32);
+            assert_eq!(image.rebase(0x4100_0000), Err(LoadError::ImageTooLarge));
+            assert_eq!(image.region.base, 0x4000_0000);
+            assert_eq!(&image.region.bytes[..8], &0x12345678u64.to_le_bytes());
+        }
     }
 }

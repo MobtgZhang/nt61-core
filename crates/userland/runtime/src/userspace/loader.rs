@@ -176,14 +176,14 @@ fn read_guest_pe(path: &str) -> Result<alloc::vec::Vec<u8>, u32> {
         })
 }
 
-struct VolumeLibraries<'a> { application_directory: &'a str }
+pub struct VolumeLibraries<'a> { pub application_directory: &'a str }
 impl crate::arch::common::btl::pe::ImportResolver for VolumeLibraries<'_> {
     fn read_library(&mut self, name: &str, mode: crate::arch::common::btl::ir::DecodeMode)
         -> Result<alloc::vec::Vec<u8>, u32> {
         // A PE32 program must never bind to the host's 64-bit System32 DLLs.
         let system = match mode {
             crate::arch::common::btl::ir::DecodeMode::X86 => "C:\\Windows\\SysWOW64",
-            crate::arch::common::btl::ir::DecodeMode::X64 => "C:\\Windows\\System32",
+            crate::arch::common::btl::ir::DecodeMode::X64 => if cfg!(target_arch = "x86_64") { "C:\\Windows\\System32" } else { "C:\\Windows\\SysX64" },
         };
         for directory in [self.application_directory, system] {
             match read_guest_pe(&alloc::format!("{directory}\\{name}")) {

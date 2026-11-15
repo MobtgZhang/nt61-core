@@ -28,6 +28,12 @@ pub enum StopReason {
     IllegalInstruction {
         pc: u64,
     },
+    /// A statically imported guest DLL returned FALSE from DLL_PROCESS_ATTACH.
+    InitializationFailed {
+        module_base: u64,
+    },
+    /// A checked runtime gateway was called for an API without an implementation.
+    UnsupportedApi { id: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

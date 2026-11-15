@@ -7,10 +7,13 @@
 
 use super::{abi::GuestAbi, ir::X86Reg, memory::GuestMemory};
 
-pub const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xc000_000c;
+#[path = "../../../../../abi/src/syscall_metadata.rs"]
+mod syscall_metadata;
+
+pub const STATUS_INVALID_SYSTEM_SERVICE: u32 = 0xc000_001c;
 pub const STATUS_ACCESS_VIOLATION: u32 = 0xc000_0005;
 pub const STATUS_NOT_IMPLEMENTED: u32 = 0xc000_0002;
-pub const MAX_ARGUMENTS: usize = 16;
+pub const MAX_ARGUMENTS: usize = 17;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Service {
@@ -138,7 +141,31 @@ pub enum ServiceResult {
     ExitThread(u32),
 }
 
+/// Host physical and paging-file accounting in bytes, captured as one sample.
+#[derive(Clone, Copy, Debug)]
+pub struct MemoryStatus {
+    pub physical_total: u64,
+    pub physical_available: u64,
+    pub paging_total: u64,
+    pub paging_available: u64,
+}
 pub trait GuestServices {
+    fn memory_status(&mut self) -> Result<MemoryStatus, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    /// Process/system logical processor availability, supplied by the guest host.
+    fn processor_mask(&mut self) -> Result<u64, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    /// Dynamic loading reads owned guest PE bytes using the same filesystem
+    /// policy as static imports. Unsupported hosts fail closed.
+    fn read_library(
+        &mut self,
+        _name: &str,
+        _mode: super::ir::DecodeMode,
+    ) -> Result<alloc::vec::Vec<u8>, u32> {
+        Err(0xc000_0135)
+    }
     /// Guest pointers remain addresses in `memory`; handlers must convert
     /// structures by guest bitness rather than cast them to native pointers.
     fn call(
@@ -158,7 +185,12 @@ pub fn dispatch(
     services: &mut dyn GuestServices,
 ) -> ServiceResult {
     let Some(service) = resolve(abi, number) else {
-        return ServiceResult::Return(STATUS_INVALID_SYSTEM_SERVICE);
+        let known = syscall_metadata::NATIVE_SERVICE_METADATA.iter().any(|entry| match abi {
+            GuestAbi::X86_32 => u32::from(entry.x86_number) == number,
+            GuestAbi::X86_64 => u32::from(entry.number) == number,
+            GuestAbi::Arm32 => false,
+        });
+        return ServiceResult::Return(if known { STATUS_NOT_IMPLEMENTED } else { STATUS_INVALID_SYSTEM_SERVICE });
     };
     let args = match capture_arguments(abi, regs, service.argument_count(), memory) {
         Ok(args) => args,
