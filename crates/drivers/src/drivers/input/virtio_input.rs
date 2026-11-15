@@ -249,8 +249,14 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         let events = MOUSE_EVENTS.load(Ordering::Acquire);
         if events != MOUSE_QUEUED_EVENTS.load(Ordering::Relaxed) {
             let (x, y, buttons) = get_mouse_state();
-            if MOUSE_REPORTS.push(x, y, buttons) {
+            let wheel = MOUSE_WHEEL.swap(0, Ordering::Relaxed);
+            if MOUSE_REPORTS.push(x, y, buttons, wheel) {
                 MOUSE_QUEUED_EVENTS.store(events, Ordering::Relaxed);
+            } else {
+                // Keep scroll notches pending if userspace has not drained
+                // the completed reports yet.
+                let _ = MOUSE_WHEEL.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+                    |pending| Some(pending.saturating_add(wheel)));
             }
         }
         return;
@@ -264,6 +270,9 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         } else if code == 1 {
             let y = MOUSE_Y.load(Ordering::Relaxed);
             MOUSE_Y.store(y.saturating_add(delta).max(0), Ordering::Relaxed);
+        } else if code == 8 { // Linux REL_WHEEL: positive means away/up.
+            let _ = MOUSE_WHEEL.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+                |pending| Some(pending.saturating_add(delta)));
         }
         return;
     }
@@ -300,6 +309,12 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         else { CONTROL_KEYS.fetch_or(bit, Ordering::Relaxed); }
         return;
     }
+    if code == 56 || code == 100 {
+        let bit = if code == 56 { 1 } else { 2 };
+        if value == KEY_VALUE_RELEASE { ALT_KEYS.fetch_and(!bit, Ordering::Relaxed); }
+        else { ALT_KEYS.fetch_or(bit, Ordering::Relaxed); }
+        return;
+    }
     // Shift releases must clear the modifier state; every other
     // release (including caps-lock toggles) is ignored.
     if value == KEY_VALUE_RELEASE {
@@ -313,7 +328,9 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
     } else if code == 58 {
         set_caps_lock(!caps_lock());
     } else {
-        for byte in translate_key(code) {
+        let bytes = translate_key(code);
+        if !bytes.is_empty() && ALT_KEYS.load(Ordering::Relaxed) != 0 { enqueue_byte(27); }
+        for byte in bytes {
             enqueue_byte(*byte);
         }
     }
@@ -361,14 +378,18 @@ pub fn has_mouse_update() -> bool {
     events != polled
 }
 
-pub fn pop_mouse_report() -> Option<(i16, i16, u8)> {
+pub fn pop_mouse_report() -> Option<(i16, i16, u8, i16)> {
     MOUSE_REPORTS
         .pop()
-        .or_else(|| has_mouse_update().then(get_mouse_state))
+        .or_else(|| has_mouse_update().then(|| {
+            let (x, y, buttons) = get_mouse_state();
+            (x, y, buttons, MOUSE_WHEEL.swap(0, Ordering::Relaxed))
+        }))
 }
 
 fn translate_key(code: u16) -> &'static [u8] {
     if control_state() {
+        match code { 35 => return b"\x8e", 102 => return b"\x1b[1;5H", 107 => return b"\x1b[1;5F", _ => {} }
         let control: u8 = match code {
             30=>1,48=>2,46=>3,32=>4,18=>5,33=>6,34=>7,35=>8,23=>9,
             36=>10,37=>11,38=>12,50=>13,49=>14,24=>15,25=>16,16=>17,
@@ -381,6 +402,9 @@ fn translate_key(code: u16) -> &'static [u8] {
         }
     }
     let shift = shift_state();
+    if shift {
+        match code {103=>return b"\x1b[1;2A",108=>return b"\x1b[1;2B",105=>return b"\x1b[1;2D",106=>return b"\x1b[1;2C",102=>return b"\x1b[1;2H",107=>return b"\x1b[1;2F",_=>{}}
+    }
     let caps = caps_lock();
     let letter_upper = shift != caps;
     let use_shift = shift;
@@ -659,6 +683,8 @@ fn translate_key(code: u16) -> &'static [u8] {
             }
         }
         57 => b" ",
+        59 => b"\x1bOP", // F1
+        61 => b"\x1bOR", // F3
         60 => b"\x1bOQ", // F2
         63 => b"\x1b[15~", // F5
         102 => b"\x1b[H", // Home
@@ -751,6 +777,7 @@ fn translate(virtual_address: u64) -> Option<u64> {
 }
 
 static CONTROL_KEYS: AtomicU8 = AtomicU8::new(0);
+static ALT_KEYS: AtomicU8 = AtomicU8::new(0);
 static DEVICE: AtomicPtr<Device> = AtomicPtr::new(core::ptr::null_mut());
 static MOUSE_DEVICE: AtomicPtr<Device> = AtomicPtr::new(core::ptr::null_mut());
 static MOUSE_DEVICE_ABSOLUTE: AtomicBool = AtomicBool::new(false);
@@ -764,6 +791,7 @@ static MOUSE_Y: AtomicI16 = AtomicI16::new(0);
 static MOUSE_ABS_X: AtomicI32 = AtomicI32::new(0);
 static MOUSE_ABS_Y: AtomicI32 = AtomicI32::new(0);
 static MOUSE_ABSOLUTE: AtomicBool = AtomicBool::new(false);
+static MOUSE_WHEEL: AtomicI16 = AtomicI16::new(0);
 static MOUSE_BUTTONS: AtomicU8 = AtomicU8::new(0);
 static MOUSE_SCREEN_WIDTH: AtomicI16 = AtomicI16::new(i16::MAX);
 static MOUSE_SCREEN_HEIGHT: AtomicI16 = AtomicI16::new(i16::MAX);

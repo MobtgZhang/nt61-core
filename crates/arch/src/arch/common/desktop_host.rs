@@ -58,6 +58,8 @@ pub struct DesktopMouseState {
     pub x: i32,
     pub y: i32,
     pub buttons: u32,
+    /// Signed vertical wheel notches in this completed report.
+    pub wheel: i32,
 }
 
 impl DesktopFramebufferInfo {
@@ -260,19 +262,20 @@ pub unsafe fn poll_key(key: *mut u8) -> u64 {
 ///
 /// # Safety
 ///
-/// `state` must point to writable user memory of at least 12 bytes.
+/// `state` must point to writable user memory of at least 16 bytes.
 pub unsafe fn poll_mouse(state_pointer: *mut DesktopMouseState) -> u64 {
     if state_pointer.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     crate::drivers::input::virtio_input::poll();
-    let Some((x, y, buttons)) = crate::drivers::input::virtio_input::pop_mouse_report() else {
+    let Some((x, y, buttons, wheel)) = crate::drivers::input::virtio_input::pop_mouse_report() else {
         return 0;
     };
     let state = DesktopMouseState {
         x: i32::from(x),
         y: i32::from(y),
         buttons: u32::from(buttons),
+        wheel: i32::from(wheel),
     };
     let bytes = core::mem::size_of::<DesktopMouseState>();
     let raw = core::ptr::from_ref(&state) as *const u8;

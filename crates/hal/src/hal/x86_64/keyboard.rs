@@ -265,27 +265,19 @@ pub fn scancode_to_ascii(sc: u8, shift: bool, caps: bool) -> Option<u8> {
 /// pushes decoded ASCII (or ANSI escape sequences for arrow keys)
 /// into the ring buffer.
 pub fn process_scancode(sc: u8) {
+    if sc == 0xE0 { EXTENDED_PREFIX.store(true, Ordering::Relaxed); return; }
     let release = (sc & 0x80) != 0;
     let code = sc & 0x7F;
-
-    // Handle the 0xE0 extended prefix (arrow keys, navigation).
-    if EXTENDED_PREFIX.load(Ordering::Relaxed) {
-        EXTENDED_PREFIX.store(false, Ordering::Relaxed);
-        if release {
-            return;
-        }
-        match code {
-            0x48 => push_ansi_escape(b'A'),
-            0x50 => push_ansi_escape(b'B'),
-            0x4B => push_ansi_escape(b'D'),
-            0x4D => push_ansi_escape(b'C'),
-            _ => {}
-        }
-        return;
-    }
-
-    if code == 0xE0 {
-        EXTENDED_PREFIX.store(true, Ordering::Relaxed);
+    if EXTENDED_PREFIX.swap(false, Ordering::Relaxed) {
+        if code == 0x1D { CTRL_DOWN.store(!release, Ordering::Relaxed); return; }
+        if code == 0x38 { ALT_DOWN.store(!release, Ordering::Relaxed); return; }
+        if release { return; }
+        let direction = match code { 0x48=>b'A',0x50=>b'B',0x4B=>b'D',0x4D=>b'C',0x47=>b'H',0x4F=>b'F',_=>0 };
+        if direction != 0 {
+            if CTRL_DOWN.load(Ordering::Relaxed) && matches!(direction,b'H'|b'F') { push_sequence(b"\x1b[1;5"); push_byte(direction); }
+            else if SHIFT_DOWN.load(Ordering::Relaxed) { push_sequence(b"\x1b[1;2"); push_byte(direction); }
+            else { push_ansi_escape(direction); }
+        } else { match code {0x49=>push_sequence(b"\x1b[5~"),0x51=>push_sequence(b"\x1b[6~"),0x53=>push_sequence(b"\x1b[3~"),_=>{}} }
         return;
     }
 
@@ -300,15 +292,23 @@ pub fn process_scancode(sc: u8) {
         }
         _ => {
             if !release {
+                match code {0x3B=>{push_sequence(b"\x1bOP");return;},0x3C=>{push_sequence(b"\x1bOQ");return;},0x3D=>{push_sequence(b"\x1bOR");return;},0x3F=>{push_sequence(b"\x1b[15~");return;},_=>{}}
                 let shift = SHIFT_DOWN.load(Ordering::Relaxed);
                 let caps = CAPS_LOCK.load(Ordering::Relaxed);
                 if let Some(c) = scancode_to_ascii(code, shift, caps) {
-                    push_byte(if c == b'\n' { b'\r' } else { c });
+                    if CTRL_DOWN.load(Ordering::Relaxed) && c.is_ascii_alphabetic() {
+                        push_byte(if c.eq_ignore_ascii_case(&b'h') { 0x8e } else { c.to_ascii_lowercase()-b'a'+1 });
+                    } else {
+                        if ALT_DOWN.load(Ordering::Relaxed) { push_byte(27); }
+                        push_byte(if c == b'\n' { b'\r' } else { c });
+                    }
                 }
             }
         }
     }
 }
+
+fn push_sequence(bytes: &[u8]) { for &byte in bytes { push_byte(byte); } }
 
 /// Push an ANSI escape sequence for an arrow key into the buffer.
 fn push_ansi_escape(direction: u8) {

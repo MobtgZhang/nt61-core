@@ -97,6 +97,14 @@ pub fn hid_emit(usage: u8, shift: bool, caps_lock: bool) {
     }
 }
 
+/// Forward all USB modifiers through the shared desktop key protocol.
+pub fn hid_emit_modifiers(usage:u8,modifiers:u8,caps_lock:bool){
+    #[cfg(target_arch="x86_64")]
+    crate::hal::x86_64::keyboard_unified::hid_emit_modifiers(usage,modifiers,caps_lock);
+    #[cfg(not(target_arch="x86_64"))]
+    let _=(usage,modifiers,caps_lock);
+}
+
 /// Enqueue a decoded keyboard character into the unified keyboard queue.
 pub fn keyboard_enqueue_char(ch: u8) {
     #[cfg(target_arch = "x86_64")]

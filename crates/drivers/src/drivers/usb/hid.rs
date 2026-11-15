@@ -427,7 +427,6 @@ pub fn poll_keyboards() {
                 slot.caps_lock = !slot.caps_lock;
             }
 
-            let shift = crate::drivers::arch::hid_shift_state(cur.modifiers);
             let caps = slot.caps_lock;
             let _ = caps;
 
@@ -438,7 +437,7 @@ pub fn poll_keyboards() {
                     continue;
                 }
                 if !prev.key_codes.contains(&usage) {
-                    crate::drivers::arch::hid_emit(usage, shift, caps);
+                    crate::drivers::arch::hid_emit_modifiers(usage, cur.modifiers, caps);
                 }
             }
 

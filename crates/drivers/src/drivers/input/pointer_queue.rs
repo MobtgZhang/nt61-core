@@ -20,19 +20,22 @@ impl PointerQueue {
         }
     }
 
-    pub fn push(&self, x: i16, y: i16, buttons: u8) -> bool {
+    pub fn push(&self, x: i16, y: i16, buttons: u8, wheel: i16) -> bool {
         let write = self.write.load(Ordering::Relaxed);
         let next = (write + 1) % CAPACITY;
         if next == self.read.load(Ordering::Acquire) {
             return false;
         }
-        let report = u64::from(x as u16) | (u64::from(y as u16) << 16) | (u64::from(buttons) << 32);
+        let report = u64::from(x as u16)
+            | (u64::from(y as u16) << 16)
+            | (u64::from(buttons) << 32)
+            | (u64::from(wheel as u16) << 40);
         self.reports[write].store(report, Ordering::Relaxed);
         self.write.store(next, Ordering::Release);
         true
     }
 
-    pub fn pop(&self) -> Option<(i16, i16, u8)> {
+    pub fn pop(&self) -> Option<(i16, i16, u8, i16)> {
         let read = self.read.load(Ordering::Relaxed);
         if read == self.write.load(Ordering::Acquire) {
             return None;
@@ -43,6 +46,7 @@ impl PointerQueue {
             report as u16 as i16,
             (report >> 16) as u16 as i16,
             (report >> 32) as u8,
+            (report >> 40) as u16 as i16,
         ))
     }
 }
@@ -55,12 +59,12 @@ mod tests {
     fn click_during_repaint_retains_press_and_release() {
         let queue = PointerQueue::new();
         // The device has already received the entire click before Explorer polls.
-        assert!(queue.push(416, 704, 0));
-        assert!(queue.push(416, 704, 1));
-        assert!(queue.push(416, 704, 0));
-        assert_eq!(queue.pop(), Some((416, 704, 0)));
-        assert_eq!(queue.pop(), Some((416, 704, 1)));
-        assert_eq!(queue.pop(), Some((416, 704, 0)));
+        assert!(queue.push(416, 704, 0, 0));
+        assert!(queue.push(416, 704, 1, -1));
+        assert!(queue.push(416, 704, 0, 0));
+        assert_eq!(queue.pop(), Some((416, 704, 0, 0)));
+        assert_eq!(queue.pop(), Some((416, 704, 1, -1)));
+        assert_eq!(queue.pop(), Some((416, 704, 0, 0)));
         assert_eq!(queue.pop(), None);
     }
 
@@ -69,11 +73,11 @@ mod tests {
         let queue = PointerQueue::new();
         for round in 0..3 {
             for index in 0..CAPACITY - 1 {
-                assert!(queue.push(index as i16, -7, round));
+                assert!(queue.push(index as i16, -7, round, -3));
             }
-            assert!(!queue.push(999, 999, 7));
+            assert!(!queue.push(999, 999, 7, 1));
             for index in 0..CAPACITY - 1 {
-                assert_eq!(queue.pop(), Some((index as i16, -7, round)));
+                assert_eq!(queue.pop(), Some((index as i16, -7, round, -3)));
             }
             assert_eq!(queue.pop(), None);
         }

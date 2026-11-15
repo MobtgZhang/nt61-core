@@ -164,7 +164,18 @@ pub fn hid_usage_shifted(usage: u8) -> Option<u8> {
 
 /// Decode a single HID usage code given the current modifier
 /// state and emit it into the shared keyboard ring buffer.
-pub fn hid_emit(usage: u8, shift: bool, caps: bool) {
+pub fn hid_emit(usage:u8,shift:bool,caps:bool){hid_emit_modifiers(usage,if shift{2}else{0},caps);}
+
+/// Preserve Control/Alt and navigation when decoding USB boot keyboard reports.
+pub fn hid_emit_modifiers(usage:u8,modifiers:u8,caps:bool){
+    let shift=hid_shift_state(modifiers);
+    let control=modifiers&0x11!=0;
+    let alt=modifiers&0x44!=0;
+    let sequence:&[u8]=match usage{0x3a=>b"\x1bOP",0x3b=>b"\x1bOQ",0x3c=>b"\x1bOR",0x3e=>b"\x1b[15~",0x4b=>b"\x1b[5~",0x4e=>b"\x1b[6~",0x4c=>b"\x1b[3~",_=>b""};
+    if !sequence.is_empty(){for &b in sequence{inject_byte(b);}return;}
+    let nav=match usage{0x52=>b'A',0x51=>b'B',0x50=>b'D',0x4f=>b'C',0x4a=>b'H',0x4d=>b'F',_=>0};
+    if nav!=0{let prefix:&[u8]=if control&&matches!(nav,b'H'|b'F'){b"\x1b[1;5"}else if shift{b"\x1b[1;2"}else{b"\x1b["};for &b in prefix{inject_byte(b);}inject_byte(nav);return;}
+
     if usage == 0 {
         return;
     } // 0 = no event in the array slot.
@@ -187,7 +198,8 @@ pub fn hid_emit(usage: u8, shift: bool, caps: bool) {
         base
     };
 
-    inject_byte(c);
+    if control&&c.is_ascii_alphabetic(){inject_byte(if c.eq_ignore_ascii_case(&b'h'){0x8e}else{c.to_ascii_lowercase()-b'a'+1});}
+    else{if alt{inject_byte(27);}inject_byte(if c==b'\n'{b'\r'}else{c});}
 }
 
 /// Translate the HID modifier byte into the same flags we keep
