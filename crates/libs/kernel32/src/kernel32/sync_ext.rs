@@ -18,15 +18,14 @@ pub unsafe extern "C" fn create_waitable_timer_w(
     manual_reset: BOOL,
     _name: LPCWSTR,
 ) -> HANDLE {
-    let mut oa = crate::libs::ntdll::types::ObjectAttributes::new();
-    let mut h: HANDLE = ptr::null_mut();
     let timer_type = if manual_reset != 0 { 0 } else { 1 };
-    let status = ntdll_sync::nt_create_timer(&mut h, 0, &mut oa, timer_type);
-    if status != STATUS_SUCCESS {
-        set_last_error(8);
-        return ptr::null_mut();
+    match ntdll_timer::create_timer_kernel(timer_type) {
+        Ok(handle) => handle,
+        Err(status) => {
+            set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
+            ptr::null_mut()
+        }
     }
-    h
 }
 
 /// # Safety
@@ -45,21 +44,22 @@ pub unsafe extern "C" fn set_waitable_timer(
         return FALSE;
     }
 
-    let _ = (completion_routine, arg_to_completion_routine);
-    let status = ntdll_timer::nt_set_timer(
+    // SAFETY: This in-kernel Win32 wrapper accepts a caller-owned pointer;
+    // capture it here before entering the trusted native helper.
+    let due = unsafe { due_time.read_unaligned() };
+    let status = ntdll_timer::set_timer_kernel(
         timer,
-        due_time as *const crate::libs::ntdll::types::LargeInteger,
-        ptr::null_mut(),
-        ptr::null_mut(),
-        resume as u8,
+        due,
+        completion_routine as *mut _,
+        arg_to_completion_routine as *mut _,
+        u8::from(resume != 0),
         period,
-        ptr::null_mut(),
     );
 
     if status == STATUS_SUCCESS {
         TRUE
     } else {
-        set_last_error(6);
+        set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
         FALSE
     }
 }
@@ -77,7 +77,7 @@ pub unsafe extern "C" fn cancel_waitable_timer(timer: HANDLE) -> BOOL {
     if status == STATUS_SUCCESS {
         TRUE
     } else {
-        set_last_error(6);
+        set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
         FALSE
     }
 }

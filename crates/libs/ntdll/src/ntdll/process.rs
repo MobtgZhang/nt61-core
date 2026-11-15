@@ -9,7 +9,7 @@
 //! References: MSDN Library "Windows 7" — `ntdll.dll` process
 //! APIs.
 
-use super::file::{alloc_handle, HandleKind};
+use super::file::{alloc_handle, free_handle, lookup_handle, HandleKind};
 use super::status::{
     STATUS_ACCESS_DENIED, STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS,
     STATUS_INVALID_PARAMETER, STATUS_NO_MEMORY, STATUS_SUCCESS,
@@ -18,7 +18,7 @@ use super::types::{client_id, HANDLE, NTSTATUS, PVOID};
 use crate::mm::user_copy::{copy_from_user, copy_to_user, probe_user_write};
 use crate::ps::process as ps;
 
-const PROCESS_BASIC_INFO_SIZE: usize = 24; // sizeof(PROCESS_BASIC_INFORMATION) on x64
+const PROCESS_BASIC_INFO_SIZE: usize = 48; // NT 6.1 64-bit PROCESS_BASIC_INFORMATION
 const PROCESS_CREATE_PROCESS: u32 = 0x0080;
 
 /// Current-process pseudo-handle.
@@ -178,23 +178,37 @@ pub unsafe extern "C" fn nt_open_process(
     if process_handle.is_null() || client_id.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    if let Err(status) = probe_user_write(process_handle as u64, core::mem::size_of::<HANDLE>()) {
+        return status;
+    }
     let cid: client_id = match crate::mm::user_copy::read_user_object(client_id as u64) {
         Ok(value) => value,
-        Err(_) => return STATUS_INVALID_PARAMETER,
+        Err(status) => return status,
     };
     let pid = cid.unique_process as u64;
-    if ps::get_by_pid(pid).is_none() {
-        return STATUS_INVALID_HANDLE;
-    }
-    let h = alloc_handle(HandleKind::Process, pid);
-    if h.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-    if crate::mm::user_copy::write_user_object(process_handle as u64, &h).is_err() {
-        return STATUS_INVALID_HANDLE;
+    let h = match open_process_kernel(pid) {
+        Ok(handle) => handle,
+        Err(status) => return status,
+    };
+    if let Err(status) = crate::mm::user_copy::write_user_object(process_handle as u64, &h) {
+        free_handle(h);
+        return status;
     }
     let _ = (desired_access, object_attributes);
     STATUS_SUCCESS
+}
+
+/// Open a registered process for trusted kernel callers without passing
+/// kernel-local output pointers through the native user-copy contract.
+pub fn open_process_kernel(pid: u64) -> Result<HANDLE, NTSTATUS> {
+    if ps::get_by_pid(pid).is_none() {
+        return Err(0xC000000Bu32 as i32); // STATUS_INVALID_CID
+    }
+    let h = alloc_handle(HandleKind::Process, pid);
+    if h.is_null() {
+        return Err(STATUS_NO_MEMORY);
+    }
+    Ok(h)
 }
 
 /// # Safety
@@ -235,72 +249,83 @@ pub unsafe extern "C" fn nt_query_information_process(
     process_information_length: u32,
     return_length: *mut u32,
 ) -> NTSTATUS {
-    if process_handle.is_null() || process_information.is_null() {
-        return STATUS_INVALID_PARAMETER;
+    let process = match query_process_target(process_handle) {
+        Ok(process) => process,
+        Err(status) => return status,
+    };
+    let required = match process_information_class {
+        0 => PROCESS_BASIC_INFO_SIZE,
+        26 => core::mem::size_of::<usize>(),
+        // EPROCESS retains a truncated basename, not the full native image
+        // path. Do not invent a UNICODE_STRING or copy ASCII past the buffer.
+        27 => return super::status::STATUS_NOT_IMPLEMENTED,
+        _ => return STATUS_INVALID_INFO_CLASS,
+    };
+    if !return_length.is_null() {
+        if let Err(status) = probe_user_write(return_length as u64, 4) {
+            return status;
+        }
     }
-    if probe_user_write(
-        process_information as u64,
-        process_information_length as usize,
-    )
-    .is_err()
-    {
-        return super::status::STATUS_ACCESS_VIOLATION;
+    if process_information_length as usize != required {
+        if let Err(status) = write_return_length(return_length, required) {
+            return status;
+        }
+        return super::status::STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if let Err(status) = probe_user_write(process_information as u64, required) {
+        return status;
     }
     match process_information_class {
         0 => {
-            // ProcessBasicInformation: returns ExitStatus, ...
-            if process_information_length < PROCESS_BASIC_INFO_SIZE as u32 {
-                if write_return_length(return_length, PROCESS_BASIC_INFO_SIZE).is_err() {
-                    return super::status::STATUS_ACCESS_VIOLATION;
-                }
-                return super::status::STATUS_BUFFER_TOO_SMALL;
+            // Explicit serialization initializes ABI padding and avoids
+            // leaking Rust struct padding into a user buffer.
+            let mut output = [0u8; PROCESS_BASIC_INFO_SIZE];
+            output[0..4].copy_from_slice(&process.exit_status.to_le_bytes());
+            output[8..16].copy_from_slice(&(process.peb as u64).to_le_bytes());
+            output[16..24].copy_from_slice(&process.affinity.mask[0].to_le_bytes());
+            output[24..28].copy_from_slice(&i32::from(process.base_priority).to_le_bytes());
+            output[32..40].copy_from_slice(&process.unique_process_id.to_le_bytes());
+            // The process manager records inherited parent PID in spare5.
+            output[40..48].copy_from_slice(&process.spare5.to_le_bytes());
+            if let Err(status) = copy_to_user(process_information as u64, &output) {
+                return status;
             }
-            // Zero the structure: PEB base address, affinity
-            // mask, base priority, unique PID, parent PID.
-            let output = [0u8; PROCESS_BASIC_INFO_SIZE];
-            if copy_to_user(process_information as u64, &output).is_err() {
-                return super::status::STATUS_ACCESS_VIOLATION;
-            }
-            if write_return_length(return_length, PROCESS_BASIC_INFO_SIZE).is_err() {
-                return super::status::STATUS_ACCESS_VIOLATION;
-            }
-            STATUS_SUCCESS
         }
         26 => {
-            // ProcessWow64Information — we are 64-bit, so the
-            // result is a NULL pointer.
-            if process_information_length < 8 {
-                return super::status::STATUS_BUFFER_TOO_SMALL;
+            // The PEB32 user VA differs from its kernel backing pointer.
+            let address = if process.is_wow64_process() {
+                process.get_wow64_peb32_va() as usize
+            } else {
+                0
+            };
+            if let Err(status) = copy_to_user(process_information as u64, &address.to_le_bytes()) {
+                return status;
             }
-            if copy_to_user(process_information as u64, &[0u8; 8]).is_err() {
-                return super::status::STATUS_ACCESS_VIOLATION;
-            }
-            if write_return_length(return_length, 8).is_err() {
-                return super::status::STATUS_ACCESS_VIOLATION;
-            }
-            STATUS_SUCCESS
         }
-        27 => {
-            // ProcessImageFileName
-            if process_information_length < 16 {
-                return super::status::STATUS_BUFFER_TOO_SMALL;
-            }
-            let name = b"\\SystemRoot\\System32";
-            if copy_to_user(process_information as u64, name).is_err() {
-                return super::status::STATUS_ACCESS_VIOLATION;
-            }
-            if write_return_length(return_length, name.len()).is_err() {
-                return super::status::STATUS_ACCESS_VIOLATION;
-            }
-            STATUS_SUCCESS
-        }
-        _ => {
-            if write_return_length(return_length, 0).is_err() {
-                return super::status::STATUS_ACCESS_VIOLATION;
-            }
-            STATUS_INVALID_INFO_CLASS
-        }
+        _ => unreachable!(),
     }
+    match write_return_length(return_length, required) {
+        Ok(()) => STATUS_SUCCESS,
+        Err(status) => status,
+    }
+}
+
+fn query_process_target(handle: HANDLE) -> Result<&'static ps::Eprocess, NTSTATUS> {
+    if handle == nt_current_process() {
+        let thread = crate::ps::thread::get_current_ethread();
+        if thread.is_null() {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+        // The per-CPU current thread owns the authoritative process pointer.
+        return unsafe { (*thread).kthread.process.as_ref() }.ok_or(STATUS_INVALID_HANDLE);
+    }
+    let entry = lookup_handle(handle).ok_or(STATUS_INVALID_HANDLE)?;
+    if entry.kind != HandleKind::Process {
+        return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    ps::get_by_pid(entry.target)
+        .map(|process| &*process)
+        .ok_or(STATUS_INVALID_HANDLE)
 }
 
 fn write_return_length(return_length: *mut u32, length: usize) -> Result<(), i32> {

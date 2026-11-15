@@ -3,17 +3,23 @@
 //! `nt_create_event`, `nt_create_mutant`, `nt_create_semaphore`,
 //! `nt_wait_for_single_object`, `nt_wait_for_multiple_objects`,
 //! `nt_delay_execution`. All objects are tracked in the kernel
-//! handle table; `NtWait*` calls the kernel dispatcher.
+//! handle table. Wait requests pin shared objects, consume signals atomically,
+//! and observe signals, abandonment and deadlines while yielding the scheduler.
 //
 //! References: MSDN Library "Windows 7" — `ntdll.dll` sync
 //! APIs.
 
-use super::file::{alloc_handle, free_handle, lookup_handle, HandleKind};
+use super::file::{
+    alloc_dispatcher_handle, alloc_handle, free_handle, with_sync_handles, DispatcherState,
+    HandleKind, MutantState,
+};
 use super::status::{
     STATUS_ACCESS_VIOLATION, STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
 };
 use super::types::{HANDLE, NTSTATUS};
-use crate::mm::user_copy::{copy_from_user, read_user_object};
+use crate::mm::user_copy::{
+    copy_from_user, copy_to_user, probe_user_write, read_user_object, write_user_object,
+};
 
 /// Event state tracking for proper kernel event integration.
 pub(crate) struct EventState {
@@ -35,6 +41,26 @@ fn encode_event_state(event_type: u32, signaled: bool, manual_reset: bool) -> u6
     et | mr | sig
 }
 
+fn change_event(handle: HANDLE, previous: *mut u32, signaled: bool) -> NTSTATUS {
+    if !previous.is_null() {
+        if let Err(status) = probe_user_write(previous as u64, core::mem::size_of::<u32>()) {
+            return status;
+        }
+    }
+    with_sync_handles(&[handle], |entries| {
+        let entry = &mut entries[0];
+        if entry.kind != HandleKind::Event {
+            return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        if !previous.is_null() {
+            write_user_object(previous as u64, &((entry.target & 1) as u32))?;
+        }
+        entry.target = (entry.target & !1) | u64::from(signaled);
+        Ok(STATUS_SUCCESS)
+    })
+    .unwrap_or_else(|status| status)
+}
+
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
@@ -48,22 +74,41 @@ pub unsafe extern "C" fn nt_create_event(
 ) -> NTSTATUS {
     use super::status::STATUS_INVALID_PARAMETER;
 
-    if event_handle.is_null() {
+    if event_handle.is_null() || event_type > 1 {
         return STATUS_INVALID_PARAMETER;
+    }
+    if let Err(status) = probe_user_write(event_handle as u64, core::mem::size_of::<HANDLE>()) {
+        return status;
     }
     let _ = (desired_access, object_attributes);
 
-    // Determine event type and initial state
-    let manual_reset = event_type == 0; // NotificationEvent = manual reset
-    let signaled = initial_state != 0;
-
-    let target = encode_event_state(event_type, signaled, manual_reset);
-    let h = alloc_handle(HandleKind::Event, target);
-    if h.is_null() {
-        return STATUS_INVALID_HANDLE;
+    match create_event_kernel(event_type, initial_state != 0) {
+        Ok(handle) => match write_user_object(event_handle as u64, &handle) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(status) => {
+                free_handle(handle);
+                status
+            }
+        },
+        Err(status) => status,
     }
-    *event_handle = h;
-    STATUS_SUCCESS
+}
+
+/// Create an unnamed event for trusted callers without routing a kernel pointer
+/// through the user-mode output contract.
+pub fn create_event_kernel(event_type: u32, signaled: bool) -> Result<HANDLE, NTSTATUS> {
+    if event_type > 1 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let handle = alloc_handle(
+        HandleKind::Event,
+        encode_event_state(event_type, signaled, event_type == 0),
+    );
+    if handle.is_null() {
+        Err(super::status::STATUS_NO_MEMORY)
+    } else {
+        Ok(handle)
+    }
 }
 
 /// # Safety
@@ -71,33 +116,9 @@ pub unsafe extern "C" fn nt_create_event(
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `nt_set_event` / `nt_reset_event` / `nt_pulse_event`.
 ///
-/// nt_set_event sets the event to the signaled state and releases
-/// any waiting threads. Returns the previous state.
+/// Set the stored signal state and return its previous value.
 pub unsafe extern "C" fn nt_set_event(event_handle: HANDLE, previous_state: *mut u32) -> NTSTATUS {
-    use super::status::STATUS_INVALID_HANDLE;
-
-    if event_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    // Look up the event handle
-    if let Some(entry) = lookup_handle(event_handle) {
-        if entry.kind == HandleKind::Event {
-            // Get current state from the encoded target
-            let current_state = decode_event_state(entry.target);
-            let was_signaled = current_state.signaled;
-
-            // Return previous state
-            if !previous_state.is_null() {
-                *previous_state = if was_signaled { 1 } else { 0 };
-            }
-
-            // Event is now signaled
-            // In a real implementation, this would wake waiting threads
-            return STATUS_SUCCESS;
-        }
-    }
-    STATUS_INVALID_HANDLE
+    change_event(event_handle, previous_state, true)
 }
 
 /// # Safety
@@ -108,26 +129,7 @@ pub unsafe extern "C" fn nt_reset_event(
     event_handle: HANDLE,
     previous_state: *mut u32,
 ) -> NTSTATUS {
-    use super::status::STATUS_INVALID_HANDLE;
-
-    if event_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    if let Some(entry) = lookup_handle(event_handle) {
-        if entry.kind == HandleKind::Event {
-            let current_state = decode_event_state(entry.target);
-            let was_signaled = current_state.signaled;
-
-            if !previous_state.is_null() {
-                *previous_state = if was_signaled { 1 } else { 0 };
-            }
-
-            // Event is now non-signaled
-            return STATUS_SUCCESS;
-        }
-    }
-    STATUS_INVALID_HANDLE
+    change_event(event_handle, previous_state, false)
 }
 
 /// # Safety
@@ -135,18 +137,7 @@ pub unsafe extern "C" fn nt_reset_event(
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// nt_clear_event clears the event to non-signaled state (same as reset_event).
 pub unsafe extern "C" fn nt_clear_event(event_handle: HANDLE) -> NTSTATUS {
-    use super::status::STATUS_INVALID_HANDLE;
-
-    if event_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    if let Some(entry) = lookup_handle(event_handle) {
-        if entry.kind == HandleKind::Event {
-            return STATUS_SUCCESS;
-        }
-    }
-    STATUS_INVALID_HANDLE
+    change_event(event_handle, core::ptr::null_mut(), false)
 }
 
 /// # Safety
@@ -158,27 +149,12 @@ pub unsafe extern "C" fn nt_pulse_event(
     event_handle: HANDLE,
     previous_state: *mut u32,
 ) -> NTSTATUS {
-    use super::status::STATUS_INVALID_HANDLE;
-
-    if event_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    if let Some(entry) = lookup_handle(event_handle) {
-        if entry.kind == HandleKind::Event {
-            let current_state = decode_event_state(entry.target);
-            let was_signaled = current_state.signaled;
-
-            if !previous_state.is_null() {
-                *previous_state = if was_signaled { 1 } else { 0 };
-            }
-
-            // Pulse: signal then immediately reset
-            // In real implementation, would wake threads then reset
-            return STATUS_SUCCESS;
+    if !previous_state.is_null() {
+        if let Err(status) = probe_user_write(previous_state as u64, 4) {
+            return status;
         }
     }
-    STATUS_INVALID_HANDLE
+    super::file::pulse_event(event_handle, previous_state)
 }
 
 /// # Safety
@@ -197,28 +173,40 @@ pub unsafe extern "C" fn nt_create_mutant(
     if mutant_handle.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    if let Err(status) = probe_user_write(mutant_handle as u64, core::mem::size_of::<HANDLE>()) {
+        return status;
+    }
     let _ = (desired_access, object_attributes);
 
-    // Encode mutex state: initial_owner flag in low bit
-    let target = if initial_owner != 0 {
-        // Owned by current thread
-        let current_ethread = crate::ps::thread::get_current_ethread();
-        if current_ethread.is_null() {
-            0x00u64
-        } else {
-            let tid = unsafe { (*current_ethread).client_id.unique_thread };
-            (tid << 8) | 0x01 // owned flag | tid
-        }
-    } else {
-        0x00 // not owned
-    };
-
-    let h = alloc_handle(HandleKind::Mutant, target);
-    if h.is_null() {
-        return STATUS_INVALID_HANDLE;
+    match create_mutant_kernel(initial_owner != 0) {
+        Ok(handle) => match write_user_object(mutant_handle as u64, &handle) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(status) => {
+                free_handle(handle);
+                status
+            }
+        },
+        Err(status) => status,
     }
-    *mutant_handle = h;
-    STATUS_SUCCESS
+}
+
+/// Allocate an unnamed mutant for trusted callers.
+pub fn create_mutant_kernel(initial_owner: bool) -> Result<HANDLE, NTSTATUS> {
+    let (owner_process, owner_thread) = current_client_id();
+    if initial_owner && owner_thread == 0 {
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    let state = MutantState {
+        owner_thread: if initial_owner { owner_thread } else { 0 },
+        owner_process: if initial_owner { owner_process } else { 0 },
+        depth: u32::from(initial_owner),
+        abandoned: false,
+    };
+    let h = alloc_dispatcher_handle(HandleKind::Mutant, 0, DispatcherState::Mutant(state));
+    if h.is_null() {
+        return Err(super::status::STATUS_NO_MEMORY);
+    }
+    Ok(h)
 }
 
 /// # Safety
@@ -231,41 +219,183 @@ pub unsafe extern "C" fn nt_release_mutant(
     mutant_handle: HANDLE,
     previous_count: *mut u32,
 ) -> NTSTATUS {
-    use super::status::{STATUS_INVALID_HANDLE, STATUS_MUTEX_NOT_OWNED, STATUS_SUCCESS};
-
-    if mutant_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    if let Some(entry) = lookup_handle(mutant_handle) {
-        if entry.kind == HandleKind::Mutant {
-            // Get current thread ID
-            let current_ethread = crate::ps::thread::get_current_ethread();
-            if current_ethread.is_null() {
-                return STATUS_INVALID_HANDLE;
-            }
-            let current_tid = unsafe { (*current_ethread).client_id.unique_thread };
-            let owned_tid = entry.target >> 8;
-            let is_owned = (entry.target & 0x01) != 0;
-
-            if is_owned && owned_tid == current_tid {
-                // Release the mutex
-                if !previous_count.is_null() {
-                    *previous_count = 1; // Return previous lock count
-                }
-                return STATUS_SUCCESS;
-            } else if is_owned {
-                return STATUS_MUTEX_NOT_OWNED;
-            } else {
-                // Mutex not owned
-                if !previous_count.is_null() {
-                    *previous_count = 0;
-                }
-                return STATUS_SUCCESS;
-            }
+    if !previous_count.is_null() {
+        if let Err(status) = probe_user_write(previous_count as u64, core::mem::size_of::<u32>()) {
+            return status;
         }
     }
-    STATUS_INVALID_HANDLE
+    let (_, tid) = current_client_id();
+    with_sync_handles(&[mutant_handle], |entries| {
+        let entry = &mut entries[0];
+        if entry.kind != HandleKind::Mutant {
+            return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let DispatcherState::Mutant(state) = &mut entry.dispatcher else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        if state.depth == 0 || state.owner_thread != tid || tid == 0 {
+            return Err(super::status::STATUS_MUTEX_NOT_OWNED);
+        }
+        if !previous_count.is_null() {
+            write_user_object(
+                previous_count as u64,
+                &((1i64 - i64::from(state.depth)) as i32),
+            )?;
+        }
+        state.depth -= 1;
+        if state.depth == 0 {
+            state.owner_thread = 0;
+            state.owner_process = 0;
+        }
+        Ok(STATUS_SUCCESS)
+    })
+    .unwrap_or_else(|status| status)
+}
+
+fn current_client_id() -> (u64, u64) {
+    let thread = crate::ps::thread::get_current_ethread();
+    if thread.is_null() {
+        return (0, 0);
+    }
+    // SAFETY: the per-CPU current ETHREAD stays live throughout this nonblocking
+    // read. Only scalar identifiers are copied; no borrow survives scheduling.
+    unsafe {
+        (
+            (*thread).client_id.unique_process,
+            (*thread).client_id.unique_thread,
+        )
+    }
+}
+
+/// Validate every query output before looking at object state. The wire
+/// representation is emitted as bytes so no Rust structure padding escapes.
+pub(crate) fn query_output(
+    information: super::types::PVOID,
+    length: u32,
+    required: u32,
+    return_length: *mut u32,
+) -> Result<(), NTSTATUS> {
+    if length < required {
+        return Err(super::status::STATUS_INFO_LENGTH_MISMATCH);
+    }
+    probe_user_write(information as u64, required as usize)?;
+    if !return_length.is_null() {
+        probe_user_write(return_length as u64, 4)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_query_output(
+    information: super::types::PVOID,
+    bytes: &[u8],
+    return_length: *mut u32,
+) -> Result<NTSTATUS, NTSTATUS> {
+    copy_to_user(information as u64, bytes)?;
+    if !return_length.is_null() {
+        write_user_object(return_length as u64, &(bytes.len() as u32))?;
+    }
+    Ok(STATUS_SUCCESS)
+}
+
+/// Query EVENT_BASIC_INFORMATION (event type and signal state).
+///
+/// # Safety
+/// Output addresses are user pointers and are probed/captured by user_copy.
+pub unsafe extern "C" fn nt_query_event(
+    handle: HANDLE,
+    class: u32,
+    information: super::types::PVOID,
+    length: u32,
+    return_length: *mut u32,
+) -> NTSTATUS {
+    if class != 0 {
+        return super::status::STATUS_INVALID_INFO_CLASS;
+    }
+    if let Err(status) = query_output(information, length, 8, return_length) {
+        return status;
+    }
+    with_sync_handles(&[handle], |entries| {
+        let entry = &entries[0];
+        if entry.kind != HandleKind::Event {
+            return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&((entry.target >> 32) as u32).to_le_bytes());
+        bytes[4..].copy_from_slice(&((entry.target & 1) as i32).to_le_bytes());
+        write_query_output(information, &bytes, return_length)
+    })
+    .unwrap_or_else(|status| status)
+}
+
+/// Query SEMAPHORE_BASIC_INFORMATION without consuming a count.
+///
+/// # Safety
+/// Output addresses are user pointers and are probed/captured by user_copy.
+pub unsafe extern "C" fn nt_query_semaphore(
+    handle: HANDLE,
+    class: u32,
+    information: super::types::PVOID,
+    length: u32,
+    return_length: *mut u32,
+) -> NTSTATUS {
+    if class != 0 {
+        return super::status::STATUS_INVALID_INFO_CLASS;
+    }
+    if let Err(status) = query_output(information, length, 8, return_length) {
+        return status;
+    }
+    with_sync_handles(&[handle], |entries| {
+        let entry = &entries[0];
+        if entry.kind != HandleKind::Semaphore {
+            return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let mut bytes = [0; 8];
+        bytes[..4].copy_from_slice(&(entry.target as u32).to_le_bytes());
+        bytes[4..].copy_from_slice(&((entry.target >> 32) as u32).to_le_bytes());
+        write_query_output(information, &bytes, return_length)
+    })
+    .unwrap_or_else(|status| status)
+}
+
+/// Query MUTANT_BASIC_INFORMATION or MUTANT_OWNER_INFORMATION.
+///
+/// # Safety
+/// Output addresses are user pointers and are probed/captured by user_copy.
+pub unsafe extern "C" fn nt_query_mutant(
+    handle: HANDLE,
+    class: u32,
+    information: super::types::PVOID,
+    length: u32,
+    return_length: *mut u32,
+) -> NTSTATUS {
+    let required = match class {
+        0 => 8,
+        1 => 16,
+        _ => return super::status::STATUS_INVALID_INFO_CLASS,
+    };
+    if let Err(status) = query_output(information, length, required, return_length) {
+        return status;
+    }
+    let (_, tid) = current_client_id();
+    with_sync_handles(&[handle], |entries| {
+        if entries[0].kind != HandleKind::Mutant {
+            return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let DispatcherState::Mutant(state) = entries[0].dispatcher else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        let mut bytes = [0; 16];
+        if class == 0 {
+            bytes[..4].copy_from_slice(&((1i64 - i64::from(state.depth)) as i32).to_le_bytes());
+            bytes[4] = u8::from(state.depth != 0 && state.owner_thread == tid);
+            bytes[5] = u8::from(state.abandoned);
+        } else {
+            bytes[..8].copy_from_slice(&state.owner_process.to_le_bytes());
+            bytes[8..].copy_from_slice(&state.owner_thread.to_le_bytes());
+        }
+        write_query_output(information, &bytes[..required as usize], return_length)
+    })
+    .unwrap_or_else(|status| status)
 }
 
 /// # Safety
@@ -279,19 +409,43 @@ pub unsafe extern "C" fn nt_create_semaphore(
     initial_count: u32,
     maximum_count: u32,
 ) -> NTSTATUS {
-    if semaphore_handle.is_null() {
+    if semaphore_handle.is_null()
+        || maximum_count == 0
+        || maximum_count > i32::MAX as u32
+        || initial_count > maximum_count
+    {
         return STATUS_INVALID_PARAMETER;
     }
-    let _ = (desired_access, object_attributes);
-    let h = alloc_handle(
-        HandleKind::Semaphore,
-        ((maximum_count as u64) << 32) | (initial_count as u64),
-    );
-    if h.is_null() {
-        return STATUS_INVALID_HANDLE;
+    if let Err(status) = probe_user_write(semaphore_handle as u64, core::mem::size_of::<HANDLE>()) {
+        return status;
     }
-    *semaphore_handle = h;
-    STATUS_SUCCESS
+    let _ = (desired_access, object_attributes);
+    match create_semaphore_kernel(initial_count, maximum_count) {
+        Ok(handle) => match write_user_object(semaphore_handle as u64, &handle) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(status) => {
+                free_handle(handle);
+                status
+            }
+        },
+        Err(status) => status,
+    }
+}
+
+/// Create an unnamed semaphore for trusted callers.
+pub fn create_semaphore_kernel(initial_count: u32, maximum_count: u32) -> Result<HANDLE, NTSTATUS> {
+    if maximum_count == 0 || maximum_count > i32::MAX as u32 || initial_count > maximum_count {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let handle = alloc_handle(
+        HandleKind::Semaphore,
+        (u64::from(maximum_count) << 32) | u64::from(initial_count),
+    );
+    if handle.is_null() {
+        Err(super::status::STATUS_NO_MEMORY)
+    } else {
+        Ok(handle)
+    }
 }
 
 /// # Safety
@@ -303,13 +457,32 @@ pub unsafe extern "C" fn nt_release_semaphore(
     release_count: u32,
     previous_count: *mut u32,
 ) -> NTSTATUS {
-    if semaphore_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
+    if release_count == 0 || release_count > i32::MAX as u32 {
+        return STATUS_INVALID_PARAMETER;
     }
     if !previous_count.is_null() {
-        *previous_count = release_count;
+        if let Err(status) = probe_user_write(previous_count as u64, core::mem::size_of::<u32>()) {
+            return status;
+        }
     }
-    STATUS_SUCCESS
+    with_sync_handles(&[semaphore_handle], |entries| {
+        let entry = &mut entries[0];
+        if entry.kind != HandleKind::Semaphore {
+            return Err(super::status::STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let count = entry.target as u32;
+        let maximum = (entry.target >> 32) as u32;
+        let new_count = count
+            .checked_add(release_count)
+            .filter(|value| *value <= maximum)
+            .ok_or(0xC000_0047u32 as i32)?; // STATUS_SEMAPHORE_LIMIT_EXCEEDED
+        if !previous_count.is_null() {
+            write_user_object(previous_count as u64, &count)?;
+        }
+        entry.target = (u64::from(maximum) << 32) | u64::from(new_count);
+        Ok(STATUS_SUCCESS)
+    })
+    .unwrap_or_else(|status| status)
 }
 
 /// # Safety
@@ -322,16 +495,7 @@ pub unsafe extern "C" fn nt_create_timer(
     object_attributes: *mut super::types::ObjectAttributes,
     timer_type: u32,
 ) -> NTSTATUS {
-    if timer_handle.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    let _ = (desired_access, object_attributes);
-    let h = alloc_handle(HandleKind::Timer, timer_type as u64);
-    if h.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-    *timer_handle = h;
-    STATUS_SUCCESS
+    super::timer::nt_create_timer(timer_handle, desired_access, object_attributes, timer_type)
 }
 
 /// # Safety
@@ -354,26 +518,21 @@ pub unsafe extern "C" fn nt_create_timer(
 pub unsafe extern "C" fn nt_set_timer(
     timer_handle: HANDLE,
     due_time: *const i64,
-    _period: u32,
-    _callback: *const (),
-    _arg: *mut (),
-    _resume: u8,
-    _handle: *mut HANDLE,
+    callback: super::types::PVOID,
+    context: super::types::PVOID,
+    resume: u8,
+    period: i32,
+    previous_state: *mut u8,
 ) -> NTSTATUS {
-    if timer_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-    if due_time.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    // In a full implementation, this would:
-    // 1. Insert the timer into the kernel timer queue
-    // 2. Set up the DPC callback
-    // 3. Configure the hardware timer interrupt
-    // For now, we return success
-
-    STATUS_SUCCESS
+    super::timer::nt_set_timer(
+        timer_handle,
+        due_time.cast(),
+        callback,
+        context,
+        resume,
+        period,
+        previous_state,
+    )
 }
 
 /// # Safety
@@ -384,20 +543,8 @@ pub unsafe extern "C" fn nt_set_timer(
 /// # Arguments
 /// * `timer_handle` - handle to the timer object
 /// * `set_handle` - If provided, receives the previous state
-pub unsafe extern "C" fn nt_cancel_timer(
-    timer_handle: HANDLE,
-    _set_handle: *mut HANDLE,
-) -> NTSTATUS {
-    if timer_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    // In a full implementation, this would:
-    // 1. Remove the timer from the kernel timer queue
-    // 2. Cancel any pending DPC
-    // For now, we return success
-
-    STATUS_SUCCESS
+pub unsafe extern "C" fn nt_cancel_timer(timer_handle: HANDLE, current_state: *mut u8) -> NTSTATUS {
+    super::timer::nt_cancel_timer(timer_handle, current_state)
 }
 
 /// # Safety
@@ -437,36 +584,7 @@ pub fn nt_wait_for_single_object_kernel(
     alertable: u8,
     timeout: Option<i64>,
 ) -> NTSTATUS {
-    use super::status::STATUS_TIMEOUT;
-
-    if handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    let timeout_ms = match timeout {
-        None => u32::MAX,
-        Some(raw) if raw < 0 => ((-raw) / 10_000) as u32,
-        Some(_) => u32::MAX,
-    };
-
-    // Look up the handle
-    if let Some(entry) = lookup_handle(handle) {
-        match entry.kind {
-            HandleKind::Event | HandleKind::Semaphore | HandleKind::Timer => {
-                // In a real implementation, this would call the kernel dispatcher
-                // For now, return success as the objects are always "signaled" in bootstrap
-                let _ = alertable;
-
-                // If timeout is zero, this should return timeout immediately
-                if timeout_ms == 0 {
-                    return STATUS_TIMEOUT;
-                }
-                return STATUS_SUCCESS;
-            }
-            _ => return STATUS_INVALID_HANDLE,
-        }
-    }
-    STATUS_INVALID_HANDLE
+    nt_wait_for_multiple_objects_kernel(1, &[handle], 1, alertable, timeout)
 }
 
 /// # Safety
@@ -522,45 +640,79 @@ pub fn nt_wait_for_multiple_objects_kernel(
     alertable: u8,
     timeout: Option<i64>,
 ) -> NTSTATUS {
-    use super::status::STATUS_TIMEOUT;
-
-    if handles.len() != count as usize || count == 0 || count as usize > 64 {
+    if handles.len() != count as usize || count == 0 || count > 64 || wait_type > 1 {
         return STATUS_INVALID_PARAMETER;
     }
-
-    let _ = wait_type;
-    let _ = alertable;
-
-    let timeout_ms = if timeout.is_none() {
-        u32::MAX
-    } else {
-        let raw = timeout.unwrap_or_default();
-        ((-raw) / 10_000) as u32
-    };
-
-    for &handle in handles {
-        if handle.is_null() {
-            return STATUS_INVALID_HANDLE;
-        }
-        if lookup_handle(handle).is_none() {
-            return STATUS_INVALID_HANDLE;
-        }
+    let wait_all = wait_type == 0; // WAIT_TYPE: WaitAll=0, WaitAny=1.
+    if wait_all
+        && handles
+            .iter()
+            .enumerate()
+            .any(|(index, handle)| handles[..index].contains(handle))
+    {
+        return STATUS_INVALID_PARAMETER;
     }
-
-    // If timeout is zero, return timeout immediately
-    if timeout_ms == 0 {
-        return STATUS_TIMEOUT;
-    }
-
-    // For bootstrap, return success
-    STATUS_SUCCESS
+    let _ = alertable; // User APC delivery requires a user-return trampoline.
+    let (pid, tid) = current_client_id();
+    complete_wait(super::file::begin_wait(
+        handles, wait_all, pid, tid, timeout,
+    ))
 }
 
-/// `nt_delay_execution` — convert a relative `i64` (in 100ns
-/// units, negative == relative) to a millisecond sleep.
+fn complete_wait(start: Result<super::file::WaitStart, NTSTATUS>) -> NTSTATUS {
+    match start {
+        Ok(super::file::WaitStart::Complete(status)) => status,
+        Ok(super::file::WaitStart::Pending(wait)) => loop {
+            if let Some(status) = wait.poll() {
+                return status;
+            }
+            // Keep the syscall stack resumable while the dispatcher owns the
+            // wait request. Signal/timeout completion is stored before yield;
+            // a transient pulse is never lost between checking and yielding.
+            crate::ke::scheduler::yield_();
+            core::hint::spin_loop();
+        },
+        Err(status) => status,
+    }
+}
+
+/// Signal an event, semaphore or owned mutant, then wait for one object.
 ///
-/// On success, returns `STATUS_SUCCESS`. If the alertable flag is set,
-/// the wait can be interrupted by an APC.
+/// # Safety
+/// The optional timeout address belongs to the calling user process.
+pub unsafe extern "C" fn nt_signal_and_wait_for_single_object(
+    signal: HANDLE,
+    handle: HANDLE,
+    alertable: u8,
+    timeout: *const i64,
+) -> NTSTATUS {
+    let timeout = if timeout.is_null() {
+        None
+    } else {
+        match read_user_object::<i64>(timeout as u64) {
+            Ok(raw) => Some(raw),
+            Err(status) => return status,
+        }
+    };
+    signal_and_wait_kernel(signal, handle, alertable, timeout)
+}
+
+/// Trusted helper using an already captured timeout.
+pub fn signal_and_wait_kernel(
+    signal: HANDLE,
+    handle: HANDLE,
+    alertable: u8,
+    timeout: Option<i64>,
+) -> NTSTATUS {
+    let _ = alertable; // APC return trampoline is still required.
+    let (pid, tid) = current_client_id();
+    complete_wait(super::file::signal_and_begin_wait(
+        signal, handle, pid, tid, timeout,
+    ))
+}
+
+/// Delay until an absolute NT wall time or a relative interrupt-time deadline,
+/// expressed in 100ns units. APC interruption is not yet implemented.
 pub extern "C" fn nt_delay_execution(alertable: u8, interval: *mut i64) -> NTSTATUS {
     if interval.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -577,28 +729,32 @@ pub extern "C" fn nt_delay_execution(alertable: u8, interval: *mut i64) -> NTSTA
 /// Trusted-kernel entry point for `nt_delay_execution`.
 pub fn nt_delay_execution_kernel(alertable: u8, interval: i64) -> NTSTATUS {
     let _ = alertable;
-    let raw = interval;
-
-    // Negative = relative time, Positive = absolute time
-    if raw >= 0 {
-        // Absolute time - would need system time comparison
+    if interval == 0 {
+        crate::ke::scheduler::yield_();
         return STATUS_SUCCESS;
     }
-
-    // Relative time: convert 100ns units to milliseconds
-    let ms = ((-raw) / 10_000) as u32;
-
-    // Call the kernel scheduler to perform the delay
-    // In a real implementation, this would:
-    // 1. Check for pending APCs if alertable
-    // 2. Call KeDelayExecutionThread with the converted timeout
-    // For bootstrap, we yield instead of sleeping to avoid blocking
-    if ms > 0 {
-        // Yield to other threads
-        crate::ke::scheduler::yield_();
+    if interval > 0 && interval as u64 <= crate::ke::time::get_system_time() {
+        return STATUS_SUCCESS;
     }
-
-    STATUS_SUCCESS
+    let start = crate::ke::time::get_time_snapshot();
+    let deadline = if interval < 0 {
+        start.interrupt_time.saturating_add(interval.unsigned_abs())
+    } else {
+        interval as u64
+    };
+    loop {
+        let now = crate::ke::time::get_time_snapshot();
+        if (if interval < 0 {
+            now.interrupt_time
+        } else {
+            now.system_time
+        }) >= deadline
+        {
+            return STATUS_SUCCESS;
+        }
+        crate::ke::scheduler::yield_();
+        core::hint::spin_loop();
+    }
 }
 
 /// # Safety
@@ -606,9 +762,5 @@ pub fn nt_delay_execution_kernel(alertable: u8, interval: i64) -> NTSTATUS {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `NT_CLOSE` re-export for kernel32.
 pub unsafe extern "C" fn nt_close_sync(h: HANDLE) -> NTSTATUS {
-    if free_handle(h) {
-        STATUS_SUCCESS
-    } else {
-        STATUS_INVALID_HANDLE
-    }
+    super::file::close_handle(h).map_or_else(|status| status, |_| STATUS_SUCCESS)
 }

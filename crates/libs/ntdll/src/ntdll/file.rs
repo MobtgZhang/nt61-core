@@ -53,83 +53,14 @@ fn struct_bytes<T>(value: &T) -> &[u8] {
 // handle table
 // ---------------------------------------------------------------------------
 
-const MAX_HANDLES: usize = 4096;
-
-#[derive(Clone, Copy)]
-pub(crate) struct HandleEntry {
-    pub kind: HandleKind,
-    pub target: u64,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HandleKind {
-    File,
-    Process,
-    Thread,
-    Token,
-    Section,
-    Event,
-    Mutant,
-    Semaphore,
-    Timer,
-    /// Pipe end (read or write). The `target` is the pipe slot
-    /// index (low 32 bits) plus the direction flag (bit 32: 0 =
-    /// read, 1 = write). See `pipe_slot_for`/`pipe_is_write` in
-    /// this module.
-    Pipe,
-    /// AFD endpoint. The `target` is the AFD handle id (cast
-    /// u64 → u32). `nt_device_io_control` routes through
-    /// `netstack::afd::dispatch`.
-    Afd,
-}
-
-static HANDLE_TABLE: Spinlock<HandleTable> = Spinlock::new(HandleTable::new());
-
-struct HandleTable {
-    entries: [Option<HandleEntry>; MAX_HANDLES],
-}
-
-impl HandleTable {
-    const fn new() -> Self {
-        const NONE: Option<HandleEntry> = None;
-        Self {
-            entries: [NONE; MAX_HANDLES],
-        }
-    }
-}
-
-pub(crate) fn alloc_handle(kind: HandleKind, target: u64) -> HANDLE {
-    let mut tbl = HANDLE_TABLE.lock();
-    for (i, e) in tbl.entries.iter_mut().enumerate() {
-        if e.is_none() {
-            *e = Some(HandleEntry { kind, target });
-            return encode_handle(i);
-        }
-    }
-    ptr::null_mut()
-}
-
-pub(crate) fn free_handle(h: HANDLE) -> bool {
-    let idx = decode_handle(h);
-    let mut tbl = HANDLE_TABLE.lock();
-    if idx >= MAX_HANDLES {
-        return false;
-    }
-    if tbl.entries[idx].is_none() {
-        return false;
-    }
-    tbl.entries[idx] = None;
-    true
-}
-
-pub(crate) fn lookup_handle(h: HANDLE) -> Option<HandleEntry> {
-    let idx = decode_handle(h);
-    let tbl = HANDLE_TABLE.lock();
-    if idx >= MAX_HANDLES {
-        return None;
-    }
-    tbl.entries[idx]
-}
+#[path = "file/handles.rs"]
+mod handles;
+pub use handles::handle_count;
+pub(crate) use handles::{
+    abandon_mutants, alloc_dispatcher_handle, alloc_handle, begin_wait, close_handle, free_handle,
+    handle_flags, lookup_handle, pulse_event, signal_and_begin_wait, tick_timers, update_handle_flags,
+    with_sync_handles, DispatcherState, HandleEntry, HandleKind, MutantState, TimerState, WaitStart,
+};
 
 /// Resolve a client-side process handle to its kernel target id.
 pub fn process_handle_target(h: HANDLE) -> Option<u64> {
@@ -145,17 +76,6 @@ pub fn thread_handle_target(h: HANDLE) -> Option<u64> {
         HandleKind::Thread => Some(entry.target),
         _ => None,
     })
-}
-
-fn encode_handle(idx: usize) -> HANDLE {
-    ((idx + 1) as u64) as HANDLE
-}
-
-fn decode_handle(h: HANDLE) -> usize {
-    if h.is_null() {
-        return usize::MAX;
-    }
-    ((h as u64) - 1) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -194,7 +114,7 @@ fn fs_device() -> *mut crate::io::DeviceObject {
 /// later opens of the same name can be arbitrated (wdm.h share modes,
 /// enforced by the I/O manager in NT).
 struct ShareEntry {
-    handle: HANDLE,
+    identity: u64,
     path: Vec<u16>,
     access: u32,
     share: u32,
@@ -254,16 +174,19 @@ fn check_share_access(path_u16: &[u16], access: u32, share: u32) -> bool {
 }
 
 fn record_share_entry(handle: HANDLE, path: Vec<u16>, access: u32, share: u32) {
+    let Some(object) = lookup_handle(handle) else {
+        return;
+    };
     SHARE_TABLE.lock().push(ShareEntry {
-        handle,
+        identity: object.identity,
         path,
         access,
         share,
     });
 }
 
-fn remove_share_entry(handle: HANDLE) {
-    SHARE_TABLE.lock().retain(|entry| entry.handle != handle);
+fn remove_share_entry(identity: u64) {
+    SHARE_TABLE.lock().retain(|entry| entry.identity != identity);
 }
 
 /// Resolve a File handle to the NtfsHandle FCB the CREATE IRP produced,
@@ -1322,28 +1245,19 @@ pub unsafe extern "C" fn nt_close(handle: HANDLE) -> NTSTATUS {
         return STATUS_INVALID_HANDLE;
     }
 
-    let entry = match lookup_handle(handle) {
-        Some(entry) => entry,
-        None => return STATUS_INVALID_HANDLE,
+    let (entry, retired) = match close_handle(handle) {
+        Ok(value) => value,
+        Err(status) => return status,
     };
 
-    if entry.kind == HandleKind::File {
+    if retired && entry.kind == HandleKind::File {
         let file_object = file_object_of(entry.target);
         let _ = file_close_irp(file_object);
         free_file_object(file_object);
-        remove_share_entry(handle);
+        remove_share_entry(entry.identity);
     }
 
-    // First close in ob's global handle table (if integration enabled)
-    // Note: In this bootstrap, the ntdll table is the primary table,
-    // and ob registration is optional for kernel objects.
-
-    // Then close in the ntdll handle table
-    if free_handle(handle) {
-        STATUS_SUCCESS
-    } else {
-        STATUS_INVALID_HANDLE
-    }
+    STATUS_SUCCESS
 }
 
 /// # Safety
@@ -1705,15 +1619,6 @@ pub unsafe extern "C" fn nt_query_directory_file(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-pub fn handle_count() -> usize {
-    HANDLE_TABLE
-        .lock()
-        .entries
-        .iter()
-        .filter(|e| e.is_some())
-        .count()
-}
 
 /// Register a pipe end with the handle table. `pipe_id` is the
 /// host-side identifier returned by `io::pipe::create_anonymous`;

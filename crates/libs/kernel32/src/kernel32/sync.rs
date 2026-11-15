@@ -5,16 +5,23 @@
 //! `create_mutex_w`, `release_mutex`, `create_semaphore_w`,
 //! `release_semaphore`, `initialize_critical_section`,
 //! `enter_critical_section`, `leave_critical_section`,
-//! `delete_critical_section`. The user-mode side of this
-//! kernel is never executed, so we accept the calls and
-//! forward to ntdll.
+//! `delete_critical_section`. Object operations forward to the native dispatcher.
 
 use super::error::set_last_error;
 use super::types::{BOOL, DWORD, FALSE, HANDLE, LPCWSTR, TRUE};
-use crate::libs::ntdll::status::{STATUS_INVALID_HANDLE, STATUS_SUCCESS};
+use crate::libs::ntdll::status::nt_status_to_dos_error;
 use crate::libs::ntdll::sync as ntdll_sync;
 use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
+
+fn bool_result(status: i32) -> BOOL {
+    if status >= 0 {
+        TRUE
+    } else {
+        set_last_error(nt_status_to_dos_error(status));
+        FALSE
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Events
@@ -30,15 +37,14 @@ pub unsafe extern "C" fn create_event_w(
     initial_state: BOOL,
     _name: LPCWSTR,
 ) -> HANDLE {
-    let mut oa = crate::libs::ntdll::types::ObjectAttributes::new();
     let event_type = if manual_reset != 0 { 0 } else { 1 };
-    let mut h: HANDLE = ptr::null_mut();
-    let status = ntdll_sync::nt_create_event(&mut h, 0, &mut oa, event_type, initial_state as u8);
-    if status != STATUS_SUCCESS {
-        set_last_error(8);
-        return ptr::null_mut();
+    match ntdll_sync::create_event_kernel(event_type, initial_state != 0) {
+        Ok(handle) => handle,
+        Err(status) => {
+            set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
+            ptr::null_mut()
+        }
     }
-    h
 }
 
 /// # Safety
@@ -46,31 +52,19 @@ pub unsafe extern "C" fn create_event_w(
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `set_event` / `reset_event` / `pulse_event`.
 pub unsafe extern "C" fn set_event(event: HANDLE) -> BOOL {
-    if ntdll_sync::nt_set_event(event, ptr::null_mut()) == STATUS_SUCCESS {
-        TRUE
-    } else {
-        FALSE
-    }
+    bool_result(ntdll_sync::nt_set_event(event, ptr::null_mut()))
 }
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 pub unsafe extern "C" fn reset_event(event: HANDLE) -> BOOL {
-    if ntdll_sync::nt_reset_event(event, ptr::null_mut()) == STATUS_SUCCESS {
-        TRUE
-    } else {
-        FALSE
-    }
+    bool_result(ntdll_sync::nt_reset_event(event, ptr::null_mut()))
 }
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 pub unsafe extern "C" fn pulse_event(event: HANDLE) -> BOOL {
-    if ntdll_sync::nt_pulse_event(event, ptr::null_mut()) == STATUS_SUCCESS {
-        TRUE
-    } else {
-        FALSE
-    }
+    bool_result(ntdll_sync::nt_pulse_event(event, ptr::null_mut()))
 }
 
 // ---------------------------------------------------------------------------
@@ -86,14 +80,13 @@ pub unsafe extern "C" fn create_mutex_w(
     initial_owner: BOOL,
     _name: LPCWSTR,
 ) -> HANDLE {
-    let mut oa = crate::libs::ntdll::types::ObjectAttributes::new();
-    let mut h: HANDLE = ptr::null_mut();
-    let status = ntdll_sync::nt_create_mutant(&mut h, 0, &mut oa, initial_owner as u8);
-    if status != STATUS_SUCCESS {
-        set_last_error(8);
-        return ptr::null_mut();
+    match ntdll_sync::create_mutant_kernel(initial_owner != 0) {
+        Ok(handle) => handle,
+        Err(status) => {
+            set_last_error(nt_status_to_dos_error(status));
+            ptr::null_mut()
+        }
     }
-    h
 }
 
 /// # Safety
@@ -101,11 +94,7 @@ pub unsafe extern "C" fn create_mutex_w(
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `release_mutex`.
 pub unsafe extern "C" fn release_mutex(mutex: HANDLE) -> BOOL {
-    if ntdll_sync::nt_release_mutant(mutex, ptr::null_mut()) == STATUS_SUCCESS {
-        TRUE
-    } else {
-        FALSE
-    }
+    bool_result(ntdll_sync::nt_release_mutant(mutex, ptr::null_mut()))
 }
 
 // ---------------------------------------------------------------------------
@@ -122,14 +111,13 @@ pub unsafe extern "C" fn create_semaphore_w(
     maximum_count: DWORD,
     _name: LPCWSTR,
 ) -> HANDLE {
-    let mut oa = crate::libs::ntdll::types::ObjectAttributes::new();
-    let mut h: HANDLE = ptr::null_mut();
-    let status = ntdll_sync::nt_create_semaphore(&mut h, 0, &mut oa, initial_count, maximum_count);
-    if status != STATUS_SUCCESS {
-        set_last_error(8);
-        return ptr::null_mut();
+    match ntdll_sync::create_semaphore_kernel(initial_count, maximum_count) {
+        Ok(handle) => handle,
+        Err(status) => {
+            set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
+            ptr::null_mut()
+        }
     }
-    h
 }
 
 /// # Safety
@@ -141,12 +129,11 @@ pub unsafe extern "C" fn release_semaphore(
     release_count: DWORD,
     previous_count: *mut DWORD,
 ) -> BOOL {
-    if ntdll_sync::nt_release_semaphore(semaphore, release_count, previous_count) == STATUS_SUCCESS
-    {
-        TRUE
-    } else {
-        FALSE
-    }
+    bool_result(ntdll_sync::nt_release_semaphore(
+        semaphore,
+        release_count,
+        previous_count,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,24 +146,37 @@ const WAIT_TIMEOUT: DWORD = 0x102;
 const WAIT_FAILED: DWORD = 0xFFFF_FFFF;
 pub const INFINITE: DWORD = 0xFFFF_FFFF;
 
+fn wait_timeout(milliseconds: DWORD) -> Option<i64> {
+    if milliseconds == INFINITE {
+        None
+    } else {
+        Some(-(i64::from(milliseconds) * 10_000))
+    }
+}
+
+fn wait_result(status: i32) -> DWORD {
+    if (0..64).contains(&status)
+        || (0x80..0xc0).contains(&status)
+        || status == 0x102
+        || status == 0xc0
+    {
+        status as DWORD
+    } else {
+        set_last_error(crate::libs::ntdll::status::nt_status_to_dos_error(status));
+        WAIT_FAILED
+    }
+}
+
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `wait_for_single_object`.
-pub unsafe extern "C" fn wait_for_single_object(handle: HANDLE, _milliseconds: DWORD) -> DWORD {
-    if handle.is_null() {
-        set_last_error(6);
-        return WAIT_FAILED;
-    }
-    let status = ntdll_sync::nt_wait_for_single_object_kernel(handle, 0, None);
-    if status == STATUS_SUCCESS {
-        WAIT_OBJECT_0
-    } else if status == STATUS_INVALID_HANDLE {
-        set_last_error(6);
-        WAIT_FAILED
-    } else {
-        WAIT_TIMEOUT
-    }
+pub unsafe extern "C" fn wait_for_single_object(handle: HANDLE, milliseconds: DWORD) -> DWORD {
+    wait_result(ntdll_sync::nt_wait_for_single_object_kernel(
+        handle,
+        0,
+        wait_timeout(milliseconds),
+    ))
 }
 
 /// # Safety
@@ -187,7 +187,7 @@ pub unsafe extern "C" fn wait_for_multiple_objects(
     count: DWORD,
     handles: *const HANDLE,
     wait_all: BOOL,
-    _milliseconds: DWORD,
+    milliseconds: DWORD,
 ) -> DWORD {
     if count == 0 || count > 64 || handles.is_null() {
         set_last_error(87);
@@ -199,13 +199,25 @@ pub unsafe extern "C" fn wait_for_multiple_objects(
         unsafe { core::slice::from_raw_parts(handles, count as usize) },
         wait_type,
         0,
-        None,
+        wait_timeout(milliseconds),
     );
-    if status == STATUS_SUCCESS {
-        WAIT_OBJECT_0
-    } else {
-        WAIT_TIMEOUT
-    }
+    wait_result(status)
+}
+
+/// # Safety
+/// Handles identify dispatcher objects owned by the caller.
+pub unsafe extern "C" fn signal_object_and_wait(
+    signal: HANDLE,
+    handle: HANDLE,
+    milliseconds: DWORD,
+    alertable: BOOL,
+) -> DWORD {
+    wait_result(ntdll_sync::signal_and_wait_kernel(
+        signal,
+        handle,
+        u8::from(alertable != 0),
+        wait_timeout(milliseconds),
+    ))
 }
 
 // ---------------------------------------------------------------------------

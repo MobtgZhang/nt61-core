@@ -11,8 +11,7 @@ use super::error::set_last_error;
 use super::types::{BOOL, DWORD, FALSE, HANDLE, HANDLE_CURRENT_PROCESS, LPSTR, TRUE};
 use crate::libs::ntdll::process as ntdll_process;
 use crate::libs::ntdll::status::STATUS_SUCCESS;
-use crate::libs::ntdll::sync as ntdll_sync;
-use crate::libs::ntdll::types::{client_id, ObjectAttributes};
+use crate::libs::ntdll::types::ObjectAttributes;
 use alloc::string::String;
 use core::ptr;
 
@@ -245,16 +244,18 @@ pub unsafe extern "C" fn open_process(
         set_last_error(87);
         return ptr::null_mut();
     }
-    let mut h: HANDLE = ptr::null_mut();
-    let mut oa = ObjectAttributes::new();
-    let mut cid = client_id::new();
-    cid.unique_process = process_id as HANDLE;
-    let status = ntdll_process::nt_open_process(&mut h, 0, &mut oa, &mut cid);
-    if status != STATUS_SUCCESS {
-        set_last_error(87);
-        return ptr::null_mut();
+    match ntdll_process::open_process_kernel(u64::from(process_id)) {
+        Ok(handle) => handle,
+        Err(status) => {
+            let error = if status == 0xC000000Bu32 as i32 {
+                87 // ERROR_INVALID_PARAMETER for an unknown process ID.
+            } else {
+                crate::libs::ntdll::status::nt_status_to_dos_error(status)
+            };
+            set_last_error(error);
+            ptr::null_mut()
+        }
     }
-    h
 }
 
 /// # Safety
@@ -262,19 +263,7 @@ pub unsafe extern "C" fn open_process(
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `wait_for_single_object` re-exported for process wait.
 ///
-/// `ms` is part of the Win32 ABI but the stub does not sleep
-/// (it just round-trips to `NT_WAIT_FOR_SINGLE_OBJECT`). The
-/// parameter is left in the signature for ABI compatibility;
-/// the next phase will plumb it into the kernel scheduler.
-pub unsafe extern "C" fn wait_for_single_object(handle: HANDLE, _ms: DWORD) -> DWORD {
-    if handle.is_null() {
-        set_last_error(6);
-        return 0xFFFF_FFFF;
-    }
-    let status = ntdll_sync::nt_wait_for_single_object_kernel(handle, 0, None);
-    if status == STATUS_SUCCESS {
-        0
-    } else {
-        0xFFFF_FFFF
-    }
+/// Preserve the Win32 timeout through the shared synchronization wrapper.
+pub unsafe extern "C" fn wait_for_single_object(handle: HANDLE, ms: DWORD) -> DWORD {
+    super::sync::wait_for_single_object(handle, ms)
 }

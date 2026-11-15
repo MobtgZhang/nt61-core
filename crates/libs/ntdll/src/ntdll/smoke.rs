@@ -427,6 +427,8 @@ pub fn test_nt_query_section() -> bool {
                 Err(_) => return report("NtQuerySection handle read", false),
             };
         let mut information = section::SectionBasicInformation {
+            base_address: ptr::null_mut(),
+            reserved: 0,
             attributes: 0,
             maximum_size: 0,
         };
@@ -458,7 +460,7 @@ pub fn test_nt_query_section() -> bool {
         {
             return report("NtQuerySection length read", false);
         }
-        if information.attributes != 0x80 || information.maximum_size != 0x1234 {
+        if information.attributes != 0x0800_0000 || information.maximum_size != 0x1234 {
             return report("NtQuerySection values", false);
         }
         if return_length != core::mem::size_of::<section::SectionBasicInformation>() {

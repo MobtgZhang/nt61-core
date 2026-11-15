@@ -1,22 +1,22 @@
 //! ntdll — Nt* section (file mapping) APIs
 //
 //! `nt_create_section`, `nt_map_view_of_section`,
-//! `nt_unmap_view_of_section`, `nt_query_section`. The
-//! implementation is a stub: sections are tracked in the
-//! handle table but no actual mapping happens (the user-mode
-//! side of this kernel is never executed).
+//! `nt_unmap_view_of_section`, `nt_query_section`.
+//! Section objects retain creation metadata. View mapping is not yet
+//! implemented and returns an explicit failure without publishing an address.
 //
 //! References: MSDN Library "Windows 7" — `ntdll.dll` section
 //! APIs.
 
-use super::file::{alloc_handle, free_handle, HandleKind};
+use super::file::{alloc_handle, free_handle, lookup_handle, HandleKind};
 use super::status::{
     STATUS_ACCESS_DENIED, STATUS_ACCESS_VIOLATION, STATUS_INFO_LENGTH_MISMATCH,
-    STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+    STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS,
 };
 use super::types::{SizeT, HANDLE, NTSTATUS, PVOID};
 use crate::ke::sync::Spinlock;
-use crate::mm::user_copy::{read_user_object, write_user_object};
+use crate::mm::user_copy::{probe_user_write, read_user_object, write_user_object};
 use alloc::vec::Vec;
 
 /// `SectionBasicInformation` information class.
@@ -28,19 +28,17 @@ pub const SECTION_BASIC_INFORMATION: u32 = 0;
 /// parameters that `NtQuerySection` must report.
 #[derive(Clone, Copy)]
 struct SectionEntry {
-    handle: HANDLE,
+    identity: u64,
     desired_access: u32,
     maximum_size: i64,
     allocation_attributes: u32,
     file_mapped: bool,
 }
 
-const SECTION_ATTRIBUTE_FILE: u32 = 0x0000_0010;
-const SECTION_ATTRIBUTE_IMAGE: u32 = 0x0000_0020;
-const SECTION_ATTRIBUTE_RESERVE: u32 = 0x0000_0040;
-const SECTION_ATTRIBUTE_COMMIT: u32 = 0x0000_0080;
-const ALLOCATION_ATTRIBUTE_IMAGE: u32 = 0x0100_0000;
-const ALLOCATION_ATTRIBUTE_RESERVE: u32 = 0x0400_0000;
+const SECTION_ATTRIBUTE_FILE: u32 = 0x0080_0000;
+const SECTION_ATTRIBUTE_IMAGE: u32 = 0x0100_0000;
+const SECTION_ATTRIBUTE_RESERVE: u32 = 0x0400_0000;
+const SECTION_ATTRIBUTE_COMMIT: u32 = 0x0800_0000;
 
 fn is_supported_page_protection(protection: u32) -> bool {
     const PAGE_GUARD: u32 = 0x0100;
@@ -53,15 +51,16 @@ fn is_supported_page_protection(protection: u32) -> bool {
 }
 
 fn section_attributes(entry: SectionEntry) -> u32 {
+    let mut attributes = entry.allocation_attributes;
     if entry.file_mapped {
-        SECTION_ATTRIBUTE_FILE
-    } else if entry.allocation_attributes & ALLOCATION_ATTRIBUTE_IMAGE != 0 {
-        SECTION_ATTRIBUTE_IMAGE
-    } else if entry.allocation_attributes & ALLOCATION_ATTRIBUTE_RESERVE != 0 {
-        SECTION_ATTRIBUTE_RESERVE
-    } else {
-        SECTION_ATTRIBUTE_COMMIT
+        attributes |= SECTION_ATTRIBUTE_FILE;
     }
+    if attributes & (SECTION_ATTRIBUTE_IMAGE | SECTION_ATTRIBUTE_RESERVE | SECTION_ATTRIBUTE_COMMIT)
+        == 0
+    {
+        attributes |= SECTION_ATTRIBUTE_COMMIT;
+    }
+    attributes
 }
 
 static SECTION_TABLE: Spinlock<Vec<SectionEntry>> = Spinlock::new(Vec::new());
@@ -70,7 +69,9 @@ static SECTION_TABLE: Spinlock<Vec<SectionEntry>> = Spinlock::new(Vec::new());
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SectionBasicInformation {
+    pub base_address: PVOID,
     pub attributes: u32,
+    pub reserved: u32,
     pub maximum_size: i64,
 }
 
@@ -89,6 +90,9 @@ pub unsafe extern "C" fn nt_create_section(
 ) -> NTSTATUS {
     if section_handle.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    if probe_user_write(section_handle as u64, core::mem::size_of::<HANDLE>()).is_err() {
+        return STATUS_ACCESS_VIOLATION;
     }
     if !maximum_size.is_null() && read_user_object::<i64>(maximum_size as u64).is_err() {
         return STATUS_ACCESS_VIOLATION;
@@ -114,6 +118,7 @@ pub unsafe extern "C" fn nt_create_section(
         return status;
     }
     if write_user_object(section_handle as u64, &output).is_err() {
+        free_handle(output);
         return STATUS_ACCESS_VIOLATION;
     }
     STATUS_SUCCESS
@@ -134,12 +139,19 @@ pub fn nt_create_section_kernel(
     if maximum_size.as_ref().is_some_and(|value| **value < 0) {
         return STATUS_INVALID_PARAMETER;
     }
-    let handle = alloc_handle(HandleKind::Section, 0xC0DE_CAFE_F00D_BEEF);
+    if !file_handle.is_null()
+        && !matches!(lookup_handle(file_handle), Some(entry) if entry.kind == HandleKind::File)
+    {
+        return STATUS_INVALID_HANDLE;
+    }
+    static NEXT_IDENTITY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    let identity = NEXT_IDENTITY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let handle = alloc_handle(HandleKind::Section, identity);
     if handle.is_null() {
         return STATUS_INVALID_HANDLE;
     }
     let entry = SectionEntry {
-        handle,
+        identity,
         desired_access,
         maximum_size: maximum_size.copied().unwrap_or(0),
         allocation_attributes,
@@ -168,11 +180,13 @@ pub unsafe extern "C" fn nt_map_view_of_section(
     allocation_type: u32,
     win32_protect: u32,
 ) -> NTSTATUS {
-    if section_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
+    match lookup_handle(section_handle) {
+        Some(entry) if entry.kind == HandleKind::Section => {}
+        _ => return STATUS_INVALID_HANDLE,
     }
     let _ = (
         process_handle,
+        base_address,
         zero_bits,
         commit_size,
         section_offset,
@@ -181,25 +195,8 @@ pub unsafe extern "C" fn nt_map_view_of_section(
         allocation_type,
         win32_protect,
     );
-    if base_address.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if write_user_object(base_address as u64, &(0x0000_7000_0000_0000usize as PVOID)).is_err() {
-        return STATUS_ACCESS_VIOLATION;
-    }
-    if !section_offset.is_null() {
-        let offset = 0i64;
-        if write_user_object(section_offset as u64, &offset).is_err() {
-            return STATUS_ACCESS_VIOLATION;
-        }
-    }
-    if !view_size.is_null() {
-        let view_size_value = 0 as SizeT;
-        if write_user_object(view_size as u64, &view_size_value).is_err() {
-            return STATUS_ACCESS_VIOLATION;
-        }
-    }
-    STATUS_SUCCESS
+    // No view exists until the memory manager can install and track it.
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// # Safety
@@ -210,7 +207,7 @@ pub unsafe extern "C" fn nt_unmap_view_of_section(
     _process_handle: HANDLE,
     _base_address: PVOID,
 ) -> NTSTATUS {
-    STATUS_SUCCESS
+    STATUS_NOT_IMPLEMENTED
 }
 
 /// # Safety
@@ -233,11 +230,15 @@ pub unsafe extern "C" fn nt_query_section(
     if info.is_null() || length < core::mem::size_of::<SectionBasicInformation>() {
         return STATUS_INFO_LENGTH_MISMATCH;
     }
+    let identity = match lookup_handle(section_handle) {
+        Some(entry) if entry.kind == HandleKind::Section => entry.target,
+        _ => return STATUS_INVALID_HANDLE,
+    };
     let sections = SECTION_TABLE.lock();
     let Some(entry) = sections
         .iter()
         .copied()
-        .find(|entry| entry.handle == section_handle)
+        .find(|entry| entry.identity == identity)
     else {
         return STATUS_INVALID_HANDLE;
     };
@@ -246,6 +247,8 @@ pub unsafe extern "C" fn nt_query_section(
         return STATUS_ACCESS_DENIED;
     }
     let information = SectionBasicInformation {
+        base_address: core::ptr::null_mut(),
+        reserved: 0,
         attributes: section_attributes(entry),
         maximum_size: entry.maximum_size,
     };
@@ -270,10 +273,15 @@ pub unsafe extern "C" fn nt_query_section(
 /// `NT_CLOSE` (re-exported so kernel32 can call it without
 /// touching the file module).
 pub unsafe extern "C" fn nt_close_section(h: HANDLE) -> NTSTATUS {
-    if !free_handle(h) {
+    if !matches!(lookup_handle(h), Some(entry) if entry.kind == HandleKind::Section) {
         return STATUS_INVALID_HANDLE;
     }
-    let mut sections = SECTION_TABLE.lock();
-    sections.retain(|entry| entry.handle != h);
-    STATUS_SUCCESS
+    super::file::close_handle(h).map_or_else(|status| status, |_| STATUS_SUCCESS)
+}
+
+/// Release creation metadata when the shared handle table closes a section.
+pub(crate) fn release_section(identity: u64) {
+    SECTION_TABLE
+        .lock()
+        .retain(|entry| entry.identity != identity);
 }

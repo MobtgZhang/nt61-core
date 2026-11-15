@@ -1,119 +1,126 @@
-//! ntdll — Timer Objects (NT 6.1.7601)
-//!
-//! Waitable timer objects for scheduled execution and delays.
-//! Timers can be manual-reset or synchronization (auto-reset).
-//!
-//! References:
-//!   * MSDN Library "Windows 7" — Timer Objects
-//!   * Windows Internals 7th Ed. - Chapter 8
-
-use super::file::{alloc_handle, lookup_handle, HandleKind};
-use super::status::{
-    STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_SUCCESS, STATUS_TIMER_NOT_CANCELED,
+//! Native timer objects backed by the shared handle/object store.
+//! Clock polling publishes expiration independently of queries. APC callbacks
+//! and wake-from-suspend remain unavailable and are rejected before mutation.
+use super::file::{
+    alloc_dispatcher_handle, with_sync_handles, DispatcherState, HandleKind, TimerState,
 };
+use super::status::*;
 use super::types::{LargeInteger, HANDLE, NTSTATUS, PVOID};
-use crate::ke::sync::Spinlock;
-use core::ptr;
+use crate::mm::user_copy::{probe_user_write, read_user_object, write_user_object};
 
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimerType {
-    NotificationTimer = 0,    // Manual-reset
-    SynchronizationTimer = 1, // Auto-reset
+    NotificationTimer = 0,
+    SynchronizationTimer = 1,
 }
 
-#[derive(Clone, Copy)]
-struct TimerState {
-    timer_type: u32,
-    due_time: LargeInteger, // Changed from i64 to LargeInteger
-    period: i32,            // Milliseconds (0 = one-shot)
-    signaled: bool,
-    armed: bool,
-    apc_routine: PVOID,
-    apc_context: PVOID,
+/// Refresh a timer against its deadline clock. Relative deadlines and periodic
+/// intervals use monotonic interrupt time; absolute deadlines track wall time.
+/// Missed periods coalesce into one signal and the next future deadline.
+pub(crate) fn refresh_timer(state: &mut TimerState) {
+    let now = crate::ke::time::get_time_snapshot();
+    refresh_timer_at(state, now.system_time, now.interrupt_time);
 }
 
-impl TimerState {
-    const fn new() -> Self {
-        Self {
-            timer_type: 0,
-            due_time: LargeInteger { quad_part: 0 },
-            period: 0,
-            signaled: false,
-            armed: false,
-            apc_routine: ptr::null_mut(),
-            apc_context: ptr::null_mut(),
-        }
+pub(crate) fn refresh_timer_at(state: &mut TimerState, wall: u64, uptime: u64) {
+    if !state.armed {
+        return;
+    }
+    let now = if state.absolute { wall } else { uptime };
+    if now < state.deadline {
+        return;
+    }
+    state.signaled = true;
+    if state.period_ms == 0 {
+        state.armed = false;
+    } else {
+        let period = u64::from(state.period_ms) * 10_000;
+        let next = period - (now - state.deadline) % period;
+        state.deadline = uptime.saturating_add(next);
+        state.absolute = false;
     }
 }
 
-const MAX_TIMERS: usize = 64;
-static TIMER_STATES: Spinlock<[Option<TimerState>; MAX_TIMERS]> = Spinlock::new([None; MAX_TIMERS]);
+/// Allocate a timer for trusted kernel32 callers.
+pub fn create_timer_kernel(timer_type: u32) -> Result<HANDLE, NTSTATUS> {
+    if timer_type > 1 {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let handle = alloc_dispatcher_handle(
+        HandleKind::Timer,
+        0,
+        DispatcherState::Timer(TimerState {
+            timer_type,
+            deadline: 0,
+            absolute: false,
+            period_ms: 0,
+            signaled: false,
+            armed: false,
+        }),
+    );
+    if handle.is_null() {
+        Err(STATUS_NO_MEMORY)
+    } else {
+        Ok(handle)
+    }
+}
 
-/// # Safety
+/// Create a native timer object.
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// # Safety
+/// The output pointer is a user address validated by user_copy.
 pub unsafe extern "C" fn nt_create_timer(
     timer_handle: *mut HANDLE,
     desired_access: u32,
     object_attributes: *mut super::types::ObjectAttributes,
     timer_type: u32,
 ) -> NTSTATUS {
-    if timer_handle.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-
     if timer_type > 1 {
         return STATUS_INVALID_PARAMETER;
     }
-
-    let _ = (desired_access, object_attributes);
-
-    let mut states = TIMER_STATES.lock();
-    let timer_id = match states.iter().position(|s| s.is_none()) {
-        Some(idx) => idx,
-        None => return STATUS_INVALID_HANDLE,
-    };
-
-    let mut state = TimerState::new();
-    state.timer_type = timer_type;
-    states[timer_id] = Some(state);
-    drop(states);
-
-    let h = alloc_handle(HandleKind::Timer, timer_id as u64);
-    if h.is_null() {
-        let mut states = TIMER_STATES.lock();
-        states[timer_id] = None;
-        return STATUS_INVALID_HANDLE;
+    if let Err(status) = probe_user_write(timer_handle as u64, core::mem::size_of::<HANDLE>()) {
+        return status;
     }
-
-    *timer_handle = h;
-    STATUS_SUCCESS
+    let _ = (desired_access, object_attributes);
+    match create_timer_kernel(timer_type) {
+        Ok(handle) => match write_user_object(timer_handle as u64, &handle) {
+            Ok(()) => STATUS_SUCCESS,
+            Err(status) => {
+                super::file::free_handle(handle);
+                status
+            }
+        },
+        Err(status) => status,
+    }
 }
 
-/// # Safety
+/// Open a named timer. Namespace integration remains unavailable.
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// # Safety
+/// Pointers belong to the calling user process.
 pub unsafe extern "C" fn nt_open_timer(
     timer_handle: *mut HANDLE,
     desired_access: u32,
     object_attributes: *mut super::types::ObjectAttributes,
 ) -> NTSTATUS {
-    if timer_handle.is_null() || object_attributes.is_null() {
+    if let Err(status) = probe_user_write(timer_handle as u64, core::mem::size_of::<HANDLE>()) {
+        return status;
+    }
+    if object_attributes.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-
     let _ = desired_access;
-
-    STATUS_INVALID_PARAMETER
+    STATUS_NOT_SUPPORTED
 }
 
-pub type TimerApcRoutine =
-    unsafe extern "C" fn(timer_context: PVOID, timer_low_value: u32, timer_high_value: i32);
+pub type TimerApcRoutine = unsafe extern "C" fn(PVOID, u32, i32);
 
-/// # Safety
+/// Arm/rearm a timer, clearing its old signal state. The previous-state output
+/// is the BOOLEAN signal state before resetting, not whether it was armed.
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// # Safety
+/// Input/output pointers are user addresses captured via user_copy.
 pub unsafe extern "C" fn nt_set_timer(
     timer_handle: HANDLE,
     due_time: *const LargeInteger,
@@ -123,85 +130,105 @@ pub unsafe extern "C" fn nt_set_timer(
     period: i32,
     previous_state: *mut u8,
 ) -> NTSTATUS {
-    if timer_handle.is_null() || due_time.is_null() {
+    if period < 0 {
         return STATUS_INVALID_PARAMETER;
     }
-
-    let entry = match lookup_handle(timer_handle) {
-        Some(e) if e.kind == HandleKind::Timer => e,
-        _ => return STATUS_INVALID_HANDLE,
+    let due = match read_user_object::<LargeInteger>(due_time as u64) {
+        Ok(value) => value.quad_part,
+        Err(status) => return status,
     };
-
-    let timer_id = entry.target as usize;
-    if timer_id >= MAX_TIMERS {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    let _ = resume;
-
-    let mut states = TIMER_STATES.lock();
-    let state = match &mut states[timer_id] {
-        Some(s) => s,
-        None => return STATUS_INVALID_HANDLE,
-    };
-
     if !previous_state.is_null() {
-        *previous_state = if state.signaled { 1 } else { 0 };
+        if let Err(status) = probe_user_write(previous_state as u64, 1) {
+            return status;
+        }
     }
-
-    state.due_time = *due_time;
-    state.period = period;
-    state.signaled = false;
-    state.armed = true;
-    state.apc_routine = timer_apc_routine;
-    state.apc_context = timer_context;
-
-    STATUS_SUCCESS
+    change_timer(timer_handle, due, timer_apc_routine, timer_context, resume, period, |signaled| {
+        if previous_state.is_null() {
+            Ok(())
+        } else {
+            write_user_object(previous_state as u64, &u8::from(signaled))
+        }
+    })
 }
 
-/// # Safety
+/// Trusted caller has already captured the 64-bit interval. No kernel address
+/// is routed through the user-memory capture performed by NtSetTimer.
+pub fn set_timer_kernel(
+    timer_handle: HANDLE,
+    due: i64,
+    timer_apc_routine: PVOID,
+    timer_context: PVOID,
+    resume: u8,
+    period: i32,
+) -> NTSTATUS {
+    change_timer(timer_handle, due, timer_apc_routine, timer_context, resume, period, |_| Ok(()))
+}
+
+fn change_timer(
+    timer_handle: HANDLE,
+    due: i64,
+    timer_apc_routine: PVOID,
+    _timer_context: PVOID,
+    resume: u8,
+    period: i32,
+    previous: impl FnOnce(bool) -> Result<(), NTSTATUS>,
+) -> NTSTATUS {
+    if period < 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    with_sync_handles(&[timer_handle], |entries| {
+        if entries[0].kind != HandleKind::Timer {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let DispatcherState::Timer(state) = &mut entries[0].dispatcher else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        if !timer_apc_routine.is_null() || resume != 0 {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        refresh_timer(state);
+        previous(state.signaled)?;
+        let now = crate::ke::time::get_time_snapshot();
+        state.deadline = if due < 0 {
+            now.interrupt_time.saturating_add(due.unsigned_abs())
+        } else {
+            due as u64
+        };
+        state.absolute = due >= 0;
+        state.period_ms = period as u32;
+        state.signaled = false;
+        state.armed = true;
+        refresh_timer_at(state, now.system_time, now.interrupt_time);
+        Ok(STATUS_SUCCESS)
+    })
+    .unwrap_or_else(|status| status)
+}
+
+/// Cancel future expirations while preserving the current signal state.
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// # Safety
+/// The optional output pointer is validated by user_copy.
 pub unsafe extern "C" fn nt_cancel_timer(timer_handle: HANDLE, current_state: *mut u8) -> NTSTATUS {
-    if timer_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    let entry = match lookup_handle(timer_handle) {
-        Some(e) if e.kind == HandleKind::Timer => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    let timer_id = entry.target as usize;
-    if timer_id >= MAX_TIMERS {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    let mut states = TIMER_STATES.lock();
-    let state = match &mut states[timer_id] {
-        Some(s) => s,
-        None => return STATUS_INVALID_HANDLE,
-    };
-
     if !current_state.is_null() {
-        *current_state = if state.signaled { 1 } else { 0 };
+        if let Err(status) = probe_user_write(current_state as u64, 1) {
+            return status;
+        }
     }
-
-    // ReactOS ntoskrnl/ex/timer.c (ExCancelTimer) and the NT 6.1 DDI both
-    // report STATUS_TIMER_NOT_CANCELED when the timer was not armed, so the
-    // caller can distinguish "nothing to cancel" from a successful cancel.
-    if !state.armed {
-        return STATUS_TIMER_NOT_CANCELED;
-    }
-
-    state.due_time = LargeInteger { quad_part: 0 };
-    state.period = 0;
-    state.signaled = false;
-    state.armed = false;
-    state.apc_routine = ptr::null_mut();
-    state.apc_context = ptr::null_mut();
-
-    STATUS_SUCCESS
+    with_sync_handles(&[timer_handle], |entries| {
+        if entries[0].kind != HandleKind::Timer {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let DispatcherState::Timer(state) = &mut entries[0].dispatcher else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        refresh_timer(state);
+        if !current_state.is_null() {
+            write_user_object(current_state as u64, &u8::from(state.signaled))?;
+        }
+        state.armed = false;
+        Ok(STATUS_SUCCESS)
+    })
+    .unwrap_or_else(|status| status)
 }
 
 #[repr(u32)]
@@ -210,56 +237,49 @@ pub enum TimerInformationClass {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct TimerBasicInformation {
     pub remaining_time: LargeInteger,
     pub timer_state: u8,
 }
 
-/// # Safety
+/// Query the native 16-byte TIMER_BASIC_INFORMATION. Padding is explicitly zero.
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// # Safety
+/// Output pointers are user addresses validated by user_copy.
 pub unsafe extern "C" fn nt_query_timer(
-    timer_handle: HANDLE,
-    timer_information_class: u32,
-    timer_information: PVOID,
-    timer_information_length: u32,
+    handle: HANDLE,
+    class: u32,
+    information: PVOID,
+    length: u32,
     return_length: *mut u32,
 ) -> NTSTATUS {
-    if timer_handle.is_null() || timer_information.is_null() {
-        return STATUS_INVALID_PARAMETER;
+    if class != 0 {
+        return STATUS_INVALID_INFO_CLASS;
     }
-
-    let entry = match lookup_handle(timer_handle) {
-        Some(e) if e.kind == HandleKind::Timer => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    let timer_id = entry.target as usize;
-    if timer_id >= MAX_TIMERS {
-        return STATUS_INVALID_HANDLE;
+    if let Err(status) = super::sync::query_output(information, length, 16, return_length) {
+        return status;
     }
-
-    if timer_information_class != TimerInformationClass::TimerBasicInformation as u32 {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if timer_information_length < core::mem::size_of::<TimerBasicInformation>() as u32 {
-        return super::status::STATUS_BUFFER_TOO_SMALL;
-    }
-
-    let states = TIMER_STATES.lock();
-    let state = match &states[timer_id] {
-        Some(s) => s,
-        None => return STATUS_INVALID_HANDLE,
-    };
-
-    let info = timer_information as *mut TimerBasicInformation;
-    (*info).remaining_time = state.due_time;
-    (*info).timer_state = if state.signaled { 1 } else { 0 };
-
-    if !return_length.is_null() {
-        *return_length = core::mem::size_of::<TimerBasicInformation>() as u32;
-    }
-
-    STATUS_SUCCESS
+    with_sync_handles(&[handle], |entries| {
+        if entries[0].kind != HandleKind::Timer {
+            return Err(STATUS_OBJECT_TYPE_MISMATCH);
+        }
+        let DispatcherState::Timer(state) = &mut entries[0].dispatcher else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        let now = crate::ke::time::get_time_snapshot();
+        refresh_timer_at(state, now.system_time, now.interrupt_time);
+        let clock = if state.absolute {
+            now.system_time
+        } else {
+            now.interrupt_time
+        };
+        let remaining = (i128::from(state.deadline) - i128::from(clock))
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+        let mut bytes = [0; 16];
+        bytes[..8].copy_from_slice(&remaining.to_le_bytes());
+        bytes[8] = u8::from(state.signaled);
+        super::sync::write_query_output(information, &bytes, return_length)
+    })
+    .unwrap_or_else(|status| status)
 }

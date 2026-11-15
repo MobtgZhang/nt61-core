@@ -1,26 +1,7 @@
-//! ntdll — Wait Block Management for Synchronization
-//!
-//! Implements KWAIT_BLOCK structures and wait list management for
-//! proper thread blocking and signaling. This module provides the
-//! user-mode interface to the kernel dispatcher's wait mechanism.
-//!
-//! NT 6.1.7601 Wait Architecture:
-//! - Each waitable object has a wait list
-//! - Blocked threads are represented by KWAIT_BLOCK entries
-//! - The kernel dispatcher manages thread state transitions
-//! - Timeout support via timer objects
-//!
-//! References:
-//!   * Windows Internals 7th Ed. - Chapter 5 (Threads)
-//!   * ReactOS ke/wait.c
-//!   * WRK base/ntos/ex/synch.c
+//! Trusted wait helpers share the native dispatcher object state and queues.
+//! User APC delivery still requires a user-return trampoline.
 
-use super::file::{lookup_handle, HandleKind};
-use super::status::{
-    STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_TIMEOUT, STATUS_WAIT_0,
-};
 use super::types::{HANDLE, NTSTATUS};
-use crate::ke::sync::Spinlock;
 use core::ptr;
 
 #[repr(C)]
@@ -53,8 +34,8 @@ impl Default for KWaitBlock {
     }
 }
 
-pub const WAIT_TYPE_ANY: u16 = 0; // WaitAny - return when any object is signaled
-pub const WAIT_TYPE_ALL: u16 = 1; // WaitAll - return when all objects are signaled
+pub const WAIT_TYPE_ANY: u16 = 1; // WaitAny - return when any object is signaled
+pub const WAIT_TYPE_ALL: u16 = 0; // WaitAll - return when all objects are signaled
 
 pub const MAXIMUM_WAIT_OBJECTS: usize = 64;
 
@@ -99,192 +80,16 @@ impl Default for ThreadWaitContext {
     }
 }
 
-const MAX_THREADS: usize = 256;
-static WAIT_CONTEXTS: Spinlock<[Option<ThreadWaitContext>; MAX_THREADS]> =
-    Spinlock::new([None; MAX_THREADS]);
-
-fn get_current_wait_context() -> Option<&'static mut ThreadWaitContext> {
-    // For now, use thread slot 0
-    unsafe {
-        let mut contexts = WAIT_CONTEXTS.lock();
-        if contexts[0].is_none() {
-            contexts[0] = Some(ThreadWaitContext::new());
-        }
-        let ptr = contexts[0].as_mut().unwrap() as *mut ThreadWaitContext;
-        Some(&mut *ptr)
-    }
-}
-
-fn is_object_signaled(handle: HANDLE) -> (bool, bool) {
-    let entry = match lookup_handle(handle) {
-        Some(e) => e,
-        None => return (false, false),
-    };
-
-    match entry.kind {
-        HandleKind::Event => {
-            let signaled = (entry.target & 0x01) != 0;
-            let manual_reset = (entry.target & 0x100) != 0;
-            (signaled, !manual_reset) // auto-reset = true if not manual
-        }
-        HandleKind::Mutant => {
-            let owned = (entry.target & 0x01) != 0;
-            (!owned, false)
-        }
-        HandleKind::Semaphore => {
-            let count = (entry.target & 0xFFFFFFFF) as u32;
-            (count > 0, false)
-        }
-        HandleKind::Thread | HandleKind::Process => {
-            let terminated = (entry.target & 0x01) != 0;
-            (terminated, false)
-        }
-        _ => (false, false),
-    }
-}
-
-fn auto_reset_object(handle: HANDLE) {
-    let _ = handle;
-}
-
-fn wait_for_single_object_internal(handle: HANDLE, timeout_ms: u64, _alertable: bool) -> NTSTATUS {
-    let (signaled, auto_reset) = is_object_signaled(handle);
-    if signaled {
-        if auto_reset {
-            auto_reset_object(handle);
-        }
-        return STATUS_WAIT_0;
-    }
-
-    let ctx = match get_current_wait_context() {
-        Some(c) => c,
-        None => return STATUS_INVALID_PARAMETER,
-    };
-
-    ctx.state = WaitState::Waiting;
-    ctx.wait_count = 1;
-    ctx.wait_type = WAIT_TYPE_ANY;
-    ctx.timeout_ms = timeout_ms;
-    ctx.wait_blocks[0].object = handle as u64;
-    ctx.wait_blocks[0].wait_key = 0;
-    ctx.wait_blocks[0].wait_type = WAIT_TYPE_ANY;
-
-    if timeout_ms == 0 {
-        ctx.state = WaitState::TimedOut;
-        STATUS_TIMEOUT
-    } else {
-        ctx.state = WaitState::Satisfied;
-        if auto_reset {
-            auto_reset_object(handle);
-        }
-        STATUS_WAIT_0
-    }
-}
-
-fn wait_for_multiple_objects_internal(
-    count: u32,
-    handles: &[HANDLE],
-    wait_type: u32,
-    timeout_ms: u64,
-    _alertable: bool,
-) -> NTSTATUS {
-    if handles.len() != count as usize || count == 0 || count as usize > MAXIMUM_WAIT_OBJECTS {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    let wait_all = wait_type != 0;
-    let handle_slice = handles;
-
-    if wait_all {
-        let mut all_signaled = true;
-        let mut auto_reset_list = [false; MAXIMUM_WAIT_OBJECTS];
-
-        for (i, &handle) in handle_slice.iter().enumerate() {
-            let (signaled, auto_reset) = is_object_signaled(handle);
-            if !signaled {
-                all_signaled = false;
-                break;
-            }
-            auto_reset_list[i] = auto_reset;
-        }
-
-        if all_signaled {
-            for (i, &handle) in handle_slice.iter().enumerate() {
-                if auto_reset_list[i] {
-                    auto_reset_object(handle);
-                }
-            }
-            return STATUS_WAIT_0;
-        }
-    } else {
-        for (i, &handle) in handle_slice.iter().enumerate() {
-            let (signaled, auto_reset) = is_object_signaled(handle);
-            if signaled {
-                if auto_reset {
-                    auto_reset_object(handle);
-                }
-                return STATUS_WAIT_0 + (i as i32);
-            }
-        }
-    }
-
-    let ctx = match get_current_wait_context() {
-        Some(c) => c,
-        None => return STATUS_INVALID_PARAMETER,
-    };
-
-    ctx.state = WaitState::Waiting;
-    ctx.wait_count = count as usize;
-    ctx.wait_type = if wait_all {
-        WAIT_TYPE_ALL
-    } else {
-        WAIT_TYPE_ANY
-    };
-    ctx.timeout_ms = timeout_ms;
-
-    for (i, &handle) in handle_slice.iter().enumerate() {
-        ctx.wait_blocks[i].object = handle as u64;
-        ctx.wait_blocks[i].wait_key = i as u16;
-        ctx.wait_blocks[i].wait_type = ctx.wait_type;
-    }
-
-    if timeout_ms == 0 {
-        ctx.state = WaitState::TimedOut;
-        STATUS_TIMEOUT
-    } else {
-        ctx.state = WaitState::Satisfied;
-        ctx.signaled_index = 0;
-
-        let (_, auto_reset) = is_object_signaled(handle_slice[0]);
-        if auto_reset {
-            auto_reset_object(handle_slice[0]);
-        }
-
-        STATUS_WAIT_0
-    }
-}
-
-// Public Wait Functions (used by sync.rs)
-
+/// Wait using a captured timeout rather than a user pointer.
 pub fn nt_wait_for_single_object_kernel(
     handle: HANDLE,
     alertable: u8,
     timeout: Option<i64>,
 ) -> NTSTATUS {
-    if handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    let timeout_ms = match timeout {
-        None => u64::MAX,
-        Some(0) => 0,
-        Some(raw) if raw < 0 => raw.unsigned_abs() / 10_000,
-        Some(_) => u64::MAX,
-    };
-
-    wait_for_single_object_internal(handle, timeout_ms, alertable != 0)
+    super::sync::nt_wait_for_single_object_kernel(handle, alertable, timeout)
 }
 
+/// WaitAll=0 and WaitAny=1, matching WAIT_TYPE in the native API.
 pub fn nt_wait_for_multiple_objects_kernel(
     count: u32,
     handles: &[HANDLE],
@@ -292,38 +97,26 @@ pub fn nt_wait_for_multiple_objects_kernel(
     alertable: u8,
     timeout: Option<i64>,
 ) -> NTSTATUS {
-    if handles.len() != count as usize || count == 0 {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    let timeout_ms = match timeout {
-        None => u64::MAX,
-        Some(0) => 0,
-        Some(raw) if raw < 0 => raw.unsigned_abs() / 10_000,
-        Some(_) => u64::MAX,
-    };
-
-    wait_for_multiple_objects_internal(count, handles, wait_type, timeout_ms, alertable != 0)
+    super::sync::nt_wait_for_multiple_objects_kernel(count, handles, wait_type, alertable, timeout)
 }
 
-// Signal Functions (used by sync.rs)
-
 pub fn signal_event(handle: HANDLE) -> bool {
-    !handle.is_null()
+    // SAFETY: no user output is requested; the handle is checked by the dispatcher.
+    unsafe { super::sync::nt_set_event(handle, ptr::null_mut()) >= 0 }
 }
 
 pub fn release_mutex(handle: HANDLE) -> bool {
-    !handle.is_null()
+    // SAFETY: no user output is requested; ownership is checked by the dispatcher.
+    unsafe { super::sync::nt_release_mutant(handle, ptr::null_mut()) >= 0 }
 }
 
 pub fn release_semaphore(handle: HANDLE, release_count: i32) -> bool {
-    !handle.is_null() && release_count > 0
+    // SAFETY: no user output is requested; count and handle are checked natively.
+    unsafe { super::sync::nt_release_semaphore(handle, release_count as u32, ptr::null_mut()) >= 0 }
 }
 
+/// APC alert testing and delivery are not implemented by this compatibility helper.
 pub fn test_alert() -> bool {
     false
 }
-
-pub fn deliver_apcs() {
-    // 1. Dequeue user-mode APCs
-}
+pub fn deliver_apcs() {}

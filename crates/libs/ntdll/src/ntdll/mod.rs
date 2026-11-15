@@ -34,6 +34,7 @@
 //!   * ReactOS 0.3.x ntdll headers
 //!   * Wine 1.7.x ntdll.spec
 
+pub mod clock;
 pub mod debug;
 pub mod file;
 pub mod heap;
@@ -41,6 +42,7 @@ pub mod info;
 pub mod ioctl;
 pub mod ldr;
 pub mod ob_integration;
+pub mod object;
 pub mod peb_teb;
 pub mod process;
 pub mod registry;

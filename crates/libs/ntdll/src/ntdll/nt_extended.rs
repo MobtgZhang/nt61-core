@@ -3,7 +3,7 @@
 //! Extended system call wrappers: nt_query_object, nt_set_information_object,
 //! nt_query_directory_file, nt_query_volume_information_file, nt_device_io_control_file.
 
-use super::status::{STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
+use super::status::{STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 use super::types::{IoStatusBlock, UnicodeString, HANDLE, NTSTATUS, PVOID};
 use crate::mm::user_copy::{probe_user_read, probe_user_write, write_user_object};
 
@@ -47,80 +47,7 @@ pub enum ObjectInformationClass {
     ObjectHandleFlagInformation = 4,
 }
 
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe extern "C" fn nt_query_object(
-    handle: HANDLE,
-    object_information_class: u32,
-    object_information: PVOID,
-    object_information_length: u32,
-    return_length: *mut u32,
-) -> NTSTATUS {
-    if handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    if !object_information.is_null()
-        && object_information_length > 0
-        && probe_user_write(
-            object_information as u64,
-            object_information_length as usize,
-        )
-        .is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-    if !return_length.is_null()
-        && probe_user_write(return_length as u64, core::mem::size_of::<u32>()).is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let _ = (
-        object_information_class,
-        object_information,
-        object_information_length,
-    );
-
-    if !return_length.is_null() {
-        *return_length = 0;
-    }
-
-    STATUS_SUCCESS
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe extern "C" fn nt_set_information_object(
-    handle: HANDLE,
-    object_information_class: u32,
-    object_information: PVOID,
-    object_information_length: u32,
-) -> NTSTATUS {
-    if handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    if !object_information.is_null()
-        && object_information_length > 0
-        && probe_user_read(
-            object_information as u64,
-            object_information_length as usize,
-        )
-        .is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let _ = (
-        object_information_class,
-        object_information,
-        object_information_length,
-    );
-    STATUS_SUCCESS
-}
+pub use super::object::{nt_query_object, nt_set_information_object};
 
 /// # Safety
 ///
