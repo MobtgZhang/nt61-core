@@ -75,26 +75,26 @@ pub fn init_page_walk() {
             | (PW_DIR_WIDTH << 25);
         let pwch: u64 =
             PW_DIR3_BASE | (PW_DIR_WIDTH << 6) | (PW_DIR4_BASE << 12) | (PW_DIR_WIDTH << 18);
-        asm!("csrwr {}, 0x1C", in(reg) pwcl, options(nostack));
-        asm!("csrwr {}, 0x1D", in(reg) pwch, options(nostack));
+        // CSRWR exchanges the operand with the previous CSR value.
+        asm!("csrwr {}, 0x1C", inout(reg) pwcl => _, options(nostack));
+        asm!("csrwr {}, 0x1D", inout(reg) pwch => _, options(nostack));
 
-        // STLBPS = 0 selects 4 KiB software TLB pages (16 KiB is the
-        // reset default and would mismatch the 4 KiB page tables).
-        asm!("csrwr {}, 0x1E", in(reg) 0u64, options(nostack));
+        // STLBPS holds log2(page size in bytes): 12 selects 4 KiB.
+        asm!("csrwr {}, 0x1E", inout(reg) 12u64 => _, options(nostack));
 
         // Publish DMW0 before the first mapped-mode instruction
         // executes. The UART and later platform MMIO use this window;
         // early boot keeps physical addresses because DMW only applies
         // when CRMD.PG is enabled.
         let dmw0 = paging::CSR_DMW0_INIT;
-        asm!("csrwr {}, 0x180", in(reg) dmw0, options(nostack));
+        asm!("csrwr {}, 0x180", inout(reg) dmw0 => _, options(nostack));
 
         // The image and exception vectors are in the VSEG-0xA identity
         // window.  Install DMW1 immediately: without it, setting PG makes
         // `loongarch64_exception` itself unmapped and the firmware's
         // default handler takes over before our refill code can run.
         let dmw1 = paging::DMW1_KERNEL_VIRT_BASE | paging::CSR_DMW0_PLV0;
-        asm!("csrwr {}, 0x181", in(reg) dmw1, options(nostack));
+        asm!("csrwr {}, 0x181", inout(reg) dmw1 => _, options(nostack));
     }
 }
 

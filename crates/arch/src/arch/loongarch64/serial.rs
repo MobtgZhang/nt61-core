@@ -35,11 +35,11 @@ fn with_uart_da_mode<T>(operation: impl FnOnce() -> T) -> T {
 
     let protected = (crmd & !CRMD_IE & !CRMD_PG) | CRMD_DA;
     unsafe {
-        core::arch::asm!("csrwr {}, 0x0", in(reg) protected, options(nostack));
+        core::arch::asm!("csrwr {}, 0x0", inout(reg) protected => _, options(nostack));
     }
     let result = operation();
     unsafe {
-        core::arch::asm!("csrwr {}, 0x0", in(reg) crmd, options(nostack));
+        core::arch::asm!("csrwr {}, 0x0", inout(reg) crmd => _, options(nostack));
     }
     result
 }
@@ -83,6 +83,7 @@ pub fn write_char(c: u8) {
     if crate::hal::common::serial_disable::is_disabled() {
         return;
     }
+    let _tx_guard = crate::hal::common::serial::lock_uart_tx();
     while read_uart(UART_LSR) & 0x20 == 0 {}
     write_uart(UART_THR, c);
 }
@@ -92,6 +93,7 @@ pub fn write_string(s: &str) {
     if crate::hal::common::serial_disable::is_disabled() {
         return;
     }
+    let _tx_guard = crate::hal::common::serial::lock_uart_tx();
     for c in s.bytes() {
         write_char(c);
     }
@@ -99,6 +101,9 @@ pub fn write_string(s: &str) {
 
 /// Writes diagnostic strings even in non-debug builds.
 pub fn write_string_always(s: &str) {
+    // This is the implementation re-exported by hal::serial. Hold the
+    // shared lock across the complete message, including on AP startup.
+    let _tx_guard = crate::hal::common::serial::lock_uart_tx();
     for c in s.bytes() {
         while read_uart(UART_LSR) & 0x20 == 0 {}
         write_uart(UART_THR, c);
@@ -106,6 +111,7 @@ pub fn write_string_always(s: &str) {
 }
 
 pub fn write_hex_u64_always(value: u64) {
+    let _tx_guard = crate::hal::common::serial::lock_uart_tx();
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut buf = [b'0'; 16];
     for (index, byte) in buf.iter_mut().enumerate() {

@@ -304,24 +304,14 @@ pub fn init() {
         ecfg |= 1 << 2;
         ecfg |= 1 << 11;
         ecfg &= !(0x7 << 16);
-        asm!("csrwr {}, 0x4", in(reg) ecfg, options(nostack));
+        asm!("csrwr {}, 0x4", inout(reg) ecfg => _, options(nostack));
 
-        // The vector page must be executable in the page-table root
-        // that is active when the first exception arrives. Re-check
-        // and re-map right before interrupts can be taken; allocator
-        // reuse has been observed to wipe the bootstrap mapping.
-        let vector_va = vector_page_va();
-        let mapped = crate::arch::loongarch64::paging::page_is_mapped_in_root(
-            crate::arch::loongarch64::paging::read_page_root_pfn(),
-            vector_va,
-        );
-        if !mapped {
-            let _ = crate::arch::loongarch64::paging::map_page(
-                vector_va,
-                vector_va,
-                crate::mm::pte::PTE_P | crate::mm::pte::PTE_RW,
-            );
-        }
+        // In direct-address mode no page table participates in vector fetch.
+        // PGDL can still contain a firmware root with a different walk geometry;
+        // interpreting it as the kernel's five-level table can dereference
+        // arbitrary memory before our own root has even been installed.
+        // Mapped mode still needs the allocator-reuse check before interrupts.
+        let _ = crate::arch::loongarch64::paging::ensure_vector_page_mapped();
     }
 }
 

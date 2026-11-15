@@ -56,35 +56,12 @@ pub unsafe fn sbi_call(
     arg4: u64,
     arg5: u64,
 ) -> SbiRet {
-    let (err, val): (i64, i64);
-    asm!(
-        "mv    a0, {a0}",
-        "mv    a1, {a1}",
-        "mv    a2, {a2}",
-        "mv    a3, {a3}",
-        "mv    a4, {a4}",
-        "mv    a5, {a5}",
-        "mv    a6, {fid}",
-        "mv    a7, {eid}",
-        "ecall",
-        "mv    {err}, a0",
-        "mv    {val}, a1",
-        a0 = in(reg) arg0,
-        a1 = in(reg) arg1,
-        a2 = in(reg) arg2,
-        a3 = in(reg) arg3,
-        a4 = in(reg) arg4,
-        a5 = in(reg) arg5,
-        fid = in(reg) fid,
-        eid = in(reg) eid,
-        err = out(reg) err,
-        val = out(reg) val,
-        options(nostack),
-    );
-    SbiRet {
-        error: err,
-        value: val,
-    }
+    let mut error = arg0;
+    let mut value = arg1;
+    asm!("ecall", inout("a0") error, inout("a1") value,
+        in("a2") arg2, in("a3") arg3, in("a4") arg4, in("a5") arg5,
+        in("a6") fid, in("a7") eid, options(nostack));
+    SbiRet { error: error as i64, value: value as i64 }
 }
 
 // =====================================================================
@@ -125,7 +102,7 @@ pub struct SpecVersion {
 /// Returns `true` if the firmware returns SBI_SUCCESS for `BASE::PROBE`.
 pub unsafe fn probe(eid: u64) -> bool {
     let r = sbi_call(eid::BASE, 3 /* PROBE */, eid, 0, 0, 0, 0, 0);
-    r.error == 0
+    r.error == 0 && r.value != 0
 }
 
 /// # Safety
@@ -169,14 +146,6 @@ pub unsafe fn marchid() -> u64 {
 /// Return the machine implementation ID (`mimpid`).
 pub unsafe fn mimpid() -> u64 {
     sbi_call(eid::BASE, 6 /* GET_MIMPID */, 0, 0, 0, 0, 0, 0).value as u64
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Return the current hart ID (`mhartid`).
-pub unsafe fn current_hartid() -> u64 {
-    sbi_call(eid::BASE, 7 /* GET_CURRENT_HARTID */, 0, 0, 0, 0, 0, 0).value as u64
 }
 
 // =====================================================================

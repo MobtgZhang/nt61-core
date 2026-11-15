@@ -148,7 +148,7 @@ pub fn init_secondary_cpu(_cpu_id: u32) {}
 
 /// Get the current number of CPUs.
 pub fn get_cpu_count() -> u32 {
-    soc::cpu_count() as u32
+    smp::cpu_count()
 }
 
 // Re-export commonly used types (matches x86_64 / aarch64 / loongarch64

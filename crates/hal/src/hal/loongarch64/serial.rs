@@ -38,11 +38,11 @@ fn with_uart_da_mode<T>(operation: impl FnOnce() -> T) -> T {
 
     let protected = (crmd & !CRMD_IE & !CRMD_PG) | CRMD_DA;
     unsafe {
-        core::arch::asm!("csrwr {}, 0x0", in(reg) protected, options(nostack));
+        core::arch::asm!("csrwr {}, 0x0", inout(reg) protected => _, options(nostack));
     }
     let result = operation();
     unsafe {
-        core::arch::asm!("csrwr {}, 0x0", in(reg) crmd, options(nostack));
+        core::arch::asm!("csrwr {}, 0x0", inout(reg) crmd => _, options(nostack));
     }
     result
 }
@@ -107,13 +107,13 @@ pub fn write_string_always(s: &str) {
         // caller's mapped-mode execution is unaffected.
         let mut prev_crmd: u64;
         unsafe { core::arch::asm!("csrrd {}, 0x0", out(reg) prev_crmd, options(nostack)) };
-        let direct = (prev_crmd | (1 << 3)) & !(1 << 4);
-        unsafe { core::arch::asm!("csrwr {}, 0x0", in(reg) direct, options(nostack)) };
+        let direct = (prev_crmd | (1 << 3)) & !((1 << 4) | (1 << 2));
+        unsafe { core::arch::asm!("csrwr {}, 0x0", inout(reg) direct => _, options(nostack)) };
         let _tx_guard = crate::hal::common::serial::lock_uart_tx();
         for c in s.bytes() {
             write_char(c);
         }
-        unsafe { core::arch::asm!("csrwr {}, 0x0", in(reg) prev_crmd, options(nostack)) };
+        unsafe { core::arch::asm!("csrwr {}, 0x0", inout(reg) prev_crmd => _, options(nostack)) };
     }
 }
 

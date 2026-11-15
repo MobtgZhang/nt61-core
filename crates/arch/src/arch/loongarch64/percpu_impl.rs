@@ -126,7 +126,7 @@ pub fn per_cpu_base_for(cpu_id: u32) -> u64 {
 #[inline(always)]
 pub fn set_tp(val: u64) {
     unsafe {
-        core::arch::asm!("csrwr {}, 0x36", in(reg) val, options(nostack));
+        core::arch::asm!("csrwr {}, 0x36", inout(reg) val => _, options(nostack));
     }
 }
 

@@ -14,7 +14,7 @@
 //! correct default for the detected platform.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::aarch64::cpuinfo;
 use crate::arch::aarch64::paging;
@@ -28,7 +28,22 @@ core::arch::global_asm!(
     ".text",
     ".global aarch64_secondary_entry_asm",
     "aarch64_secondary_entry_asm:",
-    // x0 = stack_top (context_id from PSCI CPU_ON)
+    // PSCI starts with translation disabled. Restore the BSP translation
+    // regime while executing the identity-mapped kernel image.
+    "  adrp x9, AARCH64_AP_REGISTERS",
+    "  add x9, x9, :lo12:AARCH64_AP_REGISTERS",
+    "  ldp x10, x11, [x9]",
+    "  msr ttbr0_el1, x10",
+    "  msr ttbr1_el1, x10",
+    "  msr tcr_el1, x11",
+    "  ldp x10, x11, [x9, #16]",
+    "  msr mair_el1, x10",
+    "  mov x12, #0x300000",
+    "  msr cpacr_el1, x12",
+    "  dsb sy",
+    "  isb",
+    "  msr sctlr_el1, x11",
+    "  isb",
     "  mov sp, x0",
     "  bl {secondary_entry}",
     // If secondary_entry returns (it should not), park the CPU.
@@ -52,14 +67,15 @@ pub enum SmpMethod {
 }
 
 static METHOD: AtomicU32 = AtomicU32::new(0);
-static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
-static SECONDARY_ROOT_PFN: AtomicU32 = AtomicU32::new(0);
+static SECONDARY_ROOT_PFN: AtomicU64 = AtomicU64::new(0);
+static PSCI_HVC: AtomicU32 = AtomicU32::new(0);
+static ONLINE: AtomicU32 = AtomicU32::new(1);
+static mut TOPOLOGY: crate::arch::common::smp::ProcessorTopology = crate::arch::common::smp::ProcessorTopology::empty();
+#[no_mangle]
+static mut AARCH64_AP_REGISTERS: [u64; 4] = [0; 4];
 
 pub fn cpu_count() -> u32 {
-    CPU_COUNT
-        .load(Ordering::Relaxed)
-        .max(cpuinfo::logical_cpu_count())
-        .max(1)
+    ONLINE.load(Ordering::Acquire)
 }
 
 pub fn set_method(m: SmpMethod) {
@@ -79,29 +95,18 @@ pub fn get_method() -> SmpMethod {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// Real PSCI CPU_ON — place secondary cores at `entry` with the
 /// `context_id` (passed in `x0` to the entry) through the SMCCC
-/// interface. Returns the SMCCC return code in the lower 32 bits;
-/// PSCI status codes are encoded in the upper 32.
+/// interface. Returns the signed PSCI status code from x0.
 pub unsafe fn psci_cpu_on(target_cpu: u64, entry: u64, context_id: u64) -> i64 {
-    let mut r: i64 = 0;
-    unsafe {
-        asm!(
-            // ARM SMCCC passes the function ID in x0 and arguments in
-            // x1..x3. PSCI_CPU_ON takes target_cpu, entry, context_id.
-            "mov x0, #0x3",
-            "movk x0, #0xC400, lsl #16",
-            "mov x1, {cpu}",
-            "mov x2, {entry}",
-            "mov x3, {ctx}",
-            "smc #0",
-            "mov {r}, x0",
-            cpu = in(reg) target_cpu,
-            entry = in(reg) entry,
-            ctx = in(reg) context_id,
-            r = out(reg) r,
-            options(nostack),
-        );
+    let mut result = 0xc400_0003u64;
+    // ACPI FADT ARM_BOOT_ARCH bit 1 selects the firmware conduit.
+    if PSCI_HVC.load(Ordering::Relaxed) != 0 {
+        asm!("hvc #0", inout("x0") result, in("x1") target_cpu,
+            in("x2") entry, in("x3") context_id, clobber_abi("C"), options(nostack));
+    } else {
+        asm!("smc #0", inout("x0") result, in("x1") target_cpu,
+            in("x2") entry, in("x3") context_id, clobber_abi("C"), options(nostack));
     }
-    r
+    result as i32 as i64
 }
 
 /// Spin-table release address used by Phytium firmware.
@@ -146,11 +151,31 @@ pub extern "Rust" fn __smp_cpu_count() -> u32 {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 #[no_mangle]
 pub unsafe extern "Rust" fn __smp_boot_secondary(pml4_pfn: u64) {
-    SECONDARY_ROOT_PFN.store((pml4_pfn & 0x000F_FFFF_FFFF) as u32, Ordering::Release);
+    SECONDARY_ROOT_PFN.store(pml4_pfn, Ordering::Release);
 
     // Use the configured bring-up method. The PSCI implementation
     // here assumes the system firmware implements SMCCC 0.2+.
-    let secondary_count = cpu_count().max(1);
+    let mut topology = crate::arch::common::smp::firmware_processors(11);
+    let mpidr: u64;
+    asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nostack));
+    topology.bootstrap_first(mpidr & 0xff00_ffffff);
+    TOPOLOGY = topology;
+    if let Some(fadt) = crate::hal::common::acpi::find_table(b"FACP") {
+        let table = fadt.cast::<u8>();
+        let length = core::ptr::read_unaligned(table.add(4).cast::<u32>());
+        if length >= 131 {
+            let flags = core::ptr::read_unaligned(table.add(129).cast::<u16>());
+            PSCI_HVC.store(((flags >> 1) & 1) as u32, Ordering::Relaxed);
+        }
+    }
+    let secondary_count = topology.count as u32;
+    let (tcr, mair, sctlr): (u64, u64, u64);
+    asm!("mrs {}, tcr_el1", out(reg) tcr, options(nostack));
+    asm!("mrs {}, mair_el1", out(reg) mair, options(nostack));
+    asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nostack));
+    AARCH64_AP_REGISTERS = [pml4_pfn << 12, tcr, mair, sctlr];
+    asm!("dsb sy", options(nostack));
+    crate::hal::serial::write_string_always(&alloc::format!("[SMP] enumerated={}\r\n", secondary_count));
     crate::ke::scheduler::init_smp(secondary_count);
 
     // Give every AP its own per-CPU area and bootstrap stack before it
@@ -162,7 +187,6 @@ pub unsafe extern "Rust" fn __smp_boot_secondary(pml4_pfn: u64) {
         let stack =
             crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, AP_STACK_SIZE) as u64;
         if per_cpu_base == 0 || stack == 0 {
-            set_cpu_count(cpu as u32);
             return;
         }
         let stack_top = stack + AP_STACK_SIZE as u64 - 16;
@@ -175,14 +199,15 @@ pub unsafe extern "Rust" fn __smp_boot_secondary(pml4_pfn: u64) {
     for cpu in 1..secondary_count {
         match get_method() {
             SmpMethod::PSCI => {
-                let _ = unsafe {
+                let status = unsafe {
                     psci_cpu_on(
-                        cpu as u64,
+                        topology.ids[cpu as usize],
                         aarch64_secondary_entry_asm as *const () as u64,
                         *(crate::arch::aarch64::percpu_impl::per_cpu_base_for(cpu) as *const u64)
                             .add(1),
                     )
                 };
+                crate::hal::serial::write_string_always(&alloc::format!("[SMP] CPU_ON cpu={} status={}\r\n", cpu, status));
             }
             SmpMethod::SpinTable => unsafe {
                 spin_table_release(
@@ -197,6 +222,11 @@ pub unsafe extern "Rust" fn __smp_boot_secondary(pml4_pfn: u64) {
             }
         }
     }
+    for _ in 0..10_000_000 {
+        if ONLINE.load(Ordering::Acquire) == secondary_count { break; }
+        core::hint::spin_loop();
+    }
+    cpuinfo::set_logical_cpu_count(ONLINE.load(Ordering::Acquire));
 }
 
 #[no_mangle]
@@ -205,19 +235,14 @@ pub extern "Rust" fn __smp_get_current_cpu_id() -> u32 {
     unsafe {
         asm!("mrs {}, MPIDR_EL1", out(reg) mpidr, options(nostack));
     }
-    ((mpidr >> 8) & 0xFF) as u32
+    let id = mpidr & 0xff00_ffffff;
+    unsafe { TOPOLOGY.ids[..TOPOLOGY.count].iter().position(|&v| v == id).unwrap_or(0) as u32 }
 }
 
-/// Entry point for secondary cores. Implemented in assembly — see
-/// `secondary_entry.S` for the stub. The default is a permanent
-/// `wfi` loop so that the linker keeps the symbol alive even before
-/// assembly has been added.
+/// Rust entry after the assembly trampoline has installed translation,
+/// floating-point access and this core's private stack.
 #[no_mangle]
 pub extern "C" fn secondary_entry(_arg: u64) -> ! {
-    let stack_top = _arg;
-    unsafe {
-        asm!("mov sp, {}", in(reg) stack_top, options(nostack));
-    }
 
     let cpu = __smp_get_current_cpu_id();
     let base = percpu_impl::per_cpu_base_for(cpu);
@@ -233,22 +258,19 @@ pub extern "C" fn secondary_entry(_arg: u64) -> ! {
         asm!("msr tpidr_el1, {}", in(reg) base, options(nostack));
     }
 
-    let root_pfn = SECONDARY_ROOT_PFN.load(Ordering::Acquire) as u64;
+    let root_pfn = SECONDARY_ROOT_PFN.load(Ordering::Acquire);
     if root_pfn != 0 {
         unsafe { paging::load_page_root(root_pfn) };
     }
 
+    crate::arch::aarch64::idt::init();
     crate::ke::scheduler::init_smp_this_cpu(cpu);
+    ONLINE.fetch_add(1, Ordering::Release);
+    crate::hal::serial::write_string_always(&alloc::format!("[SMP] online cpu={}\r\n", cpu));
     crate::ke::scheduler::idle_loop()
 }
 
 const AP_STACK_SIZE: usize = 64 * 1024;
-
-/// Update the cached logical CPU count. Called by the SMP scanner
-/// once it has enumerated cores via PSCI_VERSION / CPUID / GICR.
-pub fn set_cpu_count(n: u32) {
-    CPU_COUNT.store(n, Ordering::Release);
-}
 
 /// Smoke test: verify that the SMP method has been set.
 pub fn smoke_test() -> bool {
