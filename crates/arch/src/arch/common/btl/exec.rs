@@ -169,6 +169,93 @@ fn alu(state: &mut GuestState, op: AluOp, a: u64, b: u64, width: u8) -> u64 {
     }
     r
 }
+fn adc(s: &mut GuestState, a: u64, b: u64, w: u8) -> u64 {
+    let a = a & mask(w);
+    let b = b & mask(w);
+    let carry = s.flag(FLAG_CF) as u64;
+    let wide = a as u128 + b as u128 + carry as u128;
+    let r = wide as u64 & mask(w);
+    let sign = 1u64 << (w * 8 - 1);
+    s.set_flag(FLAG_CF, wide > mask(w) as u128);
+    s.set_flag(FLAG_OF, (!(a ^ b) & (a ^ r) & sign) != 0);
+    s.set_flag(FLAG_AF, (a ^ b ^ r) & 16 != 0);
+    s.set_flag(FLAG_ZF, r == 0);
+    s.set_flag(FLAG_SF, r & sign != 0);
+    s.set_flag(FLAG_PF, (r as u8).count_ones() % 2 == 0);
+    r
+}
+fn shift(s: &mut GuestState, kind: u8, a: u64, count: u8, w: u8) -> u64 {
+    let bits = w * 8;
+    let count = count & if w == 8 { 63 } else { 31 };
+    let effective = match kind {
+        0 | 1 => count % bits,
+        2 | 3 if w < 4 => count % (bits + 1),
+        _ => count,
+    };
+    let mut value = a & mask(w);
+    if effective == 0 {
+        if count != 0 && kind == 0 {
+            s.set_flag(FLAG_CF, value & 1 != 0)
+        } else if count != 0 && kind == 1 {
+            s.set_flag(FLAG_CF, value >> (bits - 1) != 0)
+        }
+        return value;
+    }
+    let old_sign = value >> (bits - 1);
+    let mut carry = s.flag(FLAG_CF);
+    for _ in 0..effective {
+        match kind {
+            0 => {
+                carry = value >> (bits - 1) != 0;
+                value = ((value << 1) | carry as u64) & mask(w)
+            }
+            1 => {
+                carry = value & 1 != 0;
+                value = (value >> 1) | ((carry as u64) << (bits - 1))
+            }
+            2 => {
+                let next = value >> (bits - 1) != 0;
+                value = ((value << 1) | carry as u64) & mask(w);
+                carry = next
+            }
+            3 => {
+                let next = value & 1 != 0;
+                value = (value >> 1) | ((carry as u64) << (bits - 1));
+                carry = next
+            }
+            4 | 6 => {
+                carry = value >> (bits - 1) != 0;
+                value = (value << 1) & mask(w)
+            }
+            5 => {
+                carry = value & 1 != 0;
+                value >>= 1
+            }
+            _ => {
+                carry = value & 1 != 0;
+                value = (value >> 1) | (value & (1u64 << (bits - 1)))
+            }
+        }
+    }
+    s.set_flag(FLAG_CF, carry);
+    if count == 1 {
+        s.set_flag(
+            FLAG_OF,
+            match kind {
+                0 | 2 | 4 | 6 => (value >> (bits - 1) != 0) ^ carry,
+                1 | 3 => ((value >> (bits - 1)) ^ (value >> (bits - 2))) & 1 != 0,
+                5 => old_sign != 0,
+                _ => false,
+            },
+        )
+    }
+    if kind >= 4 {
+        s.set_flag(FLAG_ZF, value == 0);
+        s.set_flag(FLAG_SF, value >> (bits - 1) != 0);
+        s.set_flag(FLAG_PF, (value as u8).count_ones() % 2 == 0)
+    }
+    value
+}
 fn eval_cond(s: &GuestState, c: BranchCond) -> bool {
     let z = s.flag(FLAG_ZF);
     let n = s.flag(FLAG_SF);
@@ -279,6 +366,7 @@ pub fn execute_block(
         if matches!(
             i.op,
             IROp::Jmp { .. }
+                | IROp::Loop { .. }
                 | IROp::Jcc { .. }
                 | IROp::Call { .. }
                 | IROp::Ret
@@ -313,6 +401,175 @@ fn execute_one(
     let stores_result = |op| !matches!(op, AluOp::Cmp | AluOp::Test);
     match i.op {
         IROp::Nop => {}
+        IROp::Scan { repeat } => {
+            let aw = i.address_width;
+            let count = s.reg(X86Reg::Rcx) & mask(aw);
+            if repeat == 0 || count != 0 {
+                let ptr = s.reg(X86Reg::Rdi) & mask(aw);
+                let value = mem_read(m, ptr, w).ok_or(fault)?;
+                alu(s, AluOp::Cmp, s.reg(X86Reg::Rax), value, w);
+                let step = if s.flag(10) {
+                    (w as u64).wrapping_neg()
+                } else {
+                    w as u64
+                };
+                s.write_reg(X86Reg::Rdi, ptr.wrapping_add(step), aw);
+                if repeat != 0 {
+                    let count = count.wrapping_sub(1) & mask(aw);
+                    s.write_reg(X86Reg::Rcx, count, aw);
+                    if count != 0 && s.flag(FLAG_ZF) == (repeat == 1) {
+                        s.set_reg(X86Reg::Rip, i.guest_va)
+                    }
+                }
+            }
+        }
+        IROp::Shift { kind, dst, count } => {
+            let a = match dst {
+                Ok(r) => s.reg(r),
+                Err(mem) => {
+                    mem_read(m, effective_address(s, &mem, i, true), mem.width).ok_or(fault)?
+                }
+            };
+            let count = count.unwrap_or(s.reg(X86Reg::Rcx) as u8);
+            let value = shift(s, kind, a, count, w);
+            match dst {
+                Ok(r) => s.write_reg(r, value, w),
+                Err(mem) => {
+                    if !mem_write(m, effective_address(s, &mem, i, true), value, mem.width) {
+                        return Err(fault);
+                    }
+                }
+            }
+        }
+        IROp::Exchange {
+            left,
+            right,
+            left_high,
+            right_high,
+        } => {
+            let l = (s.reg(left) >> if left_high { 8 } else { 0 }) & mask(w);
+            let r = (s.reg(right) >> if right_high { 8 } else { 0 }) & mask(w);
+            let set = |s: &mut GuestState, reg, high, v| {
+                if high {
+                    s.set_reg(reg, (s.reg(reg) & !0xff00) | ((v & 255) << 8))
+                } else {
+                    s.write_reg(reg, v, w)
+                }
+            };
+            set(s, left, left_high, r);
+            set(s, right, right_high, l);
+        }
+        IROp::ExchangeMem { reg, mem, high_byte } => {
+            // Capture EA and register before updating either operand: the
+            // register can itself be part of the memory address (or be SP).
+            // GuestImage owns isolated memory and runs one guest instruction
+            // at a time. This is not a cross-core atomic RMW implementation.
+            let address = effective_address(s, &mem, i, true);
+            if !m.probe_write(address, w as usize) { return Err(fault); }
+            let original = mem_read(m, address, w).ok_or(fault)?;
+            let value = (s.reg(reg) >> if high_byte { 8 } else { 0 }) & mask(w);
+            if !mem_write(m, address, value, w) { return Err(fault); }
+            if high_byte {
+                s.set_reg(reg, (s.reg(reg) & !0xff00) | ((original & 255) << 8));
+            } else {
+                s.write_reg(reg, original, w);
+            }
+        }
+        IROp::Loop { target, kind } => {
+            let aw = i.address_width;
+            let n = s.reg(X86Reg::Rcx) & mask(aw);
+            let take = if kind == 3 {
+                n == 0
+            } else {
+                let n = n.wrapping_sub(1) & mask(aw);
+                s.write_reg(X86Reg::Rcx, n, aw);
+                n != 0
+                    && match kind {
+                        0 => !s.flag(FLAG_ZF),
+                        1 => s.flag(FLAG_ZF),
+                        _ => true,
+                    }
+            };
+            if take {
+                s.set_reg(X86Reg::Rip, target)
+            }
+        }
+        IROp::PushAll | IROp::PopAll => {
+            if s.mode != DecodeMode::X86 {
+                return Err(unsupported);
+            }
+            let sw = s.stack_width(i) as usize;
+            let sp = s.reg(X86Reg::Rsp);
+            if i.op == IROp::PushAll {
+                let bottom = sp.wrapping_sub((sw * 8) as u64) as u32 as u64;
+                let mut bytes = [0u8; 32];
+                for (j, r) in [
+                    X86Reg::Rdi,
+                    X86Reg::Rsi,
+                    X86Reg::Rbp,
+                    X86Reg::Rsp,
+                    X86Reg::Rbx,
+                    X86Reg::Rdx,
+                    X86Reg::Rcx,
+                    X86Reg::Rax,
+                ]
+                .iter()
+                .enumerate()
+                {
+                    bytes[j * sw..(j + 1) * sw].copy_from_slice(&s.reg(*r).to_le_bytes()[..sw]);
+                }
+                if !m.write_virt(bottom, &bytes[..sw * 8]) {
+                    return Err(fault);
+                }
+                s.set_reg(X86Reg::Rsp, bottom);
+            } else {
+                let mut bytes = [0u8; 32];
+                if m.read_virt(sp, &mut bytes[..sw * 8]) != sw * 8 {
+                    return Err(fault);
+                }
+                for (j, r) in [
+                    X86Reg::Rdi,
+                    X86Reg::Rsi,
+                    X86Reg::Rbp,
+                    X86Reg::Rsp,
+                    X86Reg::Rbx,
+                    X86Reg::Rdx,
+                    X86Reg::Rcx,
+                    X86Reg::Rax,
+                ]
+                .iter()
+                .enumerate()
+                {
+                    if *r == X86Reg::Rsp {
+                        continue;
+                    }
+                    let mut value = [0; 8];
+                    value[..sw].copy_from_slice(&bytes[j * sw..(j + 1) * sw]);
+                    s.write_reg(*r, u64::from_le_bytes(value), sw as u8);
+                }
+                s.set_reg(X86Reg::Rsp, sp.wrapping_add((sw * 8) as u64));
+            }
+        }
+        IROp::IncDec { dst, decrement } => {
+            let carry = s.flag(FLAG_CF);
+            let value = alu(
+                s,
+                if decrement { AluOp::Sub } else { AluOp::Add },
+                s.reg(dst),
+                1,
+                w,
+            );
+            s.write_reg(dst, value, w);
+            s.set_flag(FLAG_CF, carry);
+        }
+        IROp::AdcReg { dst, src } => {
+            let value = adc(s, s.reg(dst), s.reg(src), w);
+            s.write_reg(dst, value, w);
+        }
+        IROp::AdcImm { dst, imm } => {
+            let value = adc(s, s.reg(dst), imm as u64, w);
+            s.write_reg(dst, value, w);
+        }
         IROp::MovImm { dst, imm } => s.write_reg(dst, imm as u64, w),
         IROp::MovReg { dst, src } => s.write_reg(dst, s.reg(src), w),
         IROp::Load { dst, mem } => {
@@ -372,9 +629,43 @@ fn execute_one(
             let a = effective_address(s, &mem, i, false);
             s.write_reg(dst, a, w)
         }
+        IROp::UnaryNotNeg { dst, high_byte, negate } => {
+            let value = match dst {
+                Ok(reg) => s.reg(reg) >> if high_byte { 8 } else { 0 },
+                Err(mem) => mem_read(m, effective_address(s, &mem, i, true), w).ok_or(fault)?,
+            };
+            let result = if negate { alu(s, AluOp::Sub, 0, value, w) } else { !value & mask(w) };
+            match dst {
+                Ok(reg) if high_byte => s.set_reg(reg, (s.reg(reg) & !0xff00) | ((result & 255) << 8)),
+                Ok(reg) => s.write_reg(reg, result, w),
+                Err(mem) => {
+                    if !mem_write(m, effective_address(s, &mem, i, true), result, w) { return Err(fault); }
+                }
+            }
+        }
+        IROp::Leave => {
+            // Stack address size belongs to the stack segment/mode, not 67h
+            // or the operand size. Thus 66h LEAVE still addresses through
+            // EBP/RBP, but pops only BP and preserves its upper bits.
+            let frame = if s.mode == DecodeMode::X86 {
+                s.reg(X86Reg::Rbp) as u32 as u64
+            } else {
+                s.reg(X86Reg::Rbp)
+            };
+            let sw = s.stack_width(i);
+            let value = mem_read(m, frame, sw).ok_or(fault)?;
+            s.set_reg(X86Reg::Rsp, frame.wrapping_add(sw as u64));
+            s.write_reg(X86Reg::Rbp, value, sw);
+        }
         IROp::Push { src } => {
             let v = s.reg(src);
             push(s, m, i, v).ok_or(fault)?;
+        }
+        IROp::PushMem { mem } => {
+            // Sample the source (including [E/RSP]) before pushing changes SP.
+            let address = effective_address(s, &mem, i, true);
+            let value = mem_read(m, address, s.stack_width(i)).ok_or(fault)?;
+            push(s, m, i, value).ok_or(fault)?;
         }
         IROp::PushImm { value } => {
             push(s, m, i, value as u64).ok_or(fault)?;

@@ -73,6 +73,18 @@ pub fn decode_one(code: &[u8], offset: usize) -> Result<(Decoded, usize), Decode
                 IROp::StoreImm { .. } => 0xC7,
                 IROp::AluStore { .. } | IROp::AluStoreImm { .. } => 0x83,
                 IROp::JumpReg { .. } | IROp::JumpMem { .. } => 0xFF,
+                IROp::PushAll => 0x60,
+                IROp::PopAll => 0x61,
+                IROp::Leave => 0xc9,
+                IROp::UnaryNotNeg { .. } => 0xf7,
+                IROp::PushMem { .. } => 0xff,
+                IROp::IncDec { .. } => 0x40,
+                IROp::AdcReg { .. } => 0x11,
+                IROp::AdcImm { .. } => 0x83,
+                IROp::Scan { .. } => 0xAE,
+                IROp::Shift { .. } => 0xC1,
+                IROp::Exchange { .. } | IROp::ExchangeMem { .. } => 0x87,
+                IROp::Loop { .. } => 0xE2,
                 IROp::Unsupported => 0x0F,
             };
             Ok((

@@ -246,6 +246,52 @@ impl BranchCond {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IROp {
     Nop,
+    Scan {
+        repeat: u8,
+    },
+    Shift {
+        kind: u8,
+        dst: Result<X86Reg, MemOperand>,
+        count: Option<u8>,
+    },
+    Exchange {
+        left: X86Reg,
+        right: X86Reg,
+        left_high: bool,
+        right_high: bool,
+    },
+    /// Exchange a register with memory in the isolated single-thread backend.
+    /// This IR does not promise interprocessor LOCK atomicity.
+    ExchangeMem {
+        reg: X86Reg,
+        mem: MemOperand,
+        high_byte: bool,
+    },
+    Loop {
+        target: u64,
+        kind: u8,
+    },
+    PushAll,
+    PopAll,
+    /// Restore the frame pointer with the mode's stack address width.
+    Leave,
+    UnaryNotNeg {
+        dst: Result<X86Reg, MemOperand>,
+        high_byte: bool,
+        negate: bool,
+    },
+    IncDec {
+        dst: X86Reg,
+        decrement: bool,
+    },
+    AdcReg {
+        dst: X86Reg,
+        src: X86Reg,
+    },
+    AdcImm {
+        dst: X86Reg,
+        imm: i64,
+    },
     MovImm {
         dst: X86Reg,
         imm: i64,
@@ -284,6 +330,9 @@ pub enum IROp {
     Push {
         src: X86Reg,
     },
+    PushMem {
+        mem: MemOperand,
+    },
     Pop {
         dst: X86Reg,
     },
@@ -298,13 +347,34 @@ pub enum IROp {
         target: u64,
     },
     Ret,
-    RetImm { bytes: u16 },
-    PushImm { value: i64 },
-    StoreImm { mem: MemOperand, value: i64 },
-    AluStore { op: AluOp, mem: MemOperand, src: X86Reg },
-    AluStoreImm { op: AluOp, mem: MemOperand, imm: i64 },
-    JumpReg { target: X86Reg, call: bool },
-    JumpMem { mem: MemOperand, call: bool },
+    RetImm {
+        bytes: u16,
+    },
+    PushImm {
+        value: i64,
+    },
+    StoreImm {
+        mem: MemOperand,
+        value: i64,
+    },
+    AluStore {
+        op: AluOp,
+        mem: MemOperand,
+        src: X86Reg,
+    },
+    AluStoreImm {
+        op: AluOp,
+        mem: MemOperand,
+        imm: i64,
+    },
+    JumpReg {
+        target: X86Reg,
+        call: bool,
+    },
+    JumpMem {
+        mem: MemOperand,
+        call: bool,
+    },
     Syscall,
     /// SIMD move: dst_xmm = src (reg or memory).
     SimdMov {
@@ -337,10 +407,17 @@ pub enum SimdSrc {
 
 /// Guest instruction-set mode. This belongs to a thread, never a global CPU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodeMode { X86, X64 }
+pub enum DecodeMode {
+    X86,
+    X64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Segment { Flat, Fs, Gs }
+pub enum Segment {
+    Flat,
+    Fs,
+    Gs,
+}
 
 /// One lowered IR instruction with its guest VA and length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

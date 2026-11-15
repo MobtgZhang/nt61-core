@@ -578,7 +578,7 @@ pub fn encode_block(ir: &[IrInst], guest_start: u64) -> CodeBlock {
                 let word: u32 = 0xD400_0000 | 0x0020_0000;
                 em.push(word);
             }
-            IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => {
+            IROp::Scan { .. } | IROp::Shift { .. } | IROp::Exchange { .. } | IROp::ExchangeMem { .. } | IROp::Loop { .. } | IROp::PushAll | IROp::PopAll | IROp::Leave | IROp::UnaryNotNeg { .. } | IROp::PushMem { .. } | IROp::IncDec { .. } | IROp::AdcReg { .. } | IROp::AdcImm { .. } | IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => {
                 // Emit BRK #0 to signal an unsupported instruction.
                 let word: u32 = 0xD420_0000;
                 em.push(word);

@@ -571,7 +571,7 @@ pub fn encode_block(ir: &[IrInst], guest_start: u64) -> alloc::vec::Vec<u8> {
                 // syscall (breakpoint trap in LA64)
                 em.push(0x002B_0000); // syscall encoding
             }
-            IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => {
+            IROp::Scan { .. } | IROp::Shift { .. } | IROp::Exchange { .. } | IROp::ExchangeMem { .. } | IROp::Loop { .. } | IROp::PushAll | IROp::PopAll | IROp::Leave | IROp::UnaryNotNeg { .. } | IROp::PushMem { .. } | IROp::IncDec { .. } | IROp::AdcReg { .. } | IROp::AdcImm { .. } | IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => {
                 // break 0
                 em.push(0x002A_0000);
             }
@@ -690,7 +690,7 @@ pub fn translate(
         IROp::Call { .. } => em.emit_call(),
         IROp::Ret => em.emit_jirl(LA_ZERO, LA_RA, 0),
         IROp::Syscall => em.push(LA64_SYSCALL),
-        IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => em.push(LA64_BREAK),
+        IROp::Scan { .. } | IROp::Shift { .. } | IROp::Exchange { .. } | IROp::ExchangeMem { .. } | IROp::Loop { .. } | IROp::PushAll | IROp::PopAll | IROp::Leave | IROp::UnaryNotNeg { .. } | IROp::PushMem { .. } | IROp::IncDec { .. } | IROp::AdcReg { .. } | IROp::AdcImm { .. } | IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => em.push(LA64_BREAK),
         IROp::SimdMov { .. } | IROp::SimdStore { .. } | IROp::SimdArith { .. } => {
             em.push(LA64_BREAK)
         }

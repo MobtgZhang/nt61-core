@@ -437,12 +437,16 @@ impl<'a> Decoder<'a> {
         }
         let op = self.fetch()?;
         // 16-bit addressing is deliberately rejected until its BX/SI forms exist.
-        if self.mode == DecodeMode::X86 && self.bytes[start..self.offset].contains(&0x67) {
+        if self.mode == DecodeMode::X86 && self.bytes[start..self.offset].contains(&0x67)
+            // LEAVE has no explicit address operand: 67h does not change its
+            // stack segment address size, so no 16-bit ModRM support is needed.
+            && op != 0xc9
+        {
             return Some(IROp::Unsupported);
         }
 
         // REP/REPNZ are not interchangeable with ordinary integer semantics.
-        if (self.has_f2 || self.has_f3) && op != 0x0f && op != 0x90 {
+        if (self.has_f2 || self.has_f3) && !matches!(op, 0x0f | 0x90 | 0xae | 0xaf) {
             return Some(IROp::Unsupported);
         }
         if op == OPCODE_SYSCALL_HI {
@@ -492,6 +496,131 @@ impl<'a> Decoder<'a> {
 
         let result = match op {
             OPCODE_NOP => Some(IROp::Nop),
+            0xae | 0xaf => {
+                self.byte_operand = op == 0xae;
+                Some(IROp::Scan {
+                    repeat: if self.has_f2 {
+                        2
+                    } else if self.has_f3 {
+                        1
+                    } else {
+                        0
+                    },
+                })
+            }
+            0x00 | 0x02 | 0x08 | 0x0a | 0x20 | 0x22 | 0x28 | 0x2a | 0x30 | 0x32 | 0x38 | 0x3a
+            | 0x84 => {
+                self.byte_operand = true;
+                if !self.has_rex && self.uses_high_byte_registers()? {
+                    return Some(IROp::Unsupported);
+                }
+                let kind = match op {
+                    0x00 | 0x02 => AluOp::Add,
+                    0x08 | 0x0a => AluOp::Or,
+                    0x20 | 0x22 => AluOp::And,
+                    0x28 | 0x2a => AluOp::Sub,
+                    0x30 | 0x32 => AluOp::Xor,
+                    0x38 | 0x3a => AluOp::Cmp,
+                    _ => AluOp::Test,
+                };
+                if op == 0x84 || op & 2 != 0 {
+                    self.decode_alu_r_rm(kind)
+                } else {
+                    self.decode_alu_rm_r(kind)
+                }
+            }
+            0x91..=0x97 => Some(IROp::Exchange {
+                left: X86Reg::Rax,
+                right: X86Reg::from_modrm(op & 7, self.rex_b),
+                left_high: false,
+                right_high: false,
+            }),
+            0x86 | 0x87 => {
+                self.byte_operand = op == 0x86;
+                let raw = self.peek()?;
+                let (left, right, _) = self.decode_modrm()?;
+                match right {
+                    Ok(right) => {
+                        let lh = self.byte_operand && !self.has_rex && ((raw >> 3) & 7) >= 4;
+                        let rh = self.byte_operand && !self.has_rex && (raw & 7) >= 4;
+                        Some(IROp::Exchange {
+                            left: if lh {
+                                X86Reg::from_modrm((raw >> 3) & 3, false)
+                            } else {
+                                left
+                            },
+                            right: if rh {
+                                X86Reg::from_modrm(raw & 3, false)
+                            } else {
+                                right
+                            },
+                            left_high: lh,
+                            right_high: rh,
+                        })
+                    }
+                    Err(mem) => {
+                        let high_byte = self.byte_operand && !self.has_rex && ((raw >> 3) & 7) >= 4;
+                        Some(IROp::ExchangeMem {
+                            reg: if high_byte { X86Reg::from_modrm((raw >> 3) & 3, false) } else { left },
+                            mem,
+                            high_byte,
+                        })
+                    }
+                }
+            }
+            0xc0 | 0xc1 | 0xd0 | 0xd1 | 0xd2 | 0xd3 => {
+                self.byte_operand = op & 1 == 0;
+                let raw = self.peek()?;
+                if self.byte_operand && !self.has_rex && raw >> 6 == 3 && raw & 7 >= 4 {
+                    return Some(IROp::Unsupported);
+                }
+                let (_, dst, _) = self.decode_modrm()?;
+                let count = match op {
+                    0xc0 | 0xc1 => Some(self.fetch()?),
+                    0xd0 | 0xd1 => Some(1),
+                    _ => None,
+                };
+                Some(IROp::Shift {
+                    kind: (raw >> 3) & 7,
+                    dst,
+                    count,
+                })
+            }
+            0xe0..=0xe3 => {
+                let rel = self.fetch()? as i8;
+                Some(IROp::Loop {
+                    target: self
+                        .base_va
+                        .wrapping_add(self.offset as u64)
+                        .wrapping_add(rel as i64 as u64),
+                    kind: op & 3,
+                })
+            }
+            0x60 if self.mode == DecodeMode::X86 => Some(IROp::PushAll),
+            0x61 if self.mode == DecodeMode::X86 => Some(IROp::PopAll),
+            0xc9 => Some(IROp::Leave),
+            0xf6 | 0xf7 => {
+                self.byte_operand = op == 0xf6;
+                let raw = self.peek()?;
+                let group = (raw >> 3) & 7;
+                let (_, mut dst, _) = self.decode_modrm()?;
+                let high_byte = self.byte_operand && !self.has_rex && raw >> 6 == 3 && raw & 7 >= 4;
+                if high_byte { dst = Ok(X86Reg::from_modrm((raw & 7) - 4, false)); }
+                Some(if group == 2 || group == 3 {
+                    IROp::UnaryNotNeg { dst, high_byte, negate: group == 3 }
+                } else { IROp::Unsupported })
+            }
+            0x40..=0x4f if self.mode == DecodeMode::X86 => Some(IROp::IncDec {
+                dst: X86Reg::from_modrm(op & 7, false),
+                decrement: op >= 0x48,
+            }),
+            0x11 => {
+                let (src, dst, _) = self.decode_modrm()?;
+                Some(match dst {
+                    Ok(dst) => IROp::AdcReg { dst, src },
+                    _ => IROp::Unsupported,
+                })
+            }
             OPCODE_RET_NEAR => Some(IROp::Ret),
             0xC2 => Some(IROp::RetImm {
                 bytes: u16::from_le_bytes([self.fetch()?, self.fetch()?]),
@@ -511,6 +640,12 @@ impl<'a> Decoder<'a> {
                 let group = (self.peek()? >> 3) & 7;
                 let (_, target, _) = self.decode_modrm()?;
                 match (group, target) {
+                    (6, Ok(src)) => Some(IROp::Push { src }),
+                    (6, Err(mut mem)) => {
+                        mem.width = if self.operand_width() == 2 { 2 }
+                            else if self.mode == DecodeMode::X64 { 8 } else { 4 };
+                        Some(IROp::PushMem { mem })
+                    }
                     (2 | 4, Ok(target)) => Some(IROp::JumpReg {
                         target,
                         call: group == 2,
@@ -728,6 +863,17 @@ impl<'a> Decoder<'a> {
                 let (_, dst, _) = self.decode_modrm()?;
                 // The ALU sub-operation is encoded in the ModR/M reg field.
                 let alu_idx = (modrm_byte >> 3) & 0x07;
+                if alu_idx == 2 {
+                    let imm = if op == OPCODE_ALU_IMM32 {
+                        self.fetch_imm()?
+                    } else {
+                        self.fetch()? as i8 as i64
+                    };
+                    return Some(match dst {
+                        Ok(dst) => IROp::AdcImm { dst, imm },
+                        _ => IROp::Unsupported,
+                    });
+                }
                 let alu_op = match alu_idx {
                     OPCODE_ALU_ADD_IMM => AluOp::Add,
                     OPCODE_ALU_OR_IMM => AluOp::Or,
@@ -984,6 +1130,7 @@ pub fn decode_block_mode(
         if matches!(
             op,
             IROp::Ret
+                | IROp::Loop { .. }
                 | IROp::RetImm { .. }
                 | IROp::Call { .. }
                 | IROp::JumpReg { .. }

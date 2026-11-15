@@ -451,7 +451,7 @@ pub fn encode_block(ir: &[IrInst], raw_va: u64) -> CodeBlock {
             IROp::Call { .. } => em.emit_call(),
             IROp::Ret => em.emit_jalr(RV_ZERO, 1, 0),
             IROp::Syscall => em.emit_ecall(),
-            IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => em.push(0x0010_0073),
+            IROp::Scan { .. } | IROp::Shift { .. } | IROp::Exchange { .. } | IROp::ExchangeMem { .. } | IROp::Loop { .. } | IROp::PushAll | IROp::PopAll | IROp::Leave | IROp::UnaryNotNeg { .. } | IROp::PushMem { .. } | IROp::IncDec { .. } | IROp::AdcReg { .. } | IROp::AdcImm { .. } | IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => em.push(0x0010_0073),
             IROp::SimdMov { .. } | IROp::SimdStore { .. } | IROp::SimdArith { .. } => {
                 em.push(0x0010_0073)
             }
