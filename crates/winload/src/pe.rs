@@ -8,8 +8,7 @@
 //!   * WX (write+execute) sections are detected and reported,
 //!   * the Load Config directory is parsed for CFG
 //!     (IMAGE_GUARD_CF_INSTRUMENTED, guard function table / count),
-//!   * SafeSEH (SEHandlerTable / SEHandlerCount) is read from the
-//!     same Load Config structure,
+//!   * PE32+ reserved SEHandler fields are not reported as x86 SafeSEH,
 //!   * the import directory (DLL dependency table) and the delay-load
 //!     import directory are walked to produce the module's DLL
 //!     dependency list.
@@ -32,7 +31,7 @@ const GUARD_CF_FUNCTION_TABLE_PRESENT: u32 = 0x0000_0400;
 pub const PE32PLUS_CHECKSUM_OFFSET: usize = 0x40;
 /// Offset of the DataDirectory array inside a PE32+ optional header.
 const PE32PLUS_DATA_DIR_OFFSET: usize = 0x70;
-const PE32PLUS_OPT_MIN_LEN: usize = PE32PLUS_DATA_DIR_OFFSET + 16 * 8;
+const PE32PLUS_OPT_MIN_LEN: usize = PE32PLUS_DATA_DIR_OFFSET;
 
 /// Data directory indices used by the loader.
 pub const DIR_IMPORT: usize = 1;
@@ -72,7 +71,7 @@ impl SectionInfo {
     /// image, or None when the section cannot be page-protected.
     fn protected_range(&self) -> Option<(u64, u64)> {
         const PAGE: u32 = 0x1000;
-        let start = self.rva.div_ceil(PAGE) * PAGE;
+        let start = self.rva.checked_add(PAGE - 1)? & !(PAGE - 1);
         let end = self.rva.saturating_add(self.virtual_size) & !(PAGE - 1);
         if end > start {
             Some((u64::from(start), u64::from(end)))
@@ -141,30 +140,11 @@ fn u64_at(image: &[u8], off: usize) -> Option<u64> {
 }
 
 fn pe_layout(image: &[u8]) -> Option<(usize, usize, usize, usize)> {
-    if image.len() < 0x40 {
-        return None;
-    }
-    let dos = image.as_ptr() as *const crate::DosHeader;
-    if unsafe { (*dos).e_magic } != 0x5A4D {
-        return None;
-    }
-    let e_lfanew = unsafe { (*dos).e_lfanew } as usize;
-    if e_lfanew + 4 > image.len() {
-        return None;
-    }
-    let sig = [
-        image[e_lfanew],
-        image[e_lfanew + 1],
-        image[e_lfanew + 2],
-        image[e_lfanew + 3],
-    ];
-    if sig != [0x50, 0x45, 0x00, 0x00] {
-        return None;
-    }
-    let opt_off = e_lfanew + 4 + 20;
-    let num_sections = u16_at(image, e_lfanew + 4 + 2)? as usize;
-    let opt_size = u16_at(image, e_lfanew + 4 + 16)? as usize;
-    let sections_off = opt_off + opt_size;
+    let opt_off = crate::boot_image::optional_header_offset(image)?;
+    let num_sections = u16_at(image, opt_off - 18)? as usize;
+    let opt_size = u16_at(image, opt_off - 4)? as usize;
+    let sections_off = opt_off.checked_add(opt_size)?;
+    image.get(sections_off..sections_off.checked_add(num_sections.checked_mul(40)?)?)?;
     Some((opt_off, num_sections, sections_off, opt_size))
 }
 
@@ -193,7 +173,8 @@ fn rva_to_offset(
 }
 
 fn read_asciiz(image: &[u8], off: usize, max: usize) -> Option<String> {
-    let end = image.get(off..off + max)?.iter().position(|&b| b == 0)?;
+    let available = image.get(off..)?;
+    let end = available[..available.len().min(max)].iter().position(|&b| b == 0)?;
     let bytes = &image[off..off + end];
     if bytes.iter().any(|&b| b < 0x20 || b > 0x7E) {
         return None;
@@ -273,36 +254,32 @@ fn parse_delay_import_directory(
 }
 
 /// PE32+ IMAGE_LOAD_CONFIG_DIRECTORY offsets used here.
-const LC_SE_HANDLER_TABLE: usize = 96;
-const LC_SE_HANDLER_COUNT: usize = 104;
-const LC_GUARD_FLAGS: usize = 112;
-const LC_GUARD_CF_TABLE: usize = 120;
-const LC_GUARD_CF_COUNT: usize = 128;
-const LC_MIN_PARSE_LEN: usize = LC_GUARD_CF_COUNT + 8;
+// PE32+ has two 64-bit GuardCF function pointers at 112 and 120,
+// followed by the function table, count, and GuardFlags. Win7's shorter
+// load-config structure does not contain CFG fields at all.
+const LC_GUARD_CF_TABLE: usize = 128;
+const LC_GUARD_CF_COUNT: usize = 136;
+const LC_GUARD_FLAGS: usize = 144;
+const LC_MIN_PARSE_LEN: usize = LC_GUARD_FLAGS + 4;
 
 fn parse_load_config(
     image: &[u8],
     sections: &[SectionInfo],
     section_files: &[(u32, u32)],
     dir_rva: u32,
+    dir_size: u32,
 ) -> (Option<GuardConfig>, Option<SafeSehInfo>) {
     let mut cfg = None;
-    let mut seh = None;
+    let seh = None;
     let Some(off) = rva_to_offset(image, sections, section_files, dir_rva) else {
         return (None, None);
     };
     let size = u32_at(image, off).unwrap_or(0) as usize;
-    if size < LC_MIN_PARSE_LEN || off + LC_MIN_PARSE_LEN > image.len() {
+    if size < LC_MIN_PARSE_LEN || (dir_size as usize) < LC_MIN_PARSE_LEN || off + LC_MIN_PARSE_LEN > image.len() {
         return (None, None);
     }
-    let seh_table = u64_at(image, off + LC_SE_HANDLER_TABLE).unwrap_or(0);
-    let seh_count = u64_at(image, off + LC_SE_HANDLER_COUNT).unwrap_or(0);
-    if seh_table != 0 {
-        seh = Some(SafeSehInfo {
-            handler_table_va: seh_table,
-            handler_count: seh_count,
-        });
-    }
+    // SafeSEH is a PE32 x86 mechanism. The PE32+ SEHandler fields
+    // are reserved; do not advertise them as x64 exception handling.
     let guard_flags = u32_at(image, off + LC_GUARD_FLAGS).unwrap_or(0);
     let table = u64_at(image, off + LC_GUARD_CF_TABLE).unwrap_or(0);
     let count = u64_at(image, off + LC_GUARD_CF_COUNT).unwrap_or(0);
@@ -318,11 +295,11 @@ fn parse_load_config(
 
 /// Parse the full image layout. Returns None for non-PE32+ images.
 pub fn parse_image_layout(image: &[u8]) -> Option<PeImageInfo> {
-    let (opt_off, num_sections, sections_off, _opt_size) = pe_layout(image)?;
+    let (opt_off, num_sections, sections_off, opt_size) = pe_layout(image)?;
     if u16_at(image, opt_off)? != 0x20B {
         return None;
     }
-    if opt_off + PE32PLUS_OPT_MIN_LEN > image.len() {
+    if opt_size < PE32PLUS_OPT_MIN_LEN || opt_off + PE32PLUS_OPT_MIN_LEN > image.len() {
         return None;
     }
     let mut sections = Vec::with_capacity(num_sections);
@@ -350,6 +327,8 @@ pub fn parse_image_layout(image: &[u8]) -> Option<PeImageInfo> {
 
     let read_dir = |index: usize| {
         let d = PE32PLUS_DATA_DIR_OFFSET + index * 8;
+        let count = u32_at(image, opt_off + 0x6c).unwrap_or(0) as usize;
+        if index >= count || d + 8 > opt_size { return 0; }
         u32_at(image, opt_off + d).unwrap_or(0)
     };
 
@@ -357,8 +336,13 @@ pub fn parse_image_layout(image: &[u8]) -> Option<PeImageInfo> {
         parse_import_directory(image, &sections, &section_files, read_dir(DIR_IMPORT));
     let delay_load_dependencies =
         parse_delay_import_directory(image, &sections, &section_files, read_dir(DIR_DELAY_IMPORT));
-    let (cfg, safe_seh) =
-        parse_load_config(image, &sections, &section_files, read_dir(DIR_LOAD_CONFIG));
+    let load_config_size = if DIR_LOAD_CONFIG < u32_at(image, opt_off + 0x6c)? as usize
+        && PE32PLUS_DATA_DIR_OFFSET + DIR_LOAD_CONFIG * 8 + 8 <= opt_size {
+        u32_at(image, opt_off + PE32PLUS_DATA_DIR_OFFSET + DIR_LOAD_CONFIG * 8 + 4)?
+    } else { 0 };
+    let (cfg, safe_seh) = parse_load_config(
+        image, &sections, &section_files, read_dir(DIR_LOAD_CONFIG), load_config_size,
+    );
     let has_wx_sections = sections.iter().any(|s| s.is_wx());
 
     Some(PeImageInfo {

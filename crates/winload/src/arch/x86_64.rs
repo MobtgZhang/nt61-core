@@ -1,53 +1,46 @@
-//! x86_64-specific OS Loader trampoline.
+//! x86_64 loader-to-kernel handoff.
 //!
-//! The UEFI firmware hands control to `efi_main` with the Microsoft
-//! x64 ABI: `rcx = handle, rdx = system table`. `kernel_main` is
-//! declared `extern "C"` and therefore uses the System V AMD64 ABI:
-//! `rdi = first arg`. The x86_64 trampoline below converts between
-//! the two ABIs and `call`s into `kernel_main`.
-//!
-//! The trampoline is `#[inline(never)]` so the linker cannot move
-//! the `call` target out from under the relative offset; the asm
-//! uses a `sym` operand that resolves to the kernel symbol's
-//! address.
+//! The loaded project kernel uses the private `BootInfo` ABI and its
+//! `extern "C"` ELF entry expects the pointer in RDI. RCX is populated as
+//! well for the project's EFI-ABI compatibility entry. This is not the
+//! Windows 7 `LOADER_PARAMETER_BLOCK` contract.
 
-/// RVA of the `KiSystemStartup` export inside a Win7 `ntoskrnl.exe`
-/// image. The disk-side stub's `KiSystemStartup` body is hand-written
-/// to do nothing but call back into the host trampoline (see
-/// `tools/src/fs/build.rs::build_ntoskrnl_pe`); its RVA is
-/// `SECTION_ALIGNMENT (0x1000) + 0` because the stub's only section
-/// starts at the image base and the entry point is `export[0]`.
+/// Publish the legacy project callback slot, retained for older images.
 pub fn install_kernel_handoff() -> u64 {
     ntoskrnl::arch::x86_64::ntoskrnl_handoff::install_handoff_pointer()
 }
 
+/// Make copied and relocated code visible to instruction fetch on this CPU.
+///
 /// # Safety
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// The supplied range must describe a live, mapped image.
+pub unsafe fn sync_image_code(_base: u64, _size: u64) {
+    // x86 instruction and data caches are coherent for newly mapped code.
+    // Prevent the compiler from moving image writes across the entry call.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// # Safety
+///
+/// The entry must be executable mapped kernel code, `bi_ptr` must point to a
+/// live `BootInfo`, and the writable stack must cover the aligned stack top
+/// and the entry's stack usage. Boot services must already have exited.
 pub unsafe fn launch_kernel(stack_top: u64, bi_ptr: u64, ntoskrnl_entry: u64) -> ! {
-    jump_to_ntoskrnl_kisystemstartup(stack_top, bi_ptr, ntoskrnl_entry)
+    // SAFETY: the caller supplies the validated image, boot information and stack.
+    unsafe { jump_to_ntoskrnl_kisystemstartup(stack_top, bi_ptr, ntoskrnl_entry) }
 }
 
 pub fn write_debug_marker(bytes: &[u8]) {
     write_com1_marker(bytes);
 }
 
+/// Enter the loaded PE image at its validated absolute entry address.
+///
 /// # Safety
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Jump to the on-disk `ntoskrnl.exe!KiSystemStartup` and never
-/// return. This is the Win-7 winload → kernel hand-off.
-///
-/// The argument convention matches the Microsoft x64 ABI used by
-/// `ntoskrnl!KiSystemStartup(LoaderBlock)`:
-///   * `rcx` — pointer to the `LoaderBlock`-equivalent (`bi_ptr`)
-///   * the rest of the Win-7 calling-state is supplied by the
-///     firmware / winload state at ExitBootServices time
-///   * `rsp` must already be the kernel stack
-///
-/// After we `call` into the disk KiSystemStartup, the disk-side
-/// stub immediately calls back into the host trampoline at
-/// `HOST_HANDOFF_SLOT_VADDR` (published by `install_handoff_pointer`).
+/// The caller must meet the mapping, stack and lifetime requirements of
+/// `launch_kernel`. The entry must obey the project's private `BootInfo` ABI.
 #[cfg(target_arch = "x86_64")]
 #[inline(never)]
 pub unsafe extern "C" fn jump_to_ntoskrnl_kisystemstartup(
@@ -55,31 +48,26 @@ pub unsafe extern "C" fn jump_to_ntoskrnl_kisystemstartup(
     bi_ptr: u64,
     ntoskrnl_entry: u64,
 ) -> ! {
-    let sp = stack_top;
-    let bi = bi_ptr;
-    let entry = ntoskrnl_entry;
-    core::arch::asm!(
-        // Install kernel stack FIRST so an incoming IRQ cannot
-        // observe a half-converted state.
-        "mov rsp, {sp}",
-       // Microsoft x64 ABI: rcx = first arg (bi_ptr).
-       "mov rcx, {bi}",
-        // System V AMD64 ABI: rdi = first arg, so the kernel ELF
-        // entry (kernel_entry(bi_ptr), extern "C") receives the same
-        // pointer regardless of which ABI the entry expects.
-        "mov rdi, {bi}",
-        // rax = ntoskrnl_entry (the absolute runtime address).
-        "mov rax, {entry}",
-        // xor rbp (so KiSystemStartup sees a clean stack frame).
-        "xor rbp, rbp",
-        // call into KiSystemStartup (never returns; the disk stub
-        // either halts or jumps back into the host trampoline).
-        "call rax",
-        sp = in(reg) sp,
-        bi = in(reg) bi,
-        entry = in(reg) entry,
-        options(noreturn, preserves_flags),
-    );
+    // SAFETY: fixed input registers cannot be overwritten by the stack/argument
+    // moves. Interrupts are masked before replacing the firmware stack. The
+    // call enters with RSP % 16 == 8 and reserves Microsoft x64 shadow space.
+    unsafe {
+        core::arch::asm!(
+            "cli",
+            "cld",
+            "mov rsp, rdx",
+            "and rsp, -16",
+            "sub rsp, 32",
+            "mov rdi, rcx",
+            "xor ebp, ebp",
+            "call rax",
+            "ud2",
+            in("rdx") stack_top,
+            in("rcx") bi_ptr,
+            in("rax") ntoskrnl_entry,
+            options(noreturn),
+        );
+    }
 }
 /// Write raw diagnostic bytes to COM1 before UEFI services are initialized.
 #[inline(never)]

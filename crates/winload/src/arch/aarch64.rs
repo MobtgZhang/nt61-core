@@ -1,86 +1,81 @@
-//! AArch64 OS Loader trampoline.
-//!
-//! On AArch64 the loader and kernel use the same AAPCS64 ABI, so
-//! `kernel_main` (declared `extern "C" fn kernel_main(&BootInfo)`)
-//! expects `x0` to hold the BootInfo pointer. The C-style Rust
-//! `call` already places the first argument in `x0` per AAPCS64,
-//! so the only thing the trampoline has to do is install the
-//! kernel stack and jump to the kernel symbol.
-//!
-//! Convention notes:
-//!   * `sp` is the stack pointer. AAPCS64 says the *callee* owns
-//!     the stack below `sp`, so the kernel can write its first
-//!     frame at `[sp]` without SPINC.
-//!   * `x0` is the first integer argument / return value register.
-//!     We pass `bi_ptr` in `x0`; the kernel returns `!`.
-//!   * The kernel assumes interrupts are masked (`DAIF.I = 1`)
-//!     and that the page-table state is "boot-strapped"; the
-//!     firmware normally leaves the MMU on, so we do not touch
-//!     `sctlr_el1` here.
-//!
-//! Inline assembly uses `sym` to take the address of
-//! `kernel_main`; the linker resolves it during final link.
+//! AArch64 loader-to-kernel handoff using the project's private `BootInfo`
+//! ABI: X0 is the pointer and SP is 16-byte aligned. Firmware translation
+//! remains active until the loaded kernel establishes its own page tables.
 
-use ntoskrnl::kernel_main::kernel_main;
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Switch to the kernel stack and jump to `kernel_main`. Never
-/// returns.
-#[cfg(target_arch = "aarch64")]
-#[inline(never)]
-pub unsafe extern "C" fn call_kernel_main(stack_top: u64, bi_ptr: u64) -> ! {
-    // We invoke `kernel_main` as a normal C-ABI call by storing
-    // its address in a function pointer and using `blr` through
-    // a register. The `sym` operand is not directly usable inside
-    // a `blr` instruction, and COFF does not support the
-    // `movw`-style symbol relocation. Using a function pointer
-    // keeps both the assembler and the linker happy.
-    //
-    // We declare a thin shim with the same C-ABI signature as the
-    // real kernel entry (`fn(u64) -> !`) and have the shim call
-    // `kernel_main` with the supplied pointer cast to `&BootInfo`.
-    // That gives us a `fn(u64) -> !` value we can pass to the
-    // inline asm without needing to take the address of a
-    // function item.
-    extern "C" fn km_shim(bi_ptr: u64) -> ! {
-        // SAFETY: the caller of `call_kernel_main_from_loader`
-        // passes a valid `&BootInfo` pointer.
-        unsafe { kernel_main(&*(bi_ptr as *const nt61_boot_types::boot_types::BootInfo)) }
-    }
-    let km_addr: u64 = km_shim as *const () as usize as u64;
-    core::arch::asm!(
-        // 1. Install the kernel stack *before* we touch `x0` so an
-        //    incoming IRQ cannot observe a half-converted state.
-        "mov sp, {sp}",
-        // 2. Place the BootInfo pointer in `x0` (AAPCS64 first
-        //    integer argument register).
-        "mov x0, {bi}",
-        // 3. Branch to the kernel. The function pointer is loaded
-        //    into a register so `blr` has a register operand (the
-        //    only addressing mode AArch64 supports here).
-        "mov x16, {km}",
-        "blr x16",
-        sp = in(reg) stack_top,
-        bi = in(reg) bi_ptr,
-        km = in(reg) km_addr,
-        options(noreturn),
-    );
-}
-
-/// Install any loader-published kernel callback. AArch64 currently uses
-/// the native Rust entry point, so no PE callback slot is required.
+/// No legacy callback slot is needed for the loaded native kernel entry.
 pub fn install_kernel_handoff() -> u64 {
     0
 }
 
+/// Make copied and relocated code visible to instruction fetch on this CPU.
+///
 /// # Safety
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Launch the kernel after ExitBootServices using the unified entry.
-pub unsafe fn launch_kernel(stack_top: u64, bi_ptr: u64, _ntoskrnl_base: u64) -> ! {
-    call_kernel_main(stack_top, bi_ptr)
+/// `base..base + size` must be a live, mapped image with a checked extent.
+pub unsafe fn sync_image_code(base: u64, size: u64) {
+    let end = base.checked_add(size).expect("validated image extent");
+    let ctr: u64;
+    // SAFETY: UEFI executes at an exception level permitting cache maintenance.
+    unsafe {
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nostack));
+    }
+    let dline = 4u64 << ((ctr >> 16) & 0xf);
+    let iline = 4u64 << (ctr & 0xf);
+    let mut addr = base & !(dline - 1);
+    while addr < end {
+        // SAFETY: addr selects a cache line covering the validated image mapping.
+        unsafe {
+            core::arch::asm!("dc cvau, {addr}", addr = in(reg) addr, options(nostack));
+        }
+        addr += dline;
+    }
+    // SAFETY: finish data writeback before invalidating corresponding I-cache lines.
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack));
+    }
+    addr = base & !(iline - 1);
+    while addr < end {
+        // SAFETY: addr selects a cache line covering the validated image mapping.
+        unsafe {
+            core::arch::asm!("ic ivau, {addr}", addr = in(reg) addr, options(nostack));
+        }
+        addr += iline;
+    }
+    // SAFETY: complete maintenance before fetching the loaded entry.
+    unsafe {
+        core::arch::asm!("dsb ish", "isb", options(nostack));
+    }
+}
+
+/// Enter the loaded PE kernel after ExitBootServices.
+///
+/// # Safety
+///
+/// The entry must be executable mapped kernel code, `bi_ptr` must point to a
+/// live `BootInfo` describing that mapping, and the writable stack must cover
+/// the aligned stack top and the entry's stack usage.
+#[inline(never)]
+pub unsafe fn launch_kernel(stack_top: u64, bi_ptr: u64, ntoskrnl_entry: u64) -> ! {
+    // SAFETY: the caller guarantees a validated, mapped image and BootInfo.
+    unsafe {
+        let bi = &*(bi_ptr as *const nt61_boot_types::boot_types::BootInfo);
+        sync_image_code(bi.ntoskrnl_image_base, bi.ntoskrnl_image_size);
+    }
+    // SAFETY: fixed registers preserve all operands while switching the stack.
+    // Mask exceptions before replacing SP; keep the firmware MMU state intact.
+    unsafe {
+        core::arch::asm!(
+            "msr daifset, #0xf",
+            "mov sp, x9",
+            "mov x29, xzr",
+            "blr x16",
+            "brk #0",
+            in("x9") stack_top & !15,
+            in("x0") bi_ptr,
+            in("x16") ntoskrnl_entry,
+            options(noreturn),
+        );
+    }
 }
 
 /// Write an architecture-local early diagnostic marker.

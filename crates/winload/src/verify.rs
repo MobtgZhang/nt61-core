@@ -26,59 +26,10 @@ use nt61_crypto::crypto::rsa::{BigUint, RsaPublicKey};
 /// Location of the RSA trust anchor on the system partition.
 const TRUST_ANCHOR_PATH: &str = "\\EFI\\nt61\\trust.pub";
 
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn hex_decode(text: &str) -> Option<alloc::vec::Vec<u8>> {
-    let bytes = text.as_bytes();
-    let mut digits = bytes
-        .iter()
-        .copied()
-        .filter(|&b| b != b' ' && b != b'\r' && b != b'\n');
-    let mut out = alloc::vec::Vec::new();
-    while let (Some(hi), Some(lo)) = (digits.next(), digits.next()) {
-        out.push(hex_val(hi)? * 16 + hex_val(lo)?);
-    }
-    if digits.next().is_some() {
-        return None;
-    }
-    Some(out)
-}
-
-/// Standard PE CheckSum algorithm (CheckSumMappedFile): sum every u16
-/// word with the entire stored 4-byte checksum field excluded, fold
-/// the carry, then add the file length.
-fn pe_file_checksum(image: &[u8], checksum_field_off: usize) -> u32 {
-    let mut sum: u64 = 0;
-    let mut i = 0;
-    while i + 2 <= image.len() {
-        let word = if i == checksum_field_off || i == checksum_field_off + 2 {
-            0
-        } else {
-            u32::from(image[i]) | (u32::from(image[i + 1]) << 8)
-        };
-        sum = sum + u64::from(word);
-        sum = (sum & 0xFFFF) + (sum >> 16);
-        i += 2;
-    }
-    if i < image.len() {
-        sum = sum + u64::from(image[i]);
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    sum.wrapping_add(image.len() as u64) as u32
-}
+use crate::image_integrity::{hex_decode, pe_file_checksum};
 
 fn optional_header_offset(image: &[u8]) -> Option<usize> {
-    let dos = image.as_ptr() as *const crate::DosHeader;
-    let e_lfanew = usize::try_from(unsafe { (*dos).e_lfanew }).ok()?;
-    Some(e_lfanew + 4 + 20)
+    crate::boot_image::optional_header_offset(image)
 }
 
 fn stored_pe_checksum(image: &[u8]) -> u32 {
@@ -160,6 +111,9 @@ fn load_trust_anchor() -> Option<TrustAnchor> {
 /// a debug log so freshly generated images boot before code signing is
 /// rolled out.
 pub fn verify_image(path: &str, image: &[u8]) -> Result<(), &'static str> {
+    // Verify the declared header extent before reading CheckSum. This gate runs
+    // before full PE parsing and must remain safe even for truncated input.
+    optional_header_offset(image).ok_or("bad PE optional header")?;
     let digest = image_digest(image);
 
     if let Some(sidecar) = read_sidecar(path, ".sha256") {
