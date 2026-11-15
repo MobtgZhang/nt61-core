@@ -1,0 +1,279 @@
+{
+  "reference": "Windows 7 Ultimate SP1 x64, 6.1.7601",
+  "inputs": {
+    "Windows/System32/ExplorerFrame.dll": "e9ee1e2253445b207b76f5d3073c612ed979a982522c1515e0fe8fa9641ae568",
+    "Windows/Branding/ShellBrd/shellbrd.dll": "be225292abcfb723e19ce115375509e4f60cbcb7ced89c2e07d97fd12d1a2e26"
+  },
+  "assets": [
+    {
+      "name": "back-normal",
+      "size": [
+        27,
+        27
+      ],
+      "source": "ExplorerFrame.dll RT_BITMAP/577 cell 0",
+      "sha256": "9c9a50d5d09a936757b3f657ec7540b7d215cc5c1a5072a9ae294d3307dc8646"
+    },
+    {
+      "name": "forward-normal",
+      "size": [
+        27,
+        27
+      ],
+      "source": "ExplorerFrame.dll RT_BITMAP/577 cell 1",
+      "sha256": "961bdee4ff3398d16e093bd7d513d58f1e18ab019483e46e4c2174779061ddcf"
+    },
+    {
+      "name": "back-hot",
+      "size": [
+        27,
+        27
+      ],
+      "source": "ExplorerFrame.dll RT_BITMAP/578 cell 0",
+      "sha256": "d4f99240b21d53d1d34bb0292b3086f701dd878adea0bd50533cba41c3e225de"
+    },
+    {
+      "name": "forward-hot",
+      "size": [
+        27,
+        27
+      ],
+      "source": "ExplorerFrame.dll RT_BITMAP/578 cell 1",
+      "sha256": "59429fce867b503b580811aa3060e8d25dff2caed4dc4789f229e5d4a2ee015b"
+    },
+    {
+      "name": "back-disabled",
+      "size": [
+        27,
+        27
+      ],
+      "source": "ExplorerFrame.dll RT_BITMAP/579 cell 0",
+      "sha256": "9f1f0681d09460c5d6de7522e82b96fca00294664aaee1c38b711df8f41a990e"
+    },
+    {
+      "name": "forward-disabled",
+      "size": [
+        27,
+        27
+      ],
+      "source": "ExplorerFrame.dll RT_BITMAP/579 cell 1",
+      "sha256": "03b013326789b43e529c8baac12bc316fc364f24d5f22c3ae34e23b546ee1ec4"
+    },
+    {
+      "name": "back-pressed",
+      "size": [
+        27,
+        27
+      ],
+      "source": "ExplorerFrame.dll RT_BITMAP/581 cell 0",
+      "sha256": "7d303cb38151050ece1b0859278a597d9a66b01dd53a2c612491af6e9c0d2e48"
+    },
+    {
+      "name": "forward-pressed",
+      "size": [
+        27,
+        27
+      ],
+      "source": "ExplorerFrame.dll RT_BITMAP/581 cell 1",
+      "sha256": "e6a97bfe17d8ca760399b26a99d1d83664acf55bc0360b9c181be98120a3698c"
+    },
+    {
+      "name": "search",
+      "size": [
+        16,
+        16
+      ],
+      "source": "ExplorerFrame.dll RT_BITMAP/291 cell 0",
+      "sha256": "4a99bd2fdf946e875e2b29cc7bc463d965b9ec954f7003563a3ad880e99efb2e"
+    },
+    {
+      "name": "refresh",
+      "size": [
+        16,
+        16
+      ],
+      "source": "ExplorerFrame.dll RT_BITMAP/288 cell 2",
+      "sha256": "595c059841621b5e65dfea96f0e7b54ea1430471eb537a34a55ede3ec9105dbd"
+    },
+    {
+      "name": "favorites-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/1024",
+      "sha256": "95c615915ca9d006efab47a6266028826c14484911db5707ae9ab2ba17b94bc4"
+    },
+    {
+      "name": "desktop-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/183",
+      "sha256": "4e531de82e12fc55aa2c22c910d9113eabfb0c35d48f099245c9f5314d80139c"
+    },
+    {
+      "name": "downloads-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/184",
+      "sha256": "f1ac32d3b246c4e1f17f6096d233eabdf4fa4ce8786177bdf79f92d72a9f3f74"
+    },
+    {
+      "name": "recent-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/117",
+      "sha256": "0d2a09eb0132b958186f87900f942a466578446e195bd4af0a01315ac984c507"
+    },
+    {
+      "name": "libraries-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/1023",
+      "sha256": "64bbc2260c7e1386ae2c538b3907274fba0446333661c1494576bc43e4f2ccf9"
+    },
+    {
+      "name": "documents-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/112",
+      "sha256": "ef293a5912467c57d74ece5392730844e1140ed9f183486c446676a66df932f9"
+    },
+    {
+      "name": "music-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/108",
+      "sha256": "28183527e58617f103fa1f9fa690334d4be3050a55cdb2eae8cfddc37b66c75c"
+    },
+    {
+      "name": "pictures-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/113",
+      "sha256": "e0df693e12c998b2b15bafc645806e77cc359de6e870e8a1529cd1f659a8895d"
+    },
+    {
+      "name": "videos-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/189",
+      "sha256": "51973433af437b26371ec3de3a16d7f220fc1bae9126ffc8506db962528edb92"
+    },
+    {
+      "name": "computer-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/109",
+      "sha256": "d598f71b54c3c90ad8306b2f25d5c26ff4a29d84774d9eda34340e7544fe8502"
+    },
+    {
+      "name": "computer-48",
+      "size": [
+        48,
+        48
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/109",
+      "sha256": "739a3f297999e43f6c64991c02e7642aadd854402262653676dbb292c0836612"
+    },
+    {
+      "name": "drive-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/32",
+      "sha256": "79948df764ef0073b5f7235ab096b6ba6936af0853914341750238daaa78cfa6"
+    },
+    {
+      "name": "drive-48",
+      "size": [
+        48,
+        48
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/32",
+      "sha256": "290e4ae3bb08cb5c4efc2717eb6cc400fe3c24e676e0afa14937bdbdac848df4"
+    },
+    {
+      "name": "network-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/120",
+      "sha256": "9dea7d87bcbc344444230e815cbaa83bf7c3e14946e9941c6b5766895751e68c"
+    },
+    {
+      "name": "shield-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/78",
+      "sha256": "92285da993a8ae24499e3dd8eae51ea35eb8913b75eb6c8261138258554654fe"
+    },
+    {
+      "name": "help-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/99",
+      "sha256": "7db94f475bc67254532886cfba78da9aa4580948266f0233792fd53dda381b7c"
+    },
+    {
+      "name": "folder-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/3",
+      "sha256": "1c8e6c0a3fd769b4e0be19a74c60b4d9552acd7016d2dac49c156e7354b6b88c"
+    },
+    {
+      "name": "folder-48",
+      "size": [
+        48,
+        48
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/3",
+      "sha256": "234659aff86f8240712a98449b59d896bd5a8f4940f6ac4bc499c65a20632d37"
+    },
+    {
+      "name": "document-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/2",
+      "sha256": "d06ebfd4e55c50650f2f804af97e226041bfc39be8ff327b058a32033d0d6b95"
+    },
+    {
+      "name": "windows-brand",
+      "size": [
+        275,
+        174
+      ],
+      "source": "shellbrd.dll RT_BITMAP/1000",
+      "sha256": "6b1730af0956e63c85de657f8782e898d1c858191df373243df5944a4d088399"
+    }
+  ]
+}

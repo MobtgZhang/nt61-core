@@ -8,8 +8,13 @@ use alloc::{format, string::String, vec::Vec};
 pub mod input;
 pub mod layout;
 mod render;
+pub mod system;
+pub mod theme;
+
+/// Virtual shell namespace; VFS node identifiers start at one.
+pub const COMPUTER: u32 = 0;
 use layout::{Layout, ROW_HEIGHT};
-pub use render::draw;
+pub use render::{draw, draw_on_glass};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sort {
@@ -41,6 +46,8 @@ pub enum Hit {
     Row(u32),
     Column(usize),
     Scroll(bool),
+    ScrollLine(bool),
+    ScrollThumb,
     Menu(usize),
     Blank,
     ConfirmDelete(bool),
@@ -62,6 +69,7 @@ pub struct Explorer {
     pub offset: usize,
     pub hot: Option<Hit>,
     pressed: Option<Hit>,
+    scroll_grab: Option<i32>,
     last_click: Option<(u32, u64, i32, i32)>,
     pub menu: Option<Rect>,
     pub rename: String,
@@ -82,7 +90,7 @@ pub struct Explorer {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DeleteJob {
-    scan: Vec<(u32,bool)>,
+    scan: Vec<(u32, bool)>,
     order: Vec<u32>,
     cursor: usize,
 }
@@ -109,6 +117,7 @@ impl Explorer {
             offset: 0,
             hot: None,
             pressed: None,
+            scroll_grab: None,
             last_click: None,
             menu: None,
             rename: String::new(),
@@ -139,6 +148,10 @@ impl Explorer {
         self.status.clear();
     }
     fn load(&mut self, files: &mut FileSystem, id: u32) -> bool {
+        if id == COMPUTER {
+            files.refresh_volume_space();
+            return true;
+        }
         if !files
             .node(id)
             .is_some_and(|n| n.kind == NodeKind::Directory && !n.deleted)
@@ -193,6 +206,9 @@ impl Explorer {
         }
     }
     pub fn rows<'a>(&self, files: &'a FileSystem) -> Vec<&'a FileNode> {
+        if self.directory == COMPUTER {
+            return files.node(files.root_id()).into_iter().collect();
+        }
         let query = self.query.to_lowercase();
         let mut rows = if query.is_empty() {
             files.children(self.directory)
@@ -265,42 +281,85 @@ impl Explorer {
     pub fn search_pending(&self) -> bool {
         self.search_cursor < self.search_queue.len()
     }
-    pub fn work_pending(&self)->bool{self.delete_job.is_some()||self.search_pending()}
-    fn confirm_delete(&mut self){
-        if let Some(id)=self.delete_prompt.take(){
-            if self.delete_accept{
+    pub fn work_pending(&self) -> bool {
+        self.delete_job.is_some() || self.search_pending()
+    }
+    fn confirm_delete(&mut self) {
+        if let Some(id) = self.delete_prompt.take() {
+            if self.delete_accept {
                 self.cancel_search();
-                self.delete_job=Some(DeleteJob{scan:alloc::vec![(id,false)],order:Vec::new(),cursor:0});
-                self.status="Preparing to delete... (Esc to cancel)".into();
+                self.delete_job = Some(DeleteJob {
+                    scan: alloc::vec![(id, false)],
+                    order: Vec::new(),
+                    cursor: 0,
+                });
+                self.status = "Preparing to delete... (Esc to cancel)".into();
             }
         }
     }
     /// Preflight the complete subtree before deleting anything. Each job step
     /// enumerates one directory or removes one item, yielding to input between calls.
-    fn delete_step(&mut self,files:&mut FileSystem)->bool{
-        let Some(mut job)=self.delete_job.take()else{return false;};
-        let result=(||->Result<bool,u32>{
-            if let Some((id,expanded))=job.scan.pop(){
-                if expanded{job.order.push(id);}
-                else{
-                    if id==files.root_id(){return Err(nt61_abi::desktop_bridge::STATUS_ACCESS_DENIED);}
-                    let node=files.node(id).filter(|n|!n.deleted).ok_or(nt61_abi::desktop_bridge::STATUS_NOT_FOUND)?;
-                    if node.kind==NodeKind::Directory{
+    fn delete_step(&mut self, files: &mut FileSystem) -> bool {
+        let Some(mut job) = self.delete_job.take() else {
+            return false;
+        };
+        let result = (|| -> Result<bool, u32> {
+            if let Some((id, expanded)) = job.scan.pop() {
+                if expanded {
+                    job.order.push(id);
+                } else {
+                    if id == files.root_id() {
+                        return Err(nt61_abi::desktop_bridge::STATUS_ACCESS_DENIED);
+                    }
+                    let node = files
+                        .node(id)
+                        .filter(|n| !n.deleted)
+                        .ok_or(nt61_abi::desktop_bridge::STATUS_NOT_FOUND)?;
+                    if node.kind == NodeKind::Directory {
                         files.refresh_directory(id)?;
-                        job.scan.push((id,true));
-                        for node in files.iter_children(id){job.scan.push((node.id,false));}
-                    }else{job.order.push(id);}
-                    if job.scan.len()+job.order.len()>65536{return Err(nt61_abi::desktop_bridge::STATUS_NOT_SUPPORTED);}
+                        job.scan.push((id, true));
+                        for node in files.iter_children(id) {
+                            job.scan.push((node.id, false));
+                        }
+                    } else {
+                        job.order.push(id);
+                    }
+                    if job.scan.len() + job.order.len() > 65536 {
+                        return Err(nt61_abi::desktop_bridge::STATUS_NOT_SUPPORTED);
+                    }
                 }
                 return Ok(false);
             }
-            if let Some(id)=job.order.get(job.cursor).copied(){files.remove(id)?;job.cursor+=1;}
-            Ok(job.cursor==job.order.len())
+            if let Some(id) = job.order.get(job.cursor).copied() {
+                files.remove(id)?;
+                job.cursor += 1;
+            }
+            Ok(job.cursor == job.order.len())
         })();
-        match result{
-            Ok(true)=>{self.selected=None;self.status="Deleted permanently".into();}
-            Ok(false)=>{self.status=if job.cursor==0{"Preparing to delete... (Esc to cancel)".into()}else{format!("Deleting {} of {} items (Esc to cancel)",job.cursor,job.order.len())};self.delete_job=Some(job);}
-            Err(status)=>{self.status=format!("Delete stopped (0x{status:08X}); {} item(s) deleted",job.cursor);files.last_error=Some(status);}
+        match result {
+            Ok(true) => {
+                self.selected = None;
+                self.status = "Deleted permanently".into();
+            }
+            Ok(false) => {
+                self.status = if job.cursor == 0 {
+                    "Preparing to delete... (Esc to cancel)".into()
+                } else {
+                    format!(
+                        "Deleting {} of {} items (Esc to cancel)",
+                        job.cursor,
+                        job.order.len()
+                    )
+                };
+                self.delete_job = Some(job);
+            }
+            Err(status) => {
+                self.status = format!(
+                    "Delete stopped (0x{status:08X}); {} item(s) deleted",
+                    job.cursor
+                );
+                files.last_error = Some(status);
+            }
         }
         true
     }
@@ -308,7 +367,9 @@ impl Explorer {
     /// This deliberately uses the existing service ABI rather than impersonating
     /// explorer7's COM scheduler or creating kernel threads from the painter.
     pub fn work(&mut self, files: &mut FileSystem) -> bool {
-        if self.delete_job.is_some(){return self.delete_step(files);}
+        if self.delete_job.is_some() {
+            return self.delete_step(files);
+        }
         if !self.search_pending() {
             return false;
         }
@@ -407,31 +468,67 @@ impl Explorer {
             ("Music", find("Users\\Administrator\\Music"), 1),
             ("Pictures", find("Users\\Administrator\\Pictures"), 1),
             ("Videos", find("Users\\Administrator\\Videos"), 1),
-            ("Computer", Some(files.root_id()), 0),
-            ("Local Disk (C:)", Some(files.root_id()), 1)
+            ("Computer", Some(COMPUTER), 0),
+            ("Local Disk (C:)", Some(files.root_id()), 1),
+            ("Network", None, 0)
         ]
     }
     /// Poll one visible folder after input has been handled. Compare metadata
     /// only: cloning file bodies here makes multi-window input unresponsive.
     pub fn poll_directory(&mut self, files: &mut FileSystem) -> bool {
-        if self.delete_prompt.is_some()||self.delete_job.is_some()||!files.is_mounted() || self.edit.is_some() || self.menu.is_some() || !self.query.is_empty(){return false;}
-        let before:Vec<_>=files.iter_children(self.directory)
-            .map(|n|(n.id,n.name.clone(),n.kind,n.size)).collect();
-        if let Err(error)=files.refresh_directory(self.directory){
-            let message=format!("Refresh failed (0x{error:08X})");
-            let changed=self.status!=message;self.status=message;return changed;
+        if self.directory == COMPUTER {
+            let previous = files.volume_space;
+            files.refresh_volume_space();
+            return previous != files.volume_space;
         }
-        let changed=before!=files.iter_children(self.directory)
-            .map(|n|(n.id,n.name.clone(),n.kind,n.size)).collect::<Vec<_>>();
-        let recovered=self.status.starts_with("Refresh failed");
-        if recovered {self.status.clear();}
-        let missing=self.selected.is_some_and(|id| !files.node(id).is_some_and(|n|!n.deleted));
-        if missing {self.selected=None;self.last_click=None;}
-        if changed {self.offset=self.offset.min(self.rows(files).len().saturating_sub(self.page_size));}
+        if self.delete_prompt.is_some()
+            || self.delete_job.is_some()
+            || !files.is_mounted()
+            || self.edit.is_some()
+            || self.menu.is_some()
+            || !self.query.is_empty()
+        {
+            return false;
+        }
+        let before: Vec<_> = files
+            .iter_children(self.directory)
+            .map(|n| (n.id, n.name.clone(), n.kind, n.size))
+            .collect();
+        if let Err(error) = files.refresh_directory(self.directory) {
+            let message = format!("Refresh failed (0x{error:08X})");
+            let changed = self.status != message;
+            self.status = message;
+            return changed;
+        }
+        let changed = before
+            != files
+                .iter_children(self.directory)
+                .map(|n| (n.id, n.name.clone(), n.kind, n.size))
+                .collect::<Vec<_>>();
+        let recovered = self.status.starts_with("Refresh failed");
+        if recovered {
+            self.status.clear();
+        }
+        let missing = self
+            .selected
+            .is_some_and(|id| !files.node(id).is_some_and(|n| !n.deleted));
+        if missing {
+            self.selected = None;
+            self.last_click = None;
+        }
+        if changed {
+            self.offset = self
+                .offset
+                .min(self.rows(files).len().saturating_sub(self.page_size));
+        }
         changed || recovered || missing
     }
 
     fn refresh(&mut self, files: &mut FileSystem) {
+        if self.directory == COMPUTER {
+            files.refresh_volume_space();
+            return;
+        }
         self.status = match files.refresh_directory(self.directory) {
             Ok(()) => String::new(),
             Err(status) => format!("Refresh failed (0x{status:08X})"),
@@ -466,6 +563,10 @@ impl Explorer {
     }
     fn command(&mut self, files: &mut FileSystem, command: usize) -> Action {
         files.last_error = None;
+        // The Computer namespace is a view of volumes, never a writable folder.
+        if self.directory == COMPUTER && !matches!(command, 0 | 6) {
+            return Action::None;
+        }
         match command {
             0 => {
                 if let Some(id) = self.selected {
@@ -512,21 +613,37 @@ impl Explorer {
             }
             5 => {
                 if let Some(id) = self.selected {
-                    self.delete_prompt=Some(id);self.delete_accept=false;self.menu=None;self.edit=None;
+                    self.delete_prompt = Some(id);
+                    self.delete_accept = false;
+                    self.menu = None;
+                    self.edit = None;
                 }
             }
             6 => self.refresh(files),
             7 => {
-                let mut count=1;
-                let name=loop {
-                    let name=if count==1 {String::from("New Text Document.txt")} else {format!("New Text Document ({count}).txt")};
-                    if !files.iter_children(self.directory).any(|n|n.name.eq_ignore_ascii_case(&name)){break name;}
-                    count+=1;
+                let mut count = 1;
+                let name = loop {
+                    let name = if count == 1 {
+                        String::from("New Text Document.txt")
+                    } else {
+                        format!("New Text Document ({count}).txt")
+                    };
+                    if !files
+                        .iter_children(self.directory)
+                        .any(|n| n.name.eq_ignore_ascii_case(&name))
+                    {
+                        break name;
+                    }
+                    count += 1;
                 };
-                let id=files.touch(self.directory,&name,&[]);
-                self.selected=(id!=0).then_some(id);
-                if id!=0 {self.rename=name;self.edit=Some(Edit::Rename);self.status.clear();}
-            },
+                let id = files.touch(self.directory, &name, &[]);
+                self.selected = (id != 0).then_some(id);
+                if id != 0 {
+                    self.rename = name;
+                    self.edit = Some(Edit::Rename);
+                    self.status.clear();
+                }
+            }
             _ => {}
         }
         if let Some(status) = files.last_error {
@@ -546,16 +663,21 @@ impl Explorer {
             .is_some_and(|key| self.key(files, key))
     }
     pub fn key(&mut self, files: &mut FileSystem, key: u8) -> bool {
-        if self.delete_job.is_some(){
-            if key==27{self.delete_job=None;self.status="Deletion cancelled; completed deletions remain applied".into();}
+        if self.delete_job.is_some() {
+            if key == 27 {
+                self.delete_job = None;
+                self.status = "Deletion cancelled; completed deletions remain applied".into();
+            }
             return true;
         }
-        if self.delete_prompt.is_some(){
-            match key{
-                27=>{self.delete_prompt=None;},
-                9|input::LEFT|input::RIGHT=>self.delete_accept=!self.delete_accept,
-                13|10=>self.confirm_delete(),
-                _=>{},
+        if self.delete_prompt.is_some() {
+            match key {
+                27 => {
+                    self.delete_prompt = None;
+                }
+                9 | input::LEFT | input::RIGHT => self.delete_accept = !self.delete_accept,
+                13 | 10 => self.confirm_delete(),
+                _ => {}
             }
             return true;
         }
@@ -709,9 +831,15 @@ impl Explorer {
         true
     }
     fn hit(&self, files: &FileSystem, l: Layout, x: i32, y: i32) -> Hit {
-        if self.delete_prompt.is_some(){
-            let (_,yes,no)=layout::delete_dialog(l.body);
-            return if yes.contains(x,y){Hit::ConfirmDelete(true)}else if no.contains(x,y){Hit::ConfirmDelete(false)}else{Hit::Blank};
+        if self.delete_prompt.is_some() {
+            let (_, yes, no) = layout::delete_dialog(l.body);
+            return if yes.contains(x, y) {
+                Hit::ConfirmDelete(true)
+            } else if no.contains(x, y) {
+                Hit::ConfirmDelete(false)
+            } else {
+                Hit::Blank
+            };
         }
         if let Some(menu) = self.menu {
             if menu.contains(x, y) {
@@ -755,6 +883,9 @@ impl Explorer {
             }
         }
         if l.header.contains(x, y) {
+            if self.directory == COMPUTER {
+                return Hit::Blank;
+            }
             if self.view == View::List {
                 return Hit::Column(0);
             }
@@ -764,10 +895,23 @@ impl Explorer {
                 }
             }
         }
-        if l.scroll.contains(x, y) {
-            return Hit::Scroll(y >= l.scroll.y + l.scroll.height as i32 / 2);
+        if self.directory != COMPUTER {
+            if let Some(bar) = self.scrollbar(files, l) {
+                if bar.bounds.contains(x, y) {
+                    if bar.thumb.contains(x, y) {
+                        return Hit::ScrollThumb;
+                    }
+                    if let Some(down) = bar.arrow(y) {
+                        return Hit::ScrollLine(down);
+                    }
+                    return Hit::Scroll(y >= bar.thumb.y + bar.thumb.height as i32);
+                }
+            }
         }
-        if l.list.contains(x, y) {
+        if self.directory == COMPUTER && l.computer_drive().contains(x, y) {
+            return Hit::Row(files.root_id());
+        }
+        if self.directory != COMPUTER && l.list.contains(x, y) {
             let row = ((y - l.list.y) / ROW_HEIGHT as i32) as usize;
             if row < l.capacity() {
                 if let Some(node) = self.rows(files).get(self.offset + row) {
@@ -777,6 +921,39 @@ impl Explorer {
         }
         Hit::Blank
     }
+    pub fn captures_pointer(&self) -> bool {
+        self.scroll_grab.is_some()
+    }
+
+    fn scrollbar(
+        &self,
+        files: &FileSystem,
+        l: Layout,
+    ) -> Option<super::shared::scrollbar::Scrollbar> {
+        super::shared::scrollbar::Scrollbar::new(
+            l.scroll,
+            self.rows(files).len(),
+            l.capacity(),
+            self.offset,
+        )
+    }
+
+    pub fn wheel(&mut self, files: &FileSystem, body: Rect, delta: i32) -> bool {
+        if delta == 0
+            || self.directory == COMPUTER
+            || self.delete_prompt.is_some()
+            || self.menu.is_some()
+        {
+            return false;
+        }
+        let page = Layout::new(body).capacity().max(1);
+        let maximum = self.rows(files).len().saturating_sub(page);
+        let old = self.offset;
+        self.offset = (self.offset as i64 - i64::from(delta) * 3).clamp(0, maximum as i64) as usize;
+        self.last_click = None;
+        old != self.offset
+    }
+
     /// Activation happens on release over the pressed control, like shell controls.
     pub fn pointer(
         &mut self,
@@ -788,12 +965,27 @@ impl Explorer {
         held: bool,
         right: bool,
     ) -> (bool, Action) {
-        if self.delete_job.is_some(){return (false,Action::None);}
+        if self.delete_job.is_some() {
+            return (false, Action::None);
+        }
         let l = Layout::new(b);
         self.page_size = l.capacity().max(1);
         self.offset = self
             .offset
             .min(self.rows(files).len().saturating_sub(self.page_size));
+        if let Some(grab) = self.scroll_grab {
+            if !held && !down {
+                self.scroll_grab = None;
+                self.pressed = None;
+                return (true, Action::None);
+            }
+            if let Some(bar) = self.scrollbar(files, l) {
+                let old = self.offset;
+                self.offset = bar.drag_offset(y, grab);
+                return (old != self.offset, Action::None);
+            }
+            self.scroll_grab = None;
+        }
         let hit = if b.contains(x, y) {
             Some(self.hit(files, l, x, y))
         } else {
@@ -801,12 +993,16 @@ impl Explorer {
         };
         let changed = self.hot != hit;
         self.hot = hit;
-        if self.delete_prompt.is_some(){
-            if down{self.pressed=hit;}
-            else if !held&&self.pressed.take()==hit{
-                if let Some(Hit::ConfirmDelete(accept))=hit{self.delete_accept=accept;self.confirm_delete();}
+        if self.delete_prompt.is_some() {
+            if down {
+                self.pressed = hit;
+            } else if !held && self.pressed.take() == hit {
+                if let Some(Hit::ConfirmDelete(accept)) = hit {
+                    self.delete_accept = accept;
+                    self.confirm_delete();
+                }
             }
-            return (changed||down||!held,Action::None);
+            return (changed || down || !held, Action::None);
         }
         if right {
             if let Some(Hit::Row(id)) = hit {
@@ -828,6 +1024,12 @@ impl Explorer {
                 self.menu = None;
             }
             self.pressed = hit;
+            if hit == Some(Hit::ScrollThumb) {
+                if let Some(bar) = self.scrollbar(files, l) {
+                    self.scroll_grab = Some(y - bar.thumb.y);
+                }
+                self.last_click = None;
+            }
             if let Some(Hit::Row(id)) = hit {
                 self.selected = Some(id);
                 self.edit = None;
@@ -889,6 +1091,16 @@ impl Explorer {
                             self.descending = self.sort == sort && !self.descending;
                             self.sort = sort;
                             self.offset = 0;
+                            self.last_click = None;
+                        }
+                        Hit::ScrollThumb => {}
+                        Hit::ScrollLine(down) => {
+                            let maximum = self.rows(files).len().saturating_sub(self.page_size);
+                            self.offset = if down {
+                                self.offset.saturating_add(1).min(maximum)
+                            } else {
+                                self.offset.saturating_sub(1)
+                            };
                             self.last_click = None;
                         }
                         Hit::Scroll(down) => {
@@ -1122,54 +1334,91 @@ mod tests {
     }
     #[test]
     fn polling_observes_external_changes_without_losing_selection_or_file_bodies() {
-        use core::sync::atomic::{AtomicUsize,Ordering};
-        static GENERATION:AtomicUsize=AtomicUsize::new(0);
-        fn provider(operation:u32,_:&str,_:&[u8])->Result<Vec<u8>,u32>{
-            if operation!=abi::LIST{return Err(abi::STATUS_NOT_SUPPORTED);}
-            let generation=GENERATION.load(Ordering::Relaxed);
-            let mut out=Vec::new();
-            for name in if generation==0 {&["old.txt"][..]}else{&["new.txt"][..]} {
-                out.extend_from_slice(&(name.len()as u32).to_le_bytes());
-                out.extend_from_slice(&0u32.to_le_bytes());out.extend_from_slice(&4u64.to_le_bytes());out.extend_from_slice(name.as_bytes());
-            }Ok(out)
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static GENERATION: AtomicUsize = AtomicUsize::new(0);
+        fn provider(operation: u32, _: &str, _: &[u8]) -> Result<Vec<u8>, u32> {
+            if operation != abi::LIST {
+                return Err(abi::STATUS_NOT_SUPPORTED);
+            }
+            let generation = GENERATION.load(Ordering::Relaxed);
+            let mut out = Vec::new();
+            for name in if generation == 0 {
+                &["old.txt"][..]
+            } else {
+                &["new.txt"][..]
+            } {
+                out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&4u64.to_le_bytes());
+                out.extend_from_slice(name.as_bytes());
+            }
+            Ok(out)
         }
-        GENERATION.store(0,Ordering::Relaxed);
-        let mut fs=FileSystem::mounted(Backend(provider)).unwrap();
-        let mut state=Explorer::new(1,1);let old=fs.children(1)[0].id;
-        fs.node_mut(old).unwrap().contents=b"body".to_vec();state.selected=Some(old);
-        assert!(!state.poll_directory(&mut fs));assert_eq!(fs.node(old).unwrap().contents,b"body");
-        GENERATION.store(1,Ordering::Relaxed);
-        state.edit=Some(Edit::Rename);assert!(!state.poll_directory(&mut fs));
-        state.edit=None;assert!(state.poll_directory(&mut fs));
-        assert_eq!(fs.children(1)[0].name,"new.txt");assert_eq!(state.selected,None);
+        GENERATION.store(0, Ordering::Relaxed);
+        let mut fs = FileSystem::mounted(Backend(provider)).unwrap();
+        let mut state = Explorer::new(1, 1);
+        let old = fs.children(1)[0].id;
+        fs.node_mut(old).unwrap().contents = b"body".to_vec();
+        state.selected = Some(old);
+        assert!(!state.poll_directory(&mut fs));
+        assert_eq!(fs.node(old).unwrap().contents, b"body");
+        GENERATION.store(1, Ordering::Relaxed);
+        state.edit = Some(Edit::Rename);
+        assert!(!state.poll_directory(&mut fs));
+        state.edit = None;
+        assert!(state.poll_directory(&mut fs));
+        assert_eq!(fs.children(1)[0].name, "new.txt");
+        assert_eq!(state.selected, None);
         assert!(!state.poll_directory(&mut fs));
     }
 
     #[test]
     fn recursive_delete_requires_confirmation_preflights_and_yields_between_items() {
-        let mut fs=FileSystem::new();let folder=fs.mkdir(1,"folder");let child=fs.mkdir(folder,"child");
-        let note=fs.touch(child,"note.txt",b"preserve until confirmed");let sibling=fs.touch(1,"keep.txt",b"keep");
-        let mut state=Explorer::new(1,1);state.selected=Some(folder);
-        state.key(&mut fs,input::DELETE);
-        assert_eq!(state.delete_prompt,Some(folder));assert!(!state.work_pending());
-        state.key(&mut fs,13); // Cancel is the initial button.
+        let mut fs = FileSystem::new();
+        let folder = fs.mkdir(1, "folder");
+        let child = fs.mkdir(folder, "child");
+        let note = fs.touch(child, "note.txt", b"preserve until confirmed");
+        let sibling = fs.touch(1, "keep.txt", b"keep");
+        let mut state = Explorer::new(1, 1);
+        state.selected = Some(folder);
+        state.key(&mut fs, input::DELETE);
+        assert_eq!(state.delete_prompt, Some(folder));
+        assert!(!state.work_pending());
+        state.key(&mut fs, 13); // Cancel is the initial button.
         assert!(!fs.node(folder).unwrap().deleted);
-        state.key(&mut fs,input::DELETE);state.key(&mut fs,input::LEFT);state.key(&mut fs,13);
-        for _ in 0..5{assert!(state.work(&mut fs));assert!(!fs.node(note).unwrap().deleted);}
-        assert!(state.work(&mut fs));assert!(fs.node(note).unwrap().deleted);
-        assert!(!fs.node(child).unwrap().deleted);assert!(!fs.node(folder).unwrap().deleted);
-        while state.work(&mut fs){}
-        assert!(fs.node(folder).unwrap().deleted);assert!(!fs.node(sibling).unwrap().deleted);
-        assert_eq!(state.selected,None);assert!(!state.work_pending());
+        state.key(&mut fs, input::DELETE);
+        state.key(&mut fs, input::LEFT);
+        state.key(&mut fs, 13);
+        for _ in 0..5 {
+            assert!(state.work(&mut fs));
+            assert!(!fs.node(note).unwrap().deleted);
+        }
+        assert!(state.work(&mut fs));
+        assert!(fs.node(note).unwrap().deleted);
+        assert!(!fs.node(child).unwrap().deleted);
+        assert!(!fs.node(folder).unwrap().deleted);
+        while state.work(&mut fs) {}
+        assert!(fs.node(folder).unwrap().deleted);
+        assert!(!fs.node(sibling).unwrap().deleted);
+        assert_eq!(state.selected, None);
+        assert!(!state.work_pending());
     }
 
     #[test]
     fn cancelling_delete_before_preflight_completes_preserves_the_tree() {
-        let mut fs=FileSystem::new();let folder=fs.mkdir(1,"folder");let note=fs.touch(folder,"note.txt",b"body");
-        let mut state=Explorer::new(1,1);state.selected=Some(folder);
-        state.key(&mut fs,input::DELETE);state.key(&mut fs,input::LEFT);state.key(&mut fs,13);
-        state.work(&mut fs);state.key(&mut fs,27);assert!(!state.work_pending());
-        assert!(!fs.node(folder).unwrap().deleted);assert!(!fs.node(note).unwrap().deleted);
+        let mut fs = FileSystem::new();
+        let folder = fs.mkdir(1, "folder");
+        let note = fs.touch(folder, "note.txt", b"body");
+        let mut state = Explorer::new(1, 1);
+        state.selected = Some(folder);
+        state.key(&mut fs, input::DELETE);
+        state.key(&mut fs, input::LEFT);
+        state.key(&mut fs, 13);
+        state.work(&mut fs);
+        state.key(&mut fs, 27);
+        assert!(!state.work_pending());
+        assert!(!fs.node(folder).unwrap().deleted);
+        assert!(!fs.node(note).unwrap().deleted);
     }
 
     #[test]
@@ -1200,7 +1449,10 @@ mod tests {
         while state.work(&mut fs) {}
         assert!(state.status.contains("could not be searched"));
         state.selected = Some(id);
-        state.command(&mut fs, 5);state.key(&mut fs,input::LEFT);state.key(&mut fs,13);while state.work(&mut fs){}
+        state.command(&mut fs, 5);
+        state.key(&mut fs, input::LEFT);
+        state.key(&mut fs, 13);
+        while state.work(&mut fs) {}
         assert_eq!(state.selected, Some(id));
         assert!(!fs.node(id).unwrap().deleted);
         assert!(state.status.contains("C0000022"));
@@ -1248,13 +1500,63 @@ mod tests {
         assert_eq!(state.offset, 0);
         let r = Rect::new(
             l.scroll.x,
-            l.scroll.y + l.scroll.height as i32 - 20,
+            l.scroll.y + l.scroll.height as i32 - 40,
             l.scroll.width,
             16,
         );
         click_rect(&mut state, &mut fs, r);
         assert_eq!(state.offset, l.capacity());
     }
+    #[test]
+    fn wheel_thumb_capture_and_arrow_use_the_same_list_geometry() {
+        let mut fs = FileSystem::new();
+        for i in 0..100 {
+            fs.touch(1, &format!("item-{i:03}.txt"), b"x");
+        }
+        let mut state = Explorer::new(1, 1);
+        let b = body();
+        let l = Layout::new(b);
+        let selected = state.rows(&fs)[0].id;
+        state.selected = Some(selected);
+        assert!(state.wheel(&fs, b, -1));
+        assert_eq!(state.offset, 3);
+        assert!(state.wheel(&fs, b, i32::MIN));
+        assert_eq!(state.offset, 100 - l.capacity());
+        assert!(state.wheel(&fs, b, i32::MAX));
+        assert_eq!(state.offset, 0);
+        let thumb = state.scrollbar(&fs, l).unwrap().thumb;
+        let (x, y) = (thumb.x + 2, thumb.y + 3);
+        state.pointer(&mut fs, b, x, y, true, true, false);
+        assert!(state.captures_pointer());
+        assert_eq!(state.offset, 0, "pressing the thumb must not jump");
+        state.pointer(
+            &mut fs,
+            b,
+            b.x - 30,
+            b.y + b.height as i32 + 100,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(state.offset, 100 - l.capacity());
+        state.pointer(&mut fs, b, b.x - 30, b.y - 100, false, true, false);
+        assert_eq!(state.offset, 0);
+        state.pointer(&mut fs, b, x, y, false, false, false);
+        assert!(!state.captures_pointer());
+        click_rect(
+            &mut state,
+            &mut fs,
+            Rect::new(
+                l.scroll.x,
+                l.scroll.y + l.scroll.height as i32 - 17,
+                l.scroll.width,
+                17,
+            ),
+        );
+        assert_eq!(state.offset, 1, "arrow scrolls one item");
+        assert_eq!(state.selected, Some(selected));
+    }
+
     #[test]
     fn renderer_never_paints_outside_client_even_at_minimum_window_size() {
         for (w, h) in [(228, 84), (320, 160), (628, 414), (900, 650)] {

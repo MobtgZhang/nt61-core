@@ -48,8 +48,8 @@ impl Layout {
         let status_h = 22.min(footer);
         Self {
             body: b,
-            back: at(4, 5, 26.min(b.width), 26.min(top)),
-            forward: at(34, 5, 26.min(b.width.saturating_sub(34)), 26.min(top)),
+            back: at(4, 4, 27.min(b.width), 27.min(top)),
+            forward: at(34, 4, 27.min(b.width.saturating_sub(34)), 27.min(top)),
             address: at(68, 5, address_width.saturating_sub(24), 26.min(top)),
             refresh: at(
                 68 + address_width.saturating_sub(24),
@@ -114,6 +114,14 @@ impl Layout {
             ROW_HEIGHT,
         )
     }
+    pub fn computer_drive(&self) -> Rect {
+        Rect::new(
+            self.list.x + 12,
+            self.list.y + 12,
+            300.min(self.list.width.saturating_sub(24)),
+            64.min(self.list.height),
+        )
+    }
     pub fn capacity(&self) -> usize {
         (self.list.height / ROW_HEIGHT) as usize
     }
@@ -139,11 +147,23 @@ impl Layout {
 }
 
 /// Geometry shared by the deletion prompt painter and pointer hit testing.
-pub fn delete_dialog(b:Rect)->(Rect,Rect,Rect){
-    let width=440.min(b.width);let height=158.min(b.height);
-    let dialog=Rect::new(b.x+(b.width-width)as i32/2,b.y+(b.height-height)as i32/2,width,height);
-    let button_width=88.min(width/3);let y=dialog.y+height.saturating_sub(34)as i32;
-    let no=Rect::new(dialog.x+width.saturating_sub(button_width+12)as i32,y,button_width,24);
-    let yes=Rect::new(no.x-button_width as i32-10,y,button_width,24);
-    (dialog,yes,no)
+pub fn delete_dialog(b: Rect) -> (Rect, Rect, Rect) {
+    let width = 440.min(b.width);
+    let height = 158.min(b.height);
+    let dialog = Rect::new(
+        b.x + (b.width - width) as i32 / 2,
+        b.y + (b.height - height) as i32 / 2,
+        width,
+        height,
+    );
+    let button_width = 88.min(width / 3);
+    let y = dialog.y + height.saturating_sub(34) as i32;
+    let no = Rect::new(
+        dialog.x + width.saturating_sub(button_width + 12) as i32,
+        y,
+        button_width,
+        24,
+    );
+    let yes = Rect::new(no.x - button_width as i32 - 10, y, button_width, 24);
+    (dialog, yes, no)
 }

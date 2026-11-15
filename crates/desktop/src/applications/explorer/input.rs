@@ -16,6 +16,22 @@ pub const PAGE_DOWN: u8 = 0x88;
 pub const DELETE: u8 = 0x89;
 pub const RENAME: u8 = 0x8A;
 pub const REFRESH: u8 = 0x8B;
+pub const FIND_NEXT:u8=0x8C;
+pub const REPLACE:u8=0x8E;
+pub const HELP:u8=0x8D;
+pub const SHIFT_UP:u8=0x90;
+pub const SHIFT_DOWN:u8=0x91;
+pub const SHIFT_LEFT:u8=0x92;
+pub const SHIFT_RIGHT:u8=0x93;
+pub const SHIFT_HOME:u8=0x94;
+pub const SHIFT_END:u8=0x95;
+pub const CTRL_HOME:u8=0x96;
+pub const CTRL_END:u8=0x97;
+pub const ALT_FILE:u8=0xA0;
+pub const ALT_EDIT:u8=0xA1;
+pub const ALT_FORMAT:u8=0xA2;
+pub const ALT_VIEW:u8=0xA3;
+pub const ALT_HELP:u8=0xA4;
 impl Decoder {
     pub fn feed(&mut self, key: u8, now: u64) -> Option<u8> {
         if self.length == 0 {
@@ -29,7 +45,7 @@ impl Decoder {
         }
         if self.length == 1 && !matches!(key, b'[' | b'O') {
             self.length = 0;
-            return self.feed(key, now);
+            return match key.to_ascii_lowercase(){b'f'=>Some(ALT_FILE),b'e'=>Some(ALT_EDIT),b'o'=>Some(ALT_FORMAT),b'v'=>Some(ALT_VIEW),b'h'=>Some(ALT_HELP),_=>self.feed(key,now)};
         }
         if self.length >= self.bytes.len() {
             self.length = 0;
@@ -38,6 +54,12 @@ impl Decoder {
         self.bytes[self.length] = key;
         self.length += 1;
         let result = match &self.bytes[..self.length] {
+            b"\x1bOP"|b"\x1b[11~"=>Some(HELP),
+            b"\x1bOR"|b"\x1b[13~"=>Some(FIND_NEXT),
+            b"\x1b[1;2A"=>Some(SHIFT_UP),b"\x1b[1;2B"=>Some(SHIFT_DOWN),
+            b"\x1b[1;2C"=>Some(SHIFT_RIGHT),b"\x1b[1;2D"=>Some(SHIFT_LEFT),
+            b"\x1b[1;2H"=>Some(SHIFT_HOME),b"\x1b[1;2F"=>Some(SHIFT_END),
+            b"\x1b[1;5H"=>Some(CTRL_HOME),b"\x1b[1;5F"=>Some(CTRL_END),
             b"\x1b[A" => Some(UP),
             b"\x1b[B" => Some(DOWN),
             b"\x1b[C" => Some(RIGHT),
