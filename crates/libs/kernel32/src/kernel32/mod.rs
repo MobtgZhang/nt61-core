@@ -38,6 +38,7 @@ pub mod memory;
 pub mod module;
 pub mod process;
 pub mod smoke;
+mod sleep;
 pub mod sync;
 pub mod thread;
 pub mod time;

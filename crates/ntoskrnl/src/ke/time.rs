@@ -11,9 +11,10 @@
 //!   * **Interrupt time** — 100-ns intervals since boot, used by
 //!     ISR-time code that needs a fast monotonic clock.
 //
-//!     On x86_64 we prefer the HPET (`hal::x86_64::hpet::ticks()`)
-//!     and fall back to the TSC if the HPET is not present.
+//!     The software counters advance at the configured clock interrupt rate;
+//!     the source label records which platform timer supplies those interrupts.
 
+use crate::ke::sync::Spinlock;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Tick frequency in Hz. The PIT/HAL is programmed to this rate.
@@ -21,11 +22,11 @@ pub const TICKS_PER_SECOND: u32 = 1000;
 /// 100-ns intervals per millisecond. NT epoch math.
 pub const HUNDRED_NS_PER_MS: u64 = 10_000;
 /// Number of 100-ns intervals between 1601-01-01 and 1970-01-01.
-pub const EPOCH_DIFF_100NS: u64 = 0x01B21DD2_13814000;
+pub const EPOCH_DIFF_100NS: u64 = 116_444_736_000_000_000;
 /// Number of milliseconds in one day (24*60*60*1000).
 pub const MS_PER_DAY: u64 = 86_400_000;
 
-/// Monotonic tick count in milliseconds. Boot is tick 0.
+/// Software wall-clock value in 100-ns NT epoch units.
 static SYSTEM_TIME: AtomicU64 = AtomicU64::new(0);
 static WALL_CLOCK_BASE: AtomicU64 = AtomicU64::new(0);
 static INTERRUPT_TIME: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +34,44 @@ static INTERRUPT_TIME: AtomicU64 = AtomicU64::new(0);
 /// called. Used by the smoke test to verify the timer ISR is
 /// running.
 static ADVANCE_COUNT: AtomicU64 = AtomicU64::new(0);
+/// IRQ-safe lock serializes clock interrupts and wall-clock adjustments across
+/// CPUs. No device I/O or user-memory access occurs while this lock is held.
+static CLOCK_UPDATE: Spinlock<()> = Spinlock::new(());
+
+/// Coherent software-clock state; separate getter calls may straddle a set/tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeSnapshot {
+    pub system_time: u64,
+    pub wall_clock_base: u64,
+    pub interrupt_time: u64,
+}
+
+pub fn get_time_snapshot() -> TimeSnapshot {
+    let _guard = CLOCK_UPDATE.lock();
+    TimeSnapshot {
+        system_time: SYSTEM_TIME.load(Ordering::Relaxed),
+        wall_clock_base: WALL_CLOCK_BASE.load(Ordering::Relaxed),
+        interrupt_time: INTERRUPT_TIME.load(Ordering::Relaxed),
+    }
+}
+
+/// Atomically publish a new wall-clock value and its corresponding boot base.
+/// Returns the software time at the commit point. Interrupt time and QPC never
+/// move when setting the wall clock. Base subtraction uses the same modulo-u64
+/// arithmetic as the tick counters so even a value earlier than uptime remains
+/// coherent: base.wrapping_add(interrupt_time) == system_time.
+///
+/// Call only after the external RTC update succeeds. The RTC transaction itself
+/// is outside this short critical section; queries can observe the old software
+/// clock during that I/O. NMI callers must not acquire this lock.
+pub fn set_system_time(value: u64) -> u64 {
+    let _guard = CLOCK_UPDATE.lock();
+    let previous = SYSTEM_TIME.load(Ordering::Relaxed);
+    let uptime = INTERRUPT_TIME.load(Ordering::Relaxed);
+    WALL_CLOCK_BASE.store(value.wrapping_sub(uptime), Ordering::Relaxed);
+    SYSTEM_TIME.store(value, Ordering::Relaxed);
+    previous
+}
 /// Source of time — chosen during `init()`.
 static mut TIME_SOURCE: TimeSource = TimeSource::Stub;
 
@@ -58,6 +97,7 @@ fn pick_time_source() -> TimeSource {
 pub fn init() {
     crate::hal::serial::write_string("[ke.time] enter\r\n");
     let wall_clock = wall_clock_100ns();
+    let _guard = CLOCK_UPDATE.lock();
     WALL_CLOCK_BASE.store(wall_clock, Ordering::SeqCst);
     SYSTEM_TIME.store(wall_clock, Ordering::SeqCst);
     INTERRUPT_TIME.store(0, Ordering::SeqCst);
@@ -107,6 +147,7 @@ fn wall_clock_100ns() -> u64 {
 /// ISR; the smoke test can also drive it directly to verify the
 /// math.
 pub fn advance_tick() {
+    let _guard = CLOCK_UPDATE.lock();
     let _ = SYSTEM_TIME.fetch_add(HUNDRED_NS_PER_MS, Ordering::Relaxed);
     let _ = INTERRUPT_TIME.fetch_add(HUNDRED_NS_PER_MS, Ordering::Relaxed);
     ADVANCE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -115,6 +156,7 @@ pub fn advance_tick() {
 /// Advance the time counters by `n` ticks. Used by the smoke test
 /// to fast-forward without spinning.
 pub fn advance_ticks(n: u64) {
+    let _guard = CLOCK_UPDATE.lock();
     let delta = n * HUNDRED_NS_PER_MS;
     SYSTEM_TIME.fetch_add(delta, Ordering::Relaxed);
     INTERRUPT_TIME.fetch_add(delta, Ordering::Relaxed);
@@ -123,12 +165,10 @@ pub fn advance_ticks(n: u64) {
 
 /// Get current system time in 100ns intervals since 1601-01-01.
 pub fn get_system_time() -> u64 {
-    SYSTEM_TIME.load(Ordering::SeqCst)
+    get_time_snapshot().system_time
 }
 
-/// Get current system time as a Unix timestamp (seconds since
-/// 1970-01-01). On the bootstrap this is 0 because we never set
-/// the wall clock; the real kernel reads the RTC.
+/// Get system time as seconds since 1970-01-01; clamp pre-Unix dates to zero.
 pub fn get_unix_time() -> u64 {
     let st = get_system_time();
     if st < EPOCH_DIFF_100NS {
@@ -140,17 +180,17 @@ pub fn get_unix_time() -> u64 {
 
 /// Wall-clock boot base in 100-ns intervals since the NT epoch.
 pub fn get_wall_clock_base() -> u64 {
-    WALL_CLOCK_BASE.load(Ordering::SeqCst)
+    get_time_snapshot().wall_clock_base
 }
 
 /// Get current interrupt time in 100ns intervals since boot.
 pub fn get_interrupt_time() -> u64 {
-    INTERRUPT_TIME.load(Ordering::SeqCst)
+    get_time_snapshot().interrupt_time
 }
 
 /// Get tick count (ms since boot).
 pub fn get_tick_count() -> u32 {
-    (SYSTEM_TIME.load(Ordering::SeqCst) / HUNDRED_NS_PER_MS) as u32
+    (get_interrupt_time() / HUNDRED_NS_PER_MS) as u32
 }
 
 /// Time source chosen at init.

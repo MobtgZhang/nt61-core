@@ -110,17 +110,14 @@ pub unsafe extern "C" fn resume_thread(thread: HANDLE) -> DWORD {
     prev
 }
 
-/// `sleep` — forward to ntdll. The bootstrap ignores the
-/// actual delay.
+/// Delay in milliseconds using the shared native wait clock.
 pub extern "C" fn sleep(milliseconds: DWORD) {
-    let interval: i64 = -(milliseconds as i64) * 10_000;
-    let _ = crate::libs::ntdll::sync::nt_delay_execution_kernel(0, interval);
+    let _ = super::sleep::sleep_ex(milliseconds, false);
 }
 
-/// `sleep_ex` — same.
-pub extern "C" fn sleep_ex(milliseconds: DWORD, _alertable: BOOL) -> DWORD {
-    sleep(milliseconds);
-    0
+/// Alertable delay; returns WAIT_IO_COMPLETION after native user APC delivery.
+pub extern "C" fn sleep_ex(milliseconds: DWORD, alertable: BOOL) -> DWORD {
+    super::sleep::sleep_ex(milliseconds, alertable != 0)
 }
 
 /// `switch_to_thread` — yield to the scheduler.
