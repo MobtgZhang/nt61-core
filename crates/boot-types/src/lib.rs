@@ -6,3 +6,9 @@
 pub mod boot_types;
 
 pub mod boot_options;
+
+/// Private loader payload contract; deliberately separate from WDM DRIVER_OBJECT.
+pub mod boot_driver;
+
+/// ABI-reviewed native PE exports shared with the image builder.
+pub mod native_exports;

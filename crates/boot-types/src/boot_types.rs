@@ -312,6 +312,9 @@ pub struct BootInfo {
     pub boot_driver_records: u64,
     pub boot_driver_records_count: u32,
     pub _reserved_boot_records: u32,
+    /// Identity VA/PA extent of the loader-owned live kernel stack.
+    pub kernel_stack_base: u64,
+    pub kernel_stack_size: u64,
 }
 
 impl BootInfo {
@@ -319,7 +322,7 @@ impl BootInfo {
     pub const MAGIC: u64 = 0x4E543631_424F4F54;
     /// Current contract version. Bumped whenever a field is added
     /// or removed. Match this against the loader's build constant.
-    pub const VERSION: u64 = 10;
+    pub const VERSION: u64 = 11;
 
     pub fn is_valid(&self) -> bool {
         self.magic == Self::MAGIC && self.version == Self::VERSION
@@ -384,6 +387,7 @@ impl BootInfo {
             device_tree_size: 0,
             device_tree_hardware: DeviceTreeHardware::default(),
             boot_driver_records: 0, boot_driver_records_count: 0, _reserved_boot_records: 0,
+            kernel_stack_base: 0, kernel_stack_size: 0,
         }
     }
 
@@ -445,6 +449,7 @@ impl BootInfo {
             device_tree_size: 0,
             device_tree_hardware: DeviceTreeHardware::default(),
             boot_driver_records: 0, boot_driver_records_count: 0, _reserved_boot_records: 0,
+            kernel_stack_base: 0, kernel_stack_size: 0,
         }
     }
 }
