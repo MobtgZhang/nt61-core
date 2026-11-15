@@ -252,7 +252,14 @@ fn logonui_main() -> ! {
             let password = credentials.as_str().unwrap_or(" ");
             let authenticated = nt61_desktop::platform::services::logon(USER_NAME, password).is_ok();
             credentials.clear();
-            if authenticated { arch::exit_process(0); }
+            if authenticated {
+                if let Some(screen) = assets.as_ref() {
+                    screen.welcome(&mut frame, &framebuffer);
+                    fade_to(&frame, &mut frame_rgba, 240);
+                }
+                arch::debug_str("[LOGONUI] welcome frame ready\r\n");
+                arch::exit_process(0);
+            }
             authentication_failed = true;
             notice = None;
             redraw = true;
@@ -567,6 +574,14 @@ impl LogonAssets {
         self.draw_image(frame,&self.brand,width.saturating_sub(brand_width)/2,layout.bottom_y,brand_width);
     }
 
+    fn welcome(&self, frame: &mut Surface, fb: &arch::DesktopFramebufferInfo) {
+        frame.copy_from(&self.wallpaper);
+        self.draw_centered(frame, "Welcome", fb.width, (fb.height / 2) as i32, font_view::Ink::White);
+        let layout = Layout::new(fb.width, fb.height);
+        let brand_width = (350 * fb.height / 768).clamp(280, 438).min(fb.width);
+        self.draw_image(frame, &self.brand, fb.width.saturating_sub(brand_width) / 2, layout.bottom_y, brand_width);
+    }
+
     fn draw_image(&self, frame: &mut Surface, image: &Image, x: u32, y: u32, target_width: u32) {
         let target_height = target_width * image.height as u32 / image.width as u32;
         let scaled = scale_rgba_bilinear(image, target_width, target_height);
@@ -603,6 +618,31 @@ impl LogonAssets {
             .draw_onto(frame, text, x as i32, y as i32 + 1, font_view::Ink::Black);
         self.fonts
             .draw_onto(frame, text, x as i32, y as i32, font_view::Ink::White);
+    }
+}
+
+/// The kernel's RGBA bridge blends onto the previous frame. Incremental alpha
+/// gives the same crossfade as keeping a second full-screen copy in the kernel.
+fn fade_to(frame: &Surface, rgba: &mut [u8], duration: u64) {
+    use nt61_desktop::compositor::transition::{opacity, incremental_alpha};
+    let start = arch::ticks();
+    let mut previous = 0;
+    let mut next_frame = start;
+    loop {
+        let now = arch::ticks();
+        if now < next_frame { core::hint::spin_loop(); continue; }
+        let current = opacity(now.saturating_sub(start), duration);
+        let alpha = incremental_alpha(previous, current);
+        if alpha > 0 {
+            for (pixel, out) in frame.pixels().iter().zip(rgba.chunks_exact_mut(4)) {
+                out.copy_from_slice(&[(pixel >> 16) as u8, (pixel >> 8) as u8, *pixel as u8, alpha]);
+            }
+            // SAFETY: rgba covers the complete frame at the declared stride.
+            unsafe { arch::draw_rgba(rgba.as_ptr(), 0, 0, frame.width(), frame.height(), frame.width() as usize * 4); }
+        }
+        previous = current;
+        if current == 255 { break; }
+        next_frame = now.saturating_add(16);
     }
 }
 

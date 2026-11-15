@@ -679,6 +679,7 @@ mod program_catalog_tests {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShellModel {
+    pub fonts: crate::graphics::font::FontLibrary,
     pub applications: Vec<ApplicationSession>,
     pub process_snapshot: Option<crate::applications::processes::Snapshot>,
     pub explorers: Vec<Explorer>,
@@ -711,6 +712,7 @@ pub struct ShellModel {
 impl ShellModel {
     pub fn new(theme: Theme) -> Self {
         Self {
+            fonts: crate::graphics::font::FontLibrary::default(),
             applications: Vec::new(),
             process_snapshot: None,
             explorers: Vec::new(),
@@ -1715,7 +1717,8 @@ impl ShellModel {
                     ImageResource::RecycleBin => ("Recycle Bin Properties", WindowKind::RecycleBinProperties),
                     _ => ("Control Panel", WindowKind::ControlPanel),
                 };
-                self.open_window_with_kind(title, 180, 110, 560, 390, kind);
+                let (width, height) = if kind == WindowKind::System { (800, 580) } else { (560, 390) };
+                self.open_window_with_kind(title, 80, 60, width, height, kind);
                 true
             }
             ContextMenuCommand::Manage => {
@@ -1867,8 +1870,12 @@ impl ShellModel {
         self.taskbar
             .add_window_with_kind(id, title, x, y, width, height, kind);
         if matches!(kind, WindowKind::Explorer | WindowKind::Computer) {
-            let directory=self.files.current_directory();
-            let result=self.files.refresh_directory(directory);
+            let directory = if kind == WindowKind::Computer {
+                crate::applications::explorer::COMPUTER
+            } else {
+                self.files.current_directory()
+            };
+            let result = if directory == crate::applications::explorer::COMPUTER { Ok(()) } else { self.files.refresh_directory(directory) };
             let mut explorer=Explorer::new(id,directory);
             explorer.prepare(&mut self.files);
             if let Err(status)=result{explorer.status=alloc::format!("Cannot open folder (0x{status:08X})");}
@@ -2058,6 +2065,13 @@ impl ShellModel {
             return false;
         }
         let kind = window.kind;
+        if kind == WindowKind::System {
+            let body = Rect::new(window.x + 6, window.y + 30, window.width.saturating_sub(12) as u32, window.height.saturating_sub(36) as u32);
+            if crate::applications::explorer::system::home_link(body).contains(cursor_x, cursor_y) {
+                self.open_window_with_kind("Control Panel", 110, 80, 720, 500, WindowKind::ControlPanel);
+                return true;
+            }
+        }
         let links = Self::namespace_links(kind);
         if (window.x+18..window.x+window.width-18).contains(&cursor_x) && cursor_y >= window.y+86 {
             let row = (cursor_y-window.y-86) / 36;

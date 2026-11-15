@@ -1,3 +1,4 @@
+pub mod transition;
 use crate::graphics::Surface;
 use crate::window::Rect;
 use alloc::vec::Vec;

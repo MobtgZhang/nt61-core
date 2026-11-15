@@ -13,9 +13,11 @@ fn graphics_rect(rect: Rect) -> crate::graphics::Rect {
 }
 
 pub const GLASS_BLUR_RADIUS: u32 = 8;
-pub const GLASS_TINT_STRENGTH: u32 = 56;
-pub const GLASS_SATURATION: u32 = 208;
-pub const GLASS_TINT: u32 = 0xFF4580A4;
+pub const GLASS_TINT_STRENGTH: u32 = 107;
+pub const GLASS_SATURATION: u32 = 96;
+// Windows 7's default Sky colorization. The opacity is applied once when
+// preparing the backdrop, rather than accumulating blue overlays per frame.
+pub const GLASS_TINT: u32 = 0xFF74B8FC;
 pub const WINDOW_GLASS: u32 = 0xE845_80C4;
 pub const WINDOW_BODY: u32 = 0xFFF0_F0F0;
 pub const WINDOW_BORDER: u32 = 0xB300_0000;
@@ -27,9 +29,15 @@ pub const ELEMENT_SURFACE: u32 = 0xFFF2_F2F2;
 pub fn glass_backdrop(backdrop: &Surface, tint: u32, saturation: u32) -> Surface {
     let mut glass = backdrop.clone();
     glass.box_blur(GLASS_BLUR_RADIUS);
+    colorize_glass(&mut glass, tint, saturation);
+    glass
+}
+
+/// Apply colorization once to an already blurred lower scene.
+pub fn colorize_glass(glass: &mut Surface, tint: u32, saturation: u32) {
     glass.saturate(saturation);
     glass.tint(tint, GLASS_TINT_STRENGTH);
-    glass
+    glass.blend_rect(Rect::new(0, 0, glass.width(), glass.height()), 0x60DCE7EF);
 }
 
 pub fn blend_rect(surface: &mut Surface, bounds: Rect, color: u32) {
@@ -135,6 +143,8 @@ pub fn glass_button(surface: &mut Surface, bounds: Rect, selected: bool) {
 
 pub fn taskbar_chrome(surface: &mut Surface, bounds: Rect, glass: &Surface) {
     glass_bar_precomputed(surface, bounds, glass);
+    // The superbar uses darker glass than captions in the default Win7 theme.
+    surface.blend_rect(bounds, 0x70303C50);
     surface.blend_rect(Rect::new(bounds.x, bounds.y, bounds.width, 1), 0xB4FF_FFFF);
     surface.blend_rect(
         Rect::new(
@@ -360,27 +370,17 @@ pub fn rounded_window(surface: &mut Surface, bounds: Rect, radius: u32, fill: u3
 /// here darkens the whole glass surface and destroys its transparency.
 pub fn window_border(surface: &mut Surface, bounds: Rect, radius: u32) {
     surface.stroke_rounded_rect(bounds, radius, 1, 0xA020_3040);
-    let inner = Rect::new(bounds.x + 1, bounds.y + 1,
-        bounds.width.saturating_sub(2), bounds.height.saturating_sub(2));
+    let inner = Rect::new(
+        bounds.x + 1,
+        bounds.y + 1,
+        bounds.width.saturating_sub(2),
+        bounds.height.saturating_sub(2),
+    );
     surface.stroke_rounded_rect(inner, radius.saturating_sub(1), 1, 0xA0FF_FFFF);
 }
 
-/// Use the cached blurred backdrop for the visible glass rim, avoiding a new
-/// blur/allocation on every hover or pointer event.
-pub fn window_glass_frame(surface: &mut Surface, bounds: Rect, glass: &Surface, active: bool) {
-    let rim = 6.min(bounds.width / 2).min(bounds.height / 2);
-    let top = 30.min(bounds.height);
-    for strip in [
-        Rect::new(bounds.x, bounds.y, bounds.width, top),
-        Rect::new(bounds.x, bounds.y + top as i32, rim, bounds.height.saturating_sub(top)),
-        Rect::new(bounds.x + bounds.width.saturating_sub(rim) as i32,
-            bounds.y + top as i32, rim, bounds.height.saturating_sub(top)),
-        Rect::new(bounds.x, bounds.y + bounds.height.saturating_sub(rim) as i32, bounds.width, rim),
-    ] {
-        surface.copy_region(glass, strip, strip.x, strip.y);
-        surface.blend_rect(strip, if active { 0x4048_9BD4 } else { 0x606B_879D });
-    }
-}
+mod window_glass;
+pub use window_glass::WindowGlassCache;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowControlButtonKind {
@@ -417,7 +417,9 @@ pub fn window_control_button(
     for row in 0..bounds.height {
         let scale = row * 255 / denominator;
         let color = match kind {
-            WindowControlButtonKind::Minimize | WindowControlButtonKind::Maximize | WindowControlButtonKind::Restore => {
+            WindowControlButtonKind::Minimize
+            | WindowControlButtonKind::Maximize
+            | WindowControlButtonKind::Restore => {
                 if hovered {
                     if scale < 128 {
                         alpha_lerp(0xB8E6_F5FF, 0x7089_C5EA, scale * 255 / 128)
@@ -443,7 +445,6 @@ pub fn window_control_button(
                     alpha_lerp(0xFFCF_796A, 0xFFD5_4F36, (scale - 128) * 255 / 127)
                 }
             }
-
         };
         surface.blend_rect(
             Rect::new(bounds.x, bounds.y + row as i32, bounds.width, 1),
@@ -497,47 +498,102 @@ pub fn window_control_button(
 pub fn selection(surface: &mut Surface, b: Rect, selected: bool, hovered: bool) {
     let border = if selected { 0xD06C_AAD9 } else { 0xA0D7_EEFF };
     surface.blend_rounded_rect(b, 3, border);
-    let inner = Rect::new(b.x+1,b.y+1,b.width.saturating_sub(2),b.height.saturating_sub(2));
+    let inner = Rect::new(
+        b.x + 1,
+        b.y + 1,
+        b.width.saturating_sub(2),
+        b.height.saturating_sub(2),
+    );
     surface.blend_rounded_rect(inner, 2, 0x80FF_FFFF);
     let (top, bottom) = if selected {
         (if hovered { 0x685C_BCFF } else { 0x405C_BCFF }, 0x8862_AFE3)
-    } else { (0x20FF_FFFF, 0x484E_A5DE) };
+    } else {
+        (0x20FF_FFFF, 0x484E_A5DE)
+    };
     for y in 0..inner.height {
         let color = alpha_lerp(top, bottom, y * 255 / inner.height.max(1));
-        surface.blend_rect(Rect::new(inner.x+1,inner.y+y as i32,inner.width.saturating_sub(2),1),color);
+        surface.blend_rect(
+            Rect::new(
+                inner.x + 1,
+                inner.y + y as i32,
+                inner.width.saturating_sub(2),
+                1,
+            ),
+            color,
+        );
     }
 }
 
 fn alpha_lerp(a: u32, b: u32, t: u32) -> u32 {
-    let alpha = ((a >> 24) * (255-t) + (b >> 24) * t) / 255;
-    (alpha << 24) | (lerp_color(a,b,t) & 0xffffff)
+    let alpha = ((a >> 24) * (255 - t) + (b >> 24) * t) / 255;
+    (alpha << 24) | (lerp_color(a, b, t) & 0xffffff)
 }
 
 /// Win7 context menus have an opaque neutral body; the glass belongs to
 /// the window frame and Start panel, while menu shadows remain translucent.
 pub fn menu_surface(surface: &mut Surface, b: Rect) {
     shadow(surface, b, 5);
-    surface.fill_rect(b.x,b.y,b.width,b.height,0xFF979797);
-    surface.fill_rect(b.x+1,b.y+1,b.width.saturating_sub(2),b.height.saturating_sub(2),0xFFF5F5F5);
-    surface.fill_rect(b.x+2,b.y+2,26,b.height.saturating_sub(4),0xFFF0F0F0);
-    surface.fill_rect(b.x+28,b.y+3,1,b.height.saturating_sub(6),0xFFE1E1E1);
-    surface.fill_rect(b.x+29,b.y+3,1,b.height.saturating_sub(6),0xFFFFFFFF);
+    surface.fill_rect(b.x, b.y, b.width, b.height, 0xFF979797);
+    surface.fill_rect(
+        b.x + 1,
+        b.y + 1,
+        b.width.saturating_sub(2),
+        b.height.saturating_sub(2),
+        0xFFF5F5F5,
+    );
+    surface.fill_rect(b.x + 2, b.y + 2, 26, b.height.saturating_sub(4), 0xFFF0F0F0);
+    surface.fill_rect(b.x + 28, b.y + 3, 1, b.height.saturating_sub(6), 0xFFE1E1E1);
+    surface.fill_rect(b.x + 29, b.y + 3, 1, b.height.saturating_sub(6), 0xFFFFFFFF);
 }
 
 pub fn menu_item(surface: &mut Surface, b: Rect, hovered: bool) {
-    if !hovered { return; }
-    surface.blend_rounded_rect(b,3,0xFFAECEE7);
-    let inner = Rect::new(b.x+1,b.y+1,b.width.saturating_sub(2),b.height.saturating_sub(2));
-    surface.blend_rounded_rect(inner,2,0xFFF0F8FF);
+    if !hovered {
+        return;
+    }
+    surface.blend_rounded_rect(b, 3, 0xFFAECEE7);
+    let inner = Rect::new(
+        b.x + 1,
+        b.y + 1,
+        b.width.saturating_sub(2),
+        b.height.saturating_sub(2),
+    );
+    surface.blend_rounded_rect(inner, 2, 0xFFF0F8FF);
     for y in 1..inner.height.saturating_sub(1) {
-        let color = lerp_color(0xFFF2F8FD,0xFFD9EBFA,y*255/inner.height.max(1));
-        surface.fill_rect(inner.x+1,inner.y+y as i32,inner.width.saturating_sub(2),1,color);
+        let color = lerp_color(0xFFF2F8FD, 0xFFD9EBFA, y * 255 / inner.height.max(1));
+        surface.fill_rect(
+            inner.x + 1,
+            inner.y + y as i32,
+            inner.width.saturating_sub(2),
+            1,
+            color,
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_glass_uses_the_window_below_instead_of_only_wallpaper() {
+        let bounds = Rect::new(8, 8, 64, 44);
+        let mut wallpaper = Surface::new(80, 60);
+        wallpaper.fill_rect(0, 0, 80, 60, 0xFF105090);
+        let mut red = wallpaper.clone();
+        let mut green = wallpaper.clone();
+        red.fill_rect(0, 0, 80, 60, 0xFFD04040);
+        green.fill_rect(0, 0, 80, 60, 0xFF40D040);
+        let mut cache = WindowGlassCache::default();
+        cache.prepare(&red, 1, bounds, 0, true);
+        cache.paint(&mut red, 1, true);
+        cache.prepare(&green, 1, bounds, 0, true);
+        cache.paint(&mut green, 1, true);
+        assert_ne!(
+            red.pixel(32, 20),
+            green.pixel(32, 20),
+            "glass must transmit the actual lower window, not a static wallpaper cache"
+        );
+    }
 
     #[test]
     fn window_outline_preserves_the_glass_interior() {

@@ -42,4 +42,9 @@ pub struct DesktopMouseState {
     pub x: i32,
     pub y: i32,
     pub buttons: u32,
+    /// Signed vertical wheel notches in this completed report.
+    pub wheel: i32,
 }
+
+/// Monotonic milliseconds shared with the shell animation clock.
+pub fn ticks() -> u64 { syscall5(0x0307, 0, 0, 0, 0, 0) }

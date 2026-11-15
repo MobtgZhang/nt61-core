@@ -27,16 +27,18 @@ use nt61_desktop::bmp;
 use nt61_desktop::compositor::aero;
 use nt61_desktop::controls::PointerAction;
 use nt61_desktop::graphics::blit::blit_rgba;
-use nt61_desktop::shell::{WindowCursor, ShellModel, CONTROL_DESKTOP_BASE, CONTROL_SUBMENU_BASE, TASKBAR_HEIGHT};
+use nt61_desktop::shell::{
+    ShellModel, WindowCursor, CONTROL_DESKTOP_BASE, CONTROL_SUBMENU_BASE, TASKBAR_HEIGHT,
+};
 use nt61_desktop::theme::Theme;
 use nt61_desktop::user_account_pictures::USER;
 
 extern crate alloc;
 
-use nt61_desktop::user_allocator::StaticHeapAllocator;
+use nt61_desktop::user_allocator::ApplicationHeap;
 
 #[global_allocator]
-static EXPLORER_ALLOCATOR: StaticHeapAllocator<{ 64 * 1024 * 1024 }> = StaticHeapAllocator::new();
+static EXPLORER_ALLOCATOR: ApplicationHeap<{ 64 * 1024 * 1024 }> = ApplicationHeap::new();
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -84,11 +86,13 @@ struct Shell {
     model: ShellModel,
     wallpaper: nt61_desktop::graphics::Surface,
     glass: nt61_desktop::graphics::Surface,
+    window_glass: core::cell::RefCell<aero::WindowGlassCache>,
     hovered_caption: Option<(u32, u8)>,
     hovered_application: Option<u32>,
     scene: core::cell::RefCell<nt61_desktop::compositor::scene::WindowScene>,
     window_dirty: core::cell::Cell<Option<u32>>,
     scene_dirty: core::cell::Cell<bool>,
+    hover_damage: core::cell::Cell<Option<nt61_desktop::graphics::Rect>>,
 }
 
 fn desktop_main() -> ! {
@@ -147,12 +151,13 @@ fn desktop_main() -> ! {
     let mut cursor_rgba = alloc::vec![0u8; 32 * 32 * 4];
     let mut previous_cursor_bounds = shell.cursor_bounds(cursor_x, cursor_y);
     let mut last_desktop_click: Option<(usize, u64)> = None;
-    let mut next_explorer_job=0usize;
-    let mut next_directory_poll=0u64;
-    let mut next_process_poll=0u64;
-    let mut directory_poll_index=0usize;
+    let mut next_explorer_job = 0usize;
+    let mut next_directory_poll = 0u64;
+    let mut next_process_poll = 0u64;
+    let mut directory_poll_index = 0usize;
     let mut frame_rgba = alloc::vec![0u8; frame.pixels().len() * 4];
-    shell.draw_desktop(&framebuffer, &mut frame, &mut frame_rgba);
+    shell.compose_desktop(&framebuffer, &mut frame);
+    fade_desktop(&frame, &mut frame_rgba, 450);
     shell.draw_cursor(&frame, cursor_x, cursor_y, &mut cursor_rgba);
     shell
         .model
@@ -161,8 +166,12 @@ fn desktop_main() -> ! {
     loop {
         let mut redraw = false;
         let ticks = arch::shell_ticks();
-        for app in &mut shell.model.applications{app.input_time=ticks;}
-        for explorer in &mut shell.model.explorers { explorer.input_time=Some(ticks); }
+        for app in &mut shell.model.applications {
+            app.input_time = ticks;
+        }
+        for explorer in &mut shell.model.explorers {
+            explorer.input_time = Some(ticks);
+        }
         if ticks >= next_status {
             redraw |= shell.model.update_clock(arch::shell_time());
             next_status = ticks.saturating_add(1000);
@@ -175,12 +184,25 @@ fn desktop_main() -> ! {
         // A busy input device must leave time to submit the composed frame
         // and process keyboard input. Unread button edges stay in the queue.
         for _ in 0..64 {
-            if unsafe { arch::poll_mouse(&mut mouse) == 0 } { break; }
+            if unsafe { arch::poll_mouse(&mut mouse) == 0 } {
+                break;
+            }
             let previous_scene = shell.window_geometry();
             cursor_x = mouse.x.clamp(0, framebuffer.width.saturating_sub(1) as i32);
             cursor_y = mouse
                 .y
                 .clamp(0, framebuffer.height.saturating_sub(1) as i32);
+            if mouse.wheel != 0 {
+                if let Some(id) = shell.model.window_hit_test(cursor_x, cursor_y) {
+                    if shell
+                        .model
+                        .application_wheel(id, cursor_x, cursor_y, mouse.wheel)
+                    {
+                        shell.mark_window_dirty(id);
+                        pointer_full = true;
+                    }
+                }
+            }
             let action = if mouse.buttons & 1 == 0 && previous_buttons & 1 != 0 {
                 Some(PointerAction::Up)
             } else if mouse.buttons & 1 != 0 && previous_buttons & 1 == 0 {
@@ -190,10 +212,25 @@ fn desktop_main() -> ! {
             };
             // Retain the composed scene for pointer motion. Invalidate below
             // only when a window, application or desktop icon actually changes.
-            if mouse.buttons & 2 != 0 && previous_buttons & 2 == 0
-                && shell.model.window_hit_test(cursor_x,cursor_y).is_some_and(|id|shell.model.application(id).is_some() || shell.model.explorers.iter().any(|e|e.window_id==id)) {
-                if let Some(id)=shell.model.window_hit_test(cursor_x,cursor_y) {shell.model.application_pointer(id,cursor_x,cursor_y,true,false,true);}
-                shell.scene_dirty.set(true);pointer_full=true;previous_buttons=mouse.buttons;continue;
+            if mouse.buttons & 2 != 0
+                && previous_buttons & 2 == 0
+                && shell
+                    .model
+                    .window_hit_test(cursor_x, cursor_y)
+                    .is_some_and(|id| {
+                        shell.model.application(id).is_some()
+                            || shell.model.explorers.iter().any(|e| e.window_id == id)
+                    })
+            {
+                if let Some(id) = shell.model.window_hit_test(cursor_x, cursor_y) {
+                    shell
+                        .model
+                        .application_pointer(id, cursor_x, cursor_y, true, false, true);
+                }
+                shell.scene_dirty.set(true);
+                pointer_full = true;
+                previous_buttons = mouse.buttons;
+                continue;
             }
             if mouse.buttons & 2 != 0 && previous_buttons & 2 == 0 {
                 {
@@ -232,28 +269,43 @@ fn desktop_main() -> ! {
                     framebuffer.width,
                     framebuffer.height,
                 );
-                let over_window = !popup_over
-                    && cursor_y < framebuffer.height.saturating_sub(TASKBAR_HEIGHT) as i32
-                    && shell.model.window_hit_test(cursor_x, cursor_y).is_some();
+                let over_window = shell.model.captured_pointer_window().is_some()
+                    || (!popup_over
+                        && cursor_y < framebuffer.height.saturating_sub(TASKBAR_HEIGHT) as i32
+                        && shell.model.window_hit_test(cursor_x, cursor_y).is_some());
                 let hovered_application = if over_window && shell.model.drag_window.is_none() {
-                    shell.model.window_hit_test(cursor_x,cursor_y)
-                } else {None};
+                    shell.model.window_hit_test(cursor_x, cursor_y)
+                } else {
+                    None
+                };
                 if shell.hovered_application != hovered_application {
-                    if let Some(id)=shell.hovered_application {
+                    if let Some(id) = shell.hovered_application {
                         if shell.model.clear_application_hover(id) {
-                            shell.mark_window_dirty(id);pointer_full=true;
+                            shell.mark_window_dirty(id);
+                            pointer_full = true;
                         }
                     }
-                    shell.hovered_application=hovered_application;
+                    shell.hovered_application = hovered_application;
                 }
                 let hovered_caption = if over_window && shell.model.drag_window.is_none() {
-                    shell.model.window_hit_test(cursor_x, cursor_y)
+                    shell
+                        .model
+                        .window_hit_test(cursor_x, cursor_y)
                         .and_then(|id| shell.model.taskbar.windows.iter().find(|w| w.id == id))
-                        .and_then(|w| w.caption_control_at(cursor_x, cursor_y).map(|button| (w.id, button)))
-                } else { None };
+                        .and_then(|w| {
+                            w.caption_control_at(cursor_x, cursor_y)
+                                .map(|button| (w.id, button))
+                        })
+                } else {
+                    None
+                };
                 if shell.hovered_caption != hovered_caption {
-                    if let Some((id,_))=shell.hovered_caption {shell.mark_window_dirty(id);}
-                    if let Some((id,_))=hovered_caption {shell.mark_window_dirty(id);}
+                    if let Some((id, _)) = shell.hovered_caption {
+                        shell.mark_window_dirty(id);
+                    }
+                    if let Some((id, _)) = hovered_caption {
+                        shell.mark_window_dirty(id);
+                    }
                     shell.hovered_caption = hovered_caption;
                     pointer_full = true;
                 }
@@ -269,58 +321,118 @@ fn desktop_main() -> ! {
                         ) {
                             shell.model.select_window(window_id);
                             if !shell.model.begin_window_drag(window_id, cursor_x, cursor_y) {
-                                shell.model.application_pointer(window_id,cursor_x,cursor_y,true,true,false);
+                                shell.model.application_pointer(
+                                    window_id, cursor_x, cursor_y, true, true, false,
+                                );
                             }
                         }
                     }
                 }
-                if action==PointerAction::Down && over_window && shell.model.drag_window.is_none() {
-                    if let Some(id)=shell.model.window_hit_test(cursor_x,cursor_y) {
-                        if shell.model.needs_capture(id,cursor_x,cursor_y) {
-                            let hidden=shell.model.taskbar.windows.iter().position(|w|w.id==id);
-                            if let Some(index)=hidden {
-                                shell.model.taskbar.windows[index].minimized=true;
+                if action == PointerAction::Down && over_window && shell.model.drag_window.is_none()
+                {
+                    if let Some(id) = shell.model.window_hit_test(cursor_x, cursor_y) {
+                        if shell.model.needs_capture(id, cursor_x, cursor_y) {
+                            let hidden =
+                                shell.model.taskbar.windows.iter().position(|w| w.id == id);
+                            if let Some(index) = hidden {
+                                shell.model.taskbar.windows[index].minimized = true;
                                 shell.scene_dirty.set(true);
-                                shell.draw_desktop(&framebuffer,&mut frame,&mut frame_rgba);
-                                shell.model.capture_application(id,frame.clone());
-                                shell.model.taskbar.windows[index].minimized=false;
+                                shell.draw_desktop(&framebuffer, &mut frame, &mut frame_rgba);
+                                shell.model.capture_application(id, frame.clone());
+                                shell.model.taskbar.windows[index].minimized = false;
                                 shell.scene_dirty.set(true);
                             }
                         }
                     }
                 }
-                if action==PointerAction::Move && shell.model.drag_window.is_none() && over_window {
-                    if let Some(id)=shell.model.window_hit_test(cursor_x,cursor_y) {
-                        if shell.model.application_pointer(id,cursor_x,cursor_y,false,mouse.buttons&1!=0,false){
-                            shell.mark_window_dirty(id);pointer_full=true;
+                if action == PointerAction::Move && shell.model.drag_window.is_none() && over_window
+                {
+                    if let Some(id) = shell
+                        .model
+                        .captured_pointer_window()
+                        .or_else(|| shell.model.window_hit_test(cursor_x, cursor_y))
+                    {
+                        let old_hot = shell.model.application(id).and_then(|app| app.hot);
+                        if shell.model.application_pointer(
+                            id,
+                            cursor_x,
+                            cursor_y,
+                            false,
+                            mouse.buttons & 1 != 0,
+                            false,
+                        ) {
+                            let safe_hover = mouse.buttons & 1 == 0
+                                && shell.model.application(id).is_some_and(|app| {
+                                    !app.menu
+                                        && app.dialog.is_none()
+                                        && !app.confirm
+                                        && app.search.is_none()
+                                        && !matches!(
+                                            app.id,
+                                            nt61_desktop::applications::AppId::Notepad
+                                                | nt61_desktop::applications::AppId::WordPad
+                                                | nt61_desktop::applications::AppId::Paint
+                                        )
+                                });
+                            let new_hot = shell.model.application(id).and_then(|app| app.hot);
+                            let damage = if safe_hover {
+                                union_rect(old_hot, new_hot)
+                            } else {
+                                None
+                            };
+                            let previous_damage = shell.hover_damage.get();
+                            let already_dirty = shell.window_dirty.get().is_some();
+                            shell.mark_window_dirty(id);
+                            if !already_dirty || previous_damage.is_some() {
+                                shell.hover_damage.set(union_rect(previous_damage, damage));
+                            }
+                            pointer_full = true;
                         }
                     }
                 }
                 if matches!(action, PointerAction::Move | PointerAction::Up)
                     && shell.model.drag_window.is_some()
-                    && shell.model.drag_window_to(cursor_x, cursor_y) {
+                    && shell.model.drag_window_to(cursor_x, cursor_y)
+                {
                     shell.scene_dirty.set(true);
                     pointer_full = true;
                 }
                 if action == PointerAction::Up {
                     if shell.model.drag_window.is_none() {
-                        if let Some(id) = shell.model.selected_window {
-                            shell.model.application_pointer(id,cursor_x,cursor_y,false,false,false);
+                        if let Some(id) = shell
+                            .model
+                            .captured_pointer_window()
+                            .or(shell.model.selected_window)
+                        {
+                            if shell
+                                .model
+                                .application_pointer(id, cursor_x, cursor_y, false, false, false)
+                            {
+                                shell.mark_window_dirty(id);
+                            }
                         }
                     }
                     shell.model.release_window_drag();
                 }
-                let previous_hot=shell.model.controls.hot();
+                let previous_hot = shell.model.controls.hot();
                 let changed = match shell.model.controls.route_pointer(
                     action,
-                    if over_window || shell.model.drag_window.is_some() { -1 } else { cursor_x },
+                    if over_window || shell.model.drag_window.is_some() {
+                        -1
+                    } else {
+                        cursor_x
+                    },
                     cursor_y,
                 ) {
                     Some(event) => {
                         if let nt61_desktop::controls::ControlEvent::Activated(id) = event {
-                            if (CONTROL_DESKTOP_BASE..nt61_desktop::shell::CONTROL_MENU_BASE).contains(&id) {
+                            if (CONTROL_DESKTOP_BASE..nt61_desktop::shell::CONTROL_MENU_BASE)
+                                .contains(&id)
+                            {
                                 let index = (id - CONTROL_DESKTOP_BASE) as usize;
-                                if last_desktop_click.is_some_and(|(previous, time)| previous == index && ticks.saturating_sub(time) <= 500) {
+                                if last_desktop_click.is_some_and(|(previous, time)| {
+                                    previous == index && ticks.saturating_sub(time) <= 500
+                                }) {
                                     shell.model.open_desktop_item(index);
                                     last_desktop_click = None;
                                 } else {
@@ -329,15 +441,21 @@ fn desktop_main() -> ! {
                             }
                         }
                         shell.model.handle_control_event(event)
-                    },
+                    }
                     None => false,
                 };
                 // Popup and taskbar hover changes only their overlay. Repaint
                 // the retained desktop when an icon changes its highlight.
-                let icon_hot_changed = [previous_hot,shell.model.controls.hot()].iter()
-                    .any(|id|(CONTROL_DESKTOP_BASE..nt61_desktop::shell::CONTROL_MENU_BASE).contains(id));
-                if changed && (icon_hot_changed || (action != PointerAction::Move && !popup_over
-                    && cursor_y < framebuffer.height.saturating_sub(TASKBAR_HEIGHT) as i32)) {
+                let icon_hot_changed =
+                    [previous_hot, shell.model.controls.hot()].iter().any(|id| {
+                        (CONTROL_DESKTOP_BASE..nt61_desktop::shell::CONTROL_MENU_BASE).contains(id)
+                    });
+                if changed
+                    && (icon_hot_changed
+                        || (action != PointerAction::Move
+                            && !popup_over
+                            && cursor_y < framebuffer.height.saturating_sub(TASKBAR_HEIGHT) as i32))
+                {
                     shell.scene_dirty.set(true);
                 }
                 let hot = shell.model.controls.hot();
@@ -370,14 +488,23 @@ fn desktop_main() -> ! {
                         .refresh_controls(framebuffer.width, framebuffer.height);
                 }
             }
-            if shell.window_geometry() != previous_scene { shell.scene_dirty.set(true); }
+            if shell.window_geometry() != previous_scene {
+                shell.scene_dirty.set(true);
+            }
             previous_buttons = mouse.buttons;
         }
         let cursor_kind = if shell.model.drag_window.is_some()
             || (cursor_y < framebuffer.height.saturating_sub(TASKBAR_HEIGHT) as i32
-                && !shell.model.popup_contains(cursor_x, cursor_y, framebuffer.width, framebuffer.height)) {
+                && !shell.model.popup_contains(
+                    cursor_x,
+                    cursor_y,
+                    framebuffer.width,
+                    framebuffer.height,
+                )) {
             shell.model.window_cursor_at(cursor_x, cursor_y)
-        } else { WindowCursor::Arrow };
+        } else {
+            WindowCursor::Arrow
+        };
         pointer_moved |= shell.cursor_kind != cursor_kind;
         shell.cursor_kind = cursor_kind;
         if pointer_full {
@@ -393,12 +520,20 @@ fn desktop_main() -> ! {
                 || shell.model.start_menu.open
                 || shell.model.flyout.is_some()
             {
-                if key == 13 || key == 10 { shell.scene_dirty.set(true); }
+                if key == 13 || key == 10 {
+                    shell.scene_dirty.set(true);
+                }
                 shell.model.handle_popup_key(key)
             } else {
                 shell.scene_dirty.set(true);
                 if (key == 13 || key == 10) && shell.model.selected_window.is_none() {
-                    shell.model.desktop.selected.first().copied().is_some_and(|index| shell.model.open_desktop_item(index))
+                    shell
+                        .model
+                        .desktop
+                        .selected
+                        .first()
+                        .copied()
+                        .is_some_and(|index| shell.model.open_desktop_item(index))
                 } else {
                     shell.model.handle_window_key(key)
                 }
@@ -413,43 +548,70 @@ fn desktop_main() -> ! {
                 key_pending = unsafe { arch::poll_key(&mut key) == 1 };
             }
         }
-        if shell.model.flush_application_input(ticks){shell.scene_dirty.set(true);redraw=true;}
+        if shell.model.flush_application_input(ticks) {
+            shell.scene_dirty.set(true);
+            redraw = true;
+        }
         for explorer in &mut shell.model.explorers {
-            if explorer.flush_input(&mut shell.model.files){shell.scene_dirty.set(true);redraw=true;}
+            if explorer.flush_input(&mut shell.model.files) {
+                shell.scene_dirty.set(true);
+                redraw = true;
+            }
         }
         // Give input priority, then service one cancellable directory-search batch.
-        let count=shell.model.explorers.len();
+        let count = shell.model.explorers.len();
         for step in 0..count {
-            let index=(next_explorer_job+step)%count;
+            let index = (next_explorer_job + step) % count;
             if shell.model.explorers[index].work_pending() {
                 shell.model.explorers[index].work(&mut shell.model.files);
-                next_explorer_job=(index+1)%count;
-                shell.scene_dirty.set(true);redraw=true;break;
+                next_explorer_job = (index + 1) % count;
+                shell.scene_dirty.set(true);
+                redraw = true;
+                break;
             }
         }
         // Round-robin volume polling also observes changes made by CMD and
         // other applications. At most one directory is read per interval.
-        if ticks>=next_directory_poll && count!=0 {
-            next_directory_poll=ticks.saturating_add(250);
-            let index=directory_poll_index%count;
-            directory_poll_index=(index+1)%count;
-            if shell.model.explorers[index].poll_directory(&mut shell.model.files){
-                shell.scene_dirty.set(true);redraw=true;
+        if ticks >= next_directory_poll && count != 0 {
+            next_directory_poll = ticks.saturating_add(250);
+            let index = directory_poll_index % count;
+            directory_poll_index = (index + 1) % count;
+            if shell.model.explorers[index].poll_directory(&mut shell.model.files) {
+                shell.scene_dirty.set(true);
+                redraw = true;
             }
         }
         if ticks >= next_process_poll {
             next_process_poll = ticks.saturating_add(1000);
-            let observers: alloc::vec::Vec<_> = shell.model.applications.iter().filter(|app|
-                matches!(app.id, nt61_desktop::applications::AppId::TaskManager
-                    | nt61_desktop::applications::AppId::SystemInformation
-                    | nt61_desktop::applications::AppId::ResourceMonitor))
-                .filter(|app| shell.model.taskbar.windows.iter().any(|w|
-                    w.id == app.window_id && !w.minimized)).map(|app| app.window_id).collect();
+            let observers: alloc::vec::Vec<_> = shell
+                .model
+                .applications
+                .iter()
+                .filter(|app| {
+                    matches!(
+                        app.id,
+                        nt61_desktop::applications::AppId::TaskManager
+                            | nt61_desktop::applications::AppId::SystemInformation
+                            | nt61_desktop::applications::AppId::ResourceMonitor
+                    )
+                })
+                .filter(|app| {
+                    shell
+                        .model
+                        .taskbar
+                        .windows
+                        .iter()
+                        .any(|w| w.id == app.window_id && !w.minimized)
+                })
+                .map(|app| app.window_id)
+                .collect();
             if !observers.is_empty() {
                 if let Ok(snapshot) = nt61_desktop::platform::services::processes() {
                     if shell.model.process_snapshot.as_ref() != Some(&snapshot) {
                         shell.model.process_snapshot = Some(snapshot);
-                        for id in observers { shell.mark_window_dirty(id); }
+                        for id in observers {
+                            shell.mark_window_dirty(id);
+                        }
                         redraw = true;
                     }
                 }
@@ -488,6 +650,67 @@ fn desktop_main() -> ! {
     }
 }
 
+fn union_rect(
+    a: Option<nt61_desktop::graphics::Rect>,
+    b: Option<nt61_desktop::graphics::Rect>,
+) -> Option<nt61_desktop::graphics::Rect> {
+    use nt61_desktop::graphics::Rect;
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            let x = a.x.min(b.x);
+            let y = a.y.min(b.y);
+            let right = (a.x + a.width as i32).max(b.x + b.width as i32);
+            let bottom = (a.y + a.height as i32).max(b.y + b.height as i32);
+            Some(Rect::new(x, y, (right - x) as u32, (bottom - y) as u32))
+        }
+        (a, b) => a.or(b),
+    }
+}
+
+fn fade_desktop(frame: &nt61_desktop::graphics::Surface, rgba: &mut [u8], duration: u64) {
+    use nt61_desktop::compositor::transition::{incremental_alpha, opacity};
+    arch::debug_str("[EXPLORER] desktop fade begin\r\n");
+    let start = arch::shell_ticks();
+    let mut previous = 0;
+    let mut next_frame = start;
+    loop {
+        let now = arch::shell_ticks();
+        if now < next_frame {
+            core::hint::spin_loop();
+            continue;
+        }
+        let current = opacity(now.saturating_sub(start), duration);
+        let alpha = incremental_alpha(previous, current);
+        if alpha > 0 {
+            for (pixel, out) in frame.pixels().iter().zip(rgba.chunks_exact_mut(4)) {
+                out.copy_from_slice(&[
+                    (pixel >> 16) as u8,
+                    (pixel >> 8) as u8,
+                    *pixel as u8,
+                    alpha,
+                ]);
+            }
+            // SAFETY: rgba contains width * height pixels at the supplied stride.
+            unsafe {
+                arch::draw_rgba(
+                    rgba.as_ptr(),
+                    0,
+                    0,
+                    frame.width(),
+                    frame.height(),
+                    frame.width() as usize * 4,
+                );
+            }
+        }
+        previous = current;
+        if current == 255 {
+            break;
+        }
+        next_frame = now.saturating_add(16);
+    }
+    arch::debug_str("[EXPLORER] desktop fade complete\r\n");
+}
+
 fn decoded_wallpaper() -> Option<png::Image> {
     png::decode_png(WALLPAPER_PNG).ok()
 }
@@ -510,16 +733,19 @@ struct CursorImage {
 impl CursorImage {
     fn load(bytes: &[u8]) -> Option<Self> {
         let (image, hotspot) = ico::decode_cur_preferred(bytes, 32).ok()?;
-        Some(Self { image, hotspot: (i32::from(hotspot.0), i32::from(hotspot.1)) })
+        Some(Self {
+            image,
+            hotspot: (i32::from(hotspot.0), i32::from(hotspot.1)),
+        })
     }
 }
 
 impl Shell {
     fn load() -> Option<Self> {
         let mut model = ShellModel::new(Theme::aero());
-        model.files = match nt61_desktop::file::FileSystem::mounted(
-            nt61_desktop::file::Backend(nt61_desktop::platform::services::transfer),
-        ) {
+        model.files = match nt61_desktop::file::FileSystem::mounted(nt61_desktop::file::Backend(
+            nt61_desktop::platform::services::transfer,
+        )) {
             Ok(files) => files,
             Err(_) => {
                 arch::debug_str("[EXPLORER] system volume mount failed\r\n");
@@ -550,12 +776,22 @@ impl Shell {
             12,
             300,
         );
+        // Load the default editor face alongside the chrome face. Launching a
+        // document and opening Font then reuse the process-local font library.
+        model
+            .fonts
+            .get(nt61_desktop::graphics::font::MONOSPACE_FONT)
+            .ok()?;
         Some(Self {
+            window_glass: core::cell::RefCell::new(aero::WindowGlassCache::default()),
             hovered_caption: None,
             hovered_application: None,
-            scene: core::cell::RefCell::new(nt61_desktop::compositor::scene::WindowScene::new(1, 1)),
+            scene: core::cell::RefCell::new(nt61_desktop::compositor::scene::WindowScene::new(
+                1, 1,
+            )),
             window_dirty: core::cell::Cell::new(None),
             scene_dirty: core::cell::Cell::new(true),
+            hover_damage: core::cell::Cell::new(None),
             computer: scaled_icon(resources_data::COMPUTER)?,
             network: scaled_icon(resources_data::NETWORK)?,
             recycle_bin: scaled_icon(resources_data::RECYCLE_BIN)?,
@@ -572,17 +808,28 @@ impl Shell {
             },
             cursor: CursorImage::load(CURSOR_CUR)?,
             resize_cursors: [
-                CursorImage::load(include_bytes!("../../../assets/windows7/cursors/aero_ew.cur"))?,
-                CursorImage::load(include_bytes!("../../../assets/windows7/cursors/aero_ns.cur"))?,
-                CursorImage::load(include_bytes!("../../../assets/windows7/cursors/aero_nwse.cur"))?,
-                CursorImage::load(include_bytes!("../../../assets/windows7/cursors/aero_nesw.cur"))?,
+                CursorImage::load(include_bytes!(
+                    "../../../assets/windows7/cursors/aero_ew.cur"
+                ))?,
+                CursorImage::load(include_bytes!(
+                    "../../../assets/windows7/cursors/aero_ns.cur"
+                ))?,
+                CursorImage::load(include_bytes!(
+                    "../../../assets/windows7/cursors/aero_nwse.cur"
+                ))?,
+                CursorImage::load(include_bytes!(
+                    "../../../assets/windows7/cursors/aero_nesw.cur"
+                ))?,
             ],
             cursor_kind: WindowCursor::Arrow,
             start_button_normal: png::decode_png(START_BUTTON_NORMAL_PNG).ok()?,
             start_button_hover: png::decode_png(START_BUTTON_HOVER_PNG).ok()?,
             start_button_pressed: png::decode_png(START_BUTTON_PRESSED_PNG).ok()?,
             wallpaper_asset: decoded_wallpaper()?,
-            fonts: font_view::FontPack::new(nt61_desktop::shell::layout::UI_FONT_SIZE)?,
+            fonts: font_view::FontPack::with_library(
+                nt61_desktop::shell::layout::UI_FONT_SIZE,
+                &model.fonts,
+            )?,
             model,
             wallpaper: nt61_desktop::graphics::Surface::new(1, 1),
             glass: nt61_desktop::graphics::Surface::new(1, 1),
@@ -601,16 +848,25 @@ impl Shell {
         }
         glass.copy_from(&wallpaper);
         glass.box_blur(aero::GLASS_BLUR_RADIUS);
-        glass.saturate(aero::GLASS_SATURATION);
-        glass.tint(aero::GLASS_TINT, aero::GLASS_TINT_STRENGTH);
+        aero::colorize_glass(&mut glass, aero::GLASS_TINT, aero::GLASS_SATURATION);
         self.wallpaper = wallpaper;
         self.glass = glass;
-        self.scene = core::cell::RefCell::new(nt61_desktop::compositor::scene::WindowScene::new(width, height));
+        self.scene = core::cell::RefCell::new(nt61_desktop::compositor::scene::WindowScene::new(
+            width, height,
+        ));
+        self.window_glass = core::cell::RefCell::new(aero::WindowGlassCache::default());
         self.scene_dirty.set(true);
     }
 
-    fn mark_window_dirty(&self,id:u32) {
-        if self.window_dirty.get().is_some_and(|previous|previous!=id) {self.scene_dirty.set(true);}
+    fn mark_window_dirty(&self, id: u32) {
+        self.hover_damage.set(None);
+        if self
+            .window_dirty
+            .get()
+            .is_some_and(|previous| previous != id)
+        {
+            self.scene_dirty.set(true);
+        }
         self.window_dirty.set(Some(id));
     }
 
@@ -619,8 +875,14 @@ impl Shell {
     fn window_geometry(&self) -> u64 {
         let mut key = self.model.selected_window.unwrap_or(0) as u64;
         for window in &self.model.taskbar.windows {
-            for value in [window.id, window.x as u32, window.y as u32,
-                window.width as u32, window.height as u32, window.minimized as u32] {
+            for value in [
+                window.id,
+                window.x as u32,
+                window.y as u32,
+                window.width as u32,
+                window.height as u32,
+                window.minimized as u32,
+            ] {
                 key = key.wrapping_mul(0x100000001b3) ^ value as u64;
             }
         }
@@ -633,23 +895,66 @@ impl Shell {
         frame: &mut nt61_desktop::graphics::Surface,
         output_pixels: &mut [u8],
     ) {
+        self.compose_desktop(framebuffer, frame);
+        let damage = self.scene.borrow().damage();
+        let has_overlay = self.model.start_menu.open
+            || self.model.context_menu.is_some()
+            || self.model.flyout.is_some();
+        if let Some(region) = damage.filter(|_| !has_overlay) {
+            use nt61_desktop::graphics::{present::update_rgba_region, Rect};
+            let changed = update_rgba_region(frame, output_pixels, region);
+            let taskbar = Rect::new(
+                0,
+                framebuffer.height.saturating_sub(TASKBAR_HEIGHT) as i32,
+                framebuffer.width,
+                TASKBAR_HEIGHT,
+            );
+            let changed_taskbar = update_rgba_region(frame, output_pixels, taskbar);
+            if let Some(changed) = union_rect(changed, changed_taskbar) {
+                present_surface_region(frame, output_pixels, changed);
+            }
+        } else {
+            present_surface_with(frame, output_pixels);
+        }
+    }
+
+    fn compose_desktop(
+        &self,
+        framebuffer: &arch::DesktopFramebufferInfo,
+        frame: &mut nt61_desktop::graphics::Surface,
+    ) {
         use nt61_desktop::compositor::scene::Repaint;
-        let plan=self.scene.borrow_mut().begin(frame,self.scene_dirty.replace(false),self.window_dirty.take());
+        let damage = self.hover_damage.take();
+        let dirty = self.window_dirty.take();
+        let selected = self.model.selected_window;
+        let all = self.scene_dirty.replace(false)
+            || damage.zip(dirty).is_some_and(|(rect, dirty)| {
+                let dirty_order = (Some(dirty) == selected, dirty);
+                self.window_glass
+                    .borrow()
+                    .intersects_blur(rect, |id| (Some(id) == selected, id) > dirty_order)
+            });
+        let plan = self.scene.borrow_mut().begin_region(
+            frame,
+            all,
+            dirty,
+            if all { None } else { damage },
+        );
         if plan != Repaint::None {
             if plan == Repaint::All {
                 frame.copy_from(&self.wallpaper);
                 self.draw_icons(frame, framebuffer);
             }
-            self.draw_windows(frame,plan);
+            self.draw_windows(frame, plan);
             self.scene.borrow_mut().finish(frame);
         }
+        frame.set_draw_clip(None);
         self.draw_taskbar(frame, framebuffer);
         if self.model.start_menu.open {
             self.draw_start_menu(frame, framebuffer);
         }
         self.draw_context_menu(frame, framebuffer);
         self.draw_flyout(frame, framebuffer);
-        present_surface_with(frame, output_pixels);
     }
 
     fn current_cursor(&self) -> &CursorImage {
@@ -664,22 +969,49 @@ impl Shell {
 
     fn cursor_bounds(&self, x: i32, y: i32) -> nt61_desktop::graphics::Rect {
         let cursor = self.current_cursor();
-        nt61_desktop::graphics::Rect::new(x - cursor.hotspot.0, y - cursor.hotspot.1,
-            cursor.image.width, cursor.image.height)
+        nt61_desktop::graphics::Rect::new(
+            x - cursor.hotspot.0,
+            y - cursor.hotspot.1,
+            cursor.image.width,
+            cursor.image.height,
+        )
     }
 
-    fn draw_cursor(&self, base: &nt61_desktop::graphics::Surface, x: i32, y: i32, scratch: &mut [u8]) {
+    fn draw_cursor(
+        &self,
+        base: &nt61_desktop::graphics::Surface,
+        x: i32,
+        y: i32,
+        scratch: &mut [u8],
+    ) {
         let bounds = self.cursor_bounds(x, y);
-        present_cursor_region(base, &self.current_cursor().image, bounds.x, bounds.y, scratch);
+        present_cursor_region(
+            base,
+            &self.current_cursor().image,
+            bounds.x,
+            bounds.y,
+            scratch,
+        );
     }
 
-    fn update_cursor(&self, base: &nt61_desktop::graphics::Surface, old: nt61_desktop::graphics::Rect,
-        x: i32, y: i32, output: &mut [u8], scratch: &mut [u8]) {
+    fn update_cursor(
+        &self,
+        base: &nt61_desktop::graphics::Surface,
+        old: nt61_desktop::graphics::Rect,
+        x: i32,
+        y: i32,
+        output: &mut [u8],
+        scratch: &mut [u8],
+    ) {
         present_surface_region(base, output, old);
         self.draw_cursor(base, x, y, scratch);
     }
 
-    fn draw_icons(&self, frame: &mut nt61_desktop::graphics::Surface, _fb: &arch::DesktopFramebufferInfo) {
+    fn draw_icons(
+        &self,
+        frame: &mut nt61_desktop::graphics::Surface,
+        _fb: &arch::DesktopFramebufferInfo,
+    ) {
         use nt61_desktop::{graphics::Rect, resources::ImageResource};
         for (index, item) in self.model.desktop.items.iter().enumerate() {
             let icon = match item.icon {
@@ -694,48 +1026,82 @@ impl Shell {
             let selected = self.model.desktop.selected.contains(&index);
             let hot = self.model.controls.hot() == CONTROL_DESKTOP_BASE + index as u32;
             // Paint the translucent selection behind both icon and label.
-            if selected || hot { aero::selection(frame, bounds, selected, hot); }
+            if selected || hot {
+                aero::selection(frame, bounds, selected, hot);
+            }
             let size = icon.width.min(icon.height).min(ICON_CELL);
             let x = bounds.x + (bounds.width - size) as i32 / 2;
-            blit_rgba(frame, &icon.pixels, icon.width as usize * 4, Rect::new(x, bounds.y + 4, size, size));
-            let text_x = bounds.x + bounds.width.saturating_sub(self.fonts.measure(&item.name)) as i32 / 2;
-            self.fonts.draw_labelled_onto(frame, &item.name, text_x, bounds.y + 68);
+            blit_rgba(
+                frame,
+                &icon.pixels,
+                icon.width as usize * 4,
+                Rect::new(x, bounds.y + 4, size, size),
+            );
+            let text_x =
+                bounds.x + bounds.width.saturating_sub(self.fonts.measure(&item.name)) as i32 / 2;
+            self.fonts
+                .draw_labelled_onto(frame, &item.name, text_x, bounds.y + 68);
         }
     }
 
-    fn draw_windows(&self, frame: &mut nt61_desktop::graphics::Surface, plan: nt61_desktop::compositor::scene::Repaint) {
+    fn draw_windows(
+        &self,
+        frame: &mut nt61_desktop::graphics::Surface,
+        plan: nt61_desktop::compositor::scene::Repaint,
+    ) {
         use nt61_desktop::compositor::scene::Repaint;
         let environment = self.model.application_environment();
+        let refresh_glass = plan == Repaint::All && self.scene.borrow().damage().is_none();
+        if refresh_glass {
+            self.window_glass.borrow_mut().retain(|id| {
+                self.model
+                    .taskbar
+                    .windows
+                    .iter()
+                    .any(|window| window.id == id && !window.minimized)
+            });
+        }
         let mut windows: alloc::vec::Vec<_> = self.model.taskbar.windows.iter().collect();
         windows.sort_by_key(|w| (Some(w.id) == self.model.selected_window, w.id));
-        let foremost=windows.iter().rev().find(|w|!w.minimized).map(|w|w.id);
+        let foremost = windows.iter().rev().find(|w| !w.minimized).map(|w| w.id);
         for window in windows {
             if window.minimized || matches!(plan,Repaint::Window(id) if id!=window.id) {
                 continue;
             }
-            if plan==Repaint::All && foremost==Some(window.id) {
-                self.scene.borrow_mut().save_beneath(frame,window.id);
+            if plan == Repaint::All && foremost == Some(window.id) {
+                self.scene.borrow_mut().save_beneath(frame, window.id);
             }
             let x = window.x;
             let y = window.y;
             let width = window.width.max(1) as u32;
             let height = window.height.max(1) as u32;
             let bounds = nt61_desktop::graphics::Rect::new(x as i32, y as i32, width, height);
-            aero::shadow(frame, bounds, 8);
-            aero::window_glass_frame(frame, bounds, &self.glass,
-                Some(window.id) == self.model.selected_window);
-            let caption = nt61_desktop::graphics::Rect::new(
-                x as i32 + 2,
-                y as i32 + 2,
-                width.saturating_sub(4),
-                28,
+            let shadow_bounds = nt61_desktop::graphics::Rect::new(
+                bounds.x - 8,
+                bounds.y - 8,
+                bounds.width + 16,
+                bounds.height + 16,
             );
-            aero::title_bar(frame, caption, &self.glass);
-            aero::blend_rect(
+            if frame
+                .drawing_bounds()
+                .intersection(&shadow_bounds)
+                .is_none()
+            {
+                continue;
+            }
+            let explorer_glass = matches!(
+                window.kind,
+                nt61_desktop::shell::WindowKind::Explorer
+                    | nt61_desktop::shell::WindowKind::Computer
+            );
+            self.window_glass.borrow_mut().prepare(
                 frame,
-                nt61_desktop::graphics::Rect::new(caption.x, caption.y + 27, caption.width, 1),
-                0x60FF_FFFF,
+                window.id,
+                bounds,
+                if explorer_glass { 36 } else { 0 },
+                refresh_glass,
             );
+            aero::shadow(frame, bounds, 8);
             let body = nt61_desktop::graphics::Rect::new(
                 x as i32 + 6,
                 y as i32 + 30,
@@ -743,11 +1109,23 @@ impl Shell {
                 height.saturating_sub(36),
             );
             aero::window_body(frame, body);
+            self.window_glass.borrow().paint(
+                frame,
+                window.id,
+                Some(window.id) == self.model.selected_window,
+            );
             match window.kind {
                 nt61_desktop::shell::WindowKind::Application(_) => {
-                    if let Some(app)=self.model.application(window.id) {
-                        nt61_desktop::applications::view::draw(app,frame,body,&environment,
-                            |frame,text,b,color|self.fonts.draw_fit(frame,text,b.x,b.y,b.width,color));
+                    if let Some(app) = self.model.application(window.id) {
+                        nt61_desktop::applications::view::draw(
+                            app,
+                            frame,
+                            body,
+                            &environment,
+                            |frame, text, b, color| {
+                                self.fonts.draw_fit(frame, text, b.x, b.y, b.width, color)
+                            },
+                        );
                     }
                 }
                 nt61_desktop::shell::WindowKind::Notepad => {
@@ -763,16 +1141,37 @@ impl Shell {
                 }
                 nt61_desktop::shell::WindowKind::Explorer
                 | nt61_desktop::shell::WindowKind::Computer => {
-                    if let Some(state)=self.model.explorers.iter().find(|e|e.window_id==window.id) {
-                        nt61_desktop::applications::explorer::draw(state,&self.model.files,frame,body,
-                            |frame,text,b,color|self.fonts.draw_fit(frame,text,b.x,b.y,b.width,color));
+                    if let Some(state) = self
+                        .model
+                        .explorers
+                        .iter()
+                        .find(|e| e.window_id == window.id)
+                    {
+                        nt61_desktop::applications::explorer::draw_on_glass(
+                            state,
+                            &self.model.files,
+                            frame,
+                            body,
+                            |frame, text, b, color| {
+                                self.fonts.draw_fit(frame, text, b.x, b.y, b.width, color)
+                            },
+                        );
                     }
                 }
                 nt61_desktop::shell::WindowKind::CommandPrompt => {
-                    if let Some(app)=self.model.application(window.id) {
-                        nt61_desktop::applications::view::draw(app,frame,body,&environment,
-                            |frame,text,b,color|self.fonts.draw_fit(frame,text,b.x,b.y,b.width,color));
-                    }else {self.draw_command_prompt(frame, body);}
+                    if let Some(app) = self.model.application(window.id) {
+                        nt61_desktop::applications::view::draw(
+                            app,
+                            frame,
+                            body,
+                            &environment,
+                            |frame, text, b, color| {
+                                self.fonts.draw_fit(frame, text, b.x, b.y, b.width, color)
+                            },
+                        );
+                    } else {
+                        self.draw_command_prompt(frame, body);
+                    }
                 }
                 nt61_desktop::shell::WindowKind::ShellSettings(kind) => {
                     self.draw_shell_settings(frame, body, kind);
@@ -805,25 +1204,72 @@ impl Shell {
                 0xD0FF_FFFF,
             );
             aero::window_border(frame, bounds, 6);
-            let title_x = window.x + 10;
-            let title_y = window.y + 7;
-            let title_width = width.saturating_sub(120);
-            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                self.fonts.draw_fit(frame, &window.title, title_x + dx, title_y + dy,
-                    title_width, 0x90FFFFFF);
+            let application = self.model.application(window.id);
+            if let Some(app) = application {
+                nt61_desktop::applications::icons::draw(
+                    frame,
+                    app.id,
+                    nt61_desktop::graphics::Rect::new(window.x + 8, window.y + 7, 16, 16),
+                );
             }
-            self.fonts.draw_fit(frame, &window.title, title_x, title_y,
-                title_width, 0xFF102030);
-            aero::window_control_group(frame, window.caption_control_group(),
-                Some(window.id) == self.model.selected_window);
-            for (index, (bounds, kind)) in window.caption_controls().into_iter().zip([
-                aero::WindowControlButtonKind::Minimize,
-                if window.maximized { aero::WindowControlButtonKind::Restore }
-                    else { aero::WindowControlButtonKind::Maximize },
-                aero::WindowControlButtonKind::Close,
-            ]).enumerate() {
-                aero::window_control_button(frame, bounds, kind,
-                    self.hovered_caption == Some((window.id, index as u8)));
+            if application.is_none() {
+                let name = match window.kind {
+                    nt61_desktop::shell::WindowKind::Computer
+                    | nt61_desktop::shell::WindowKind::System => "Computer",
+                    _ => "Folder",
+                };
+                nt61_desktop::applications::explorer::theme::icon(
+                    frame,
+                    name,
+                    nt61_desktop::graphics::Rect::new(window.x + 8, window.y + 7, 16, 16),
+                );
+            }
+            let title_x = window.x + 30;
+            let title_y = window.y + 7;
+            let title_width = width.saturating_sub(if application.is_some() { 140 } else { 120 });
+            for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                self.fonts.draw_fit(
+                    frame,
+                    &window.title,
+                    title_x + dx,
+                    title_y + dy,
+                    title_width,
+                    0x90FFFFFF,
+                );
+            }
+            self.fonts.draw_fit(
+                frame,
+                &window.title,
+                title_x,
+                title_y,
+                title_width,
+                0xFF102030,
+            );
+            aero::window_control_group(
+                frame,
+                window.caption_control_group(),
+                Some(window.id) == self.model.selected_window,
+            );
+            for (index, (bounds, kind)) in window
+                .caption_controls()
+                .into_iter()
+                .zip([
+                    aero::WindowControlButtonKind::Minimize,
+                    if window.maximized {
+                        aero::WindowControlButtonKind::Restore
+                    } else {
+                        aero::WindowControlButtonKind::Maximize
+                    },
+                    aero::WindowControlButtonKind::Close,
+                ])
+                .enumerate()
+            {
+                aero::window_control_button(
+                    frame,
+                    bounds,
+                    kind,
+                    self.hovered_caption == Some((window.id, index as u8)),
+                );
             }
         }
     }
@@ -992,19 +1438,52 @@ impl Shell {
         let items = self.model.context_menu_items();
         aero::menu_surface(frame, bounds);
         for (index, item) in items.iter().enumerate() {
-            let Some(row) = self.model.context_item_bounds(index, framebuffer.width, framebuffer.height) else { continue; };
+            let Some(row) =
+                self.model
+                    .context_item_bounds(index, framebuffer.width, framebuffer.height)
+            else {
+                continue;
+            };
             if item.0.is_empty() {
-                frame.fill_rect(row.x+29,row.y+3,row.width.saturating_sub(32),1,0xFFD7D7D7);
-                frame.fill_rect(row.x+29,row.y+4,row.width.saturating_sub(32),1,0xFFFFFFFF);
+                frame.fill_rect(
+                    row.x + 29,
+                    row.y + 3,
+                    row.width.saturating_sub(32),
+                    1,
+                    0xFFD7D7D7,
+                );
+                frame.fill_rect(
+                    row.x + 29,
+                    row.y + 4,
+                    row.width.saturating_sub(32),
+                    1,
+                    0xFFFFFFFF,
+                );
                 continue;
             }
             let enabled = self.model.context_item_enabled(index);
             let id = nt61_desktop::shell::CONTROL_CONTEXT_MENU_BASE + index as u32;
-            let highlighted = enabled && (self.model.controls.hot() == id || self.model.controls.focus() == id);
+            let highlighted =
+                enabled && (self.model.controls.hot() == id || self.model.controls.focus() == id);
             aero::menu_item(frame, row, highlighted);
-            self.fonts.draw_color(frame,item.0,row.x+32,row.y+4, if enabled { 0xFF111111 } else { 0xFF8C8C8C });
+            self.fonts.draw_color(
+                frame,
+                item.0,
+                row.x + 32,
+                row.y + 4,
+                if enabled { 0xFF111111 } else { 0xFF8C8C8C },
+            );
             if self.model.context_submenu_group(index).is_some() {
-                aero::arrow_right(frame, nt61_desktop::graphics::Rect::new(row.x+row.width as i32-13,row.y+8,5,8), 0xFF111111);
+                aero::arrow_right(
+                    frame,
+                    nt61_desktop::graphics::Rect::new(
+                        row.x + row.width as i32 - 13,
+                        row.y + 8,
+                        5,
+                        8,
+                    ),
+                    0xFF111111,
+                );
             }
         }
         if let Some(submenu) = self
@@ -1019,15 +1498,18 @@ impl Shell {
                 let item_bounds =
                     nt61_desktop::graphics::Rect::new(submenu.x + 4, item_y, submenu.width - 8, 28);
                 let enabled = ShellModel::submenu_item_enabled(group.unwrap(), index);
-                let highlighted = enabled && self.model.controls.hot() == CONTROL_SUBMENU_BASE + index as u32;
+                let highlighted =
+                    enabled && self.model.controls.hot() == CONTROL_SUBMENU_BASE + index as u32;
                 aero::menu_item(frame, item_bounds, highlighted);
                 let checked = match group.unwrap() {
                     nt61_desktop::shell::MenuGroup::DesktopView => index == 1,
-                    nt61_desktop::shell::MenuGroup::DesktopSortBy => match self.model.desktop.sort_mode {
-                        nt61_desktop::shell::SortMode::Name => index == 0,
-                        nt61_desktop::shell::SortMode::Type => index == 2,
-                        _ => false,
-                    },
+                    nt61_desktop::shell::MenuGroup::DesktopSortBy => {
+                        match self.model.desktop.sort_mode {
+                            nt61_desktop::shell::SortMode::Name => index == 0,
+                            nt61_desktop::shell::SortMode::Type => index == 2,
+                            _ => false,
+                        }
+                    }
                     _ => false,
                 };
                 if checked {
@@ -1192,34 +1674,74 @@ fn present_surface_with(surface: &nt61_desktop::graphics::Surface, pixels: &mut 
     }
 }
 
-fn present_surface_region(surface: &nt61_desktop::graphics::Surface, pixels: &mut [u8], region: nt61_desktop::graphics::Rect) {
+fn present_surface_region(
+    surface: &nt61_desktop::graphics::Surface,
+    pixels: &mut [u8],
+    region: nt61_desktop::graphics::Rect,
+) {
     let stride = surface.width() as usize * 4;
-    if pixels.len() < stride * surface.height() as usize { return; }
+    if pixels.len() < stride * surface.height() as usize {
+        return;
+    }
     let screen = nt61_desktop::graphics::Rect::new(0, 0, surface.width(), surface.height());
-    let Some(clip) = screen.intersection(&region) else { return; };
+    let Some(clip) = screen.intersection(&region) else {
+        return;
+    };
     let offset = clip.y as usize * stride + clip.x as usize * 4;
     // SAFETY: clipped rectangle is in the persistent staging allocation;
     // draw_rgba reads only the visible width on each row at the supplied stride.
-    unsafe { arch::draw_rgba(pixels.as_ptr().add(offset), clip.x as u32, clip.y as u32, clip.width, clip.height, stride); }
+    unsafe {
+        arch::draw_rgba(
+            pixels.as_ptr().add(offset),
+            clip.x as u32,
+            clip.y as u32,
+            clip.width,
+            clip.height,
+            stride,
+        );
+    }
 }
 
-fn present_cursor_region(base: &nt61_desktop::graphics::Surface, cursor: &png::Image, x: i32, y: i32, scratch: &mut [u8]) {
-    use nt61_desktop::graphics::{Rect, present::cursor_over};
+fn present_cursor_region(
+    base: &nt61_desktop::graphics::Surface,
+    cursor: &png::Image,
+    x: i32,
+    y: i32,
+    scratch: &mut [u8],
+) {
+    use nt61_desktop::graphics::{present::cursor_over, Rect};
     let bounds = Rect::new(x, y, cursor.width, cursor.height);
     let screen = Rect::new(0, 0, base.width(), base.height());
-    let Some(clip) = screen.intersection(&bounds) else { return; };
+    let Some(clip) = screen.intersection(&bounds) else {
+        return;
+    };
     let stride = clip.width as usize * 4;
-    if scratch.len() < stride * clip.height as usize { return; }
+    if scratch.len() < stride * clip.height as usize {
+        return;
+    }
     for row in 0..clip.height {
         for column in 0..clip.width {
             let (dx, dy) = (clip.x as u32 + column, clip.y as u32 + row);
-            let source = (((dy as i32 - y) as u32 * cursor.width + (dx as i32 - x) as u32) * 4) as usize;
+            let source =
+                (((dy as i32 - y) as u32 * cursor.width + (dx as i32 - x) as u32) * 4) as usize;
             let target = row as usize * stride + column as usize * 4;
-            scratch[target..target + 4].copy_from_slice(&cursor_over(base.pixel(dx, dy).unwrap_or(0), &cursor.pixels[source..source+4]));
+            scratch[target..target + 4].copy_from_slice(&cursor_over(
+                base.pixel(dx, dy).unwrap_or(0),
+                &cursor.pixels[source..source + 4],
+            ));
         }
     }
     // SAFETY: scratch holds the complete clipped cursor rectangle.
-    unsafe { arch::draw_rgba(scratch.as_ptr(), clip.x as u32, clip.y as u32, clip.width, clip.height, stride); }
+    unsafe {
+        arch::draw_rgba(
+            scratch.as_ptr(),
+            clip.x as u32,
+            clip.y as u32,
+            clip.width,
+            clip.height,
+            stride,
+        );
+    }
 }
 
 fn draw_fallback_desktop(framebuffer: &arch::DesktopFramebufferInfo) {
@@ -1227,8 +1749,7 @@ fn draw_fallback_desktop(framebuffer: &arch::DesktopFramebufferInfo) {
     draw_wallpaper_into(&mut surface, framebuffer.width, framebuffer.height);
     let mut glass = surface.clone();
     glass.box_blur(aero::GLASS_BLUR_RADIUS);
-    glass.saturate(aero::GLASS_SATURATION);
-    glass.tint(aero::GLASS_TINT, aero::GLASS_TINT_STRENGTH);
+    aero::colorize_glass(&mut glass, aero::GLASS_TINT, aero::GLASS_SATURATION);
     aero::glass_bar_precomputed(
         &mut surface,
         nt61_desktop::graphics::Rect::new(

@@ -38,6 +38,8 @@ pub struct DesktopMouseState {
     pub x: i32,
     pub y: i32,
     pub buttons: u32,
+    /// Signed vertical wheel notches in this completed report.
+    pub wheel: i32,
 }
 
 pub fn shell_time() -> u64 {

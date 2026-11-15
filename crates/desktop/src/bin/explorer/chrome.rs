@@ -56,7 +56,7 @@ impl Shell {
     fn program_icon(&self, frame: &mut Surface, program: StartProgram, b: Rect) {
         match program {
             StartProgram::Folder(_) => image(frame,&self.folder,b),
-            StartProgram::Application(id) => nt61_desktop::applications::icons::draw(frame,id,b),            StartProgram::Notepad => image(frame, &self.document, b),
+            StartProgram::Application(id) => nt61_desktop::applications::icons::draw(frame,id,b),            StartProgram::Notepad => nt61_desktop::applications::icons::draw(frame,nt61_desktop::applications::AppId::Notepad,b),
             StartProgram::Computer => image(frame, &self.computer, b),
             StartProgram::Explorer => image(frame, &self.folder, b),
             StartProgram::CommandPrompt => {
@@ -69,6 +69,13 @@ impl Shell {
         }
     }
     pub(super) fn draw_namespace_window(&self, frame: &mut Surface, body: Rect, kind: WindowKind) {
+        if kind == WindowKind::System {
+            nt61_desktop::applications::explorer::system::draw(
+                frame, body, self.model.process_snapshot.as_ref().map(|s| s.cpu_count),
+                |frame, value, rect, color| self.label(frame, value, rect, color),
+            );
+            return;
+        }
         frame.fill_rect(body.x,body.y,body.width,body.height,0xFFFFFFFF);
         let heading = match kind {
             WindowKind::System => "View basic information about your computer",
