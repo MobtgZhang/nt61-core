@@ -100,21 +100,27 @@ pub fn parse(bytes: &[u8]) -> Option<PeImage> {
         return None;
     }
     let magic = u16::from_le_bytes([bytes[opt], bytes[opt + 1]]);
-    if magic != 0x20B {
+    if magic != 0x20B && magic != 0x10B {
         return None;
     }
 
     let entry_point = read_u32(bytes, opt + 0x10);
-    let image_base = read_u64(bytes, opt + 0x18);
+    let pe32 = magic == 0x10b;
+    let image_base = if pe32 {
+        u64::from(read_u32(bytes, opt + 0x1c))
+    } else {
+        read_u64(bytes, opt + 0x18)
+    };
     let size_of_image = read_u32(bytes, opt + 0x38);
     let size_of_headers = read_u32(bytes, opt + 0x3C);
     let subsystem = u16::from_le_bytes([bytes[opt + 0x44], bytes[opt + 0x45]]);
     let dll_characteristics = u16::from_le_bytes([bytes[opt + 0x46], bytes[opt + 0x47]]);
-    let number_of_rva_and_sizes = read_u32(bytes, opt + 0x6C) as usize;
+    let directory_offset = if pe32 { 0x60 } else { 0x70 };
+    let number_of_rva_and_sizes = read_u32(bytes, opt + directory_offset - 4) as usize;
 
     let mut data_directories = Vec::with_capacity(number_of_rva_and_sizes);
     for index in 0..number_of_rva_and_sizes {
-        let at = opt + 0x70 + index * 8;
+        let at = opt + directory_offset + index * 8;
         if at + 8 > bytes.len() {
             break;
         }
@@ -249,18 +255,23 @@ pub fn parse(bytes: &[u8]) -> Option<PeImage> {
                 let table = if ilt_rva != 0 { ilt_rva } else { iat_rva };
                 let mut entry_index = 0u32;
                 loop {
-                    let entry = rva_to_file(table + entry_index * 8);
+                    let width = if pe32 { 4 } else { 8 };
+                    let entry = rva_to_file(table + entry_index * width);
                     let Some(entry_offset) = entry else {
                         break;
                     };
-                    if entry_offset + 8 > bytes.len() {
+                    if entry_offset + width as usize > bytes.len() {
                         break;
                     }
-                    let value = read_u64(bytes, entry_offset);
+                    let value = if pe32 {
+                        u64::from(read_u32(bytes, entry_offset))
+                    } else {
+                        read_u64(bytes, entry_offset)
+                    };
                     if value == 0 {
                         break;
                     }
-                    if value & (1u64 << 63) == 0 {
+                    if value & (if pe32 { 1u64 << 31 } else { 1u64 << 63 }) == 0 {
                         let rva = (value & 0x7FFF_FFFF) as u32;
                         symbols.push(read_cstr(rva + 2));
                     } else {

@@ -113,6 +113,74 @@ fn export_directory_lists_names_ordinals_and_forwarders() {
 }
 
 #[test]
+fn sparse_exports_preserve_original_ordinals_sorted_names_and_forwarder_slots() {
+    for machine in [MACHINE_AMD64, 0x14c] {
+        let mut spec = sample_dll();
+        spec.machine = machine;
+        spec.image_base = 0x6000_0000;
+        // Input order, ordinal order, name order and dense EAT indices all
+        // differ. In particular, the forwarders must use slots 3 and 13,
+        // rather than their indices in the list of supplied exports.
+        spec.exports = vec![
+            ExportSymbol::Forwarder {
+                name: "Beta".into(), ordinal: 1325, target: "kernel32.#17".into(),
+            },
+            ExportSymbol::ByName {
+                name: "Zebra".into(), ordinal: 1312, rva: 0x1010,
+            },
+            ExportSymbol::ByName {
+                name: "Middle".into(), ordinal: 1320, rva: 0x1020,
+            },
+            ExportSymbol::ByOrdinal { ordinal: 1314, rva: 0x1030 },
+            ExportSymbol::Forwarder {
+                name: "Alpha".into(), ordinal: 1315, target: "ntdll.RtlZeroMemory".into(),
+            },
+        ];
+        let (bytes, report) = pe::emit(&spec);
+        assert_eq!(report.export_count, 5);
+        assert_eq!(report.forwarder_count, 2);
+        let image = pe_read::parse(&bytes).expect("parse sparse exports");
+        let file_offset = |rva: u32| {
+            let section = image.sections.iter().find(|s| {
+                rva >= s.virtual_address && rva < s.virtual_address + s.size_of_raw_data
+            }).expect("RVA has file backing");
+            (section.pointer_to_raw_data + rva - section.virtual_address) as usize
+        };
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let directory = file_offset(image.data_directories[0].0);
+        assert_eq!(u32_at(directory + 16), 1312, "Base must preserve the first ordinal");
+        assert_eq!(u32_at(directory + 20), 14, "EAT includes unassigned ordinals");
+        assert_eq!(u32_at(directory + 24), 4);
+        let functions = file_offset(u32_at(directory + 28));
+        let names = file_offset(u32_at(directory + 32));
+        let ordinals = file_offset(u32_at(directory + 36));
+        for index in [1usize, 4, 5, 6, 7, 9, 10, 11, 12] {
+            assert_eq!(u32_at(functions + index * 4), 0, "hole {index} stays null");
+        }
+        for (index, (name, slot)) in [("Alpha", 3u16), ("Beta", 13), ("Middle", 8), ("Zebra", 0)]
+            .into_iter().enumerate()
+        {
+            let at = file_offset(u32_at(names + index * 4));
+            let end = bytes[at..].iter().position(|b| *b == 0).unwrap() + at;
+            assert_eq!(&bytes[at..end], name.as_bytes(), "name table is lexically sorted");
+            let actual_slot = u16::from_le_bytes(bytes[ordinals + index * 2..ordinals + index * 2 + 2]
+                .try_into().unwrap());
+            assert_eq!(actual_slot, slot, "name ordinal is unbiased EAT slot");
+        }
+        for (ordinal, rva) in [(1312, 0x1010), (1314, 0x1030), (1320, 0x1020)] {
+            assert_eq!(image.exports_by_ordinal.get(&ordinal), Some(&rva));
+        }
+        assert_eq!(image.exports_by_name.get("Zebra"), Some(&0x1010));
+        assert_eq!(image.exports_by_name.get("Middle"), Some(&0x1020));
+        for (name, ordinal, target) in [("Alpha", 1315, "ntdll.RtlZeroMemory"),
+                                      ("Beta", 1325, "kernel32.#17")] {
+            assert_eq!(image.forwarders.get(name).map(String::as_str), Some(target));
+            assert_eq!(image.exports_by_name.get(name), image.exports_by_ordinal.get(&ordinal));
+        }
+    }
+}
+
+#[test]
 fn import_directory_lists_modules_and_symbols() {
     let spec = sample_dll();
     let (bytes, report) = pe::emit(&spec);
@@ -391,4 +459,29 @@ fn the_loader_can_rebase_a_relocatable_image() {
         .lookup("user32.dll", "GetLastError")
         .expect("GetLastError must be exported");
     assert_eq!(address, actual + 0x1010);
+}
+
+#[test]
+fn pe32_uses_i386_headers_four_byte_imports_and_highlow_relocations() {
+    let mut spec = sample_dll();
+    spec.machine = 0x14c;
+    spec.image_base = 0x6000_0000;
+    let (bytes, _) = pe::emit(&spec);
+    let image = pe_read::parse(&bytes).expect("parse PE32");
+    assert_eq!(image.magic, 0x10b);
+    assert_eq!(image.machine, 0x14c);
+    assert_eq!(image.image_base, 0x6000_0000);
+    assert_eq!(image.imports.len(), 1);
+    assert_eq!(
+        image.imports[0].symbols[0].as_deref(),
+        Some("NtUserWaitMessage")
+    );
+    assert_eq!(image.imports[0].ordinals, vec![7]);
+    assert_eq!(image.relocations, vec![0x1018, 0x1028, 0x1038]);
+    let section = image.sections.iter().find(|s| s.name == ".reloc").unwrap();
+    let at = section.pointer_to_raw_data as usize + 8;
+    assert_eq!(
+        u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) >> 12,
+        3
+    );
 }

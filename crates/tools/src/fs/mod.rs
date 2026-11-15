@@ -25,6 +25,7 @@ pub mod ntfs;
 pub mod partition;
 pub mod pe;
 pub mod pe_read;
+pub mod pe_exports;
 pub mod qcow2;
 pub mod refs;
 pub mod remove;

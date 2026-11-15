@@ -327,6 +327,8 @@ pub struct PeEmitReport {
 /// through the returned [`PeEmitReport`].
 pub fn emit(spec: &PeImageSpec) -> (Vec<u8>, PeEmitReport) {
     let mut report = PeEmitReport::default();
+    let pe32 = spec.machine == 0x014c;
+    let optional_size = if pe32 { 224u16 } else { 240u16 };
 
     // -----------------------------------------------------------------
     //  Phase 1 — build the directory blobs
@@ -353,7 +355,7 @@ pub fn emit(spec: &PeImageSpec) -> (Vec<u8>, PeEmitReport) {
     let reloc_blob = if spec.relocations.is_empty() {
         Vec::new()
     } else {
-        build_base_relocation_table(&spec.relocations)
+        build_base_relocation_table_typed(&spec.relocations, if pe32 { 3 } else { 10 })
     };
 
     report.export_count = spec.exports.len();
@@ -450,7 +452,7 @@ pub fn emit(spec: &PeImageSpec) -> (Vec<u8>, PeEmitReport) {
         import_dir_rva = import_base;
         import_dir_size = import_blob.len() as u32;
         let mut blob = import_blob;
-        relocate_import_blob(&mut blob, import_base);
+        relocate_import_blob(&mut blob, import_base, pe32);
         let at = (rdata_prefix_len + export_blob.blob.len() as u32) as usize;
         placed[rdata_index].data[at..at + blob.len()].copy_from_slice(&blob);
     }
@@ -504,7 +506,7 @@ pub fn emit(spec: &PeImageSpec) -> (Vec<u8>, PeEmitReport) {
     image[coff..coff + 2].copy_from_slice(&spec.machine.to_le_bytes());
     image[coff + 2..coff + 4].copy_from_slice(&(placed.len() as u16).to_le_bytes());
     image[coff + 4..coff + 8].copy_from_slice(&0x2024_1118u32.to_le_bytes());
-    image[coff + 16..coff + 18].copy_from_slice(&240u16.to_le_bytes());
+    image[coff + 16..coff + 18].copy_from_slice(&optional_size.to_le_bytes());
     let mut characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE;
     if spec.is_dll {
         characteristics |= IMAGE_FILE_DLL;
@@ -517,7 +519,7 @@ pub fn emit(spec: &PeImageSpec) -> (Vec<u8>, PeEmitReport) {
     //  Optional header (PE32+)
     // -----------------------------------------------------------------
     let opt = 0x98usize;
-    image[opt..opt + 2].copy_from_slice(&0x020Bu16.to_le_bytes()); // PE32+
+    image[opt..opt + 2].copy_from_slice(&(if pe32 { 0x010bu16 } else { 0x020bu16 }).to_le_bytes());
     image[opt + 2..opt + 3].copy_from_slice(&[14u8]); // linker major
     image[opt + 3..opt + 4].copy_from_slice(&[0u8]); // linker minor
     let size_of_code: u32 = placed
@@ -534,7 +536,16 @@ pub fn emit(spec: &PeImageSpec) -> (Vec<u8>, PeEmitReport) {
     image[opt + 8..opt + 12].copy_from_slice(&size_of_init_data.to_le_bytes());
     image[opt + 16..opt + 20].copy_from_slice(&spec.entry_point_rva.to_le_bytes());
     image[opt + 20..opt + 24].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
-    image[opt + 24..opt + 32].copy_from_slice(&spec.image_base.to_le_bytes());
+    if pe32 {
+        assert!(
+            spec.image_base <= u32::MAX as u64,
+            "PE32 base must fit the guest ISA"
+        );
+        image[opt + 24..opt + 28].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
+        image[opt + 28..opt + 32].copy_from_slice(&(spec.image_base as u32).to_le_bytes());
+    } else {
+        image[opt + 24..opt + 32].copy_from_slice(&spec.image_base.to_le_bytes());
+    }
     image[opt + 32..opt + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
     image[opt + 36..opt + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
     // Windows 7 SP1 version numbers.
@@ -553,14 +564,29 @@ pub fn emit(spec: &PeImageSpec) -> (Vec<u8>, PeEmitReport) {
             | IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE
     };
     image[opt + 70..opt + 72].copy_from_slice(&dll_characteristics.to_le_bytes());
-    image[opt + 72..opt + 80].copy_from_slice(&0x0010_0000u64.to_le_bytes());
-    image[opt + 80..opt + 88].copy_from_slice(&0x1000u64.to_le_bytes());
-    image[opt + 88..opt + 96].copy_from_slice(&0x0010_0000u64.to_le_bytes());
-    image[opt + 96..opt + 104].copy_from_slice(&0x1000u64.to_le_bytes());
-    image[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
-
-    // Data directories (16 entries, starting at opt + 112).
-    let dd = opt + 112;
+    let dd = if pe32 {
+        for (offset, value) in [
+            (72, 0x10_0000u32),
+            (76, 0x1000),
+            (80, 0x10_0000),
+            (84, 0x1000),
+            (92, 16),
+        ] {
+            image[opt + offset..opt + offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        opt + 96
+    } else {
+        for (offset, value) in [
+            (72, 0x10_0000u64),
+            (80, 0x1000),
+            (88, 0x10_0000),
+            (96, 0x1000),
+        ] {
+            image[opt + offset..opt + offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        image[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        opt + 112
+    };
     let mut set_dir = |index: usize, rva: u32, size: u32| {
         if rva == 0 && size == 0 {
             return;
@@ -576,7 +602,7 @@ pub fn emit(spec: &PeImageSpec) -> (Vec<u8>, PeEmitReport) {
     // -----------------------------------------------------------------
     //  Section table
     // -----------------------------------------------------------------
-    let sect_table = opt + 240;
+    let sect_table = opt + optional_size as usize;
     for (index, section) in placed.iter().enumerate() {
         let at = sect_table + index * 40;
         let mut name_bytes = [0u8; 8];
@@ -643,8 +669,8 @@ pub fn align_up(value: u32, alignment: u32) -> u32 {
 /// address-of-functions table hold forwarders, so the relocation pass
 /// knows exactly which entries are pointers and which are code.
 fn build_export_directory(spec: &PeImageSpec) -> ExportBlob {
-    // Collect the exports in ordinal order. The ordinal is the index
-    // into the address-of-functions table.
+    // A public ordinal is Base + EAT index. Sorting the supplied exports
+    // does not make them dense: missing ordinals must keep zero EAT slots.
     let mut slots: Vec<Slot> = Vec::new();
     for export in &spec.exports {
         match export {
@@ -670,13 +696,20 @@ fn build_export_directory(spec: &PeImageSpec) -> ExportBlob {
         }
     }
     slots.sort_by_key(|entry| entry.ordinal);
+    let ordinal_base = slots.first().map_or(1, |slot| slot.ordinal);
+    let function_count = slots.last().map_or(0, |slot| {
+        usize::from(slot.ordinal) - usize::from(ordinal_base) + 1
+    });
+    let eat_index = |slot: &Slot| usize::from(slot.ordinal) - usize::from(ordinal_base);
 
-    // The named exports, in the same order.
-    let named_indices: Vec<usize> = slots
+    // PE name lookup uses a lexically sorted name-pointer table. The parallel
+    // ordinal table contains the unbiased EAT index, not the supplied index.
+    let mut named_indices: Vec<usize> = slots
         .iter()
         .enumerate()
         .filter_map(|(index, slot)| slot.name.as_ref().map(|_| index))
         .collect();
+    named_indices.sort_by(|a, b| slots[*a].name.cmp(&slots[*b].name));
 
     // Layout of the blob:
     //   0x00  IMAGE_EXPORT_DIRECTORY (40 bytes)
@@ -688,7 +721,7 @@ fn build_export_directory(spec: &PeImageSpec) -> ExportBlob {
     //         export name strings
     const DIRECTORY_SIZE: usize = 40;
     let functions_off = DIRECTORY_SIZE;
-    let names_off = functions_off + slots.len() * 4;
+    let names_off = functions_off + function_count * 4;
     let ordinals_off = names_off + named_indices.len() * 4;
     let strings_off = ordinals_off + named_indices.len() * 2;
 
@@ -706,9 +739,9 @@ fn build_export_directory(spec: &PeImageSpec) -> ExportBlob {
     // The forwarder strings must live *inside* the export directory
     // range; that is what tells the loader the slot is a forwarder.
     let mut forwarder_offsets: BTreeMap<usize, u32> = BTreeMap::new();
-    for (index, slot) in slots.iter().enumerate() {
+    for slot in &slots {
         if let SlotKind::Forwarder(target) = &slot.kind {
-            forwarder_offsets.insert(index, put_cstr(&mut blob, target));
+            forwarder_offsets.insert(eat_index(slot), put_cstr(&mut blob, target));
         }
     }
 
@@ -721,7 +754,8 @@ fn build_export_directory(spec: &PeImageSpec) -> ExportBlob {
     }
 
     // Address of functions.
-    for (index, slot) in slots.iter().enumerate() {
+    for slot in &slots {
+        let index = eat_index(slot);
         let value = match &slot.kind {
             SlotKind::Code(rva) => *rva,
             SlotKind::Forwarder(_) => forwarder_offsets.get(&index).copied().unwrap_or(0),
@@ -737,14 +771,14 @@ fn build_export_directory(spec: &PeImageSpec) -> ExportBlob {
     // Address of name ordinals: the slot index for each named export.
     for (index, slot_index) in named_indices.iter().enumerate() {
         let at = ordinals_off + index * 2;
-        blob[at..at + 2].copy_from_slice(&(*slot_index as u16).to_le_bytes());
+        blob[at..at + 2].copy_from_slice(&(eat_index(&slots[*slot_index]) as u16).to_le_bytes());
     }
 
     // The directory header.
     let mut header = [0u8; DIRECTORY_SIZE];
     header[12..16].copy_from_slice(&module_name_off.to_le_bytes());
-    header[16..20].copy_from_slice(&1u32.to_le_bytes()); // ordinal base
-    header[20..24].copy_from_slice(&(slots.len() as u32).to_le_bytes());
+    header[16..20].copy_from_slice(&u32::from(ordinal_base).to_le_bytes());
+    header[20..24].copy_from_slice(&(function_count as u32).to_le_bytes());
     header[24..28].copy_from_slice(&(named_indices.len() as u32).to_le_bytes());
     header[28..32].copy_from_slice(&(functions_off as u32).to_le_bytes());
     header[32..36].copy_from_slice(&(names_off as u32).to_le_bytes());
@@ -754,14 +788,14 @@ fn build_export_directory(spec: &PeImageSpec) -> ExportBlob {
     ExportBlob {
         blob,
         forwarder_slots: forwarder_offsets.keys().copied().collect(),
-        function_table_len: slots.len(),
+        function_table_len: function_count,
         name_count: named_indices.len(),
     }
 }
 
 /// One export slot in the address-of-functions table.
 struct Slot {
-    /// The 1-based ordinal.
+    /// The public ordinal, before subtracting the export directory Base.
     ordinal: u16,
     /// The exported name, if the export is named.
     name: Option<String>,
@@ -866,7 +900,7 @@ fn relocate_export_blob(blob: &mut [u8], base_rva: u32, meta: &ExportBlob) {
 /// ```
 ///
 /// plus every ILT and IAT entry that carries a hint/name RVA.
-fn relocate_import_blob(blob: &mut [u8], base_rva: u32) {
+fn relocate_import_blob(blob: &mut [u8], base_rva: u32, pe32: bool) {
     fn read_u32(blob: &[u8], at: usize) -> u32 {
         u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]])
     }
@@ -898,16 +932,31 @@ fn relocate_import_blob(blob: &mut [u8], base_rva: u32) {
         // The ILT and the IAT hold the same values.
         for table in [ilt as usize, iat as usize] {
             let mut entry = table;
-            while entry + 8 <= blob.len() {
-                let value = read_u64(blob, entry);
+            let width = if pe32 { 4 } else { 8 };
+            let flag = if pe32 {
+                u64::from(IMAGE_ORDINAL_FLAG32)
+            } else {
+                IMAGE_ORDINAL_FLAG64
+            };
+            while entry + width <= blob.len() {
+                let value = if pe32 {
+                    u64::from(read_u32(blob, entry))
+                } else {
+                    read_u64(blob, entry)
+                };
                 if value == 0 {
                     break;
                 }
                 // `IMAGE_ORDINAL_FLAG64` **clear** => hint/name RVA.
-                if value & IMAGE_ORDINAL_FLAG64 == 0 {
-                    write_u64(blob, entry, u64::from(base_rva) + (value & 0x7FFF_FFFF));
+                if value & flag == 0 {
+                    let relocated = u64::from(base_rva) + value;
+                    if pe32 {
+                        write_u32(blob, entry, relocated as u32);
+                    } else {
+                        write_u64(blob, entry, relocated);
+                    }
                 }
-                entry += 8;
+                entry += width;
             }
         }
         at += descriptor_size;
@@ -919,6 +968,8 @@ fn relocate_import_blob(blob: &mut [u8], base_rva: u32) {
 /// As with the export directory, all internal pointers are
 /// blob-relative offsets.
 fn build_import_directory(spec: &PeImageSpec) -> Vec<u8> {
+    let pe32 = spec.machine == 0x014c;
+    let width = if pe32 { 4 } else { 8 };
     // Layout:
     //   descriptors: 20 * (module_count + 1)
     //   then per module: ILT, IAT, hint/name entries, DLL name
@@ -954,9 +1005,9 @@ fn build_import_directory(spec: &PeImageSpec) -> Vec<u8> {
 
         // The ILT and the IAT.
         let ilt_off = blob.len() as u32;
-        blob.resize(blob.len() + (module.symbols.len() + 1) * 8, 0);
+        blob.resize(blob.len() + (module.symbols.len() + 1) * width, 0);
         let iat_off = blob.len() as u32;
-        blob.resize(blob.len() + (module.symbols.len() + 1) * 8, 0);
+        blob.resize(blob.len() + (module.symbols.len() + 1) * width, 0);
 
         // The DLL name.
         let name_off = put_cstr(&mut blob, &module.dll_name);
@@ -969,12 +1020,18 @@ fn build_import_directory(spec: &PeImageSpec) -> Vec<u8> {
                 ImportSymbol::ByName(_) => u64::from(entries[symbol_index]),
                 // Import by ordinal: the low 16 bits carry the
                 // ordinal and `IMAGE_ORDINAL_FLAG64` is **set**.
-                ImportSymbol::ByOrdinal(ordinal) => IMAGE_ORDINAL_FLAG64 | u64::from(*ordinal),
+                ImportSymbol::ByOrdinal(ordinal) => {
+                    (if pe32 {
+                        u64::from(IMAGE_ORDINAL_FLAG32)
+                    } else {
+                        IMAGE_ORDINAL_FLAG64
+                    }) | u64::from(*ordinal)
+                }
             };
-            let ilt_at = ilt_off as usize + symbol_index * 8;
-            blob[ilt_at..ilt_at + 8].copy_from_slice(&value.to_le_bytes());
-            let iat_at = iat_off as usize + symbol_index * 8;
-            blob[iat_at..iat_at + 8].copy_from_slice(&value.to_le_bytes());
+            let ilt_at = ilt_off as usize + symbol_index * width;
+            blob[ilt_at..ilt_at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+            let iat_at = iat_off as usize + symbol_index * width;
+            blob[iat_at..iat_at + width].copy_from_slice(&value.to_le_bytes()[..width]);
         }
 
         // The descriptor.
@@ -991,6 +1048,10 @@ fn build_import_directory(spec: &PeImageSpec) -> Vec<u8> {
 
 /// Build a PE/COFF base relocation table from a list of RVAs.
 pub fn build_base_relocation_table(relocations: &[u32]) -> Vec<u8> {
+    build_base_relocation_table_typed(relocations, 10)
+}
+
+fn build_base_relocation_table_typed(relocations: &[u32], kind: u16) -> Vec<u8> {
     if relocations.is_empty() {
         // A header-only block marks an image as relocatable without
         // asking the loader to patch any word.
@@ -1028,7 +1089,7 @@ pub fn build_base_relocation_table(relocations: &[u32]) -> Vec<u8> {
             flush(&mut body, page, &mut entries);
             page = *rva & 0xFFFF_F000;
         }
-        entries.push((0xA000 | (*rva & 0xFFF)) as u16);
+        entries.push((kind << 12) | (*rva & 0xFFF) as u16);
     }
     flush(&mut body, page, &mut entries);
     body

@@ -9,7 +9,7 @@
 //!     1-based ordinals;
 //!   * imports exactly the modules and symbols the specification
 //!     lists;
-//!   * carries a base relocation table, so it can be rebased.
+//!   * does not fabricate relocations for position-independent code.
 //!
 //! A mistake here is not cosmetic: the loader resolves imports
 //! through the import directory, and a wrong ordinal makes
@@ -164,24 +164,13 @@ fn every_dll_imports_exactly_the_specified_modules_and_symbols() {
 }
 
 #[test]
-fn every_dll_has_a_base_relocation_table() {
+fn position_independent_dll_code_has_no_fabricated_relocations() {
     for spec in win32_dlls::ALL_DLLS {
         let bytes = win32_dlls::build_dll_image(spec);
         let image = pe_read::parse(&bytes).expect("parse");
-
-        let (rva, size) = image.data_directories[5];
-        assert_ne!(
-            rva, 0,
-            "{}: the relocation directory must be present",
-            spec.file_name
-        );
-        assert!(size > 0);
-        assert_eq!(
-            image.relocations.len(),
-            spec.exports.len(),
-            "{}: one relocation per stub",
-            spec.file_name
-        );
+        assert_eq!(image.data_directories[5], (0, 0));
+        assert!(image.relocations.is_empty());
+        assert_eq!(image.entry_point, 0, "an export is not DllMain");
     }
 }
 
@@ -451,4 +440,90 @@ fn the_loader_accepts_a_dll_once_its_imports_are_resolvable() {
         address,
         win32_dlls::NTDLL_BASE + u64::from(win32_dlls::stub_rva(15))
     );
+}
+
+#[test]
+fn guest_runtime_catalog_preserves_bitness_calling_convention_and_stable_services() {
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for api in win32_dlls::catalog::APIS {
+        assert!(ids.insert(api.id), "duplicate service ID {}", api.id);
+        assert!(
+            names.insert((api.dll, api.name)),
+            "duplicate export {}!{}",
+            api.dll,
+            api.name
+        );
+        assert!(api.arguments <= 16 && api.x86_arguments <= 16);
+    }
+    for x64 in [false, true] {
+        for name in win32_dlls::RUNTIME_DLLS {
+            let bytes = win32_dlls::build_runtime_dll(name, x64).unwrap();
+            let image = pe_read::parse(&bytes).unwrap();
+            assert_eq!(image.magic, if x64 { 0x20b } else { 0x10b });
+            assert_eq!(image.machine, if x64 { 0x8664 } else { 0x14c });
+            assert_eq!(image.entry_point, 0);
+            assert_eq!(image.data_directories[5], (0, 0));
+            let section = image.sections.iter().find(|s| s.name == ".text").unwrap();
+            for api in win32_dlls::catalog::APIS.iter().filter(|a| a.dll == *name) {
+                let rva = *image.exports_by_name.get(api.name).unwrap();
+                let offset = (rva - section.virtual_address + section.pointer_to_raw_data) as usize;
+                let code = &bytes[offset..offset + 16];
+                assert_eq!(code[0], 0xb8);
+                assert_eq!(
+                    u32::from_le_bytes(code[1..5].try_into().unwrap()),
+                    win32_dlls::catalog::GATEWAY_BASE | api.id
+                );
+                if x64 {
+                    assert_eq!(&code[5..11], &[0x4c, 0x8b, 0xd1, 0x0f, 0x05, 0xc3]);
+                } else {
+                    assert_eq!(&code[5..11], &[0x8d, 0x54, 0x24, 0x04, 0xcd, 0x2e]);
+                    if api.cdecl {
+                        assert_eq!(code[11], 0xc3);
+                    } else {
+                        assert_eq!(code[11], 0xc2);
+                        assert_eq!(
+                            u16::from_le_bytes(code[12..14].try_into().unwrap()),
+                            u16::from(api.x86_arguments) * 4
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ntdll_exports_all_native_services_and_zw_aliases_with_audited_abi() {
+    for x64 in [false, true] {
+        let bytes = win32_dlls::build_runtime_dll("ntdll.dll", x64).unwrap();
+        let image = pe_read::parse(&bytes).unwrap();
+        let section = image.sections.iter().find(|s| s.name == ".text").unwrap();
+        let mut ordinals = BTreeSet::new();
+        for service in win32_dlls::syscall_metadata::NATIVE_SERVICE_METADATA {
+            let zw_name = format!("Zw{}", &service.name[2..]);
+            for (name, ordinal) in [
+                (service.name, if x64 { service.x64_nt_ordinal } else { service.x86_nt_ordinal }),
+                (zw_name.as_str(), if x64 { service.x64_zw_ordinal } else { service.x86_zw_ordinal }),
+            ] {
+                assert!(ordinals.insert(ordinal), "duplicate {name} ordinal");
+                let rva = image.exports_by_name[name];
+                assert_eq!(image.exports_by_ordinal[&ordinal], rva, "{name} ordinal");
+                let offset = (rva - section.virtual_address + section.pointer_to_raw_data) as usize;
+                let code = &bytes[offset..offset + 16];
+                assert_eq!(code[0], 0xb8, "{name}");
+                let expected = win32_dlls::catalog::find("ntdll.dll", service.name)
+                    .map(|api| win32_dlls::catalog::GATEWAY_BASE | api.id)
+                    .unwrap_or(u32::from(if x64 { service.number } else { service.x86_number }));
+                assert_eq!(u32::from_le_bytes(code[1..5].try_into().unwrap()), expected, "{name}");
+                if x64 {
+                    assert_eq!(&code[5..11], &[0x4c, 0x8b, 0xd1, 0x0f, 0x05, 0xc3], "{name}");
+                } else {
+                    assert_eq!(&code[5..12], &[0x8d, 0x54, 0x24, 0x04, 0xcd, 0x2e, 0xc2], "{name}");
+                    assert_eq!(u16::from_le_bytes(code[12..14].try_into().unwrap()), u16::from(service.arguments)*4, "{name}");
+                }
+            }
+        }
+        assert_eq!(ordinals.len(), 802);
+    }
 }

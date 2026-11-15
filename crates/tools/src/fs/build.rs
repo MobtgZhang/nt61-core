@@ -215,7 +215,7 @@ pub fn build_kernel(target: &str) -> Result<PathBuf> {
             cmd.env(
                 "RUSTFLAGS",
                 format!(
-                    "-C link-arg=-T{}/crates/boot/linker-rv64.ld -C link-arg=-no-gc-sections",
+                    "-C link-arg=-T{}/crates/boot/linker-rv64.ld -C link-arg=-no-gc-sections -C link-arg=--emit-relocs -C link-arg=-e -C link-arg=kernel_entry",
                     manifest_dir.display()
                 ),
             );
@@ -224,8 +224,8 @@ pub fn build_kernel(target: &str) -> Result<PathBuf> {
             cmd.env(
                 "RUSTFLAGS",
                 format!(
-                    "-C link-arg=-T{}/crates/boot/linker-la64.ld -C link-arg=-no-gc-sections",
-                    manifest_dir.display()
+                    "-C linker=loongarch64-linux-gnu-ld -C link-arg=-T{}/crates/boot/linker-la64.ld -C link-arg=-no-gc-sections -C link-arg=--emit-relocs -C link-arg=-e -C link-arg=kernel_entry -C link-arg=-nostdlib -C link-arg=-L{}/crates/tools/loongarch64/lib",
+                    manifest_dir.display(), manifest_dir.display()
                 ),
             );
         }
@@ -242,32 +242,14 @@ pub fn build_kernel(target: &str) -> Result<PathBuf> {
         )));
     }
 
-    // Find the output binary. On x86_64 the standalone `nt61-kernel`
-    // ELF is produced by the [[bin]] entry; on every other arch the
-    // kernel is statically linked into `nt61-winload.efi` (the OS
-    // loader's own code) and there is no separate kernel binary.
-    // For non-x86_64 builds we report success and return an empty
-    // path — the caller treats the empty path as "no separate kernel
-    // image; the winload bundle already contains the kernel".
-    let output = manifest_dir
-        .join("target")
-        .join(target)
-        .join("release")
-        .join("nt61-kernel");
-
-    if output.exists() {
-        log::success(&format!("Kernel built: {}", output.display()));
-        Ok(output)
-    } else if arch == "x86_64" {
-        Err(BuildError::MissingFile(output.display().to_string()))
-    } else {
-        log::info(&format!(
-            "No standalone kernel binary for {}; the kernel is \
-             statically linked into nt61-winload.efi",
-            arch,
-        ));
-        Ok(PathBuf::new())
+    // Every architecture hands off to the separately packaged kernel.
+    // Missing output must fail here instead of silently using an old image.
+    let output = manifest_dir.join("target").join(target).join("release").join("nt61-kernel");
+    if !output.is_file() {
+        return Err(BuildError::MissingFile(output.display().to_string()));
     }
+    log::success(&format!("Kernel built: {}", output.display()));
+    Ok(output)
 }
 
 /// Map a `-*-unknown-none[-elf]` target triple back to the
@@ -955,8 +937,10 @@ fn read_elf_absolute_relocations(elf_path: &std::path::Path, image_base: u64) ->
         62 => &[1, 8],       // R_X86_64_64, R_X86_64_RELATIVE
         183 => &[257, 1027], // R_AARCH64_ABS64, R_AARCH64_RELATIVE
         243 => &[2],         // R_RISCV_64
-        262 => &[2, 64],     // legacy R_RISCV_64 value, R_LARCH_64
-        _ => &[2],
+        258 => &[2],         // R_LARCH_64 (R_LARCH_ADD64 is not a pointer fixup)
+        machine => return Err(BuildError::ImageCreateFailed(format!(
+            "{} has unsupported ELF machine {machine}", elf_path.display()
+        ))),
     };
 
     let sh_off = read_u64(&buf[40..48]) as usize;
@@ -2264,6 +2248,8 @@ pub fn build_boot(target: &str) -> Result<PathBuf> {
         return Err(BuildError::MissingFile(canonical.display().to_string()));
     };
 
+    let bytes = std::fs::read(&output).map_err(BuildError::Io)?;
+    std::fs::write(&output, refresh_pe_checksum(bytes)).map_err(BuildError::Io)?;
     log::success(&format!("Boot manager built: {}", output.display()));
     Ok(output)
 }
@@ -2480,6 +2466,8 @@ pub fn build_winload(target: &str) -> Result<PathBuf> {
         return Err(BuildError::MissingFile(canonical.display().to_string()));
     };
 
+    let bytes = std::fs::read(&output).map_err(BuildError::Io)?;
+    std::fs::write(&output, refresh_pe_checksum(bytes)).map_err(BuildError::Io)?;
     log::success(&format!("Winload built: {}", output.display()));
     Ok(output)
 }
@@ -2928,16 +2916,8 @@ fn generate_pe_files_in_process(system32_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write the Win32 Ring 3 DLLs into `C:\Windows\System32`.
-///
-/// These are the *real* PE32+ DLLs described in `fs::win32_dlls`:
-/// GUI subsystem, import table, export table and base relocations.
-/// The old `build_ntdll_pe` / `build_kernel32_pe` stubs were
-/// single-section images with an EFI-application subsystem and no
-/// import table, so nothing could link against them.
-///
-/// `ntdll.dll` and `kernel32.dll` are written from the same
-/// specification, replacing the old stubs.
+/// Package native system libraries and the separately identified x86/x64
+/// guest runtime. All runtime code is generated from NT61 source.
 fn generate_win32_dlls(system32_dir: &Path) -> Result<()> {
     use super::win32_dlls;
 
@@ -2951,6 +2931,23 @@ fn generate_win32_dlls(system32_dir: &Path) -> Result<()> {
         let bytes = refresh_pe_checksum(bytes);
         std::fs::write(&dest, &bytes).map_err(BuildError::Io)?;
         total += bytes.len();
+    }
+    // WOW64 always receives PE32/I386, independent of the host ISA. x64
+    // guests on non-x86 hosts use an explicit directory, never native System32.
+    let windows_dir = system32_dir.parent().ok_or_else(|| BuildError::InvalidParam("System32 has no parent".into()))?;
+    let wow64_dir = windows_dir.join("SysWOW64");
+    std::fs::create_dir_all(&wow64_dir).map_err(BuildError::Io)?;
+    let native_arch = arch_name(current_pe_arch());
+    let x64_dir = if native_arch == "x86_64" { system32_dir.to_path_buf() }
+        else { windows_dir.join("SysX64") };
+    std::fs::create_dir_all(&x64_dir).map_err(BuildError::Io)?;
+    for (x64, directory) in [(false, &wow64_dir), (true, &x64_dir)] {
+        for name in win32_dlls::runtime_library_names() {
+            let bytes = refresh_pe_checksum(win32_dlls::build_runtime_dll(name, x64).expect("runtime catalog library"));
+            total += bytes.len();
+            std::fs::write(directory.join(name), bytes).map_err(BuildError::Io)?;
+        }
+        std::fs::write(directory.join("nt61-runtime-exports.json"), win32_dlls::runtime_manifest(x64)).map_err(BuildError::Io)?;
     }
     log::info(&format!(
         "Generated {} Win32 DLLs ({} bytes)",
@@ -3132,7 +3129,7 @@ fn real_pe(artifact_name: &str) -> Vec<u8> {
             return bytes;
         }
         if bytes.len() >= 5 && bytes[0..5] == [0x7F, b'E', b'L', b'F', 2] {
-            if let Some(pe) = wrap_elf_to_pe(&candidate_path, arch) {
+            if let Some(pe) = wrap_elf_to_pe(&candidate_path, arch, artifact_name) {
                 return pe;
             }
         }
@@ -3221,158 +3218,26 @@ fn logonui_pe() -> Vec<u8> {
     panic!("logonui ELF not found at {}", elf_rel);
 }
 
-/// Final consistency pass over a freshly wrapped PE image.
-///
-/// `objcopy -O pei-<arch>` copies the ELF section VMAs into the PE
-/// section table verbatim (absolute, not RVA-relative) on some
-/// targets, and the rebase pass above may see a section table that
-/// was already rebased once (for example when the same driver ELF
-/// is wrapped repeatedly into one shared `.pei.tmp`). The live
-/// section table is therefore the only trustworthy source for where
-/// `.text` actually ends up, so the entry point and `SizeOfImage`
-/// are recomputed from it instead of trusting the earlier
-/// ELF-derived values. Running the pass twice converges instead of
-/// drifting, which keeps the wrapped image self-consistent.
-fn fix_pe_entry_and_size(
-    path: &std::path::Path,
-    entry_rva: u32,
-    text_rva: u32,
-    min_size_of_image: u32,
-) -> Result<()> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(BuildError::Io)?;
-
-    let mut mz = [0u8; 2];
-    f.read_exact(&mut mz).map_err(BuildError::Io)?;
-    if &mz != b"MZ" {
-        return Err(BuildError::ImageCreateFailed(format!(
-            "fix_pe_entry_and_size: {} is not a DOS/PE image",
-            path.display()
-        )));
-    }
-    f.seek(SeekFrom::Start(0x3C)).map_err(BuildError::Io)?;
-    let mut e_lfanew_bytes = [0u8; 4];
-    f.read_exact(&mut e_lfanew_bytes).map_err(BuildError::Io)?;
-    let e_lfanew = u32::from_le_bytes(e_lfanew_bytes) as u64;
-    f.seek(SeekFrom::Start(e_lfanew)).map_err(BuildError::Io)?;
-    let mut pe_sig = [0u8; 4];
-    f.read_exact(&mut pe_sig).map_err(BuildError::Io)?;
-    if &pe_sig != b"PE\x00\x00" {
-        return Err(BuildError::ImageCreateFailed(format!(
-            "fix_pe_entry_and_size: bad PE signature at e_lfanew=0x{:x}",
-            e_lfanew
-        )));
-    }
-    let coff_off = e_lfanew + 4;
-    f.seek(SeekFrom::Start(coff_off + 2))
-        .map_err(BuildError::Io)?;
-    let mut num_sections_bytes = [0u8; 2];
-    f.read_exact(&mut num_sections_bytes)
-        .map_err(BuildError::Io)?;
-    let num_sections = u16::from_le_bytes(num_sections_bytes);
-    f.seek(SeekFrom::Start(coff_off + 16))
-        .map_err(BuildError::Io)?;
-    let mut size_opt_bytes = [0u8; 2];
-    f.read_exact(&mut size_opt_bytes).map_err(BuildError::Io)?;
-    let size_opt = u16::from_le_bytes(size_opt_bytes) as u64;
-    let opt_off = coff_off + 20;
-    f.seek(SeekFrom::Start(opt_off + 0x20))
-        .map_err(BuildError::Io)?;
-    let mut align_bytes = [0u8; 4];
-    f.read_exact(&mut align_bytes).map_err(BuildError::Io)?;
-    let section_align = u32::from_le_bytes(align_bytes).max(1);
-
-    let sec_table_off = opt_off + size_opt;
-    let mut text_pe_va: Option<u32> = None;
-    let mut max_end: u32 = 0;
-    for i in 0..num_sections {
-        let off = sec_table_off + (i as u64) * 40;
-        f.seek(SeekFrom::Start(off)).map_err(BuildError::Io)?;
-        let mut hdr = [0u8; 40];
-        f.read_exact(&mut hdr).map_err(BuildError::Io)?;
-        let name = &hdr[0..8];
-        let is_text =
-            name[0] == b'.' && &name[1..5] == b"text" && (name[5] == 0 || name[5] == b'.');
-        let va = u32::from_le_bytes(hdr[12..16].try_into().unwrap());
-        let vsize = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
-        let raw = u32::from_le_bytes(hdr[16..20].try_into().unwrap());
-        if is_text {
-            text_pe_va = Some(va);
-        }
-        max_end = max_end.max(va.saturating_add(vsize.max(raw)));
-    }
-
-    let entry_offset = entry_rva.saturating_sub(text_rva);
-    let final_entry = match text_pe_va {
-        Some(text_va) => text_va.saturating_add(entry_offset),
-        None => entry_rva,
+fn wrap_elf_to_pe(elf_path: &Path, arch: TargetArch, artifact_name: &str) -> Option<Vec<u8>> {
+    // PT_LOAD describes the actual runtime layout; objcopy's individual
+    // ELF sections can overlap PE headers and each other's raw padding.
+    let elf = std::fs::read(elf_path).ok()?;
+    let mut pe = super::elf_to_pe::elf_to_pe(&elf, arch_name(arch))?;
+    let image_base = u64::from_le_bytes(pe.get(0xB0..0xB8)?.try_into().ok()?);
+    let relocations = read_elf_absolute_relocations(elf_path, image_base).ok()?;
+    super::elf_to_pe::append_base_relocations(&mut pe, &relocations)?;
+    let exports = match artifact_name {
+        "nt61-kernel.efi" => Some(("ntoskrnl.exe", nt61_boot_types::native_exports::NTOS_EXPORTS)),
+        "hal_dll.efi" => Some(("hal.dll", nt61_boot_types::native_exports::HAL_EXPORTS)),
+        _ => None,
     };
-    let final_size = max_end
-        .max(final_entry)
-        .max(min_size_of_image)
-        .checked_next_multiple_of(section_align)
-        .unwrap_or(max_end.max(final_entry));
-
-    let writes: &[(u64, u32)] = &[(opt_off + 0x10, final_entry), (opt_off + 0x38, final_size)];
-    for (offset, value) in writes {
-        f.seek(SeekFrom::Start(*offset)).map_err(BuildError::Io)?;
-        f.write_all(&value.to_le_bytes()).map_err(BuildError::Io)?;
+    if let Some((dll, manifest)) = exports {
+        // These are ABI-reviewed wrappers, not names attached to internal
+        // Rust functions. A missing linked target must fail the image build.
+        super::pe_exports::append_exports_from_elf(&mut pe, &elf, dll, manifest)
+            .unwrap_or_else(|err| panic!("native exports for {dll}: {err}"));
     }
-    log::info(&format!(
-        "fix_pe_entry_and_size: {} entry=0x{:x} SizeOfImage=0x{:x}",
-        path.display(),
-        final_entry,
-        final_size
-    ));
-    Ok(())
-}
-fn wrap_elf_to_pe(elf_path: &Path, arch: TargetArch) -> Option<Vec<u8>> {
-    let (objcopy, pei_target) = match arch {
-        TargetArch::X86_64 => ("x86_64-linux-gnu-objcopy", "pei-x86-64"),
-        TargetArch::AArch64 => ("aarch64-linux-gnu-objcopy", "pei-aarch64-little"),
-        TargetArch::RiscV64 => ("riscv64-linux-gnu-objcopy", "pei-riscv64-little"),
-        TargetArch::LoongArch64 => ("loongarch64-linux-gnu-objcopy", "pei-loongarch64"),
-    };
-    let output_path = elf_path.with_extension("pei.tmp");
-    let status = Command::new(objcopy)
-        .arg("-O")
-        .arg(pei_target)
-        .arg("--strip-all")
-        .arg("--remove-section=.comment")
-        .arg("--remove-section=.riscv.attributes")
-        .arg("--remove-section=.loongarch.attributes")
-        // The relocation records are consumed below by
-        // `read_elf_absolute_relocations` (straight from the ELF);
-        // they must not leak into the PE section table.
-        .arg("--remove-section=.rela*")
-        .arg("--remove-section=.bss")
-        .arg("--remove-section=.bss*")
-        .arg(elf_path)
-        .arg(&output_path)
-        .status()
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    if let Ok((entry, base_of_code, image_base)) = read_elf_image_layout(elf_path) {
-        let relocations = read_elf_absolute_relocations(elf_path, image_base).unwrap_or_default();
-        let image_extent_rva = read_elf_image_extent(elf_path)
-            .map(|extent| extent.saturating_sub(image_base) as u32)
-            .unwrap_or(0);
-        let _ = patch_pe_section_addresses(&output_path, image_base);
-        let _ = patch_pe_section_characteristics(&output_path);
-        let _ = patch_pe_entry_point_and_image_base(&output_path, entry, base_of_code, image_base);
-        patch_pe_subsystem_with_extent(&output_path, 0x0A, &relocations, image_extent_rva).ok()?;
-        let _ = fix_pe_entry_and_size(&output_path, entry, base_of_code, image_extent_rva);
-    } else {
-        let _ = patch_pe_subsystem(&output_path, 0x0A, &[]);
-    }
-    std::fs::read(&output_path).ok()
+    Some(pe)
 }
 
 pub fn build_system_images() -> Vec<SystemImage> {
@@ -3385,10 +3250,8 @@ pub fn build_system_images() -> Vec<SystemImage> {
             name: "hal.dll",
             bytes: real_pe("hal_dll.efi"),
         },
-        // BOOTVID.DLL — Boot Video driver. Loaded by winload as a
-        // BOOT_START_IMAGE (not a SYS driver). Exports the canonical
-        // Vid/Inbv surface the kernel calls in Phase 0/1 before the
-        // HAL display driver is up.
+        // BOOTVID.DLL is currently read-only boot metadata. The linked
+        // display implementation does not resolve native Vid/Inbv exports.
         SystemImage {
             name: "BOOTVID.DLL",
             bytes: build_bootvid_pe(),
@@ -3527,6 +3390,26 @@ pub fn build_system_images() -> Vec<SystemImage> {
             bytes: real_pe("nt61-driver-videoprt.efi"),
         },
     ];
+    // These images are mapped by our OS loader, rather than started as
+    // firmware applications. Keep UEFI subsystem 10 for bootmgr/winload.
+    for image in &mut images {
+        if image.name == "ntoskrnl.exe" || image.name == "hal.dll"
+            || image.name.to_ascii_lowercase().ends_with(".sys")
+        {
+            let pe_off = u32::from_le_bytes(image.bytes[0x3C..0x40].try_into().unwrap()) as usize;
+            let opt = pe_off + 24;
+            image.bytes[opt + 0x44..opt + 0x46].copy_from_slice(&1u16.to_le_bytes());
+            for field in [0x28, 0x30] {
+                image.bytes[opt + field..opt + field + 2].copy_from_slice(&6u16.to_le_bytes());
+                image.bytes[opt + field + 2..opt + field + 4].copy_from_slice(&1u16.to_le_bytes());
+            }
+            if image.name == "hal.dll" {
+                let flags = u16::from_le_bytes(image.bytes[pe_off + 22..pe_off + 24].try_into().unwrap());
+                image.bytes[pe_off + 22..pe_off + 24].copy_from_slice(&(flags | 0x2000).to_le_bytes());
+            }
+            image.bytes = refresh_pe_checksum(core::mem::take(&mut image.bytes));
+        }
+    }
     let root=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let arch=current_pe_arch();
     images.extend(super::applications::package(&root,arch_name(arch),kernel_target_for(arch_name(arch))));
@@ -3576,13 +3459,31 @@ fn build_pe_image(
     is_dll: bool,
     exports: &[(&str, u32)],
 ) -> Vec<u8> {
-    // The PE Machine field is hard-coded to 0x8664 (AMD64) for
-    // every image produced today. Per-arch machine IDs (0xAA64 /
-    // 0xE42C / 0x6264) will be wired in once a non-x86_64 build of
-    // the host-side emitter is actually exercised on the
-    // corresponding host triple; until then the field is a
-    // constant so the unused-feature warnings stop firing.
     let machine: u16 = current_pe_arch().machine();
+    // Metadata-only boot images have no executable implementation. Emit a
+    // read-only data section, no entry and no exports rather than advertising
+    // export-directory bytes as callable machine code.
+    if entry_point_rva == 0 && exports.is_empty() {
+        let mut spec = super::pe::PeImageSpec::new(image_base, subsystem, is_dll, machine);
+        // This block contains only IMAGE_REL_BASED_ABSOLUTE padding. The
+        // payload has no code or absolute addresses, so rebasing it requires
+        // no writes. Keep the declaration inside the same read-only section.
+        let mut metadata = SECTION_ALIGNMENT.to_le_bytes().to_vec();
+        metadata.extend_from_slice(&12u32.to_le_bytes());
+        metadata.extend_from_slice(&[0u8; 4]);
+        metadata.extend_from_slice(
+            b"NT61 metadata-only image; no executable entry or exports\0",
+        );
+        spec.sections = vec![super::pe::SectionSpec::rdata(metadata)];
+        let mut image = super::pe::emit(&spec).0;
+        let opt = 0x98;
+        let directory = opt + 0x70 + 5 * 8;
+        image[directory..directory + 4].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
+        image[directory + 4..directory + 8].copy_from_slice(&12u32.to_le_bytes());
+        let flags = u16::from_le_bytes(image[0x96..0x98].try_into().unwrap()) & !1;
+        image[0x96..0x98].copy_from_slice(&flags.to_le_bytes());
+        return image;
+    }
     let headers_size: u32 = 0x400;
     let num_sections: u16 = 1;
     let optional_header_size: u16 = 240;
@@ -3730,28 +3631,16 @@ fn build_pe_image(
 }
 
 fn build_bootvid_pe() -> Vec<u8> {
-    // Canonical NT6.1 BOOTVID.DLL export surface. Mirrors the
-    // corresponding registry in `nt61::drivers::bootvid` and the
-    // winload BOOT_DRIVER_PATHS table.
-    let stride = 0x10u32;
-    let stride_count = |i: u32| SECTION_ALIGNMENT + i * stride;
-    let exports = [
-        ("VidInitialize", stride_count(0)),
-        ("InbvDisplayString", stride_count(1)),
-        ("InbvDisplayStringBlocking", stride_count(2)),
-        ("InbvSetProgressBarSubset", stride_count(3)),
-        ("InbvRotateWaitingSpinner", stride_count(4)),
-        ("VidResetDisplay", stride_count(5)),
-        ("VidDisplayString", stride_count(6)),
-        ("VidSetCursorPosition", stride_count(7)),
-        ("VidCleanUp", stride_count(8)),
-    ];
+    // Video rendering currently lives in the native kernel's bootvid module.
+    // winload maps this DLL and publishes its range without calling an entry.
+    // Until a real separately linked BOOTVID implementation exists, expose
+    // neither a runnable entry nor Windows Vid* / kernel Inbv* exports.
     build_pe_image(
         0xFFFF_FFFF_FF00_0000,
-        SECTION_ALIGNMENT,
+        0,
         IMAGE_SUBSYSTEM_NATIVE,
         true,
-        &exports,
+        &[],
     )
 }
 
@@ -4125,6 +4014,85 @@ fn cmd_exe_write_u64(buf: &mut [u8], off: usize, v: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_elf_fixups_use_the_actual_four_machine_ids() {
+        let mut elf = vec![0u8; 0x400];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[40..48].copy_from_slice(&0x100u64.to_le_bytes());
+        elf[58..60].copy_from_slice(&64u16.to_le_bytes());
+        elf[60..62].copy_from_slice(&4u16.to_le_bytes());
+        elf[62..64].copy_from_slice(&1u16.to_le_bytes());
+        let names = b"\0.shstrtab\0.data\0.rela.data\0";
+        elf[0x300..0x300 + names.len()].copy_from_slice(names);
+        for (index, name, kind, flags, addr, offset, size) in [
+            (1usize, 1u32, 3u32, 0u64, 0u64, 0x300u64, names.len() as u64),
+            (2, 11, 1, 2, 0x2000, 0x340, 8),
+            (3, 17, 4, 0, 0, 0x350, 24),
+        ] {
+            let sh = 0x100 + index * 64;
+            elf[sh..sh + 4].copy_from_slice(&name.to_le_bytes());
+            elf[sh + 4..sh + 8].copy_from_slice(&kind.to_le_bytes());
+            for (field, value) in [(8, flags), (16, addr), (24, offset), (32, size)] {
+                elf[sh + field..sh + field + 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        elf[0x1ec..0x1f0].copy_from_slice(&2u32.to_le_bytes());
+        elf[0x350..0x358].copy_from_slice(&0x2000u64.to_le_bytes());
+        let path = std::env::temp_dir().join(format!("nt61-elf-fixups-{}.elf", std::process::id()));
+        for (machine, kind) in [(62u16, 1u64), (183, 257), (243, 2), (258, 2)] {
+            elf[18..20].copy_from_slice(&machine.to_le_bytes());
+            elf[0x358..0x360].copy_from_slice(&kind.to_le_bytes());
+            std::fs::write(&path, &elf).unwrap();
+            assert_eq!(read_elf_absolute_relocations(&path, 0x1000).unwrap(), vec![0x1000]);
+        }
+        // LoongArch ADD64 adjusts an expression; it is not a DIR64 pointer.
+        elf[0x358..0x360].copy_from_slice(&64u64.to_le_bytes());
+        std::fs::write(&path, &elf).unwrap();
+        assert!(read_elf_absolute_relocations(&path, 0x1000).unwrap().is_empty());
+        elf[18..20].copy_from_slice(&262u16.to_le_bytes());
+        std::fs::write(&path, &elf).unwrap();
+        assert!(read_elf_absolute_relocations(&path, 0x1000).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bootvid_is_a_native_metadata_dll_without_callable_exports() {
+        let bytes = build_bootvid_pe();
+        let image = super::super::pe_read::parse(&bytes).expect("parse BOOTVID metadata image");
+        assert_eq!(image.machine, current_pe_arch().machine());
+        assert_eq!(image.subsystem, IMAGE_SUBSYSTEM_NATIVE);
+        assert_ne!(image.characteristics & IMAGE_FILE_DLL, 0);
+        assert_eq!(image.entry_point, 0);
+        assert_eq!(image.data_directories[0], (0, 0));
+        assert!(image.exports_by_name.is_empty());
+        assert!(image.exports_by_ordinal.is_empty());
+        assert!(image.forwarders.is_empty());
+        assert_eq!(image.data_directories[5], (SECTION_ALIGNMENT, 12));
+        assert!(image.relocations.is_empty(), "ABSOLUTE entries never patch data");
+        assert_eq!(image.characteristics & 1, 0, "relocations are not stripped");
+        let mut preferred_db = nt61_loader::loader::ImageDatabase::new();
+        let preferred = nt61_loader::loader::load_image_full(
+            "BOOTVID.DLL", &bytes, &mut preferred_db, image.image_base,
+        ).expect("load BOOTVID at preferred base");
+        let mut relocated_db = nt61_loader::loader::ImageDatabase::new();
+        let actual_base = 0x1000_0000;
+        let relocated = nt61_loader::loader::load_image_full(
+            "BOOTVID.DLL", &bytes, &mut relocated_db, actual_base,
+        ).expect("rebase metadata BOOTVID");
+        assert_eq!(relocated.image_base, actual_base);
+        assert_eq!(relocated.image_bytes(), preferred.image_bytes(),
+            "rebasing metadata must not rewrite any bytes");
+        assert_eq!(image.sections.len(), 1);
+        let section = &image.sections[0];
+        assert_eq!(section.name, ".rdata");
+        assert_eq!(section.characteristics & 0xA000_0020, 0,
+            "metadata must not be executable, writable, or classified as code");
+        assert_ne!(section.characteristics & 0x4000_0040, 0);
+        let opt = 0x98;
+        assert_eq!(&bytes[opt + 0x28..opt + 0x2c], &[6, 0, 1, 0]);
+        assert_eq!(&bytes[opt + 0x30..opt + 0x34], &[6, 0, 1, 0]);
+    }
 
     #[test]
     fn subsystem_images_have_native_entry_instructions_on_every_architecture() {
