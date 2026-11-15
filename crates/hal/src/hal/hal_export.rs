@@ -1,35 +1,25 @@
-//! HAL / NTOS export-name registry
-//!
-//! **As of the winload-to-disk-ntoskrnl handoff refactor** this
-//! module is a stub. The export lists previously lived here as a
-//! build-time cross-check against `system_image::build_hal` and
-//! `system_image::build_ntoskrnl`. Both of those builder functions
-//! are gone — `tools/src/fs/build.rs` owns the canonical PE
-//! generator now, and its own inline export tables (see
-//! `build_ntoskrnl_pe` / `build_hal_pe`) are the single source of
-//! truth.
-//!
-//! The stub below keeps the file in place so anything that still
-//! references `hal_export::HAL_EXPORTS` / `NTOS_EXPORTS` /
-//! `hal_export_names` / `ntos_export_names` compiles. New code
-//! should NOT take a dependency on those constants — they will be
-//! removed in a follow-up cleanup.
+//! Names of the ABI-reviewed native exports. The runtime wrappers and the image
+//! builder share `nt61_boot_types::native_exports`; there is no stub export list.
+use nt61_boot_types::native_exports::{
+    NativeExport, HAL_EXPORTS as HAL_NATIVE_EXPORTS, NTOS_EXPORTS as NTOS_NATIVE_EXPORTS,
+};
 
-/// Empty placeholder list. The canonical lists live in
-/// `tools/src/fs/build.rs`.
-pub const HAL_EXPORTS: &[&str] = &[];
+const fn names<const N: usize>(exports: &[NativeExport]) -> [&'static str; N] {
+    let mut result = [""; N];
+    let mut index = 0;
+    while index < N {
+        result[index] = exports[index].name;
+        index += 1;
+    }
+    result
+}
 
-/// Empty placeholder list. See [`HAL_EXPORTS`].
-pub const NTOS_EXPORTS: &[&str] = &[];
+pub const HAL_EXPORTS: &[&str] = &names::<{ HAL_NATIVE_EXPORTS.len() }>(HAL_NATIVE_EXPORTS);
+pub const NTOS_EXPORTS: &[&str] = &names::<{ NTOS_NATIVE_EXPORTS.len() }>(NTOS_NATIVE_EXPORTS);
 
-/// Returns the canonical HAL export list. Currently always empty;
-/// kept for source compatibility with older call sites.
 pub fn hal_export_names() -> &'static [&'static str] {
     HAL_EXPORTS
 }
-
-/// Returns the canonical NTOS export list. Currently always empty;
-/// kept for source compatibility with older call sites.
 pub fn ntos_export_names() -> &'static [&'static str] {
     NTOS_EXPORTS
 }

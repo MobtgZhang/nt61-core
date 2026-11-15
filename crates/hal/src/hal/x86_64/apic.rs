@@ -593,35 +593,35 @@ pub fn ioapic_max_redir() -> u8 {
     ((v >> 16) & 0xFF) as u8
 }
 
-/// Program a single redirection entry. `gsi` is the global system
-/// interrupt number (0..max_redir). `vector` is the IDT vector to
-/// raise. `dest_apic_id` is the destination LAPIC ID.
-pub fn program_ioapic(gsi: u8, vector: u8, dest_apic_id: u8) {
-    let reg = (gsi as u32) * 2 + 0x10;
-    // I/O APIC redirection entry (low dword):
-    //   bits 0..7  = vector
-    //   bit 11     = delivery status (RO)
-    //   bit 12     = remote IRR (RO)
-    //   bit 13     = interrupt input pin polarity (0 = high-active,
-    //                1 = low-active; PCI INTx is low-active)
-    //   bit 14     = trigger mode (0 = edge, 1 = level; PCI INTx
-    //                requires level)
-    //   bit 15     = mask
-    // PCI INTx (GSIs 16+ on q35) must be level/low-active to keep
-    // the shared line asserted until the EOI; legacy ISA IRQs stay
-    // edge/high-active.
-    const PIN_POLARITY_LOW: u32 = 1 << 13;
-    const TRIGGER_LEVEL: u32 = 1 << 14;
-    const MASKED: u32 = 1 << 15;
+const IOAPIC_REDIR_POLARITY_LOW: u32 = 1 << 13;
+const IOAPIC_REDIR_LEVEL: u32 = 1 << 15;
+const IOAPIC_REDIR_MASKED: u32 = 1 << 16;
 
-    let low = if gsi >= 16 {
-        (vector as u32) & 0xFF | PIN_POLARITY_LOW | TRIGGER_LEVEL
-    } else {
-        (vector as u32) & 0xFF
-    };
-    let high = ((dest_apic_id as u32) & 0xFF) << 24;
-    write_ioapic(reg, low & !MASKED);
+fn ioapic_redirection_low(gsi: u8, vector: u8) -> u32 {
+    // q35's PCI INTx GSIs are level/low. Full MADT source-override
+    // routing remains separate; ISA inputs default to edge/high here.
+    u32::from(vector)
+        | if gsi >= 16 {
+            IOAPIC_REDIR_POLARITY_LOW | IOAPIC_REDIR_LEVEL
+        } else {
+            0
+        }
+}
+
+/// Program an I/O APIC input. `gsi` is currently the local redirection index
+/// (the caller must account for a nonzero MADT GSI base).
+pub fn program_ioapic(gsi: u8, vector: u8, dest_apic_id: u8) {
+    if vector < 0x20 || gsi > ioapic_max_redir() {
+        return;
+    }
+    let reg = u32::from(gsi) * 2 + 0x10;
+    let low = ioapic_redirection_low(gsi, vector);
+    let high = u32::from(dest_apic_id) << 24;
+    // Mask the old route before changing its destination. Writing the low
+    // half unmasked first can deliver a pending interrupt to the old CPU.
+    write_ioapic(reg, read_ioapic(reg) | IOAPIC_REDIR_MASKED);
     write_ioapic(reg + 1, high);
+    write_ioapic(reg, low);
 }
 
 /// Mask a single I/O APIC redirection entry. The bit is at
@@ -629,19 +629,33 @@ pub fn program_ioapic(gsi: u8, vector: u8, dest_apic_id: u8) {
 pub fn mask_ioapic(gsi: u8) {
     let reg = (gsi as u32) * 2 + 0x10;
     let low = read_ioapic(reg);
-    write_ioapic(reg, low | (1 << 16));
+    write_ioapic(reg, low | IOAPIC_REDIR_MASKED);
 }
 
 /// Unmask a single I/O APIC redirection entry.
 pub fn unmask_ioapic(gsi: u8) {
     let reg = (gsi as u32) * 2 + 0x10;
     let low = read_ioapic(reg);
-    write_ioapic(reg, low & !(1 << 16));
+    write_ioapic(reg, low & !IOAPIC_REDIR_MASKED);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ioapic_pci_route_uses_trigger_bit_15_and_mask_bit_16() {
+        let pci = ioapic_redirection_low(16, 0x30);
+        assert_eq!(pci & 0xff, 0x30);
+        assert_ne!(pci & (1 << 13), 0);
+        assert_ne!(pci & (1 << 15), 0);
+        assert_eq!(pci & (1 << 14), 0); // remote IRR is read-only
+        assert_eq!(pci & (1 << 16), 0); // route is unmasked
+        let masked = pci | IOAPIC_REDIR_MASKED;
+        assert_ne!(masked & (1 << 16), 0);
+        assert_eq!(masked & !IOAPIC_REDIR_MASKED, pci);
+        assert_eq!(ioapic_redirection_low(1, 0x21), 0x21);
+    }
 
     // Packing tests — only the in-memory bit fields, no hardware
     // access required.

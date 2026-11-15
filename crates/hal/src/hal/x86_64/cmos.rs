@@ -121,18 +121,14 @@ fn unlock() {
 
 /// Wait until the RTC is no longer in the middle of an update cycle
 /// (status A bit 7). Per the datasheet the update takes up to 2 ms.
-fn wait_for_update_complete() {
-    for _ in 0..1024 {
-        let a = read_register_raw(reg::STATUS_A);
-        if a & status_a::UPDATE_IN_PROGRESS == 0 {
-            return;
+fn wait_for_update_complete() -> bool {
+    for _ in 0..65_536 {
+        if read_register_raw(reg::STATUS_A) & status_a::UPDATE_IN_PROGRESS == 0 {
+            return true;
         }
-        // Tiny spin delay — at 4 GHz this is 256 ns per iteration,
-        // so 1024 iterations ≈ 256 µs.
-        for _ in 0..32 {
-            core::hint::spin_loop();
-        }
+        core::hint::spin_loop();
     }
+    false
 }
 
 fn read_register_raw(reg: u8) -> u8 {
@@ -181,108 +177,183 @@ pub fn write_register(reg: u8, value: u8) {
 /// read the current wall-clock time. Returns `None` if the CMOS is
 /// inaccessible (boot-time probe failure).
 pub fn hal_query_real_time_clock() -> Option<TimeFields> {
+    let century = crate::hal::common::acpi::rtc_century_register();
     if !try_lock() {
         return None;
     }
-
-    // Wait for any in-progress update to complete so we read a
-    // consistent snapshot.
-    wait_for_update_complete();
-
-    let status_b = read_register_raw(reg::STATUS_B);
-    let binary_mode = (status_b & status_b::BINARY_MODE) != 0;
-    let hour_24 = (status_b & status_b::HOUR_FORMAT_24) != 0;
-
-    // read each field. Status B is read once before the read loop.
-    let mut second = read_register_raw(reg::SECONDS);
-    let mut minute = read_register_raw(reg::MINUTES);
-    let mut hour = read_register_raw(reg::HOURS);
-    let weekday = read_register_raw(reg::WEEKDAY);
-    let mut day = read_register_raw(reg::DAY);
-    let mut month = read_register_raw(reg::MONTH);
-    let mut year = read_register_raw(reg::YEAR) as u16;
-
-    // On RTCs that have an UIP race we re-read the time; the IBM PC
-    // technical reference suggests re-reading if Status A UIP is
-    // set after the read loop.
-    if read_register_raw(reg::STATUS_A) & status_a::UPDATE_IN_PROGRESS != 0 {
-        second = read_register_raw(reg::SECONDS);
-        minute = read_register_raw(reg::MINUTES);
-        hour = read_register_raw(reg::HOURS);
-        let _ = read_register_raw(reg::WEEKDAY);
-        day = read_register_raw(reg::DAY);
-        month = read_register_raw(reg::MONTH);
-        year = read_register_raw(reg::YEAR) as u16;
-    }
-
+    let result = read_stable_clock_with_century(read_register_raw, century);
     unlock();
+    result
+}
 
-    // 12-hour mode: bit 7 of the hour byte is the PM flag. Extract
-    // it before the BCD-to-binary conversion so it is not lost.
-    let pm_flag = hour & 0x80;
-    let hour_7bit = hour & 0x7F;
+/// Read two complete, equal snapshots with UIP clear before and after each.
+/// Sampling seconds alone cannot detect a minute/date rollover or mode change.
+fn read_stable_clock(mut read: impl FnMut(u8) -> u8) -> Option<TimeFields> {
+    read_stable_clock_with_century(&mut read, None)
+}
 
-    if !binary_mode {
-        second = bcd_to_bin(second);
-        minute = bcd_to_bin(minute);
-        hour = bcd_to_bin(hour_7bit);
-        day = bcd_to_bin(day);
-        month = bcd_to_bin(month);
-        year = bcd_to_bin(year as u8) as u16;
-    } else {
-        hour = hour_7bit;
-    }
-
-    // Convert 12-hour time to 24-hour. The RTC encodes 12-hour
-    // time as 1..12 with the PM flag in bit 7:
-    //   12 AM (midnight) → 0
-    //   1 AM – 11 AM    → 1..11
-    //   12 PM (noon)     → 12
-    //   1 PM – 11 PM    → 13..23
-    if !hour_24 {
-        hour = if hour == 12 {
-            if pm_flag != 0 {
-                12
-            } else {
-                0
+fn read_stable_clock_with_century(mut read: impl FnMut(u8) -> u8, century_register: Option<u8>) -> Option<TimeFields> {
+    let mut previous = None;
+    for _ in 0..8 {
+        let mut ready = false;
+        for _ in 0..65_536 {
+            if read(reg::STATUS_A) & status_a::UPDATE_IN_PROGRESS == 0 {
+                ready = true;
+                break;
             }
-        } else if pm_flag != 0 {
-            hour + 12
-        } else {
-            hour
-        };
+            core::hint::spin_loop();
+        }
+        if !ready {
+            return None;
+        }
+        // VRT clear means battery-backed RAM/time is not valid.
+        if read(reg::STATUS_D) & 0x80 == 0 {
+            return None;
+        }
+        let mode = read(reg::STATUS_B);
+        let sample = [
+            mode,
+            read(reg::SECONDS),
+            read(reg::MINUTES),
+            read(reg::HOURS),
+            read(reg::DAY),
+            read(reg::MONTH),
+            read(reg::YEAR),
+        ];
+        let century = century_register.map(&mut read);
+        if read(reg::STATUS_A) & status_a::UPDATE_IN_PROGRESS != 0 || read(reg::STATUS_B) != mode {
+            previous = None;
+            continue;
+        }
+        if previous == Some((sample, century)) {
+            return decode_clock_with_century(sample, century);
+        }
+        previous = Some((sample, century));
     }
+    None
+}
 
-    // CMOS stores a two-digit year. The conventional pivot is
-    // 1980 — anything below 80 maps to 2000+, anything >= 80 to
-    // 1900+.  We apply the pivot unconditionally; BIOS and UEFI
-    // both follow the same convention.
-    let full_year = if year < 80 { 2000 + year } else { 1900 + year };
+fn decode_clock(sample: [u8; 7]) -> Option<TimeFields> {
+    decode_clock_with_century(sample, None)
+}
 
-    Some(TimeFields {
-        year: full_year,
-        month,
-        day,
+fn decode_clock_with_century(sample: [u8; 7], century: Option<u8>) -> Option<TimeFields> {
+    let [mode, second, minute, raw_hour, day, month, year] = sample;
+    let binary = mode & status_b::BINARY_MODE != 0;
+    let hour_24 = mode & status_b::HOUR_FORMAT_24 != 0;
+    let decode = |value: u8| {
+        if binary {
+            Some(value)
+        } else if value & 15 < 10 && value >> 4 < 10 {
+            Some(bcd_to_bin(value))
+        } else {
+            None
+        }
+    };
+    let mut hour = decode(raw_hour & 0x7f)?;
+    if hour_24 {
+        if raw_hour & 0x80 != 0 || hour > 23 {
+            return None;
+        }
+    } else {
+        if !(1..=12).contains(&hour) {
+            return None;
+        }
+        hour = hour % 12 + if raw_hour & 0x80 != 0 { 12 } else { 0 };
+    }
+    let year = u16::from(decode(year)?);
+    if year > 99 {
+        return None;
+    }
+    // FADT supplies a CMOS index, never a hard-coded board-specific register.
+    // Only absent century metadata uses the NT/PC 1980 pivot fallback.
+    let year = if let Some(century) = century {
+        u16::from(decode(century)?).checked_mul(100)?.checked_add(year)?
+    } else if year < 80 { 2000 + year } else { 1900 + year };
+    let mut time = TimeFields::new(
+        year,
+        decode(month)?,
+        decode(day)?,
         hour,
-        minute,
-        second,
-        weekday,
-    })
+        decode(minute)?,
+        decode(second)?,
+        1,
+    );
+    if !valid_calendar(&time) {
+        return None;
+    }
+    // The MC146818 weekday register is freely programmable, unlike the date.
+    // Derive Sunday=1 from the Gregorian date instead of trusting stale CMOS.
+    time.weekday = ((days_from_1601(&time) + 1) % 7 + 1) as u8;
+    Some(time)
+}
+
+fn valid_calendar(time: &TimeFields) -> bool {
+    if !(1601..=9999).contains(&time.year)
+        || !(1..=12).contains(&time.month)
+        || time.hour > 23
+        || time.minute > 59
+        || time.second > 59
+    {
+        return false;
+    }
+    let leap = time.year % 4 == 0 && (time.year % 100 != 0 || time.year % 400 == 0);
+    let days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    time.day != 0 && time.day <= days[usize::from(time.month - 1)]
+}
+
+fn encode_hour(hour: u8, binary: bool, hour_24: bool) -> u8 {
+    let value = if hour_24 {
+        hour
+    } else {
+        let h = hour % 12;
+        if h == 0 {
+            12
+        } else {
+            h
+        }
+    };
+    let encoded = if binary { value } else { bin_to_bcd(value) };
+    // PM is a separate flag, never a BCD digit.
+    encoded | if !hour_24 && hour >= 12 { 0x80 } else { 0 }
 }
 
 /// Program the CMOS RTC with the supplied wall-clock time. The
-/// caller is expected to provide a valid 4-digit year; values
-/// outside 0..99 are folded into the BCD register range.
+/// caller supplies a valid Gregorian date. Without a FADT century register,
+/// dates outside the 1980..2079 pivot window fail without programming CMOS.
 ///
 /// This routine disables the RTC update cycle in Status B, writes
 /// the new fields, and re-enables updates. It also performs a
 /// pre-write read of Status B to keep the other bits intact.
 pub fn hal_set_real_time_clock(time: &TimeFields) -> bool {
+    let century_register = crate::hal::common::acpi::rtc_century_register();
+    if !valid_calendar(time)
+        || (century_register.is_none() && !(1980..=2079).contains(&time.year))
+        || !(1..=7).contains(&time.weekday)
+    {
+        return false;
+    }
     if !try_lock() {
         return false;
     }
 
-    wait_for_update_complete();
+    if !wait_for_update_complete() {
+        unlock();
+        return false;
+    }
     let prev_status_b = read_register_raw(reg::STATUS_B);
     write_register_raw(reg::STATUS_B, prev_status_b | 0x80);
 
@@ -290,35 +361,21 @@ pub fn hal_set_real_time_clock(time: &TimeFields) -> bool {
     let hour_24 = (prev_status_b & status_b::HOUR_FORMAT_24) != 0;
 
     let mut year2 = (time.year % 100) as u8;
+    let mut century = (time.year / 100) as u8;
     let mut month = time.month;
     let mut day = time.day;
-    let mut hour = time.hour;
+    let hour = encode_hour(time.hour, binary_mode, hour_24);
     let mut minute = time.minute;
     let mut second = time.second;
     let weekday = time.weekday & 0x07;
 
     if !binary_mode {
         year2 = bin_to_bcd(year2);
+        century = bin_to_bcd(century);
         month = bin_to_bcd(month);
         day = bin_to_bcd(day);
         minute = bin_to_bcd(minute);
         second = bin_to_bcd(second);
-        hour = bin_to_bcd(if hour_24 {
-            hour
-        } else {
-            // 12-hour wrap.
-            let mut h12 = hour % 12;
-            if hour >= 12 {
-                h12 |= 0x80;
-            }
-            h12
-        });
-    } else if !hour_24 {
-        let mut h12 = hour % 12;
-        if hour >= 12 {
-            h12 |= 0x80;
-        }
-        hour = h12;
     }
 
     write_register_raw(reg::SECONDS, second);
@@ -328,6 +385,7 @@ pub fn hal_set_real_time_clock(time: &TimeFields) -> bool {
     write_register_raw(reg::DAY, day);
     write_register_raw(reg::MONTH, month);
     write_register_raw(reg::YEAR, year2);
+    if let Some(register) = century_register { write_register_raw(register, century); }
 
     // Resume updates with the caller's previous SET state.
     write_register_raw(reg::STATUS_B, prev_status_b);
@@ -466,5 +524,140 @@ mod tests {
         // One tick before 1601-01-01 has no representable date.
         assert!(time_fields_from_100ns(0).is_some()); // 1601-01-01 00:00
         assert!(time_fields_from_100ns(u64::MAX).is_none());
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn firmware_century_is_decoded_in_the_selected_mode_and_stabilized() {
+        assert_eq!(decode_clock_with_century([2,0,0,0,1,1,0x80],Some(0x20)).unwrap().year,2080);
+        assert_eq!(decode_clock_with_century([6,0,0,0,1,1,0],Some(21)).unwrap().year,2100);
+        assert!(decode_clock_with_century([2,0,0,0,1,1,0],Some(0x2a)).is_none());
+        assert!(decode_clock_with_century([6,0,0,0,1,1,0],Some(100)).is_none());
+        assert!(decode_clock_with_century([2,0,0,0,0x29,2,0],Some(0x21)).is_none());
+        let mut centuries = 0;
+        let time = read_stable_clock_with_century(|r| match r {
+            reg::STATUS_A => 0, reg::STATUS_B => 6, reg::STATUS_D => 0x80,
+            reg::SECONDS | reg::MINUTES | reg::HOURS | reg::YEAR => 0,
+            reg::DAY | reg::MONTH => 1,
+            0x32 => { centuries += 1; if centuries == 1 {20} else {21} },
+            _ => unreachable!(),
+        },Some(0x32)).unwrap();
+        assert_eq!(time.year,2100);
+        assert_eq!(centuries,3);
+    }
+
+    #[test]
+    fn all_hours_round_trip_in_bcd_binary_and_12_24_hour_modes() {
+        for binary in [false, true] {
+            for h24 in [false, true] {
+                let mode = if binary { 4 } else { 0 } | if h24 { 2 } else { 0 };
+                for hour in 0..24 {
+                    let encode = |v| if binary { v } else { bin_to_bcd(v) };
+                    let raw = encode_hour(hour, binary, h24);
+                    let time =
+                        decode_clock([mode, 0, 0, raw, encode(29), encode(2), encode(24)]).unwrap();
+                    assert_eq!(time.hour, hour, "raw={raw:x} binary={binary} h24={h24}");
+                    assert_eq!(time.year, 2024);
+                    assert_eq!(time.weekday, 5); // Thursday
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_bcd_calendar_hours_and_leap_days_fail() {
+        for sample in [
+            [2, 0x6a, 0, 0, 1, 1, 0x24],
+            [2, 0x60, 0, 0, 1, 1, 0x24],
+            [2, 0, 0x60, 0, 1, 1, 0x24],
+            [2, 0, 0, 0x24, 1, 1, 0x24],
+            [2, 0, 0, 0x80, 1, 1, 0x24],
+            [0, 0, 0, 0, 1, 1, 0x24],
+            [0, 0, 0, 0x13, 1, 1, 0x24],
+            [2, 0, 0, 0, 0x29, 2, 0x23],
+            [2, 0, 0, 0, 0x31, 4, 0x24],
+            [2, 0, 0, 0, 0, 1, 0x24],
+            [2, 0, 0, 0, 1, 0x13, 0x24],
+            [6, 0, 0, 0, 1, 1, 100],
+        ] {
+            assert!(decode_clock(sample).is_none(), "{sample:?}");
+        }
+        assert!(decode_clock([2, 0, 0, 0, 0x29, 2, 0]).is_some()); // 2000 is leap
+        assert!(!valid_calendar(&TimeFields::new(1900, 2, 29, 0, 0, 0, 1)));
+        assert!(valid_calendar(&TimeFields::new(2000, 2, 29, 0, 0, 0, 1)));
+        assert!(!valid_calendar(&TimeFields::new(2100, 2, 29, 0, 0, 0, 1)));
+    }
+
+    #[test]
+    fn snapshots_retry_rollover_and_uip_and_fail_boundedly() {
+        // Both samples straddle a year rollover; accept only the two matching
+        // post-rollover reads, never mixed seconds/date from the first sample.
+        let old = [2, 0x59, 0x59, 0x23, 0x31, 0x12, 0x23];
+        let new = [2, 0, 0, 0, 1, 1, 0x24];
+        let mut pass = 0;
+        let mut mode_reads = 0;
+        let time = read_stable_clock(|reg| {
+            let sample = if pass == 0 { old } else { new };
+            match reg {
+                reg::STATUS_A => 0,
+                reg::STATUS_D => 0x80,
+                reg::STATUS_B => {
+                    mode_reads += 1;
+                    if mode_reads % 2 == 0 {
+                        pass += 1;
+                    }
+                    sample[0]
+                }
+                reg::SECONDS => sample[1],
+                reg::MINUTES => sample[2],
+                reg::HOURS => sample[3],
+                reg::DAY => sample[4],
+                reg::MONTH => sample[5],
+                reg::YEAR => sample[6],
+                _ => unreachable!(),
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            (
+                time.year,
+                time.month,
+                time.day,
+                time.hour,
+                time.minute,
+                time.second
+            ),
+            (2024, 1, 1, 0, 0, 0)
+        );
+        assert_eq!(pass, 3);
+        let mut reads = 0;
+        assert!(read_stable_clock(|r| {
+            reads += 1;
+            assert_eq!(r, reg::STATUS_A);
+            0x80
+        })
+        .is_none());
+        assert_eq!(reads, 65_536);
+        assert!(read_stable_clock(|r| if r == reg::STATUS_D { 0 } else { 0 }).is_none());
+        let mut status = 0;
+        assert!(read_stable_clock(|r| match r {
+            reg::STATUS_A => {
+                status += 1;
+                if status % 2 == 0 {
+                    0x80
+                } else {
+                    0
+                }
+            }
+            reg::STATUS_D => 0x80,
+            reg::STATUS_B => 2,
+            reg::DAY | reg::MONTH => 1,
+            _ => 0,
+        })
+        .is_none());
     }
 }

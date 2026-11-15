@@ -24,14 +24,30 @@ static HPET_VA: AtomicU64 = AtomicU64::new(0);
 static HPET_FREQ_HZ: AtomicU64 = AtomicU64::new(0);
 static HPET_PERIOD_FS: AtomicU64 = AtomicU64::new(0);
 
-#[repr(C, packed)]
-struct AcpiHpetTable {
-    header: [u8; 36],
-    event_block_id: u32,
-    base_address: u64,
-    hpet_number: u8,
-    clock_tick_unit: u16,
-    _padding: u8,
+// ACPI HPET layout: header (36), event block ID (4), GAS (12),
+// sequence (1), minimum tick (2), page protection (1). GAS includes four
+// metadata bytes before its 64-bit address; it is not a bare u64.
+const HPET_TABLE_SIZE: usize = 56;
+
+fn table_register_base(table: &[u8]) -> Option<u64> {
+    if table.len() < HPET_TABLE_SIZE || &table[..4] != b"HPET" {
+        return None;
+    }
+    let length = u32::from_le_bytes(table[4..8].try_into().ok()?) as usize;
+    if length != HPET_TABLE_SIZE
+        || table[..length].iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) != 0
+        // Only system-memory GAS with a naturally aligned 64-bit register
+        // block is supported. HPET does not use the System I/O address space.
+        || table[40] != 0 || table[41] != 64 || table[42] != 0
+        || !matches!(table[43], 0 | 4)
+    {
+        return None;
+    }
+    let base = u64::from_le_bytes(table[44..52].try_into().ok()?);
+    if base == 0 || base & 0x3ff != 0 {
+        return None;
+    }
+    Some(base)
 }
 
 fn hpet_va() -> u64 {
@@ -74,49 +90,51 @@ fn hpet_reg_write64(off: u64, val: u64) {
     }
 }
 
-/// Initialise the HPET. `acpi_hpet_phys` is the physical address
-/// of the ACPI HPET table; if it is 0 we silently succeed with
-/// HPET disabled.
-pub fn init(acpi_hpet_phys: u64) -> bool {
-    if acpi_hpet_phys == 0 {
+/// Initialize from a mapped ACPI HPET table address returned by `find_table`.
+/// Zero disables discovery. The table address is a virtual address, distinct
+/// from the physical MMIO base encoded inside its Generic Address Structure.
+pub fn init(acpi_hpet_table_va: u64) -> bool {
+    if acpi_hpet_table_va == 0 {
         return false;
     }
-    let table_va = acpi_hpet_phys as *const AcpiHpetTable;
-    let base: u64 = unsafe {
-        let p = core::ptr::addr_of!((*table_va).base_address);
-        ptr::read_unaligned(p)
+    let mut table = [0u8; HPET_TABLE_SIZE];
+    for (index, byte) in table.iter_mut().enumerate() {
+        // SAFETY: the ACPI discovery path supplies a mapped HPET table; use
+        // byte reads because ACPI structures need not have Rust alignment.
+        *byte = unsafe { ptr::read_volatile((acpi_hpet_table_va as *const u8).add(index)) };
+    }
+    let Some(base) = table_register_base(&table) else {
+        return false;
     };
-    if base == 0 {
+    let page_base = base & !0xfff;
+    let page_offset = base - page_base;
+    let Some(mapping) = crate::mm::syspte::map_io_space(page_base, 1) else {
         return false;
-    }
-
-    // Map the registers. The HPET spec requires a 1 KiB aligned
-    // region; we map 1 page (4 KiB) which is plenty.
-    // A raw physical address used as a virtual address is a wild
-    // pointer. Report the mapping failure instead of proceeding.
-    let va = match crate::mm::syspte::map_io_space(base, 1) {
-        Some(v) => v,
-        None => return false,
     };
-    HPET_VA.store(va, Ordering::Release);
-
-    let cap = hpet_reg64(HPET_REG_CAP);
-    let period_fs = cap >> 32; // femtoseconds per tick
-    if period_fs == 0 {
+    let va = mapping + page_offset;
+    // SAFETY: the MMIO page covers HPET's capability/configuration registers.
+    let cap = unsafe { ptr::read_volatile((va + HPET_REG_CAP) as *const u64) };
+    let period_fs = cap >> 32;
+    // HPET specification maximum period is 100 ns; a 64-bit counter is
+    // required by this interface. Reject an unsupported 32-bit counter.
+    if period_fs == 0 || period_fs > 100_000_000 || cap & (1 << 13) == 0 {
+        crate::mm::syspte::unmap_io_space(mapping, 1);
         return false;
     }
-    let hz = 1_000_000_000_000_000u64 / period_fs;
-    HPET_FREQ_HZ.store(hz, Ordering::Release);
+    // Enable the free-running counter without legacy replacement: no HPET
+    // comparator IRQ has been configured, so redirecting PIT/RTC IRQs here
+    // would steal the existing system timer and real-time-clock interrupts.
+    // SAFETY: the mapped configuration register is naturally aligned.
+    unsafe {
+        let cfg = ptr::read_volatile((va + HPET_REG_CFG) as *const u32);
+        ptr::write_volatile(
+            (va + HPET_REG_CFG) as *mut u32,
+            (cfg | HPET_CFG_ENABLE) & !HPET_CFG_LEGACY,
+        );
+    }
     HPET_PERIOD_FS.store(period_fs, Ordering::Release);
-
-    // Enable timer + legacy replacement routing. The legacy bit
-    // is only honoured by hardware that advertises it in CAP.
-    let cfg = hpet_reg(HPET_REG_CFG);
-    let mut new_cfg = cfg | HPET_CFG_ENABLE;
-    if cap & (1 << 15) != 0 {
-        new_cfg |= HPET_CFG_LEGACY;
-    }
-    hpet_reg_write(HPET_REG_CFG, new_cfg);
+    HPET_FREQ_HZ.store(1_000_000_000_000_000u64 / period_fs, Ordering::Release);
+    HPET_VA.store(va, Ordering::Release);
     true
 }
 
@@ -136,26 +154,25 @@ pub fn counter_lo() -> u32 {
     hpet_reg(HPET_REG_COUNTER)
 }
 
-/// read the 64-bit HPET main counter. The HPET counter is 64-bit
-/// wide but most hardware exposes it as a 32-bit register that
-/// must be read twice with the high-32 read first to avoid
-/// tearing.
+/// Read a coherent 64-bit counter using high/low/high sampling.
+fn coherent_counter(mut read: impl FnMut(u64) -> u32) -> u64 {
+    loop {
+        let high = read(HPET_REG_COUNTER + 4);
+        let low = read(HPET_REG_COUNTER);
+        if high == read(HPET_REG_COUNTER + 4) {
+            return (u64::from(high) << 32) | u64::from(low);
+        }
+        // A rollover may happen before OR after the low read. Retrying is
+        // necessary; pairing the old low with the newer high can jump by 2^32.
+    }
+}
+
+/// Read the 64-bit HPET main counter without tearing across a low-word wrap.
 pub fn counter() -> u64 {
-    let va = hpet_va();
-    if va == 0 {
+    if hpet_va() == 0 {
         return 0;
     }
-    let hi_first = unsafe { ptr::read_volatile((va + HPET_REG_COUNTER + 4) as *const u32) } as u64;
-    let lo = unsafe { ptr::read_volatile((va + HPET_REG_COUNTER) as *const u32) } as u64;
-    let hi_second = unsafe { ptr::read_volatile((va + HPET_REG_COUNTER + 4) as *const u32) } as u64;
-    if hi_first == hi_second {
-        (hi_first << 32) | lo
-    } else {
-        // The counter rolled over between the two reads. The low
-        // value was read after the wrap, so it belongs with the
-        // newer (second) high word.
-        (hi_second << 32) | lo
-    }
+    coherent_counter(hpet_reg)
 }
 
 /// Equivalent of Win32 `query_performance_frequency`. Returns the
@@ -213,12 +230,65 @@ pub fn program_timer0(delay_ticks: u32) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn table() -> [u8; HPET_TABLE_SIZE] {
+        let mut table = [0u8; HPET_TABLE_SIZE];
+        table[..4].copy_from_slice(b"HPET");
+        table[4..8].copy_from_slice(&(HPET_TABLE_SIZE as u32).to_le_bytes());
+        table[8] = 1;
+        table[41] = 64;
+        table[44..52].copy_from_slice(&0xfed0_0400u64.to_le_bytes());
+        fix_checksum(&mut table);
+        table
+    }
+
+    fn fix_checksum(table: &mut [u8]) {
+        table[9] = 0;
+        table[9] = table
+            .iter()
+            .fold(0u8, |sum, b| sum.wrapping_add(*b))
+            .wrapping_neg();
+    }
 
     #[test]
-    fn period_to_hz() {
-        // 100 ns = 100,000,000 femtoseconds → 10 MHz.
-        let period_fs: u64 = 100_000_000;
-        let hz = 1_000_000_000_000_000u64 / period_fs;
-        assert_eq!(hz, 10_000_000);
+    fn hpet_gas_address_follows_its_four_metadata_bytes() {
+        assert_eq!(table_register_base(&table()), Some(0xfed0_0400));
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsupported_hpet_tables() {
+        let original = table();
+        assert_eq!(table_register_base(&original[..55]), None);
+        for (offset, value) in [
+            (0, b'X'),
+            (4, 55),
+            (9, 42),
+            (40, 1),
+            (41, 32),
+            (42, 1),
+            (43, 1),
+            (44, 1),
+        ] {
+            let mut bad = original;
+            bad[offset] = value;
+            if offset != 9 {
+                fix_checksum(&mut bad);
+            }
+            assert_eq!(table_register_base(&bad), None, "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn retries_counter_rollover_before_or_after_low_read() {
+        for low in [0xffff_ffff, 0] {
+            let values = [7, low, 8, 8, 1, 8];
+            let mut values = values.into_iter();
+            assert_eq!(
+                coherent_counter(|_| values.next().unwrap()),
+                (8u64 << 32) | 1
+            );
+            assert!(values.next().is_none());
+        }
     }
 }

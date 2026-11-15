@@ -166,8 +166,8 @@ pub fn init() {
         let _ = pit::init(100);
 
         // 4. The HPET: probe the ACPI table if one was registered.
-        if let Some(hpet_phys) = find_hpet_phys() {
-            let _ = hpet::init(hpet_phys);
+        if let Some(hpet_table_va) = find_hpet_table_va() {
+            let _ = hpet::init(hpet_table_va);
         }
 
         // 5. The 8042 keyboard controller.
@@ -217,19 +217,8 @@ pub fn hal_initialize_processor(cpu_id: u32, alloc_ist: bool) -> i32 {
     0
 }
 
-/// Look up the HPET table's physical address in the ACPI tables.
-/// Returns `None` if the table is missing or the ACPI subsystem
-/// has not been initialised.
-fn find_hpet_phys() -> Option<u64> {
-    let hpet_sig: [u8; 4] = *b"HPET";
-    let ptr = crate::hal::common::acpi::find_table(&hpet_sig)?;
-    unsafe {
-        let header_va = ptr as *const u8;
-        // HPET-specific layout: 36 bytes of standard ACPI
-        // header, then 4 bytes event_block_id, 8 bytes
-        // base_address.
-        let lo = core::ptr::read_unaligned(header_va.add(36 + 4) as *const u32);
-        let hi = core::ptr::read_unaligned(header_va.add(36 + 8) as *const u32);
-        Some(((hi as u64) << 32) | (lo as u64))
-    }
+/// Return the mapped HPET table, not the physical MMIO base inside its GAS.
+fn find_hpet_table_va() -> Option<u64> {
+    let table = crate::hal::common::acpi::find_table(b"HPET")?;
+    Some(table as u64)
 }

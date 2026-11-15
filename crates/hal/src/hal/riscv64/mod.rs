@@ -6,6 +6,7 @@
 //
 //! Also includes framebuffer support for GPU display output.
 
+pub mod rtc;
 pub mod serial;
 
 /// Framebuffer HAL for display output

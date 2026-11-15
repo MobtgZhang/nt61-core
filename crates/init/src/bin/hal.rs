@@ -22,6 +22,7 @@ pub extern "C" fn _start() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(_image_handle: usize, _system_table: usize) -> ! {
+    hal::native_exports::retain();
     hal::init();
     loop {
         nt61::arch::halt();

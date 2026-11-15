@@ -21,6 +21,7 @@ pub mod pci;
 pub mod pit;
 pub mod power;
 pub mod relock;
+pub(crate) mod rtc;
 pub mod serial;
 pub mod serial_disable;
 pub mod system_info;

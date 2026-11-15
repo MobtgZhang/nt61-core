@@ -5,6 +5,7 @@
 
 pub mod framebuffer;
 pub mod keyboard;
+pub mod rtc;
 pub mod serial;
 
 /// Initialize the HAL — serial port + framebuffer.

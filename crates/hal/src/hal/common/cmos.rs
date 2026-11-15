@@ -71,7 +71,22 @@ mod backend {
         crate::hal::aarch64::rtc::query_real_time_clock()
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(target_arch = "riscv64")]
+    pub fn query_real_time_clock() -> Option<super::TimeFields> {
+        crate::hal::riscv64::rtc::query_real_time_clock()
+    }
+
+    #[cfg(target_arch = "loongarch64")]
+    pub fn query_real_time_clock() -> Option<super::TimeFields> {
+        crate::hal::loongarch64::rtc::query_real_time_clock()
+    }
+
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
+    )))]
     pub fn query_real_time_clock() -> Option<super::TimeFields> {
         None
     }

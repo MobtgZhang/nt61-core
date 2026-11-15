@@ -11,6 +11,8 @@
 
 extern crate alloc;
 
+use crate::ke::sync::Spinlock;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ptr;
@@ -92,6 +94,19 @@ unsafe impl<T> Sync for AcpiCell<T> {}
 /// explicit.
 pub fn init() {}
 
+#[path = "acpi_reader.rs"]
+mod reader;
+
+#[path = "acpi_rtc.rs"]
+mod rtc_config;
+
+/// Discover the ACPI-advertised century index without assuming firmware tables
+/// are page aligned. Only bounded, checksummed RSDP/root/FADT data is accepted.
+#[cfg(target_arch = "x86_64")]
+pub fn rtc_century_register() -> Option<u8> {
+    rtc_config::find_century_register(read_physical, RSDP_PHYS.load(Ordering::Acquire))
+}
+
 pub fn set_rsdp(rsdp_phys: u64) {
     RSDP_PHYS.store(rsdp_phys, Ordering::Release);
 }
@@ -109,26 +124,83 @@ macro_rules! acpi_debug {
     ($($arg:tt)*) => {};
 }
 
-/// Map a physical address for ACPI table access. Uses the
-/// recursive kernel page-table self-map (if present); falls
-/// back to the identity-mapped address on the BSP.
-fn map_acpi(phys: u64) -> Option<u64> {
-    acpi_debug!("    [acpi] map_acpi: mapping phys=0x{:016x}", phys);
-    let result = crate::mm::syspte::map_io_space(phys, 1);
-    if result.is_some() {
-        acpi_debug!("    [acpi] map_acpi: mapped to {:?}", result);
-    } else {
-        acpi_debug!("    [acpi] map_acpi: mapping failed");
+/// Owns an aligned temporary mapping. `data` includes the physical offset;
+/// Drop always releases the original mapping base and exact page count.
+struct PhysicalMapping {
+    base: u64,
+    pages: u64,
+    data: *const u8,
+}
+impl Drop for PhysicalMapping {
+    fn drop(&mut self) {
+        crate::mm::syspte::unmap_io_space(self.base, self.pages);
     }
-    result
+}
+fn map_physical(physical: u64, length: usize) -> Option<PhysicalMapping> {
+    let range = reader::mapping_range(physical, length)?;
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // The generic non-x86 syspte API ignores identity-map failure, so
+        // check it here without changing semantics for unrelated callers.
+        if !crate::arch::identity_map_region(range.physical_base, range.pages * 4096) {
+            return None;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    let base = crate::mm::syspte::map_io_space(range.physical_base, range.pages)?;
+    #[cfg(not(target_arch = "x86_64"))]
+    let base = range.physical_base;
+    let mut mapping = PhysicalMapping {
+        base,
+        pages: range.pages,
+        data: core::ptr::null(),
+    };
+    base.checked_add(range.pages * 4096)?;
+    mapping.data = base.checked_add(range.offset)? as *const u8;
+    Some(mapping)
+}
+fn read_physical(physical: u64, length: usize) -> Option<Vec<u8>> {
+    let mapping = map_physical(physical, length)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).ok()?;
+    for index in 0..length {
+        // SAFETY: mapping_range checked the complete extent, including offset.
+        bytes.push(unsafe { ptr::read_volatile(mapping.data.add(index)) });
+    }
+    Some(bytes)
 }
 
-fn map_acpi_pages(phys: u64, page_count: u64) -> Option<u64> {
-    crate::mm::syspte::map_io_space(phys, page_count)
+// Validated table snapshots stay alive for the kernel lifetime. Temporary
+// physical mappings are released even for rejected tables; repeated lookups
+// reuse one immutable snapshot and return the same stable table pointer.
+static TABLES: Spinlock<Vec<(u64, Box<[u8]>)>> = Spinlock::new(Vec::new());
+fn cached_table(physical: u64) -> Option<*const AcpiTableHeader> {
+    {
+        let tables = TABLES.lock();
+        if let Some((_, bytes)) = tables.iter().find(|(pa, _)| *pa == physical) {
+            return Some(bytes.as_ptr().cast());
+        }
+    }
+    let bytes = reader::table(&mut read_physical, physical)?.into_boxed_slice();
+    let mut tables = TABLES.lock();
+    if let Some((_, bytes)) = tables.iter().find(|(pa, _)| *pa == physical) {
+        return Some(bytes.as_ptr().cast());
+    }
+    let pointer = bytes.as_ptr().cast();
+    tables.push((physical, bytes));
+    Some(pointer)
 }
-
-fn unmap_acpi(va: u64, page_count: u64) {
-    crate::mm::syspte::unmap_io_space(va, page_count);
+fn root_addresses() -> Option<Vec<u64>> {
+    let roots = reader::roots(&mut read_physical, RSDP_PHYS.load(Ordering::Acquire))?;
+    for (physical, stride) in roots {
+        let Some(bytes) = reader::table(&mut read_physical, physical) else {
+            continue;
+        };
+        if let Some(entries) = reader::root_entries(&bytes, stride) {
+            return Some(entries);
+        }
+    }
+    None
 }
 
 /// Sum the bytes of `buf` modulo 256. A valid ACPI table sums
@@ -145,55 +217,22 @@ fn checksum(buf: &[u8]) -> u8 {
 /// the XSDT (preferred) or RSDT (fallback), depending on the
 /// RSDP revision.
 pub fn find_table(signature: &[u8; 4]) -> Option<*const AcpiTableHeader> {
-    if signature.len() != 4 {
-        return None;
-    }
-    let rsdp_phys = RSDP_PHYS.load(Ordering::Acquire);
-    if rsdp_phys == 0 {
-        return None;
-    }
-    acpi_debug!(
-        "    [acpi] find_table: searching for {:?}",
-        core::str::from_utf8(signature).unwrap_or("???")
-    );
-    let rsdp_va = map_acpi(rsdp_phys)? as *const u8;
-    unsafe {
-        // read signature (8 bytes).
-        let mut sig = [0u8; 8];
-        for i in 0..8 {
-            sig[i] = ptr::read_volatile(rsdp_va.add(i));
+    for physical in root_addresses()? {
+        // Probe the signature before copying unrelated large tables.
+        let Some(header) = read_physical(physical, reader::HEADER_SIZE) else {
+            continue;
+        };
+        if header.get(..4) != Some(signature) {
+            continue;
         }
-        if &sig != RSDP_SIGNATURE {
-            // Some QEMU configurations forget the trailing
-            // space; accept "RSDP" too.
-            if &sig[..4] != b"RSDP" {
-                acpi_debug!("    [acpi] find_table: RSDP signature mismatch");
-                return None;
+        if let Some(pointer) = cached_table(physical) {
+            // The retained snapshot, rather than an earlier probe, is authoritative.
+            if unsafe { ptr::read_unaligned(pointer).signature } == *signature {
+                return Some(pointer);
             }
         }
-        // read revision.
-        let revision = ptr::read_volatile(rsdp_va.add(15));
-        acpi_debug!("    [acpi] find_table: RSDP revision={}", revision);
-        if revision >= 2 {
-            // XSDT path.
-            let xsdt_lo = read_u32(rsdp_va.add(24));
-            let xsdt_hi = read_u32(rsdp_va.add(28));
-            let xsdt_phys = ((xsdt_hi as u64) << 32) | (xsdt_lo as u64);
-            acpi_debug!(
-                "    [acpi] find_table: using XSDT at phys=0x{:016x}",
-                xsdt_phys
-            );
-            find_in_xsdt(xsdt_phys, signature)
-        } else {
-            // RSDT path.
-            let rsdt_phys = read_u32(rsdp_va.add(16)) as u64;
-            acpi_debug!(
-                "    [acpi] find_table: using RSDT at phys=0x{:016x}",
-                rsdt_phys
-            );
-            find_in_rsdt(rsdt_phys, signature)
-        }
     }
+    None
 }
 
 /// # Safety
@@ -214,186 +253,25 @@ pub unsafe fn read_u64(p: *const u8) -> u64 {
     (read_u32(p.add(4)) as u64) << 32 | (read_u32(p) as u64)
 }
 
-fn find_in_xsdt(xsdt_phys: u64, signature: &[u8; 4]) -> Option<*const AcpiTableHeader> {
-    acpi_debug!("    [acpi] find_in_xsdt: xsdt_phys=0x{:016x}", xsdt_phys);
-    let va = map_acpi(xsdt_phys)? as *const u8;
-    unsafe {
-        let length = read_u32(va.add(4));
-        let n_entries = (length.saturating_sub(36)) / 8;
-        acpi_debug!(
-            "    [acpi] find_in_xsdt: XSDT length={} entries={}",
-            length,
-            n_entries
-        );
-        for i in 0..n_entries as isize {
-            let entry_lo = read_u32(va.add(36 + (i * 8) as usize));
-            let entry_hi = read_u32(va.add(40 + (i * 8) as usize));
-            let table_phys = ((entry_hi as u64) << 32) | (entry_lo as u64);
-            if let Some(p) = find_in_table(table_phys, signature) {
-                acpi_debug!(
-                    "    [acpi] find_in_xsdt: found at phys=0x{:016x}",
-                    table_phys
-                );
-                return Some(p);
-            }
-        }
-    }
-    acpi_debug!("    [acpi] find_in_xsdt: table not found");
-    None
-}
-
-fn find_in_rsdt(rsdt_phys: u64, signature: &[u8; 4]) -> Option<*const AcpiTableHeader> {
-    let va = map_acpi(rsdt_phys)? as *const u8;
-    unsafe {
-        let length = read_u32(va.add(4));
-        let n_entries = (length.saturating_sub(36)) / 4;
-        for i in 0..n_entries as isize {
-            let entry = read_u32(va.add(36 + (i * 4) as usize));
-            if let Some(p) = find_in_table(entry as u64, signature) {
-                return Some(p);
-            }
-        }
-    }
-    None
-}
-
-fn find_in_table(phys: u64, signature: &[u8; 4]) -> Option<*const AcpiTableHeader> {
-    let va = map_acpi(phys)? as *const u8;
-    unsafe {
-        let mut sig = [0u8; 4];
-        for i in 0..4 {
-            sig[i] = ptr::read_volatile(va.add(i));
-        }
-        if &sig == signature {
-            return Some(va as *const AcpiTableHeader);
-        }
-    }
-    None
-}
-
-/// Return a `Vec` of every ACPI table the firmware reported.
-/// Useful for diagnostics and for drivers that need to find a
-/// non-standard table.
+/// Return each fully validated table with a stable kernel-lifetime pointer.
 pub fn enumerate_tables() -> Vec<(*const AcpiTableHeader, [u8; 4])> {
     let mut out = Vec::new();
-    let rsdp_phys = RSDP_PHYS.load(Ordering::Acquire);
-    if rsdp_phys == 0 {
+    let Some(addresses) = root_addresses() else {
         return out;
-    }
-    let rsdp_va = match map_acpi(rsdp_phys) {
-        Some(v) => v as *const u8,
-        None => return out,
     };
-    unsafe {
-        let revision = ptr::read_volatile(rsdp_va.add(15));
-        if revision >= 2 {
-            let xsdt_lo = read_u32(rsdp_va.add(24));
-            let xsdt_hi = read_u32(rsdp_va.add(28));
-            let xsdt_phys = ((xsdt_hi as u64) << 32) | (xsdt_lo as u64);
-            collect_xsdt(xsdt_phys, &mut out);
-        } else {
-            let rsdt_phys = read_u32(rsdp_va.add(16)) as u64;
-            collect_rsdt(rsdt_phys, &mut out);
+    for physical in addresses {
+        if let Some(pointer) = cached_table(physical) {
+            // SAFETY: cached_table validated and retained the complete header.
+            let signature = unsafe { ptr::read_unaligned(pointer).signature };
+            out.push((pointer, signature));
         }
     }
     out
 }
 
-fn collect_xsdt(xsdt_phys: u64, out: &mut Vec<(*const AcpiTableHeader, [u8; 4])>) {
-    let Some(va) = map_acpi(xsdt_phys) else {
-        return;
-    };
-    let va = va as *const u8;
-    unsafe {
-        let length = read_u32(va.add(4));
-        let n = (length.saturating_sub(36)) / 8;
-        for i in 0..n as isize {
-            let lo = read_u32(va.add(36 + (i * 8) as usize));
-            let hi = read_u32(va.add(40 + (i * 8) as usize));
-            let phys = ((hi as u64) << 32) | (lo as u64);
-            if let Some(p) = push_table(phys) {
-                out.push(p);
-            }
-        }
-    }
-}
-
-fn collect_rsdt(rsdt_phys: u64, out: &mut Vec<(*const AcpiTableHeader, [u8; 4])>) {
-    let Some(va) = map_acpi(rsdt_phys) else {
-        return;
-    };
-    let va = va as *const u8;
-    unsafe {
-        let length = read_u32(va.add(4));
-        let n = (length.saturating_sub(36)) / 4;
-        for i in 0..n as isize {
-            let entry = read_u32(va.add(36 + (i * 4) as usize));
-            if let Some(p) = push_table(entry as u64) {
-                out.push(p);
-            }
-        }
-    }
-}
-
-fn push_table(phys: u64) -> Option<(*const AcpiTableHeader, [u8; 4])> {
-    // Map at least the header first so we can read the length.
-    let header_va = map_acpi(phys)? as *const u8;
-    unsafe {
-        // Read the table length from the header.
-        let length = read_u32(header_va.add(4));
-        if length < 36 {
-            unmap_acpi(header_va as u64, 1);
-            return None;
-        }
-        let total_bytes = length as usize;
-        let page_count = ((total_bytes + 4095) / 4096) as u64;
-        unmap_acpi(header_va as u64, 1);
-        let va = match map_acpi_pages(phys, page_count) {
-            Some(va) => va as *const u8,
-            None => return None,
-        };
-        let mut sig = [0u8; 4];
-        for i in 0..4 {
-            sig[i] = ptr::read_volatile(va.add(i));
-        }
-        let p = va as *const AcpiTableHeader;
-        // Validate checksum: sum of header bytes must be zero.
-        let bytes = core::slice::from_raw_parts(va, total_bytes);
-        if checksum(bytes) != 0 {
-            return None;
-        }
-        Some((p, sig))
-    }
-}
-
-/// Validate the RSDP checksum. Reads the bytes at `rsdp_phys`
-/// and returns `true` if they sum to zero.
+/// Verify the exact RSDP signature, legacy checksum, and extended checksum.
 pub fn validate_rsdp(rsdp_phys: u64) -> bool {
-    let Some(va) = map_acpi(rsdp_phys) else {
-        return false;
-    };
-    let va = va as *const u8;
-    unsafe {
-        // Revision 1 RSDP is only 20 bytes long; the length field at
-        // offset 20 does not exist. Only read it when the revision
-        // (at offset 15) indicates an extended structure.
-        let revision = ptr::read_volatile(va.add(15));
-        let n = if revision >= 2 {
-            let length = read_u32(va.add(20));
-            if length == 0 {
-                20
-            } else {
-                length as usize
-            }
-        } else {
-            20
-        };
-        if n > 36 {
-            return false;
-        }
-        let bytes = core::slice::from_raw_parts(va, n);
-        checksum(bytes) == 0
-    }
+    reader::roots(&mut read_physical, rsdp_phys).is_some()
 }
 
 /// read a CMOS byte. Re-exported here so callers don't have to
@@ -401,7 +279,7 @@ pub fn validate_rsdp(rsdp_phys: u64) -> bool {
 /// read a byte from the CMOS register file. Stub on non-x86_64 —
 /// LoongArch / ARM64 / RISC-V64 use ACPI for time-keeping instead.
 #[cfg(target_arch = "x86_64")]
-    pub fn read_cmos(reg: u8) -> u8 {
+pub fn read_cmos(reg: u8) -> u8 {
     let addr = 0x70u16;
     let data = 0x71u16;
     crate::hal::x86_64::io_port::write_port_uchar(addr, 0x80 | (reg & 0x7F));
@@ -449,7 +327,7 @@ pub fn get_mcfg_info() -> Option<(u64, u8, u8)> {
     unsafe {
         // MCFG header (44 bytes) + variable entries (16 bytes each).
         let len = read_u32((hdr as *const u8).add(4));
-        if len < 44 {
+        if len < 60 {
             return None;
         }
         // First entry is always at offset 44 (after AcpiTableHeader + 8 reserved bytes).
@@ -666,7 +544,9 @@ fn parse_madt_locked(header: *const AcpiTableHeader) -> bool {
                 break;
             }
             match entry_type {
-                MADT_ENTRY_LOCAL_APIC => {
+                MADT_ENTRY_LOCAL_APIC
+                    if entry_len as usize >= core::mem::size_of::<MadtLocalApic>() =>
+                {
                     if info.lapic_count as usize >= MAX_MADT_LAPICS {
                         break;
                     }
@@ -683,7 +563,7 @@ fn parse_madt_locked(header: *const AcpiTableHeader) -> bool {
                         );
                     }
                 }
-                MADT_ENTRY_IO_APIC => {
+                MADT_ENTRY_IO_APIC if entry_len as usize >= core::mem::size_of::<MadtIoApic>() => {
                     if !info.has_io_apic {
                         let e: MadtIoApic =
                             core::ptr::read_unaligned(entry_va as *const MadtIoApic);
@@ -702,7 +582,9 @@ fn parse_madt_locked(header: *const AcpiTableHeader) -> bool {
                         );
                     }
                 }
-                MADT_ENTRY_INTERRUPT_OVERRIDE => {
+                MADT_ENTRY_INTERRUPT_OVERRIDE
+                    if entry_len as usize >= core::mem::size_of::<MadtIntOverride>() =>
+                {
                     if info.int_override_count < MAX_INT_OVERRIDES {
                         let e: MadtIntOverride =
                             core::ptr::read_unaligned(entry_va as *const MadtIntOverride);
@@ -717,7 +599,10 @@ fn parse_madt_locked(header: *const AcpiTableHeader) -> bool {
                                    bus, source, gsi, flags);
                     }
                 }
-                MADT_ENTRY_LOCAL_APIC_NMI if info.nmi_source_count < MAX_NMI_SOURCES => {
+                MADT_ENTRY_LOCAL_APIC_NMI
+                    if entry_len as usize >= core::mem::size_of::<MadtLocalApicNmi>()
+                        && info.nmi_source_count < MAX_NMI_SOURCES =>
+                {
                     let e: MadtLocalApicNmi =
                         core::ptr::read_unaligned(entry_va as *const MadtLocalApicNmi);
                     // Copy fields before moving the struct
@@ -921,7 +806,8 @@ fn fadt_read_u64(table: *const u8, offset: usize) -> u64 {
 /// Resolve a Generic Address Structure: prefer the 64-bit extended field
 /// when the FADT revision is >= 2 and it is populated (ACPI 6.3 §5.2.9).
 fn gas_address(table: *const u8, legacy: usize, extended: usize, revision: u8) -> u64 {
-    if revision >= 2 {
+    let length = fadt_read_u32(table, fadt_off::LENGTH) as usize;
+    if revision >= 2 && extended + 8 <= length {
         let extended_value = fadt_read_u64(table, extended);
         if extended_value != 0 {
             return extended_value;
@@ -945,7 +831,11 @@ pub fn parse_fadt() -> Option<FadtInfo> {
 
     Some(FadtInfo {
         revision,
-        minor_revision: read_u8(table, fadt_off::MINOR_REVISION),
+        minor_revision: if length > fadt_off::MINOR_REVISION as u32 {
+            read_u8(table, fadt_off::MINOR_REVISION)
+        } else {
+            0
+        },
         preferred_profile: read_u8(table, fadt_off::PREFERRED_PROFILE),
         sci_interrupt: read_u16(table, fadt_off::SCI_INTERRUPT),
         pm1a_evt_blk: gas_address(
@@ -993,12 +883,28 @@ pub fn parse_fadt() -> Option<FadtInfo> {
         gpe0_len: read_u8(table, fadt_off::GPE0_BLOCK_LENGTH),
         gpe1_len: read_u8(table, fadt_off::GPE1_BLOCK_LENGTH),
         flags: fadt_read_u32(table, fadt_off::FLAGS),
-        reset_address_space: if length > 116 { read_u8(table, 116) } else { 0xff },
+        reset_address_space: if length > 116 {
+            read_u8(table, 116)
+        } else {
+            0xff
+        },
         reset_bit_width: if length > 117 { read_u8(table, 117) } else { 0 },
         reset_bit_offset: if length > 118 { read_u8(table, 118) } else { 0 },
-        arm_boot_arch: if length >= 131 { read_u16(table, 129) } else { 0 },
-        reset_register: fadt_read_u64(table, fadt_off::RESET_REGISTER_ADDRESS),
-        reset_value: if length > fadt_off::RESET_VALUE as u32 { read_u8(table, fadt_off::RESET_VALUE) } else { 0 },
+        arm_boot_arch: if length >= 131 {
+            read_u16(table, 129)
+        } else {
+            0
+        },
+        reset_register: if length >= (fadt_off::RESET_REGISTER_ADDRESS + 8) as u32 {
+            fadt_read_u64(table, fadt_off::RESET_REGISTER_ADDRESS)
+        } else {
+            0
+        },
+        reset_value: if length > fadt_off::RESET_VALUE as u32 {
+            read_u8(table, fadt_off::RESET_VALUE)
+        } else {
+            0
+        },
     })
 }
 
