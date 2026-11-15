@@ -12,6 +12,9 @@ pub struct Surface {
     width: u32,
     height: u32,
     pixels: Vec<u32>,
+    /// Optional device-space damage clip for drawing operations. Reads keep
+    /// addressing the full surface so alpha composition sees the retained scene.
+    draw_clip: Option<Rect>,
 }
 
 #[cfg(test)]
@@ -131,7 +134,17 @@ impl Surface {
             width,
             height,
             pixels: alloc::vec![0; pixel_count],
+            draw_clip: None,
         })
+    }
+
+    pub fn set_draw_clip(&mut self, clip: Option<Rect>) {
+        self.draw_clip = clip;
+    }
+
+    pub fn drawing_bounds(&self) -> Rect {
+        let full = Rect::new(0, 0, self.width, self.height);
+        self.draw_clip.map_or(full, |clip| full.intersection(&clip).unwrap_or(Rect::new(0, 0, 0, 0)))
     }
 
     pub fn width(&self) -> u32 {
@@ -149,7 +162,9 @@ impl Surface {
     /// Replace the contents with an equally sized surface without another
     /// allocation. Shells can reuse this between frames to avoid heap churn.
     pub fn copy_from(&mut self, source: &Surface) {
-        if self.width == source.width && self.height == source.height {
+        if self.draw_clip.is_some() {
+            self.copy_region(source, Rect::new(0, 0, source.width, source.height), 0, 0);
+        } else if self.width == source.width && self.height == source.height {
             self.pixels.copy_from_slice(source.pixels());
         }
     }
@@ -157,7 +172,7 @@ impl Surface {
     /// Copy a rectangular source region to `(x, y)` while clipping both
     /// surfaces. The source and destination may be different surfaces.
     pub fn copy_region(&mut self, source: &Surface, source_bounds: Rect, x: i32, y: i32) {
-        let destination_bounds = Rect::new(0, 0, self.width, self.height);
+        let destination_bounds = self.drawing_bounds();
         let requested = Rect::new(x, y, source_bounds.width, source_bounds.height);
         let Some(clip) = destination_bounds.intersection(&requested) else {
             return;
@@ -187,13 +202,13 @@ impl Surface {
     }
 
     pub fn set_pixel(&mut self, x: u32, y: u32, color: u32) {
-        if x < self.width && y < self.height {
+        if x < self.width && y < self.height && self.draw_clip.is_none_or(|clip| clip.contains(x as i32, y as i32)) {
             self.pixels[y as usize * self.width as usize + x as usize] = color;
         }
     }
 
     pub fn blend_pixel(&mut self, x: u32, y: u32, color: u32) {
-        if x < self.width && y < self.height {
+        if x < self.width && y < self.height && self.draw_clip.is_none_or(|clip| clip.contains(x as i32, y as i32)) {
             let pixel = &mut self.pixels[y as usize * self.width as usize + x as usize];
             *pixel = composite(*pixel, color);
         }
@@ -246,8 +261,9 @@ impl Surface {
         let top = i64::from(bounds.y).max(0);
         let right = (i64::from(bounds.x) + i64::from(bounds.width)).min(i64::from(self.width));
         let bottom = (i64::from(bounds.y) + i64::from(bounds.height)).min(i64::from(self.height));
-        (left < right && top < bottom).then(|| Rect::new(left as i32, top as i32,
-            (right - left) as u32, (bottom - top) as u32))
+        let visible = (left < right && top < bottom).then(|| Rect::new(left as i32, top as i32,
+            (right - left) as u32, (bottom - top) as u32))?;
+        match self.draw_clip { Some(clip) => visible.intersection(&clip), None => Some(visible) }
     }
 
     /// Alpha-composite a rounded outline without changing the enclosed pixels.
@@ -404,12 +420,17 @@ impl Surface {
         let right = left + i64::from(rect.width);
         let bottom = top + i64::from(rect.height);
         let kernel = 2 * r + 1;
-        for y in (top - r).max(0)..(bottom + r).min(i64::from(self.height)) {
+        let clip = self.drawing_bounds();
+        let clip_right = i64::from(clip.x) + i64::from(clip.width);
+        let clip_bottom = i64::from(clip.y) + i64::from(clip.height);
+        for y in (top - r).max(i64::from(clip.y))..(bottom + r).min(clip_bottom) {
             let vertical = ((y + r + 1).min(bottom) - (y - r).max(top)).max(0);
-            for x in (left - r).max(0)..(right + r).min(i64::from(self.width)) {
-                if x >= left && x < right && y >= top && y < bottom {
-                    continue;
-                }
+            let first = (left - r).max(i64::from(clip.x));
+            let last = (right + r).min(clip_right);
+            let middle = y >= top && y < bottom;
+            let left_end = if middle { left.min(last).max(first) } else { last };
+            let right_start = if middle { right.max(first).min(last) } else { last };
+            for x in (first..left_end).chain(right_start..last) {
                 let horizontal = ((x + r + 1).min(right) - (x - r).max(left)).max(0);
                 let alpha =
                     (140 * (horizontal as u64) * (vertical as u64) / (kernel as u64).pow(2)) as u32;

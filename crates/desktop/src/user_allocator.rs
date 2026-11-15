@@ -323,8 +323,13 @@ mod tests {
             let live = HEAP.alloc(large);
             assert!(!live.is_null());
             live.write_bytes(0xA5, large.size());
-            assert!(HEAP.alloc(small).is_null(), "exhaustion must not recycle a live block");
-            assert!(core::slice::from_raw_parts(live, large.size()).iter().all(|byte| *byte == 0xA5));
+            assert!(
+                HEAP.alloc(small).is_null(),
+                "exhaustion must not recycle a live block"
+            );
+            assert!(core::slice::from_raw_parts(live, large.size())
+                .iter()
+                .all(|byte| *byte == 0xA5));
             HEAP.dealloc(live, large);
             assert_eq!(HEAP.alloc(large), live);
         }
@@ -343,5 +348,177 @@ mod tests {
             let second = HEAP.alloc(Layout::from_size_align(64, 4096).unwrap());
             assert_eq!(second, first);
         }
+    }
+}
+
+/// Fixed process arena backed by Talc's size bins and adjacent-block coalescing.
+/// Font parsing performs thousands of small allocations; a sorted linear free
+/// list makes those allocations grow quadratically as the heap fragments.
+/// Construct this in static storage: the claimed arena must never move.
+pub struct ApplicationHeap<const SIZE: usize> {
+    arena: UnsafeCell<MaybeUninit<[u8; SIZE]>>,
+    allocator: UnsafeCell<talc::Talc<talc::ErrOnOom>>,
+    locked: AtomicBool,
+    initialized: AtomicBool,
+}
+
+// SAFETY: the arena and Talc state are accessed exclusively under `locked`.
+unsafe impl<const SIZE: usize> Sync for ApplicationHeap<SIZE> {}
+
+impl<const SIZE: usize> ApplicationHeap<SIZE> {
+    pub const fn new() -> Self {
+        Self {
+            arena: UnsafeCell::new(MaybeUninit::uninit()),
+            allocator: UnsafeCell::new(talc::Talc::new(talc::ErrOnOom)),
+            locked: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
+        }
+    }
+
+    fn lock(&self) {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+impl<const SIZE: usize> Default for ApplicationHeap<SIZE> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// SAFETY: Talc receives an exclusively owned arena. Layouts are passed through
+// unchanged, and allocation/free mutations are serialized by the spin lock.
+unsafe impl<const SIZE: usize> GlobalAlloc for ApplicationHeap<SIZE> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.size() == 0 {
+            return ptr::null_mut();
+        }
+        self.lock();
+        // SAFETY: this lock provides exclusive access to the allocator state.
+        let allocator = unsafe { &mut *self.allocator.get() };
+        if !self.initialized.load(Ordering::Relaxed) {
+            let arena = talc::Span::from_base_size(self.arena.get().cast::<u8>(), SIZE);
+            // SAFETY: the static arena is writable, unclaimed and exclusively
+            // owned by this allocator for its entire lifetime.
+            if unsafe { allocator.claim(arena) }.is_err() {
+                self.locked.store(false, Ordering::Release);
+                return ptr::null_mut();
+            }
+            self.initialized.store(true, Ordering::Relaxed);
+        }
+        // SAFETY: the arena has been claimed and allocator state is exclusive.
+        let result = unsafe { allocator.malloc(layout) }.map_or(ptr::null_mut(), |p| p.as_ptr());
+        self.locked.store(false, Ordering::Release);
+        result
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        let Some(pointer) = core::ptr::NonNull::new(pointer) else {
+            return;
+        };
+        self.lock();
+        // SAFETY: the GlobalAlloc contract supplies a live pointer and its
+        // original layout; the lock provides exclusive access to Talc.
+        unsafe {
+            (&mut *self.allocator.get()).free(pointer, layout);
+        }
+        self.locked.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod application_heap_tests {
+    use super::*;
+
+    #[test]
+    fn fragmented_allocations_preserve_live_data_and_recover_the_arena() {
+        static HEAP: ApplicationHeap<{ 64 * 1024 }> = ApplicationHeap::new();
+        let mut blocks = alloc::vec::Vec::new();
+        unsafe {
+            for index in 0..256 {
+                let layout = Layout::from_size_align(1 + index % 97, 1 << (index % 7)).unwrap();
+                let p = HEAP.alloc(layout);
+                assert!(!p.is_null());
+                assert_eq!(p as usize % layout.align(), 0);
+                p.write_bytes(index as u8, layout.size());
+                blocks.push((p, layout, index as u8));
+            }
+            // Free in non-address order, then require all surviving payloads.
+            for parity in 0..2 {
+                for index in (parity..blocks.len()).step_by(2) {
+                    let (p, layout, byte) = blocks[index];
+                    assert!(core::slice::from_raw_parts(p, layout.size())
+                        .iter()
+                        .all(|b| *b == byte));
+                    HEAP.dealloc(p, layout);
+                }
+            }
+            let layout = Layout::from_size_align(48 * 1024, 4096).unwrap();
+            let p = HEAP.alloc(layout);
+            assert!(
+                !p.is_null(),
+                "coalescing must recover a large contiguous span"
+            );
+            assert_eq!(p as usize % 4096, 0);
+            HEAP.dealloc(p, layout);
+        }
+    }
+
+    #[test]
+    fn exhaustion_never_reclaims_live_allocations() {
+        static HEAP: ApplicationHeap<4096> = ApplicationHeap::new();
+        let layout = Layout::from_size_align(256, 16).unwrap();
+        let mut live = alloc::vec::Vec::new();
+        unsafe {
+            loop {
+                let p = HEAP.alloc(layout);
+                if p.is_null() {
+                    break;
+                }
+                p.write_bytes(0xa5, layout.size());
+                live.push(p);
+                assert!(live.len() < 16);
+            }
+            assert!(!live.is_empty());
+            for p in live {
+                assert!(core::slice::from_raw_parts(p, layout.size())
+                    .iter()
+                    .all(|b| *b == 0xa5));
+                HEAP.dealloc(p, layout);
+            }
+            let p = HEAP.alloc(layout);
+            assert!(!p.is_null());
+            HEAP.dealloc(p, layout);
+        }
+    }
+
+    #[test]
+    fn concurrent_allocations_use_disjoint_storage() {
+        static HEAP: ApplicationHeap<{ 64 * 1024 }> = ApplicationHeap::new();
+        std::thread::scope(|scope| {
+            for byte in 0..4u8 {
+                scope.spawn(move || {
+                    let layout = Layout::from_size_align(64, 64).unwrap();
+                    for _ in 0..512 {
+                        unsafe {
+                            let p = HEAP.alloc(layout);
+                            assert!(!p.is_null());
+                            p.write_bytes(byte, layout.size());
+                            std::thread::yield_now();
+                            assert!(core::slice::from_raw_parts(p, layout.size())
+                                .iter()
+                                .all(|b| *b == byte));
+                            HEAP.dealloc(p, layout);
+                        }
+                    }
+                });
+            }
+        });
     }
 }

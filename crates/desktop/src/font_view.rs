@@ -1,6 +1,6 @@
-use alloc::vec::Vec;
+use alloc::{rc::Rc, vec::Vec};
 
-use nt61_desktop::graphics::font::FontLib;
+use nt61_desktop::graphics::font::{FontLib, FontLibrary, UI_FONT};
 use nt61_desktop::graphics::Surface;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -10,14 +10,18 @@ pub enum Ink {
 }
 
 pub struct FontPack {
-    font: FontLib,
+    font: Rc<FontLib>,
     size: u32,
 }
 
 #[allow(dead_code)]
 impl FontPack {
     pub fn new(size: u32) -> Option<Self> {
-        let font = FontLib::ui().ok()?;
+        Self::with_library(size, &FontLibrary::default())
+    }
+
+    pub fn with_library(size: u32, library: &FontLibrary) -> Option<Self> {
+        let font = library.get(UI_FONT).ok()?;
         Some(Self { font, size })
     }
 
@@ -90,6 +94,7 @@ impl FontPack {
         width: u32,
         color: u32,
     ) {
+        if surface.drawing_bounds().intersection(&nt61_desktop::graphics::Rect::new(x, y, width, self.size + 4)).is_none() { return; }
         if self.measure(text) <= width {
             self.draw_color(surface, text, x, y, color);
             return;

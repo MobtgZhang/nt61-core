@@ -40,9 +40,46 @@ pub struct FontLib {
     glyphs: RefCell<Vec<(char, u32, Rc<RasterizedGlyph>)>>,
 }
 
+/// Process-local fonts shared by desktop chrome, editors and font previews.
+/// Point sizes share the parsed face and its bounded glyph cache. Eight recent
+/// faces are retained; callers can hold an Rc across an eviction safely.
+#[derive(Clone, Debug, Default)]
+pub struct FontLibrary(Rc<RefCell<Vec<(&'static [u8], Rc<FontLib>)>>>);
+
+impl PartialEq for FontLibrary {
+    fn eq(&self, _: &Self) -> bool {
+        // Resource caches are not part of the window/document state.
+        true
+    }
+}
+
+impl FontLibrary {
+    pub fn get(&self, data: &'static [u8]) -> Result<Rc<FontLib>, FontError> {
+        let mut faces = self.0.borrow_mut();
+        if let Some(index) = faces
+            .iter()
+            .position(|(bytes, _)| core::ptr::eq(*bytes, data))
+        {
+            let face = faces.remove(index);
+            let result = Rc::clone(&face.1);
+            faces.push(face);
+            return Ok(result);
+        }
+        let font = Rc::new(FontLib::from_bytes(data)?);
+        if faces.len() == 8 {
+            faces.remove(0);
+        }
+        faces.push((data, Rc::clone(&font)));
+        Ok(font)
+    }
+}
+
 impl FontLib {
     pub fn from_bytes(data: &[u8]) -> Result<Self, FontError> {
-        let mut library = Self { faces: Vec::new(), glyphs: RefCell::new(Vec::new()) };
+        let mut library = Self {
+            faces: Vec::new(),
+            glyphs: RefCell::new(Vec::new()),
+        };
         library.load(data)?;
         Ok(library)
     }
@@ -92,14 +129,20 @@ impl FontLib {
     }
 
     fn cached_glyph(&self, ch: char, pixel_size: u32) -> Option<Rc<RasterizedGlyph>> {
-        if let Some((_, _, glyph)) = self.glyphs.borrow().iter()
-            .find(|(key, size, _)| *key == ch && *size == pixel_size) {
+        if let Some((_, _, glyph)) = self
+            .glyphs
+            .borrow()
+            .iter()
+            .find(|(key, size, _)| *key == ch && *size == pixel_size)
+        {
             return Some(Rc::clone(glyph));
         }
         let glyph = Rc::new(self.rasterize(ch, pixel_size)?);
         let mut cache = self.glyphs.borrow_mut();
         // Bounded per-renderer storage; coverage is shared across colors and windows.
-        if cache.len() == 256 { cache.remove(0); }
+        if cache.len() == 256 {
+            cache.remove(0);
+        }
         cache.push((ch, pixel_size, Rc::clone(&glyph)));
         Some(glyph)
     }
@@ -134,12 +177,21 @@ impl FontLib {
 
     /// Long labels are clipped in one pass, without allocating and measuring
     /// every progressively shorter candidate during pointer hover repaints.
-    pub fn fitting_prefix<'a>(&self, text: &'a str, pixel_size: u32, width: u32) -> Option<&'a str> {
+    pub fn fitting_prefix<'a>(
+        &self,
+        text: &'a str,
+        pixel_size: u32,
+        width: u32,
+    ) -> Option<&'a str> {
         let mut used = 0u32;
         for (at, ch) in text.char_indices() {
-            if ch == '\n' { return Some(&text[..at]); }
+            if ch == '\n' {
+                return Some(&text[..at]);
+            }
             let advance = advance_pixels(self.glyph_metrics(ch, pixel_size)?.advance_width);
-            if advance > width.saturating_sub(used) { return Some(&text[..at]); }
+            if advance > width.saturating_sub(used) {
+                return Some(&text[..at]);
+            }
             used += advance;
         }
         Some(text)
@@ -168,7 +220,13 @@ impl FontLib {
                 let origin_x = pen_x + glyph.metrics.xmin;
                 let target_width = target.width() as i32;
                 let target_height = target.height() as i32;
-                if origin_x < target_width && top_y < target_height {
+                let glyph_bounds = crate::graphics::Rect::new(
+                    origin_x,
+                    top_y,
+                    glyph.metrics.width as u32,
+                    glyph.metrics.height as u32,
+                );
+                if origin_x < target_width && top_y < target_height && target.drawing_bounds().intersection(&glyph_bounds).is_some() {
                     for row in 0..glyph.metrics.height {
                         for column in 0..glyph.metrics.width {
                             let coverage = match glyph.coverage_at(column, row) {
@@ -202,6 +260,20 @@ fn advance_pixels(value: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_shares_faces_across_windows_sizes_and_failed_loads() {
+        let library = FontLibrary::default();
+        let first = library.get(MONOSPACE_FONT).unwrap();
+        let other_window = library.clone();
+        let again = other_window.get(MONOSPACE_FONT).unwrap();
+        assert!(Rc::ptr_eq(&first, &again));
+        assert!(first.measure("Preview", 14).is_some());
+        assert!(again.measure("Preview", 24).is_some());
+        assert!(library.get(b"invalid font").is_err());
+        assert!(Rc::ptr_eq(&first, &library.get(MONOSPACE_FONT).unwrap()));
+        assert_eq!(library.0.borrow().len(), 1);
+    }
 
     #[test]
     fn embedded_ui_font_parses_and_rasterizes() {
@@ -256,9 +328,20 @@ mod tests {
         let mut surface = Surface::new(640, 460);
         let start = std::time::Instant::now();
         for _ in 0..100 {
-            for (row, text) in ["Windows Explorer", "Administrator", "Documents", "Computer",
-                "Control Panel", "Calculator", "Applications  |  Task  |  Status"].iter().enumerate() {
-                font.draw_text(&mut surface, text, 12, row as i32 * 24, 16, 0xFFFFFFFF).unwrap();
+            for (row, text) in [
+                "Windows Explorer",
+                "Administrator",
+                "Documents",
+                "Computer",
+                "Control Panel",
+                "Calculator",
+                "Applications  |  Task  |  Status",
+            ]
+            .iter()
+            .enumerate()
+            {
+                font.draw_text(&mut surface, text, 12, row as i32 * 24, 16, 0xFFFFFFFF)
+                    .unwrap();
             }
         }
         std::println!("100 window label frames: {:?}", start.elapsed());
@@ -279,7 +362,9 @@ mod tests {
                 assert_eq!(first.coverage_at(x, y), original.coverage_at(x, y));
             }
         }
-        for ch in (32..400).filter_map(char::from_u32) { let _ = font.cached_glyph(ch, 16); }
+        for ch in (32..400).filter_map(char::from_u32) {
+            let _ = font.cached_glyph(ch, 16);
+        }
         assert!(font.glyphs.borrow().len() <= 256);
         let font_data = UI_FONT;
         let mut font = font;

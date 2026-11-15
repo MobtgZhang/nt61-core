@@ -4,18 +4,54 @@ use super::{Rect, Surface};
 /// Returns the bounding rectangle of changed pixels. The first frame must
 /// start with a zeroed staging buffer; subsequent frames reuse that buffer.
 pub fn update_rgba(surface: &Surface, rgba: &mut [u8]) -> Option<Rect> {
-    if rgba.len() != surface.pixels().len().checked_mul(4)? { return None; }
-    let w = surface.width() as usize;
-    if w == 0 { return None; }
-    let (mut left, mut top, mut right, mut bottom) = (w, surface.height() as usize, 0, 0);
-    for (index, (pixel, color)) in rgba.chunks_exact_mut(4).zip(surface.pixels()).enumerate() {
-        let next = [(*color >> 16) as u8, (*color >> 8) as u8, *color as u8, (*color >> 24) as u8];
-        if pixel == next { continue; }
-        pixel.copy_from_slice(&next);
-        let (x, y) = (index % w, index / w);
-        left = left.min(x); top = top.min(y); right = right.max(x + 1); bottom = bottom.max(y + 1);
+    update_rgba_region(
+        surface,
+        rgba,
+        Rect::new(0, 0, surface.width(), surface.height()),
+    )
+}
+
+/// Update only a known damaged area. Pixels outside it retain their previous
+/// staging values, including pixels used to erase the software cursor.
+pub fn update_rgba_region(surface: &Surface, rgba: &mut [u8], region: Rect) -> Option<Rect> {
+    if rgba.len() != surface.pixels().len().checked_mul(4)? {
+        return None;
     }
-    (right > left && bottom > top).then(|| Rect::new(left as i32, top as i32, (right-left) as u32, (bottom-top) as u32))
+    let w = surface.width() as usize;
+    if w == 0 {
+        return None;
+    }
+    let (mut left, mut top, mut right, mut bottom) = (w, surface.height() as usize, 0, 0);
+    let clip = Rect::new(0, 0, surface.width(), surface.height()).intersection(&region)?;
+    for y in clip.y as usize..clip.y as usize + clip.height as usize {
+        for x in clip.x as usize..clip.x as usize + clip.width as usize {
+            let index = y * w + x;
+            let pixel = &mut rgba[index * 4..index * 4 + 4];
+            let color = surface.pixels()[index];
+            let next = [
+                (color >> 16) as u8,
+                (color >> 8) as u8,
+                color as u8,
+                (color >> 24) as u8,
+            ];
+            if pixel == next {
+                continue;
+            }
+            pixel.copy_from_slice(&next);
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x + 1);
+            bottom = bottom.max(y + 1);
+        }
+    }
+    (right > left && bottom > top).then(|| {
+        Rect::new(
+            left as i32,
+            top as i32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        )
+    })
 }
 
 /// Cursor RGBA over an opaque ARGB desktop. Preserve channel order for
@@ -23,9 +59,12 @@ pub fn update_rgba(surface: &Surface, rgba: &mut [u8]) -> Option<Rect> {
 pub fn cursor_over(background: u32, source: &[u8]) -> [u8; 4] {
     let alpha = source[3] as u32;
     let inverse = 255 - alpha;
-    [(((background >> 16 & 255) * inverse + source[0] as u32 * alpha + 127) / 255) as u8,
-     (((background >> 8 & 255) * inverse + source[1] as u32 * alpha + 127) / 255) as u8,
-     (((background & 255) * inverse + source[2] as u32 * alpha + 127) / 255) as u8, 255]
+    [
+        (((background >> 16 & 255) * inverse + source[0] as u32 * alpha + 127) / 255) as u8,
+        (((background >> 8 & 255) * inverse + source[1] as u32 * alpha + 127) / 255) as u8,
+        (((background & 255) * inverse + source[2] as u32 * alpha + 127) / 255) as u8,
+        255,
+    ]
 }
 
 #[cfg(test)]
@@ -34,18 +73,45 @@ mod tests {
     #[test]
     fn unchanged_frame_submits_nothing_and_hover_submits_only_damage() {
         let mut surface = Surface::new(1024, 768);
-        surface.fill_rect(0,0,1024,768,0xff123456);
+        surface.fill_rect(0, 0, 1024, 768, 0xff123456);
         let mut rgba = alloc::vec![0;1024*768*4];
-        assert_eq!(update_rgba(&surface, &mut rgba), Some(Rect::new(0,0,1024,768)));
+        assert_eq!(
+            update_rgba(&surface, &mut rgba),
+            Some(Rect::new(0, 0, 1024, 768))
+        );
         assert_eq!(update_rgba(&surface, &mut rgba), None);
-        surface.fill_rect(12,12,96,88,0xff89abcd);
-        assert_eq!(update_rgba(&surface, &mut rgba), Some(Rect::new(12,12,96,88)));
-        assert_eq!(&rgba[(12*1024+12)*4..][..4], &[0x89,0xab,0xcd,255]);
+        surface.fill_rect(12, 12, 96, 88, 0xff89abcd);
+        assert_eq!(
+            update_rgba(&surface, &mut rgba),
+            Some(Rect::new(12, 12, 96, 88))
+        );
+        assert_eq!(&rgba[(12 * 1024 + 12) * 4..][..4], &[0x89, 0xab, 0xcd, 255]);
     }
     #[test]
+    fn partial_staging_preserves_pixels_outside_damage_and_clips_at_screen_edge() {
+        let mut frame = Surface::new(8, 6);
+        frame.fill_rect(0, 0, 8, 6, 0xff112233);
+        let mut rgba = alloc::vec![0; 8*6*4];
+        update_rgba(&frame, &mut rgba);
+        frame.fill_rect(0, 0, 8, 6, 0xffabcdef);
+        assert_eq!(
+            update_rgba_region(&frame, &mut rgba, Rect::new(-2, -1, 5, 4)),
+            Some(Rect::new(0, 0, 3, 3))
+        );
+        assert_eq!(&rgba[..4], &[0xab, 0xcd, 0xef, 255]);
+        assert_eq!(&rgba[(3 * 8 + 3) * 4..][..4], &[0x11, 0x22, 0x33, 255]);
+    }
+
+    #[test]
     fn cursor_edges_preserve_red_and_blue() {
-        assert_eq!(cursor_over(0xff0000ff, &[255,0,0,128]), [128,0,127,255]);
-        assert_eq!(cursor_over(0xff123456, &[255,0,0,0]), [0x12,0x34,0x56,255]);
-        assert_eq!(cursor_over(0xff123456, &[250,1,5,255]), [250,1,5,255]);
+        assert_eq!(
+            cursor_over(0xff0000ff, &[255, 0, 0, 128]),
+            [128, 0, 127, 255]
+        );
+        assert_eq!(
+            cursor_over(0xff123456, &[255, 0, 0, 0]),
+            [0x12, 0x34, 0x56, 255]
+        );
+        assert_eq!(cursor_over(0xff123456, &[250, 1, 5, 255]), [250, 1, 5, 255]);
     }
 }
