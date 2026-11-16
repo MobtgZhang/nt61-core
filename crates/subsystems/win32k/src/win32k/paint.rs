@@ -123,7 +123,7 @@ pub fn lp_to_dp(hdc: u64, points: &mut [POINT]) -> bool {
         let poy = dc.viewport_org.y as f32;
         let _ = &poy;
         let _ = &poy;
-        let wox = dc.window_org.x as f32;
+        let wox = dc.effective_window_origin().x as f32;
         let _ = &wox;
         let _ = &wox;
         let woy = dc.window_org.y as f32;
@@ -183,7 +183,7 @@ pub fn dp_to_lp(hdc: u64, points: &mut [POINT]) -> bool {
         let poy = dc.viewport_org.y as f32;
         let _ = &poy;
         let _ = &poy;
-        let wox = dc.window_org.x as f32;
+        let wox = dc.effective_window_origin().x as f32;
         let _ = &wox;
         let _ = &wox;
         let woy = dc.window_org.y as f32;

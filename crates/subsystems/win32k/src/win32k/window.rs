@@ -766,30 +766,49 @@ impl WindowManager {
             return;
         }
         let surface = unsafe { &*primary };
-        // Simple solid-fill blit of the window rect into the
-        // framebuffer. A full compositor would composite the
-        // window's back-buffer; for now we clear the client area
-        // to the window's background (black) so the caller sees
-        // a defined region rather than stale framebuffer bits.
+        let color = self.class_background_color(hwnd).unwrap_or(0);
+        // COLORREF is 0x00BBGGRR; the primary framebuffer stores B,G,R,A.
         let fb_pitch = surface.pitch as usize;
         let bpp = 4usize;
-        for y in window.client_rect.top..window.client_rect.bottom {
+        for y in window.client_rect.top..window.client_rect.bottom.min(surface.height) {
             if y < 0 {
                 continue;
             }
             let row = unsafe { surface.bits.add(y as usize * fb_pitch) };
-            for x in window.client_rect.left..window.client_rect.right {
+            for x in window.client_rect.left..window.client_rect.right.min(surface.width) {
                 if x < 0 {
                     continue;
                 }
                 let offset = (x as usize) * bpp;
                 unsafe {
-                    row.add(offset).write_volatile(0);
-                    row.add(offset + 1).write_volatile(0);
-                    row.add(offset + 2).write_volatile(0);
+                    row.add(offset).write_volatile((color >> 16) as u8);
+                    row.add(offset + 1).write_volatile((color >> 8) as u8);
+                    row.add(offset + 2).write_volatile(color as u8);
                     row.add(offset + 3).write_volatile(0xFF);
                 }
             }
+        }
+    }
+
+    /// Class backgrounds share system color state with GetSysColor and the
+    /// immortal system brushes, including COLOR_* + 1 symbolic backgrounds.
+    pub fn class_background_color(&self, hwnd: u64) -> Option<u32> {
+        let window = self.get_window(hwnd)?;
+        let class = self.classes.iter().flatten().find(|class| class.atom == window.class_atom)?;
+        super::system_colors::background_color(class.h_brbackground)
+    }
+
+    /// Queue the established user WndProc callback for top-level windows, then
+    /// invalidate the desktop tree. Callback completion remains asynchronous
+    /// under the current callback transport; this is not a synchronous Win7
+    /// BroadcastSystemMessage implementation.
+    pub fn system_colors_changed(&mut self) {
+        for window in self.windows.iter_mut().flatten() {
+            if window.parent.is_none() {
+                call_wnd_proc(window.wndproc, window.hwnd, WindowMessage::WmSyscolorchange as u32, 0, 0);
+            }
+            window.dirty = true;
+            window.dirty_rects.push(window.client_rect);
         }
     }
 
