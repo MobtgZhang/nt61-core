@@ -9,6 +9,14 @@ mod types {
 use std::sync::Mutex;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 mod ke {
+    pub mod scheduler {
+        pub fn yield_() {
+            if let Some(hook) = crate::power_cases::YIELD_HOOK.lock().unwrap().take() {
+                hook();
+            }
+            std::thread::yield_now();
+        }
+    }
     pub mod sync {
         pub struct Spinlock<T>(std::sync::Mutex<T>);
         unsafe impl<T> Sync for Spinlock<T> {}
@@ -31,8 +39,50 @@ mod libs {
 }
 mod mm {
     pub mod pool {
+        use std::{
+            alloc::{alloc_zeroed, dealloc, Layout},
+            collections::HashMap,
+            sync::{
+                atomic::{AtomicIsize, Ordering},
+                Mutex, OnceLock,
+            },
+        };
+        pub enum PoolType {
+            NonPaged,
+        }
+        static ALLOCATIONS: OnceLock<Mutex<HashMap<usize, Layout>>> = OnceLock::new();
+        pub static FAIL_AFTER: AtomicIsize = AtomicIsize::new(-1);
+        fn allocations() -> &'static Mutex<HashMap<usize, Layout>> {
+            ALLOCATIONS.get_or_init(Default::default)
+        }
+        pub fn live() -> usize {
+            allocations().lock().unwrap().len()
+        }
+        pub fn owns(ptr: *mut u8) -> bool {
+            allocations().lock().unwrap().contains_key(&(ptr as usize))
+        }
+        pub fn allocate(_: PoolType, size: usize) -> *mut u8 {
+            let remaining = FAIL_AFTER.load(Ordering::Relaxed);
+            if remaining == 0 {
+                return core::ptr::null_mut();
+            }
+            if remaining > 0 {
+                FAIL_AFTER.fetch_sub(1, Ordering::Relaxed);
+            }
+            let layout = Layout::from_size_align(size, 16).unwrap();
+            let ptr = unsafe { alloc_zeroed(layout) };
+            if !ptr.is_null() {
+                allocations().lock().unwrap().insert(ptr as usize, layout);
+            }
+            ptr
+        }
         pub unsafe fn free(ptr: *mut u8) -> *mut u8 {
-            drop(Box::from_raw(ptr as *mut crate::io::DeviceObject));
+            let layout = allocations().lock().unwrap().remove(&(ptr as usize));
+            if let Some(layout) = layout {
+                dealloc(ptr, layout);
+            } else {
+                drop(Box::from_raw(ptr as *mut crate::io::DeviceObject));
+            }
             ptr
         }
     }
@@ -44,19 +94,48 @@ mod ob {
 }
 #[path = "../src/io/apc.rs"]
 pub mod apc;
+#[path = "../src/io/completion.rs"]
+mod completion_code;
 #[path = "../src/io/device_lifecycle.rs"]
 pub mod device_lifecycle;
+#[path = "../src/io/device_power_state.rs"]
+pub mod device_power_state;
+#[path = "../src/io/device_reference.rs"]
+pub mod device_reference;
+#[path = "../src/io/device_stack.rs"]
+pub mod device_stack;
+#[path = "../src/io/file_device_binding.rs"]
+pub mod file_device_binding;
+#[path = "../src/io/file_request_lock.rs"]
+pub(crate) mod file_request_lock;
+#[path = "private_file_request_lock_cases.rs"]
+mod file_request_lock_cases;
+#[path = "private_file_binding_cases.rs"]
+mod file_binding_cases;
 #[path = "../src/io/dispatch.rs"]
 pub mod dispatch;
 #[path = "../src/io/driver_loader.rs"]
 pub mod driver_loader;
 #[path = "../src/io/irp_stack.rs"]
 pub mod irp_stack;
+#[path = "../src/io/synchronous_request.rs"]
+pub mod synchronous_request;
+#[path = "private_synchronous_request_cases.rs"]
+mod synchronous_request_cases;
+#[path = "private_device_power_cases.rs"]
+mod power_cases;
+#[path = "../src/io/target_device.rs"]
+pub mod target_device;
 mod io {
     use core::ptr::null_mut;
     use core::sync::atomic::AtomicU32;
     pub const MAX_DEVICES: usize = 64;
+    pub const IRP_CANCEL_INDICATED: u32 = 0x20;
+    pub mod pnp {
+        pub const IRP_MN_QUERY_DEVICE_RELATIONS: u8 = 7;
+    }
     pub mod major {
+        pub const IRP_MJ_PNP: u8 = 27;
         pub const IRP_MJ_READ: u8 = 3;
         pub const IRP_MJ_WRITE: u8 = 4;
         pub const IRP_MJ_DEVICE_CONTROL: u8 = 14;
@@ -98,6 +177,7 @@ mod io {
         pub vpb: *mut (),
         pub device_extension: *mut (),
         pub namespace_handle: u64,
+        pub(crate) power: crate::device_power_state::CachedDevicePowerState,
     }
     pub enum DevicePnPState {
         Deleted,
@@ -153,16 +233,49 @@ mod io {
         pub completed: u32,
     }
     pub unsafe fn io_complete_request(irp: *mut Irp, _: i32) {
-        (*irp).completed += 1;
+        if crate::mm::pool::owns(irp.cast()) {
+            if crate::completion_code::invoke_completion_routines(irp) {
+                free_irp(irp);
+            }
+        } else {
+            (*irp).completed += 1;
+        }
     }
-    pub fn allocate_irp(_: u8) -> *mut Irp {
-        null_mut()
+    pub unsafe fn io_call_driver(device: *mut DeviceObject, irp: *mut Irp) -> i32 {
+        crate::dispatch::dispatch_irp(device, irp)
+    }
+    pub fn allocate_irp(count: u8) -> *mut Irp {
+        if count == 0 {
+            return null_mut();
+        }
+        let body = core::mem::size_of::<Irp>();
+        let raw = crate::mm::pool::allocate(
+            crate::mm::pool::PoolType::NonPaged,
+            body + core::mem::size_of::<IoStackLocation>() * count as usize,
+        ) as *mut Irp;
+        if raw.is_null() {
+            return raw;
+        }
+        unsafe {
+            let base = raw.cast::<u8>().add(body).cast::<IoStackLocation>();
+            raw.write(crate::irp(base.add(count as usize - 1), count));
+            (*raw).io_status.information = 0;
+            for index in 0..count as usize {
+                base.add(index).write(crate::stack());
+            }
+        }
+        raw
     }
     pub unsafe fn unregister_driver(_: *mut DriverObject) -> bool {
         true
     }
-    pub fn free_irp(_: *mut Irp) {}
+    pub fn free_irp(irp: *mut Irp) {
+        unsafe {
+            crate::mm::pool::free(irp.cast());
+        }
+    }
     pub use crate::device_lifecycle;
+    pub use crate::device_reference;
     pub use crate::dispatch;
     pub use crate::driver_loader;
     pub use crate::irp_stack;
@@ -202,6 +315,9 @@ fn device(driver: *mut DriverObject, namespace_handle: u64) -> *mut DeviceObject
         vpb: null_mut(),
         device_extension: null_mut(),
         namespace_handle,
+        power: device_power_state::CachedDevicePowerState::new(
+            device_power_state::DevicePowerState::D0,
+        ),
     }))
 }
 unsafe extern "C" fn unload(driver: *mut DriverObject) {
@@ -456,6 +572,9 @@ fn forwarding_checks_stack_and_does_not_duplicate_completion() {
             vpb: null_mut(),
             device_extension: null_mut(),
             namespace_handle: 0,
+            power: device_power_state::CachedDevicePowerState::new(
+                device_power_state::DevicePowerState::D0,
+            ),
         });
         assert_eq!(
             dispatch::forward_irp_to_lower(&mut *upper, &mut r),

@@ -25,6 +25,7 @@ use crate::mm::pool;
 pub mod named_pipe;
 pub mod pipe;
 pub mod smoke;
+pub(crate) mod directory_search;
 
 // ---------------------------------------------------------------------------
 // I/O system constants
@@ -121,15 +122,9 @@ pub enum SystemPowerState {
     S5 = 5, // Soft off
 }
 
-/// Device power states (D0-D3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum DevicePowerState {
-    D0 = 0, // Working
-    D1 = 1, // Lightest sleep
-    D2 = 2, // Deeper sleep
-    D3 = 3, // Deepest sleep (hot removed)
-}
+mod device_power_state;
+pub use device_power_state::DevicePowerState;
+use device_power_state::CachedDevicePowerState;
 
 /// power action types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +282,8 @@ pub struct Irp {
     /// Cancel routine registered by a driver; invoked by `cancel_irp`
     /// when the request is cancelled.
     pub cancel_routine: Option<unsafe extern "C" fn(*mut Irp)>,
+    /// Buffer provenance: 0 = trusted kernel buffer, 1 = uncaptured user buffer.
+    /// Native file services capture user data before issuing a kernel request.
     pub requestor_mode: u8,
     pub pending_returned: u8,
     pub stack_count: u8,
@@ -454,7 +451,6 @@ impl Default for IoStackLocation {
 }
 
 #[repr(C)]
-#[derive(Clone)]
 pub struct FileObject {
     pub device_object: *mut DeviceObject,
     pub vpb: *mut Vpb,
@@ -462,6 +458,12 @@ pub struct FileObject {
     pub file_name: UnicodeString,
     pub current_byte_offset: u64,
     pub flags: u32,
+    // Private source ABI extension. Retain the registered owner and original
+    // device until the file and all pending I/O references have been released.
+    device_binding: Option<file_device_binding::FileDeviceBinding>,
+    pub(crate) request_lock: file_request_lock::FileRequestLock,
+    // Search lifetime belongs to this open, including all handle aliases.
+    pub(crate) directory_search: directory_search::SearchState,
 }
 
 impl FileObject {
@@ -473,7 +475,15 @@ impl FileObject {
             file_name: UnicodeString::new(),
             current_byte_offset: 0,
             flags: 0,
+            device_binding: None,
+            request_lock: file_request_lock::FileRequestLock::new(),
+            directory_search: directory_search::SearchState::new(),
         }
+    }
+
+    pub(crate) fn bind_device(&mut self, binding: file_device_binding::FileDeviceBinding) {
+        self.device_object = binding.device_ptr();
+        self.device_binding = Some(binding);
     }
 }
 
@@ -535,7 +545,7 @@ pub struct DeviceObject {
     /// Previous PnP state - used for state transitions.
     pub previous_pnp_state: DevicePreviousState,
     /// Current device power state.
-    pub device_power_state: DevicePowerState,
+    device_power_state: CachedDevicePowerState,
     /// Device power flags.
     pub power_flags: u32,
     /// Driver-defined device extension (wdm.h DeviceObject.DeviceExtension):
@@ -567,7 +577,7 @@ impl DeviceObject {
             device_name: UnicodeString::new(),
             pnp_state: DevicePnPState::NotStarted,
             previous_pnp_state: DevicePreviousState::NotStarted,
-            device_power_state: DevicePowerState::D0,
+            device_power_state: CachedDevicePowerState::new(DevicePowerState::D0),
             power_flags: 0,
             device_extension: null_mut(),
             namespace_handle: 0,
@@ -588,12 +598,12 @@ impl DeviceObject {
     }
 
     /// Set the device power state.
-    pub fn set_device_power_state(&mut self, new_state: DevicePowerState) {
-        // // kprintln!(
-        // //             "[I/O] Device power state transition: {:?} -> {:?}",
-        // //             self.device_power_state, new_state
-        // //         );
-        self.device_power_state = new_state;
+    pub fn set_device_power_state(&self, new_state: DevicePowerState) {
+        self.device_power_state.set(new_state);
+    }
+
+    pub fn get_device_power_state(&self) -> DevicePowerState {
+        self.device_power_state.get()
     }
 }
 
@@ -833,50 +843,9 @@ pub unsafe fn io_call_driver(device: *mut DeviceObject, irp: *mut Irp) -> i32 {
     unsafe { dispatch::dispatch_irp(device, irp) }
 }
 
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Invoke the completion routines registered on the IRP's stack locations,
-/// walking the driver stack from the lowest slot upward the way NT does as
-/// an IRP unwinds. Each routine is taken out of the stack location before
-/// it is called so a routine that completes the IRP itself cannot be run
-/// again. Returns false only when a routine returned
-/// STATUS_MORE_PROCESSING_REQUIRED and now owns the IRP (it must complete
-/// it later); the IRP must not be freed in that case.
-unsafe fn invoke_completion_routines(irp: *mut Irp) -> bool {
-    let count = (*irp).stack_count as usize;
-    let status = (*irp).io_status.status as i32;
-    let cancelled = ((*irp).flags & IRP_CANCEL_INDICATED) != 0;
-    let base = (irp as *mut u8).add(core::mem::size_of::<Irp>()) as *mut IoStackLocation;
-
-    for i in 0..count {
-        let stack = base.add(i);
-        // Take the routine out first: re-entrant completion from inside
-        // the routine must not invoke it a second time.
-        let routine = (*stack).completion_routine.take();
-        let Some(routine) = routine else {
-            continue;
-        };
-        let control = (*stack).control;
-        let invoke = if cancelled {
-            (control & irp_stack::SL_INVOKE_ON_CANCEL) != 0
-        } else if status >= 0 {
-            (control & irp_stack::SL_INVOKE_ON_SUCCESS) != 0
-        } else {
-            (control & irp_stack::SL_INVOKE_ON_ERROR) != 0
-        };
-        if !invoke {
-            continue;
-        }
-        let device = (*stack).device_object;
-        let context = (*stack).completion_context;
-        let result = routine(device, irp, context);
-        if result == crate::libs::ntdll::status::STATUS_MORE_PROCESSING_REQUIRED {
-            return false;
-        }
-    }
-    true
-}
+mod completion;
+pub mod synchronous_request;
+use completion::invoke_completion_routines;
 
 /// # Safety
 ///
@@ -1203,13 +1172,6 @@ pub unsafe fn create_device(
         Err(_) => device_name.len(),
     };
     if driver.is_null() || name_units > (u16::MAX as usize / 2) - 1 { return null_mut(); }
-    let mut current = (*driver).device_object;
-    let mut count = 0;
-    while !current.is_null() {
-        count += 1;
-        if count >= MAX_DEVICES { return null_mut(); }
-        current = (*current).next_device;
-    }
     let block_size = core::mem::size_of::<DeviceObject>() + (name_units + 1) * 2;
     let raw = pool::allocate(pool::PoolType::NonPaged, block_size) as *mut DeviceObject;
     if raw.is_null() {
@@ -1246,15 +1208,16 @@ pub unsafe fn create_device(
             buffer: name_buffer,
         };
 
-        // Link into the driver's device list.
-        (*raw).next_device = (*driver).device_object;
-        (*driver).device_object = raw;
-    }
-
-    // Register the device in the object manager namespace
-    // Skip registration if OB is not initialized yet (during early boot)
-    if !device_name.is_empty() && !device_name.iter().all(|&b| b == 0) {
-        (*raw).namespace_handle = register_device_in_object_manager(raw, device_name);
+        if !device_lifecycle::publish_device_with(raw, || {
+            // Initialize namespace ownership before a concurrent retained lookup
+            // can observe the device. Deletion takes graph -> OB in this order.
+            if !device_name.is_empty() && !device_name.iter().all(|&b| b == 0) {
+                (*raw).namespace_handle = register_device_in_object_manager(raw, device_name);
+            }
+        }) {
+            let _ = pool::free(raw.cast());
+            return null_mut();
+        }
     }
 
     raw
@@ -1303,6 +1266,12 @@ fn register_device_in_object_manager(device: *mut DeviceObject, device_name: &[u
 
 mod device_lifecycle;
 pub use device_lifecycle::delete_device;
+pub mod device_reference;
+pub use device_reference::DeviceReference;
+pub mod file_device_binding;
+pub(crate) mod file_request_lock;
+pub use file_device_binding::FileDeviceBinding;
+pub mod target_device;
 
 
 /// # Safety
@@ -1431,6 +1400,7 @@ pub fn init() {
 // ---------------------------------------------------------------------------
 
 use crate::libs::ntdll::status::{
+    STATUS_ACCESS_VIOLATION, STATUS_DEVICE_NOT_READY,
     STATUS_END_OF_FILE, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
     STATUS_NOT_IMPLEMENTED, STATUS_NO_MEMORY, STATUS_OBJECT_NAME_COLLISION,
     STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS,
@@ -1562,6 +1532,7 @@ unsafe extern "C" fn fs_create_dispatch(device: *mut DeviceObject, irp: *mut Irp
             io_complete_request(irp, 0);
             return STATUS_NO_MEMORY;
         }
+        core::ptr::write(allocated, FileObject::new());
         (allocated, false)
     };
 
@@ -1656,6 +1627,7 @@ unsafe extern "C" fn fs_create_dispatch(device: *mut DeviceObject, irp: *mut Irp
             OPEN_FILE_OBJECTS.lock().push(file_obj_ptr);
         }
     } else if !caller_owned {
+        core::ptr::drop_in_place(file_obj_ptr);
         let _ = pool::free(file_obj_ptr as *mut u8);
     }
 
@@ -1709,10 +1681,6 @@ unsafe extern "C" fn fs_read_dispatch(_device: *mut DeviceObject, irp: *mut Irp)
     let length = params.byte_count;
     if params.byte_offset != 0 {
         (*file_obj).current_byte_offset = params.byte_offset;
-        if !(*file_obj).fcb.is_null() {
-            let handle = (*file_obj).fcb as *mut crate::fs::ntfs::NtfsHandle;
-            unsafe { (*handle).current_position = params.byte_offset };
-        }
     }
     let byte_offset = (*file_obj).current_byte_offset;
 
@@ -1725,13 +1693,18 @@ unsafe extern "C" fn fs_read_dispatch(_device: *mut DeviceObject, irp: *mut Irp)
 
     if !(*file_obj).fcb.is_null() {
         let handle = (*file_obj).fcb as *mut crate::fs::ntfs::NtfsHandle;
-        let bytes_read;
-        if crate::mm::user_copy::is_user_range(buffer as u64, length as usize) {
+        // The issuer already captured an explicit zero in current_byte_offset.
+        // NTFS owns advancement; synchronize its cursor before every request.
+        (*handle).current_position = byte_offset;
+        let transfer;
+        // Kernel allocations may occupy numerically low virtual addresses.
+        // The issuer records buffer provenance; address magnitude cannot.
+        if (*irp).requestor_mode == 1 {
             if crate::mm::user_copy::probe_user_write(buffer as u64, length as usize).is_err() {
-                (*irp).io_status.status = STATUS_INVALID_PARAMETER as u32;
+                (*irp).io_status.status = STATUS_ACCESS_VIOLATION as u32;
                 (*irp).io_status.information = 0;
                 io_complete_request(irp, 0);
-                return STATUS_INVALID_PARAMETER;
+                return STATUS_ACCESS_VIOLATION;
             }
             let staging = pool::allocate(pool::PoolType::NonPaged, length as usize);
             if staging.is_null() {
@@ -1742,42 +1715,45 @@ unsafe extern "C" fn fs_read_dispatch(_device: *mut DeviceObject, irp: *mut Irp)
             }
             let kernel_buffer =
                 unsafe { core::slice::from_raw_parts_mut(staging, length as usize) };
-            bytes_read = crate::fs::ntfs::get_mounted_fs()
+            transfer = crate::fs::ntfs::get_mounted_fs()
+                .ok_or(STATUS_DEVICE_NOT_READY)
                 .and_then(|filesystem| {
                     crate::fs::ntfs::read_file(filesystem, unsafe { &mut *handle }, kernel_buffer)
-                        .ok()
                 })
-                .unwrap_or(0);
-            if bytes_read > 0 {
-                let src = unsafe { core::slice::from_raw_parts(staging, bytes_read) };
-                let _ = crate::mm::user_copy::copy_to_user(buffer as u64, src);
-            }
+                .and_then(|bytes_read| {
+                    if bytes_read > 0 {
+                        let src = unsafe { core::slice::from_raw_parts(staging, bytes_read) };
+                        crate::mm::user_copy::copy_to_user(buffer as u64, src)?;
+                    }
+                    Ok(bytes_read)
+                });
             pool::free(staging);
         } else {
             let kernel_buffer = unsafe { core::slice::from_raw_parts_mut(buffer, length as usize) };
-            bytes_read = crate::fs::ntfs::get_mounted_fs()
+            transfer = crate::fs::ntfs::get_mounted_fs()
+                .ok_or(STATUS_DEVICE_NOT_READY)
                 .and_then(|filesystem| {
                     crate::fs::ntfs::read_file(filesystem, unsafe { &mut *handle }, kernel_buffer)
-                        .ok()
-                })
-                .unwrap_or(0);
+                });
         }
+        let (status, bytes_read) = match transfer {
+            Ok(0) => (STATUS_END_OF_FILE, 0),
+            Ok(count) => (STATUS_SUCCESS, count),
+            Err(status) => {
+                // Keep the FCB cursor consistent with the file object after
+                // a failed transfer or a fault during the final user copy.
+                (*handle).current_position = byte_offset;
+                (status, 0)
+            }
+        };
         if bytes_read > 0 {
-            unsafe { (*handle).current_position += bytes_read as u64 };
-            (*file_obj).current_byte_offset += bytes_read as u64;
+            (*file_obj).current_byte_offset = (*handle).current_position;
         }
         {
             let mut stats = IO_STATS.lock();
             stats.bytes_read += bytes_read as u64;
             stats.reads += 1;
         }
-        let status = if bytes_read > 0 || length == 0 {
-            STATUS_SUCCESS
-        } else {
-            // A read of a non-zero length that transferred nothing is
-            // an end-of-file condition in NT, not a parameter error.
-            STATUS_END_OF_FILE
-        };
         (*irp).io_status.status = status as u32;
         (*irp).io_status.information = bytes_read;
         io_complete_request(irp, 0);
@@ -1786,12 +1762,12 @@ unsafe extern "C" fn fs_read_dispatch(_device: *mut DeviceObject, irp: *mut Irp)
 
     // The read buffer may be a user-mode address; user buffers are never
     // dereferenced directly. Stage the transfer through a kernel buffer.
-    let result = if crate::mm::user_copy::is_user_range(buffer as u64, length as usize) {
+    let result = if (*irp).requestor_mode == 1 {
         if crate::mm::user_copy::probe_user_write(buffer as u64, length as usize).is_err() {
-            (*irp).io_status.status = STATUS_INVALID_PARAMETER as u32;
+            (*irp).io_status.status = STATUS_ACCESS_VIOLATION as u32;
             (*irp).io_status.information = 0;
             io_complete_request(irp, 0);
-            return STATUS_INVALID_PARAMETER;
+            return STATUS_ACCESS_VIOLATION;
         }
         let staging = pool::allocate(pool::PoolType::NonPaged, length as usize);
         if staging.is_null() {
@@ -1801,10 +1777,13 @@ unsafe extern "C" fn fs_read_dispatch(_device: *mut DeviceObject, irp: *mut Irp)
             return STATUS_NO_MEMORY;
         }
         let kernel_buffer = unsafe { core::slice::from_raw_parts_mut(staging, length as usize) };
-        let result = crate::fs::vfs::read_file_sectors_into(0, kernel_buffer, byte_offset);
+        let mut result = crate::fs::vfs::read_file_sectors_into(0, kernel_buffer, byte_offset);
         if result.status == 0 && result.bytes_read > 0 {
             let src = unsafe { core::slice::from_raw_parts(staging, result.bytes_read) };
-            let _ = crate::mm::user_copy::copy_to_user(buffer as u64, src);
+            if let Err(status) = crate::mm::user_copy::copy_to_user(buffer as u64, src) {
+                result.status = status as u32;
+                result.bytes_read = 0;
+            }
         }
         pool::free(staging);
         result
@@ -1874,10 +1853,6 @@ unsafe extern "C" fn fs_write_dispatch(_device: *mut DeviceObject, irp: *mut Irp
 
     if params.byte_offset != 0 {
         (*file_obj).current_byte_offset = params.byte_offset;
-        if !(*file_obj).fcb.is_null() {
-            let handle = (*file_obj).fcb as *mut crate::fs::ntfs::NtfsHandle;
-            unsafe { (*handle).current_position = params.byte_offset };
-        }
     }
     // Route to the underlying filesystem via the FCB handle
     let byte_offset = (*file_obj).current_byte_offset;
@@ -1893,13 +1868,14 @@ unsafe extern "C" fn fs_write_dispatch(_device: *mut DeviceObject, irp: *mut Irp
     // rather than the raw sector fallback below.
     if !(*file_obj).fcb.is_null() {
         let handle = (*file_obj).fcb as *mut crate::fs::ntfs::NtfsHandle;
-        let bytes_written;
-        if crate::mm::user_copy::is_user_range(buffer as u64, length as usize) {
+        (*handle).current_position = byte_offset;
+        let transfer;
+        if (*irp).requestor_mode == 1 {
             if crate::mm::user_copy::probe_user_read(buffer as u64, length as usize).is_err() {
-                (*irp).io_status.status = STATUS_INVALID_PARAMETER as u32;
+                (*irp).io_status.status = STATUS_ACCESS_VIOLATION as u32;
                 (*irp).io_status.information = 0;
                 io_complete_request(irp, 0);
-                return STATUS_INVALID_PARAMETER;
+                return STATUS_ACCESS_VIOLATION;
             }
             let staging = pool::allocate(pool::PoolType::NonPaged, length as usize);
             if staging.is_null() {
@@ -1908,42 +1884,40 @@ unsafe extern "C" fn fs_write_dispatch(_device: *mut DeviceObject, irp: *mut Irp
                 io_complete_request(irp, 0);
                 return STATUS_NO_MEMORY;
             }
-            {
-                let kernel_buffer =
-                    unsafe { core::slice::from_raw_parts_mut(staging, length as usize) };
-                let _ = crate::mm::user_copy::copy_from_user(kernel_buffer, buffer as u64);
-            }
-            let kernel_buffer = unsafe { core::slice::from_raw_parts(staging, length as usize) };
-            bytes_written = crate::fs::ntfs::get_mounted_fs()
-                .and_then(|filesystem| {
+            let kernel_buffer =
+                unsafe { core::slice::from_raw_parts_mut(staging, length as usize) };
+            // Probing does not pin user pages: capture can still fault. Never
+            // send an incompletely captured write buffer to the filesystem.
+            transfer = crate::mm::user_copy::copy_from_user(kernel_buffer, buffer as u64)
+                .and_then(|()| {
+                    let filesystem = crate::fs::ntfs::get_mounted_fs()
+                        .ok_or(STATUS_DEVICE_NOT_READY)?;
                     crate::fs::ntfs::write_file(filesystem, unsafe { &mut *handle }, kernel_buffer)
-                        .ok()
-                })
-                .unwrap_or(0);
+                });
             pool::free(staging);
         } else {
             let kernel_buffer = unsafe { core::slice::from_raw_parts(buffer, length as usize) };
-            bytes_written = crate::fs::ntfs::get_mounted_fs()
+            transfer = crate::fs::ntfs::get_mounted_fs()
+                .ok_or(STATUS_DEVICE_NOT_READY)
                 .and_then(|filesystem| {
                     crate::fs::ntfs::write_file(filesystem, unsafe { &mut *handle }, kernel_buffer)
-                        .ok()
-                })
-                .unwrap_or(0);
+                });
         }
+        let (status, bytes_written) = match transfer {
+            Ok(count) => (STATUS_SUCCESS, count),
+            Err(status) => {
+                (*handle).current_position = byte_offset;
+                (status, 0)
+            }
+        };
         if bytes_written > 0 {
-            unsafe { (*handle).current_position += bytes_written as u64 };
-            (*file_obj).current_byte_offset += bytes_written as u64;
+            (*file_obj).current_byte_offset = (*handle).current_position;
         }
         {
             let mut stats = IO_STATS.lock();
             stats.bytes_written += bytes_written as u64;
             stats.writes += 1;
         }
-        let status = if bytes_written > 0 {
-            STATUS_SUCCESS
-        } else {
-            STATUS_INVALID_PARAMETER
-        };
         (*irp).io_status.status = status as u32;
         (*irp).io_status.information = bytes_written;
         io_complete_request(irp, 0);
@@ -1952,12 +1926,12 @@ unsafe extern "C" fn fs_write_dispatch(_device: *mut DeviceObject, irp: *mut Irp
 
     // The write buffer may be a user-mode address; user buffers are never
     // dereferenced directly. Stage the transfer through a kernel buffer.
-    let result = if crate::mm::user_copy::is_user_range(buffer as u64, length as usize) {
+    let result = if (*irp).requestor_mode == 1 {
         if crate::mm::user_copy::probe_user_read(buffer as u64, length as usize).is_err() {
-            (*irp).io_status.status = STATUS_INVALID_PARAMETER as u32;
+            (*irp).io_status.status = STATUS_ACCESS_VIOLATION as u32;
             (*irp).io_status.information = 0;
             io_complete_request(irp, 0);
-            return STATUS_INVALID_PARAMETER;
+            return STATUS_ACCESS_VIOLATION;
         }
         let staging = pool::allocate(pool::PoolType::NonPaged, length as usize);
         if staging.is_null() {
@@ -1966,12 +1940,15 @@ unsafe extern "C" fn fs_write_dispatch(_device: *mut DeviceObject, irp: *mut Irp
             io_complete_request(irp, 0);
             return STATUS_NO_MEMORY;
         }
-        {
-            let kernel_buffer =
-                unsafe { core::slice::from_raw_parts_mut(staging, length as usize) };
-            let _ = crate::mm::user_copy::copy_from_user(kernel_buffer, buffer as u64);
+        let kernel_buffer =
+            unsafe { core::slice::from_raw_parts_mut(staging, length as usize) };
+        if let Err(status) = crate::mm::user_copy::copy_from_user(kernel_buffer, buffer as u64) {
+            pool::free(staging);
+            (*irp).io_status.status = status as u32;
+            (*irp).io_status.information = 0;
+            io_complete_request(irp, 0);
+            return status;
         }
-        let kernel_buffer = unsafe { core::slice::from_raw_parts(staging, length as usize) };
         let result = crate::fs::vfs::write_file_sectors_from(0, kernel_buffer, byte_offset);
         pool::free(staging);
         result
@@ -2004,14 +1981,24 @@ unsafe extern "C" fn fs_write_dispatch(_device: *mut DeviceObject, irp: *mut Irp
 /// IRP_MJ_CLOSE dispatch for filesystem devices.
 /// Closes a file handle.
 unsafe extern "C" fn fs_close_dispatch(_device: *mut DeviceObject, irp: *mut Irp) -> i32 {
-    // Release the FileObjects created on this device. File identity per
-    // close arrives with the syscall/IRP coupling work; until then CLOSE
-    // is the only release point for the open-file registry.
-    {
+    // Caller-owned objects are retired by their issuer. A driver-owned close
+    // removes only its own object; it cannot invalidate unrelated opens.
+    let retired = if !irp.is_null() {
+        let stack = (*irp).current_stack;
+        let target = if stack.is_null() { null_mut() } else { (*stack).file_object };
         let mut open = OPEN_FILE_OBJECTS.lock();
-        for file_obj in open.drain(..) {
-            pool::free(file_obj as *mut u8);
-        }
+        let position = if target.is_null() {
+            (!open.is_empty()).then_some(0)
+        } else {
+            open.iter().position(|&object| object == target)
+        };
+        position.map(|index| open.remove(index))
+    } else {
+        None
+    };
+    if let Some(file_obj) = retired {
+        core::ptr::drop_in_place(file_obj);
+        pool::free(file_obj as *mut u8);
     }
     if !irp.is_null() {
         (*irp).io_status.status = STATUS_SUCCESS as u32;
@@ -2376,102 +2363,8 @@ pub fn pnp_init() {
 // Device Stack Management
 // ============================================================================
 
-/// Device stack structure for managing filter device attachments.
-/// The device stack represents the chain of devices attached to each other,
-/// from the top (closest to user) to the bottom (closest to hardware).
-#[derive(Debug)]
-pub struct DeviceStack {
-    /// Top device in the stack (filter drivers attach here)
-    pub top_device: *mut DeviceObject,
-    /// Bottom device in the stack (base device/hardware)
-    pub bottom_device: *mut DeviceObject,
-    /// List of attached filter devices
-    pub attached_devices: Option<Vec<*mut DeviceObject>>,
-}
-
-impl DeviceStack {
-    /// create a new device stack with a base device.
-    pub fn new(base_device: *mut DeviceObject) -> Option<Self> {
-        if base_device.is_null() {
-            return None;
-        }
-        Some(Self {
-            top_device: base_device,
-            bottom_device: base_device,
-            attached_devices: Some(Vec::new()),
-        })
-    }
-
-    /// # Safety
-    ///
-    /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-    /// Attach a filter device above another device in the stack.
-    /// The filter device will receive IRPs before the target device.
-    pub unsafe fn attach_filter_device(&mut self, filter: *mut DeviceObject) -> bool {
-        if filter.is_null() {
-            return false;
-        }
-
-        unsafe {
-            // Link filter above target
-            (*filter).attached_device = self.top_device;
-
-            // Update target's attached_to field
-            (*self.top_device).attached_to = Some(filter);
-
-            // Add to our tracking list
-            if let Some(ref mut list) = self.attached_devices {
-                list.push(self.top_device);
-            }
-
-            // Update top to the filter
-            self.top_device = filter;
-        }
-        true
-    }
-
-    /// # Safety
-    ///
-    /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-    /// Detach a filter device from the stack.
-    pub unsafe fn detach_filter_device(&mut self, filter: *mut DeviceObject) -> bool {
-        if filter.is_null() {
-            return false;
-        }
-
-        unsafe {
-            let below = (*filter).attached_device;
-            let above = (*filter).attached_to;
-
-            // Re-link the chain
-            if let Some(above_dev) = above {
-                (*above_dev).attached_device = below;
-            }
-            if !below.is_null() {
-                (*below).attached_to = above;
-            }
-
-            // Update top/bottom if needed
-            if self.top_device == filter {
-                self.top_device = below;
-            }
-            if self.bottom_device == filter {
-                self.bottom_device = below;
-            }
-
-            // Remove from tracking list
-            if let Some(ref mut list) = self.attached_devices {
-                list.retain(|&d| d != filter);
-            }
-        }
-        true
-    }
-
-    /// Get the number of devices in the stack.
-    pub fn depth(&self) -> usize {
-        self.attached_devices.as_ref().map_or(0, |v| v.len()) + 1
-    }
-}
+mod device_stack;
+pub use device_stack::DeviceStack;
 
 // ============================================================================
 // Fast I/O Dispatch

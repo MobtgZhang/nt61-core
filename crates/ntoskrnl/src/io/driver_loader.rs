@@ -3,7 +3,7 @@
 //! This is not a native WDM loader or a disk-backed PE/import resolver.
 
 use alloc::vec::Vec;
-use core::ptr::null_mut;
+use core::ptr::{null_mut, NonNull};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::DriverObject;
@@ -74,6 +74,52 @@ impl DriverRegistryEntry {
 const MAX_LOADED_DRIVERS: usize = 64;
 
 static DRIVER_REGISTRY: Spinlock<Vec<Option<DriverRegistryEntry>>> = Spinlock::new(Vec::new());
+
+/// An owning reference to a loaded private driver. The registry's caller-owned
+/// storage contract remains in force; this guard prevents unload from entering
+/// the driver's callback while code or device pointers are being used.
+#[must_use]
+pub struct DriverReference(NonNull<DriverObject>);
+
+impl DriverReference {
+    /// Resolve the name and retain the loaded record in one registry transaction.
+    /// A borrowed find_driver result followed by reference_driver is not atomic.
+    pub fn find(name: &[u8]) -> Result<Self, i32> {
+        let mut registry = DRIVER_REGISTRY.lock();
+        let entry = registry
+            .iter_mut()
+            .flatten()
+            .find(|entry| {
+                let length = entry.name.iter().position(|&b| b == 0).unwrap_or(64);
+                entry.load_state == DriverLoadState::Loaded && &entry.name[..length] == name
+            })
+            .ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
+        let pointer = NonNull::new(entry.driver_object).ok_or(STATUS_NO_SUCH_DEVICE)?;
+        let count = entry.ref_count.load(Ordering::Relaxed);
+        let next = count.checked_add(1).ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        entry.ref_count.store(next, Ordering::Relaxed);
+        Ok(Self(pointer))
+    }
+
+    pub fn as_ptr(&self) -> *mut DriverObject {
+        self.0.as_ptr()
+    }
+
+    pub fn try_clone(&self) -> Result<Self, i32> {
+        if reference_driver(self.as_ptr()) {
+            Ok(Self(self.0))
+        } else {
+            Err(STATUS_INSUFFICIENT_RESOURCES)
+        }
+    }
+}
+
+impl Drop for DriverReference {
+    fn drop(&mut self) {
+        let released = dereference_driver(self.as_ptr());
+        debug_assert!(released, "owned driver reference disappeared before Drop");
+    }
+}
 
 pub fn init() {
     let mut registry = DRIVER_REGISTRY.lock();

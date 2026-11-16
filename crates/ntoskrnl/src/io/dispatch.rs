@@ -121,6 +121,7 @@ pub unsafe fn dispatch_irp(device: *mut DeviceObject, irp: *mut Irp) -> i32 {
 /// Attach a lower device object onto a device stack
 /// (wdm.h IoAttachDeviceToDeviceStack).
 pub unsafe fn attach_device(device: *mut DeviceObject, lower: *mut DeviceObject) {
+    let _graph = super::device_lifecycle::DEVICE_GRAPH_LOCK.lock();
     if device.is_null() || lower.is_null() || device == lower
         || !(*device).attached_device.is_null() || (*lower).attached_to.is_some()
     {

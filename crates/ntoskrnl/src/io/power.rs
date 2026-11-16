@@ -125,7 +125,7 @@ pub unsafe fn request_device_power_state(
     }
 
     unsafe {
-        let current_state = (*device).device_power_state;
+        let current_state = (*device).get_device_power_state();
 
         if current_state == target_state {
             return true; // Already in target state
@@ -291,7 +291,7 @@ fn handle_set_power(device: *mut DeviceObject, _irp: *mut Irp) -> i32 {
 
     unsafe {
         // For now, just acknowledge the power change
-        let current_state = (*device).device_power_state;
+        let current_state = (*device).get_device_power_state();
         power_klog!("[IO-POWER] Device in state {:?}", current_state);
     }
 
