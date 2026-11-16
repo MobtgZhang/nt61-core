@@ -218,6 +218,9 @@ pub fn init() {
         let v = stvec_trap as *const () as u64;
         asm!("csrw stvec, {}", in(reg) v, options(nostack));
         asm!("csrw sscratch, zero", options(nostack));
+        // Every AP installs this vector. Enable SBI software interrupts here
+        // before its idle loop can wait with global interrupts enabled.
+        asm!("csrsi sie, 2", options(nostack));
     }
 }
 

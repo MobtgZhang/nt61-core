@@ -28,6 +28,12 @@ pub fn cpu_count() -> u32 {
     ONLINE.load(Ordering::Acquire)
 }
 
+/// Resolve a logical scheduler CPU to its firmware hart ID. Topology is
+/// immutable once AP bootstrap finishes and before user services are exposed.
+pub fn hardware_cpu_id(cpu: u32) -> Option<u64> {
+    unsafe { TOPOLOGY.ids[..TOPOLOGY.count].get(cpu as usize).copied() }
+}
+
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.

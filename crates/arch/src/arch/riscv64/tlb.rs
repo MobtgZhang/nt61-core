@@ -134,24 +134,16 @@ pub fn flush_global() {
 /// Remote TLB shootdown (for SMP)
 /// Send IPI to other harts to flush their TLBs
 #[inline]
-pub fn flush_remote(hart_mask: u64) {
-    let current = crate::arch::riscv64::smp::current_hart_id() as u64;
-    let target_mask = hart_mask & !(1 << current);
-    if target_mask == 0 {
-        return;
-    }
-
-    // Prefer the direct CLINT MSIP path. This works even when SBI's IPI
-    // extension is unavailable, including QEMU virt and SiFive-style SoCs.
-    if crate::arch::riscv64::clint::base() != 0 {
-        for hart in 0..crate::arch::riscv64::MAX_CPUS as u32 {
-            if (target_mask >> hart) & 1 != 0 {
-                crate::arch::riscv64::clint::raise_msip(hart);
-            }
-        }
-    } else {
-        // SBI accepts a hart bitmap, so sparse hart IDs do not need to be
-        // expanded here.
-        let _ = unsafe { crate::arch::riscv64::sbi::ipi_send(target_mask) };
+pub fn flush_remote(cpu_mask: u64) {
+    let current = crate::arch::riscv64::smp::__smp_get_current_cpu_id();
+    for cpu in 0..crate::arch::riscv64::smp::cpu_count().min(64) {
+        if cpu == current || cpu_mask & (1u64 << cpu) == 0 { continue; }
+        let hart = crate::arch::riscv64::smp::hardware_cpu_id(cpu)
+            .expect("online CPU has no firmware hart ID");
+        // The kernel runs in S-mode. OpenSBI owns CLINT MSIP under PMP;
+        // a direct MMIO write faults even when its VA is identity mapped.
+        // SBI delivers SSIP, rather than an M-mode software interrupt.
+        let result = unsafe { crate::arch::riscv64::sbi::ipi_send_range(1, hart) };
+        assert_eq!(result.error, 0, "firmware failed to deliver shootdown IPI");
     }
 }

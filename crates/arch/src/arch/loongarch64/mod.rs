@@ -16,6 +16,7 @@ pub mod framebuffer;
 pub mod gdt;
 pub mod hpet;
 pub mod idt;
+pub mod ipi;
 pub mod keyboard;
 pub mod paging;
 pub mod paging_impl;

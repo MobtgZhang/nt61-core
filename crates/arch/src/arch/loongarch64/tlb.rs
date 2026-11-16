@@ -256,7 +256,9 @@ pub fn flush_remote(cpu_mask: u64) {
     let target_mask = cpu_mask & !(1 << current);
     for cpu in 0..64 {
         if (target_mask >> cpu) & 1 != 0 {
-            crate::arch::loongarch64::interrupt::send_ipi(cpu);
+            let hardware = crate::arch::loongarch64::smp::hardware_cpu_id(cpu)
+                .expect("online CPU has no firmware core ID");
+            crate::arch::loongarch64::interrupt::send_ipi(hardware as u32);
         }
     }
 }

@@ -92,7 +92,7 @@ fn is_valid_page(e: u64) -> bool {
 fn sync_new_page_table() {
     unsafe {
         asm!("dsb ish", options(nostack));
-        asm!("tlbi vmalle1", options(nostack));
+        asm!("dsb ishst", "tlbi vmalle1", options(nostack));
         asm!("isb", options(nostack));
     }
 }
@@ -278,7 +278,7 @@ pub fn current_l0_phys() -> u64 {
             asm!("msr TTBR1_EL1, {}", in(reg) ttbr0, options(nostack));
             asm!("dsb nsh", options(nostack));
             asm!("isb", options(nostack));
-            asm!("tlbi vmalle1", options(nostack));
+            asm!("dsb ishst", "tlbi vmalle1", options(nostack));
         }
     }
     // After the sync above, TTBR1 always matches TTBR0 (or TTBR0 is
@@ -586,7 +586,7 @@ pub fn unmap_page(va: u64) -> Option<u64> {
         }
         let pa = pte & 0x0000_FFFF_FFFF_F000;
         core::ptr::write_volatile(l3_pte, 0);
-        asm!("tlbi VAE1, {}", in(reg) (va >> 12) & 0x0000_0FFF_FFFF_FFFF, options(nostack));
+        asm!("dsb ishst", "tlbi VAE1, {}", in(reg) (va >> 12) & 0x0000_0FFF_FFFF_FFFF, options(nostack));
         asm!("dsb nsh", options(nostack));
         asm!("isb", options(nostack));
         Some(pa)
@@ -757,7 +757,7 @@ pub fn read_page_root_pfn() -> u64 {
 /// Invalidate a single TLB entry for the given virtual address.
 pub fn invalidate_tlb(va: u64) {
     unsafe {
-        asm!("tlbi VAE1, {}", in(reg) (va >> 12) & 0x0000_0FFF_FFFF_FFFF, options(nostack));
+        asm!("dsb ishst", "tlbi VAE1, {}", in(reg) (va >> 12) & 0x0000_0FFF_FFFF_FFFF, options(nostack));
         asm!("dsb nsh", options(nostack));
         asm!("isb", options(nostack));
     }
@@ -767,7 +767,7 @@ pub fn invalidate_tlb(va: u64) {
 pub fn flush_tlb() {
     unsafe {
         // VMALLE1 invalidates all stage-1 TLB entries for EL1.
-        asm!("tlbi vmalle1", options(nostack));
+        asm!("dsb ishst", "tlbi vmalle1", options(nostack));
         asm!("dsb nsh", options(nostack));
         asm!("isb", options(nostack));
     }

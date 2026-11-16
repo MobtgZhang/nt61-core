@@ -17,6 +17,20 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// kernel-mode one raises a bugcheck.
 static PF_IN_HANDLER: AtomicBool = AtomicBool::new(false);
 
+/// Release the LAPIC in-service slot for every IPI, including the stop IPI
+/// whose handler never returns. Interrupt gates keep IF clear during dispatch.
+fn dispatch_ipi(vector: u8) {
+    crate::hal::x86_64::apic::eoi();
+    match vector {
+        0xE0 => crate::ke::dispatch::handle_ipi_reschedule(),
+        0xE1 => crate::ke::dispatch::handle_ipi_intr_enter(),
+        0xE2 => crate::ke::dispatch::handle_ipi_intr_exit(),
+        0xE3 => crate::ke::dispatch::handle_ipi_panic_stop(),
+        0xE4..=0xEF => crate::ke::dispatch::handle_ipi_dynamic(vector),
+        _ => unreachable!(),
+    }
+}
+
 /// Registers saved by `int_common_dispatch`. The frame layout
 /// matches the on-stack layout pushed by the stub:
 ///
@@ -603,11 +617,7 @@ pub unsafe extern "win64" fn dispatch_trap_frame(vector: u64, tf: *mut TrapFrame
 
             // === IPI vectors ===
             // The x86_64 architecture reserves 0xE0..0xEF for inter-processor interrupts
-            0xE0 => crate::ke::dispatch::handle_ipi_reschedule(),
-            0xE1 => crate::ke::dispatch::handle_ipi_intr_enter(),
-            0xE2 => crate::ke::dispatch::handle_ipi_intr_exit(),
-            0xE3 => crate::ke::dispatch::handle_ipi_panic_stop(),
-            0xE4..=0xEF => crate::ke::dispatch::handle_ipi_dynamic(vector as u8),
+            0xE0..=0xEF => dispatch_ipi(vector as u8),
 
             // === Spurious APIC ===
             0xFF => {}

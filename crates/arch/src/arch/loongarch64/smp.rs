@@ -41,6 +41,11 @@ pub fn cpu_count() -> u32 {
     ONLINE.load(Ordering::Acquire)
 }
 
+/// Firmware hardware core corresponding to a logical scheduler CPU.
+pub fn hardware_cpu_id(cpu: u32) -> Option<u64> {
+    unsafe { TOPOLOGY.ids[..TOPOLOGY.count].get(cpu as usize).copied() }
+}
+
 /// Number of SMT threads per physical core for the running SoC.
 /// Returns `1` for LA364/LA464, `2` for LA664.
 pub fn smt_threads() -> u8 {

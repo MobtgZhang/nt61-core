@@ -538,6 +538,22 @@ pub unsafe extern "C" fn ap_entry_long(ap_index: u64) -> ! {
     crate::arch::x86_64::syscall::set_kernel_gs_base(per_cpu_page);
     smp_print_hex(b"[smp] AP GS_BASE idx=", ap_index, b" val=0x");
     smp_print_hex(b"", per_cpu_page, b"\r\n");
+    // TSS.RSP0 only switches stacks on a privilege transition. AP idle
+    // runs at CPL0, so explicitly leave the shared trampoline stack before
+    // acknowledging startup and allowing the BSP to reuse it for another AP.
+    // The synthetic return slot gives the C entry its required RSP % 16 == 8.
+    asm!(
+        "mov rsp, {stack}",
+        "push 0",
+        "jmp {entry}",
+        stack = in(reg) rsp0,
+        entry = sym ap_entry_on_stack,
+        in("rdi") ap_index,
+        options(noreturn),
+    );
+}
+
+unsafe extern "C" fn ap_entry_on_stack(ap_index: u64) -> ! {
     // Signal the BSP that this AP made it into long mode. The
     // handshake slot lives in the identity-mapped trampoline page
     // (offset 0x548) and stores the 1-based AP index. APs boot

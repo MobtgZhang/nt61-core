@@ -26,7 +26,11 @@
 
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+#[path = "gicv2.rs"]
+mod gicv2;
+static READY: AtomicBool = AtomicBool::new(false);
 
 use crate::arch::aarch64::soc;
 
@@ -115,6 +119,34 @@ pub fn init(dist_base: u64, cpu_base: u64) {
     // no longer storm.
     crate::hal::common::keyboard_unified::enable_serial_rx_irq();
     crate::arch::boot::early_write_str(b"[TRACE] gic-done\r\n");
+    READY.store(true, Ordering::Release);
+}
+
+/// APs start before the BSP initialises the HAL. Publish their boot progress,
+/// then wait here before enabling IRQs; never reconfigure the distributor.
+pub fn init_secondary() {
+    while !READY.load(Ordering::Acquire) { core::hint::spin_loop(); }
+    match soc::interrupt_controller() {
+        soc::InterruptController::GICv2 => gicv2::init_cpu_interface(),
+        soc::InterruptController::GICv3 | soc::InterruptController::GICv4 => init_gicv3(),
+        soc::InterruptController::None => {}
+    }
+}
+
+/// Use the same controller that acknowledges interrupts. The old architecture
+/// GIC module has separate, uninitialised state and cannot deliver these IPIs.
+pub fn broadcast_tlb_shootdown() {
+    // Publish the request before raising an interrupt on another CPU.
+    unsafe { asm!("dsb ishst", options(nostack)); }
+    match soc::interrupt_controller() {
+        soc::InterruptController::GICv2 => gicv2::broadcast_shootdown(),
+        soc::InterruptController::GICv3 | soc::InterruptController::GICv4 => unsafe {
+            // ICC_SGI1R_EL1: IRM=1 (all other PEs), INTID=15.
+            asm!("msr ICC_SGI1R_EL1, {0}", "isb",
+                in(reg) (1u64 << 40) | (15 << 24), options(nostack));
+        },
+        soc::InterruptController::None => {}
+    }
 }
 
 fn init_gicv2() {
@@ -149,8 +181,7 @@ fn init_gicv2() {
         write_volatile((GICV2_DIST_BASE + gicd::CTLR as u64) as *mut u32, 1);
 
         // CPU interface: enable group 0 (0x1), set priority mask to 0xF0.
-        write_volatile((GICV2_CPU_BASE + gicc::CTLR as u64) as *mut u32, 0x1);
-        write_volatile((GICV2_CPU_BASE + gicc::PMR as u64) as *mut u32, 0xF0);
+        gicv2::init_cpu_interface();
 
         // Enable the serial receive line. The GIC masks every SPI at
         // reset, so without this the armed PL011 interrupt can never
@@ -214,18 +245,19 @@ fn init_gicv3() {
     //    GICR_WAKER lives at GICR base + 0x0014. QEMU's `virt` machine
     //    places the boot CPU redistributor at 0x080A0000; the GICv2
     //    CPU-interface address is invalid in this mode.
-    const GICR_WAKER: u64 = 0x080A_0000 + 0x0014;
-    let waker = unsafe { read_volatile(GICR_WAKER as *mut u32) };
+    let gicr_waker = 0x080A_0000 +
+        crate::arch::aarch64::smp::__smp_get_current_cpu_id() as u64 * 0x20000 + 0x14;
+    let waker = unsafe { read_volatile(gicr_waker as *mut u32) };
     if waker & 0x2 != 0 {
-        // ProcessorSleep is set: clear it and wait for ChildrenAsync.
+        // ProcessorSleep is set: clear it and wait for ChildrenAsleep.
         unsafe {
-            write_volatile(GICR_WAKER as *mut u32, waker & !0x2);
+            write_volatile(gicr_waker as *mut u32, waker & !0x2);
         }
-        // Poll until ChildrenAsync (bit 1) clears.
+        // Poll until ChildrenAsleep (bit 2) clears.
         let mut spins = 0;
         while spins < 100_000 {
-            let w = unsafe { read_volatile(GICR_WAKER as *mut u32) };
-            if w & 0x2 == 0 {
+            let w = unsafe { read_volatile(gicr_waker as *mut u32) };
+            if w & 0x4 == 0 {
                 break;
             }
             spins += 1;

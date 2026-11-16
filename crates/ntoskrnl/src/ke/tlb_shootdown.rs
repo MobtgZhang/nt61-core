@@ -14,8 +14,8 @@
 //! could prevent another CPU from servicing IPIs.
 //!
 //! Page-table callers retain the historical bounded wait and lazy fallback.
-//! The native process write-buffer service uses an unbounded acknowledgement
-//! wait because returning before a remote memory fence violates its contract.
+//! Permission revocation and the native process write-buffer service use an
+//! unbounded acknowledgement wait; both require remote completion.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -72,6 +72,7 @@ fn local_flush_and_publish() {
 /// Called from the architecture IPI/SGI handler. Flushes this CPU's
 /// TLB and acknowledges the shootdown.
 pub fn handle_shootdown_interrupt() {
+    super::instruction_shootdown::service_pending();
     local_flush_and_publish();
 }
 
@@ -79,6 +80,7 @@ pub fn handle_shootdown_interrupt() {
 /// acknowledged the current generation (e.g. it was inside a
 /// critical section when the IPI arrived), catch up now.
 pub fn lazy_flush_if_pending() {
+    super::instruction_shootdown::service_pending();
     let idx = this_cpu_index();
     if DONE[idx].load(Ordering::Acquire) < GENERATION.load(Ordering::Acquire) {
         local_flush_and_publish();
@@ -98,6 +100,16 @@ pub fn invalidate_va_all_cpus(va: u64) {
     crate::arch::invalidate_tlb(va);
 
     request_all_cpus(false);
+}
+
+/// Revoke a user permission before returning, with every online CPU's
+/// acknowledgement. Call without locks needed by remote interrupt handlers.
+pub fn invalidate_va_all_cpus_complete(va: u64) {
+    crate::arch::invalidate_tlb(va);
+    // Also discard non-current ASIDs on architectures retaining them. This
+    // must happen even on UP, where request_all_cpus has no remote work.
+    local_flush_and_publish();
+    request_all_cpus(true);
 }
 
 /// Execute a full memory fence on every online processor before returning.

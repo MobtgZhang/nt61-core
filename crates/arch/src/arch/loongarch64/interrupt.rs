@@ -27,7 +27,7 @@ mod extioi {
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-unsafe fn read_u32(address: u64) -> u32 {
+pub(super) unsafe fn read_u32(address: u64) -> u32 {
     let value: u32;
     asm!(
         "iocsrrd.w {value}, {address}",
@@ -41,7 +41,7 @@ unsafe fn read_u32(address: u64) -> u32 {
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-unsafe fn write_u32(address: u64, value: u32) {
+pub(super) unsafe fn write_u32(address: u64, value: u32) {
     asm!(
         "iocsrwr.w {value}, {address}",
         value = in(reg) value,
@@ -178,47 +178,17 @@ pub fn get_pending_for_cpu(cpu: u32) -> u32 {
 
 /// Send IPI to CPU using mailbox
 pub fn send_ipi(target_cpu: u32) {
-    if target_cpu >= MAX_CPUS as u32 {
-        return;
-    }
-
-    // LoongArch IPI is sent via IOCSR (I/O CSR space)
-    unsafe {
-        // IOCSR_IPI_SEND register
-        core::arch::asm!(
-            "iocsrwr.w {val}, {reg}",
-            val = in(reg) 1u32,
-            reg = in(reg) 0x1040 + target_cpu * 4,
-            options(nostack)
-        );
-    }
+    super::ipi::send(target_cpu);
 }
 
 /// Clear IPI for current CPU
 pub fn clear_ipi() {
-    unsafe {
-        // IOCSR_IPI_CLEAR register
-        core::arch::asm!(
-            "iocsrwr.w {val}, {reg}",
-            val = in(reg) 1u32,
-            reg = in(reg) 0x1060,
-            options(nostack)
-        );
-    }
+    super::ipi::clear();
 }
 
 /// Check if IPI is pending for current CPU
 pub fn is_ipi_pending() -> bool {
-    unsafe {
-        let val: u32;
-        core::arch::asm!(
-            "iocsrrd.w {val}, {reg}",
-            val = out(reg) val,
-            reg = in(reg) 0x1020,
-            options(nostack)
-        );
-        val != 0
-    }
+    super::ipi::pending()
 }
 
 /// handle interrupt - returns IRQ number or None

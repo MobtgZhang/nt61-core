@@ -355,9 +355,9 @@ pub extern "C" fn riscv64_trap_dispatch(frame: *mut TrapFrame) {
         // pending bit remains asserted and the trap handler spins forever.
         match scause & 0x7FFF_FFFF_FFFF_FFFF {
             1 => {
-                crate::arch::riscv64::clint::clear_msip(
-                    crate::arch::riscv64::smp::current_hart_id(),
-                );
+                // SBI raises the writable supervisor SSIP bit; CLINT is
+                // machine-mode firmware state and must not be accessed here.
+                unsafe { core::arch::asm!("csrci sip, 2", options(nostack)); }
                 crate::ke::tlb_shootdown::handle_shootdown_interrupt();
             }
             5 => {

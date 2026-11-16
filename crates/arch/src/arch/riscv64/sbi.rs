@@ -240,7 +240,13 @@ pub unsafe fn hsm_hart_status(hartid: u64) -> SbiRet {
 /// Send a software IPI to the harts listed in `hart_mask` (one bit
 /// per hart, hart 0 = bit 0).
 pub unsafe fn ipi_send(hart_mask: u64) -> SbiRet {
-    sbi_call(eid::IPI, 0 /* SEND_IPI */, hart_mask, 0, 0, 0, 0, 0)
+    ipi_send_range(hart_mask, 0)
+}
+
+/// Send an IPI to a bitmap relative to an arbitrary hardware hart ID.
+/// Using a base avoids truncating sparse hart IDs above 63.
+pub unsafe fn ipi_send_range(hart_mask: u64, hart_mask_base: u64) -> SbiRet {
+    sbi_call(eid::IPI, 0 /* SEND_IPI */, hart_mask, hart_mask_base, 0, 0, 0, 0)
 }
 
 // =====================================================================

@@ -295,7 +295,7 @@ pub fn init() {
         asm!("csrwr {}, 0x88", inout(reg) v2 => _, options(nostack));
         // QEMU resets ECFG.LIE to zero. LIE occupies bits [14:0] and
         // is aligned with ESTAT.IS; unmask the external (IS[2]) and
-        // constant-timer (IS[11]) interrupt lines. VS occupies
+        // constant-timer (IS[11]) and IPI (IS[12]) interrupt lines. VS occupies
         // bits [18:16]; keep it at zero so QEMU sends all normal
         // exceptions and interrupts to EENTRY+0x000.
         let mut ecfg: u64;
@@ -303,6 +303,8 @@ pub fn init() {
         ecfg &= !(0x3FFF);
         ecfg |= 1 << 2;
         ecfg |= 1 << 11;
+        super::ipi::init_cpu();
+        ecfg |= super::ipi::INTERRUPT_BIT;
         ecfg &= !(0x7 << 16);
         asm!("csrwr {}, 0x4", inout(reg) ecfg => _, options(nostack));
 

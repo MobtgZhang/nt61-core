@@ -267,6 +267,7 @@ pub extern "C" fn secondary_entry(_arg: u64) -> ! {
     crate::ke::scheduler::init_smp_this_cpu(cpu);
     ONLINE.fetch_add(1, Ordering::Release);
     crate::hal::serial::write_string_always(&alloc::format!("[SMP] online cpu={}\r\n", cpu));
+    crate::hal::aarch64::apic::init_secondary();
     crate::ke::scheduler::idle_loop()
 }
 

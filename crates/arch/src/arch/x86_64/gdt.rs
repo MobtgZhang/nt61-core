@@ -685,9 +685,7 @@ pub fn ap_install(gdt: &PerCpuGdt) {
     unsafe {
         core::arch::asm!(
             "lgdt [{ptr}]",
-            // Reload the data segment registers. CS stays
-            // cached; everything else must be reloaded from
-            // the new GDT.
+            // Reload data segments, then CS from this CPU's new GDT.
             "mov ds, ax",
             "mov es, ax",
             "mov ss, ax",
@@ -696,18 +694,23 @@ pub fn ap_install(gdt: &PerCpuGdt) {
             // Far-return through the new CS descriptor so the CPU
             // reloads the segment descriptor cache (the BSP path in
             // init() does the same thing via a far jump).
-            "push {cs:x}",
-            "call 2f",
-            "retf",
+            // Both far-return slots must be 64 bits. The trampoline's
+            // cached CS=0x18 names a data descriptor in the new GDT;
+            // leaving it cached would fault on the first interrupt return.
+            "push {cs}",
+            "lea rax, [rip + 2f]",
+            "push rax",
+            "retfq",
             "2:",
             // Load the TR with the TSS descriptor. ltr wants
             // a 16-bit register operand.
             "ltr cx",
             ptr = in(reg) &gdt_ptr,
             in("ax") KERNEL_DS,
-            cs = in(reg) KERNEL_CS,
+            cs = const KERNEL_CS as u32,
             in("cx") TSS_SEL,
-            options(nostack, preserves_flags),
+            lateout("rax") _,
+            options(preserves_flags),
         );
     }
 }

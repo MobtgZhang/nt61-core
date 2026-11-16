@@ -238,10 +238,9 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
         }
         TrapKind::Int => {
             let is = estat & 0x7FFF; // IS[14:0]
-                                     // IS[1] is the LoongArch IPI line. It is acknowledged through
-                                     // the IOCSR IPI mailbox, then turned into the architecture-
-                                     // independent shootdown protocol.
-            if (is & (1 << 1)) != 0 {
+            // Acknowledge the hardware IPI line before participating in the
+            // architecture-independent rendezvous. IS[1] is a software IRQ.
+            if (u64::from(is) & super::ipi::INTERRUPT_BIT) != 0 {
                 crate::arch::loongarch64::interrupt::clear_ipi();
                 crate::ke::tlb_shootdown::handle_shootdown_interrupt();
             }
