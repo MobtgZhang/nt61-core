@@ -2,6 +2,33 @@
 use super::*;
 
 #[test]
+fn virtual_resolution_changes_mapping_metrics_and_is_saved_without_changing_caps() {
+    let handle = dc::gre_create_compatible_dc(0);
+    use dc::services::nt_gdi_set_virtual_resolution as set;
+    assert_eq!(call(set, &[0, 1200, 600, 300, 150]), 0);
+    assert_eq!(call(set, &[handle, 1200, 0, 300, 150]), 0);
+    assert_eq!(call(set, &[handle, 1200, 600, 300, 150]), 1);
+    assert_eq!(extents(handle), ((1, 1), (1, 1)));
+    dc::gre_set_map_mode(handle, dc::MM_LOMETRIC);
+    assert_eq!(extents(handle), ((1200, -600), (3000, 1500)));
+    assert_eq!(call(dc::caps::nt_gdi_get_device_caps, &[handle, 8]), 1024);
+    assert_eq!(dc::gre_save_dc(handle), 1);
+    assert_eq!(call(set, &[handle, 800, 400, 100, 50]), 1);
+    dc::gre_set_map_mode(handle, dc::MM_TEXT);
+    dc::gre_set_map_mode(handle, dc::MM_HIMETRIC);
+    assert_eq!(extents(handle), ((800, -400), (10000, 5000)));
+    assert!(dc::gre_restore_dc(handle, -1));
+    dc::gre_set_map_mode(handle, dc::MM_TEXT);
+    dc::gre_set_map_mode(handle, dc::MM_HIMETRIC);
+    assert_eq!(extents(handle), ((1200, -600), (30000, 15000)));
+    assert_eq!(call(set, &[handle, 0, 0, 0, 0]), 1);
+    dc::gre_set_map_mode(handle, dc::MM_TEXT);
+    dc::gre_set_map_mode(handle, dc::MM_LOMETRIC);
+    assert_eq!(extents(handle).0, (1024, -768));
+    assert!(dc::gre_delete_dc(handle));
+}
+
+#[test]
 fn invalid_map_modes_fail_without_changing_state() {
     let handle = dc::gre_create_compatible_dc(0);
     for mode in [i32::MIN, -1, 0, 9, i32::MAX] {

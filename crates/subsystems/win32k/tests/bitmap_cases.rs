@@ -1,7 +1,161 @@
 //! Logical bitmap dimensions are metadata, independent of storage dimensions.
 use super::*;
+use bitmap::storage::{
+    nt_gdi_create_bitmap as create_bitmap, nt_gdi_get_bitmap_bits as get_bits,
+    nt_gdi_set_bitmap_bits as set_bits,
+};
 use bitmap::{nt_gdi_get_bitmap_dimension as get_size, nt_gdi_set_bitmap_dimension as set_size};
 use dc::services::nt_gdi_set_brush_org as set_origin;
+
+fn input(bytes: &[u8]) -> u64 {
+    let address = bytes.as_ptr() as u64;
+    mm::user_copy::allow(address, bytes.len(), false);
+    address
+}
+
+fn output(bytes: &mut [u8]) -> u64 {
+    let address = bytes.as_mut_ptr() as u64;
+    mm::user_copy::allow(address, bytes.len(), true);
+    address
+}
+
+#[test]
+fn bitmap_storage_rejects_overflows_and_invalid_formats_without_allocating() {
+    for (width, height, depth) in [
+        (0, 1, 1),
+        (-1, 1, 1),
+        (1, 0, 1),
+        (1, i32::MIN, 1),
+        (i32::MAX, 1, 32),
+        (1, 1, 3),
+        (1, 1, u16::MAX),
+    ] {
+        assert!(objects::GdiBitmap::new(width, height, depth).is_none());
+    }
+    for depth in [1, 4, 8, 16, 24, 32] {
+        let bitmap = objects::GdiBitmap::new(5, 3, depth).unwrap();
+        assert_eq!(bitmap.width_bytes % 4, 0);
+        // SAFETY: the bitmap owns size initialized bytes until it is dropped.
+        let bytes = unsafe { std::slice::from_raw_parts(bitmap.bits, bitmap.size as usize) };
+        assert!(bytes.iter().all(|&byte| byte == 0));
+    }
+}
+
+#[test]
+fn bitmap_creation_allocation_failures_release_every_owned_allocation() {
+    for failures_after in [0, 1] {
+        let before = mm::pool::balance();
+        mm::pool::fail_after(failures_after);
+        assert_eq!(objects::gdi_create_bitmap(8, 8, 1), 0);
+        assert_eq!(mm::pool::balance(), before);
+    }
+}
+
+#[test]
+fn bitmap_bits_use_three_arguments_and_word_aligned_scanlines() {
+    for (width, depth, bytes) in [
+        (9, 1, vec![0xa5, 0x80, 0x5a, 0x00]),
+        (3, 8, vec![1, 2, 3, 0, 4, 5, 6, 0]),
+        (1, 24, vec![1, 2, 3, 0, 4, 5, 6, 0]),
+        (1, 32, vec![1, 2, 3, 4, 5, 6, 7, 8]),
+    ] {
+        let handle = call(create_bitmap, &[width, 2, 1, depth, input(&bytes)]);
+        assert_ne!(handle, 0);
+        assert_eq!(call(get_bits, &[handle, 0, 0]), bytes.len() as u64);
+        let mut copied = vec![0xab; bytes.len() + 2];
+        let address = output(&mut copied[1..bytes.len() + 1]);
+        assert_eq!(
+            call(get_bits, &[handle, u32::MAX as u64, address]),
+            bytes.len() as u64
+        );
+        std::hint::black_box(&mut copied);
+        assert_eq!(&copied[1..bytes.len() + 1], bytes);
+        assert_eq!(copied[0], 0xab);
+        assert_eq!(copied[bytes.len() + 1], 0xab);
+        assert!(objects::gdi_delete_object(handle));
+    }
+}
+
+#[test]
+fn bitmap_partial_transfers_preserve_remaining_bytes_and_skip_internal_padding() {
+    let handle = objects::gdi_create_bitmap(9, 3, 1);
+    let bytes = [0xaa, 0x80, 0x55];
+    assert_eq!(
+        call(set_bits, &[handle, 0xdead_beef_0000_0003, input(&bytes)]),
+        3
+    );
+    let mut copied = [0xab; 8];
+    let address = output(&mut copied);
+    assert_eq!(call(get_bits, &[handle, 0xface_feed_0000_0006, address]), 6);
+    std::hint::black_box(&mut copied);
+    assert_eq!(copied, [0xaa, 0x80, 0x55, 0, 0, 0, 0xab, 0xab]);
+    assert_eq!(call(get_bits, &[handle, 1, address + 7]), 1);
+    std::hint::black_box(&mut copied);
+    assert_eq!(copied[7], 0xaa);
+    assert!(objects::gdi_delete_object(handle));
+}
+
+#[test]
+fn bitmap_transfer_faults_and_wrong_types_do_not_change_stored_pixels() {
+    let handle = objects::gdi_create_bitmap(1, 1, 32);
+    let brush = objects::gdi_create_solid_brush(0);
+    let bytes = [1, 2, 3, 4];
+    assert_eq!(call(set_bits, &[handle, 4, input(&bytes)]), 4);
+    assert_eq!(call(set_bits, &[handle, 4, 1]), 0);
+    let short = [9, 9, 9];
+    assert_eq!(call(set_bits, &[handle, 4, input(&short)]), 0);
+    assert_eq!(call(get_bits, &[handle, 4, 1]), 0);
+    assert_eq!(call(get_bits, &[handle, 4, input(&bytes)]), 0);
+    assert_eq!(call(set_bits, &[handle, 4, 0]), 0);
+    let mut copied = [0; 4];
+    assert_eq!(call(get_bits, &[handle, 4, output(&mut copied)]), 4);
+    std::hint::black_box(&mut copied);
+    assert_eq!(copied, bytes);
+    assert!(objects::gdi_delete_object(handle));
+    for invalid in [handle, brush, 0, u64::MAX] {
+        assert_eq!(call(get_bits, &[invalid, 4, 0]), 0);
+        assert_eq!(call(set_bits, &[invalid, 4, input(&bytes)]), 0);
+    }
+    assert!(objects::gdi_delete_object(brush));
+}
+
+#[test]
+fn native_bitmap_creation_validates_format_and_cleans_up_on_input_faults() {
+    let before = mm::pool::balance();
+    assert_eq!(call(create_bitmap, &[2, 2, 1, 32, 1]), 0);
+    assert_eq!(mm::pool::balance(), before);
+    for arguments in [
+        [2, 2, 2, 32, 0],
+        [2, 2, 1, 33, 0],
+        [0, 2, 1, 32, 0],
+        [2, 2, 1, 0x1_0000_0020, 0],
+    ] {
+        // ULONG arguments use their low DWORD; the last case is valid 32 bpp.
+        let result = call(create_bitmap, &arguments);
+        if arguments[3] > u32::MAX as u64 {
+            assert_ne!(result, 0);
+            assert!(objects::gdi_delete_object(result));
+        } else {
+            assert_eq!(result, 0);
+        }
+    }
+}
+
+#[test]
+fn monochrome_query_checks_the_live_bitmap_format() {
+    let mono = objects::gdi_create_bitmap(8, 8, 1);
+    let color = objects::gdi_create_bitmap(8, 8, 32);
+    let brush = objects::gdi_create_solid_brush(0);
+    assert_ne!(mono, 0);
+    assert_eq!(call(bitmap::nt_gdi_mono_bitmap, &[mono]), 1);
+    for handle in [0, u64::MAX, color, brush] {
+        assert_eq!(call(bitmap::nt_gdi_mono_bitmap, &[handle]), 0);
+    }
+    assert!(objects::gdi_delete_object(mono));
+    assert_eq!(call(bitmap::nt_gdi_mono_bitmap, &[mono]), 0);
+    assert!(objects::gdi_delete_object(color));
+    assert!(objects::gdi_delete_object(brush));
+}
 
 fn writable<T>(value: &mut T) -> u64 {
     let address = value as *mut T as u64;

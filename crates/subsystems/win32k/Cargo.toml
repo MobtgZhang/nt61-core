@@ -3,6 +3,13 @@ name = "win32k"
 version = "0.1.0"
 edition = "2021"
 publish = false
+# The case files are modules of the production-code fixture, not standalone
+# integration crates. Keep them in the single fixture so its adapters are shared.
+autotests = false
+
+[[test]]
+name = "regions"
+path = "tests/regions.rs"
 
 [lib]
 path = "src/lib.rs"
@@ -11,4 +18,6 @@ test = false
 [dependencies]
 nt61-boot-types = { path = "../../boot-types" }
 ntoskrnl = { path = "../../ntoskrnl" }
+nt61-fonts = { path = "../../fonts" }
 spin = "0.9"
+libm = "0.2"

@@ -2,6 +2,24 @@
 //! host. Only pool allocation, locking, framebuffer discovery, and user memory are adapted.
 extern crate alloc;
 
+#[path = "../src/win32k/window.rs"]
+pub mod window;
+#[path = "../src/win32k/user_state.rs"]
+pub mod user_state;
+mod menu_service_cases;
+mod window_cases;
+
+#[path = "../src/win32k/clipboard.rs"]
+pub mod clipboard;
+#[path = "clipboard_cases.rs"]
+mod clipboard_cases;
+
+#[path = "../src/win32k/font_services.rs"]
+pub mod font_services;
+#[path = "font_cases.rs"]
+mod font_cases;
+mod text_drawing_cases;
+
 #[path = "../src/win32k/bitmap.rs"]
 pub mod bitmap;
 
@@ -16,6 +34,28 @@ mod mapping_cases;
 
 #[path = "dc_query_cases.rs"]
 mod dc_query_cases;
+#[path = "palette_cases.rs"]
+mod palette_cases;
+#[path = "brush_cases.rs"]
+mod brush_cases;
+#[path = "curve_region_cases.rs"]
+mod curve_region_cases;
+#[path = "shape_cases.rs"]
+mod shape_cases;
+#[path = "bounds_cases.rs"]
+mod bounds_cases;
+#[path = "raster_effect_cases.rs"]
+mod raster_effect_cases;
+mod stretch_cases;
+mod alpha_cases;
+mod mask_cases;
+mod parallelogram_cases;
+mod dib_cases;
+mod dib_readback_cases;
+mod dib_device_cases;
+mod pattern_cases;
+#[path = "../src/win32k/palette.rs"]
+pub mod palette;
 
 #[path = "../src/win32k/objects.rs"]
 pub mod objects;
@@ -46,7 +86,18 @@ pub mod polygon;
 
 mod libs {
     pub mod win32k {
-        pub use crate::{dc, gdi_ops, objects, region_geometry, surface};
+        pub use crate::{clipboard, dc, input_services, objects, surface, window};
+        pub mod message {
+            pub use crate::message::{MessageQueue, Msg};
+            pub static POSTED: std::sync::Mutex<Vec<(u64, u32, u64, i64)>> = std::sync::Mutex::new(Vec::new());
+            pub fn post_thread_message(_: u64, hwnd: u64, message: u32, wparam: u64, lparam: i64) -> bool {
+                post_message(hwnd, message, wparam, lparam)
+            }
+            pub fn post_message(hwnd: u64, message: u32, wparam: u64, lparam: i64) -> bool {
+                POSTED.lock().unwrap().push((hwnd, message, wparam, lparam));
+                true
+            }
+        }
     }
 }
 
@@ -69,6 +120,13 @@ mod hal {
 }
 
 mod ke {
+    pub mod scheduler {
+        pub fn yield_() { std::thread::yield_now(); }
+    }
+    pub mod time {
+        std::thread_local! { pub static TICKS: core::cell::Cell<u32> = const { core::cell::Cell::new(1) }; }
+        pub fn get_tick_count() -> u32 { TICKS.with(|ticks| ticks.get()) }
+    }
     pub mod sync {
         pub struct Spinlock<T>(std::sync::Mutex<T>);
         // Kernel tables contain pool pointers; their production guard owns access.
@@ -87,6 +145,11 @@ mod ke {
 
 mod arch {
     pub mod common {
+        pub mod percpu {
+            pub fn get_current_thread() -> *mut crate::ps::thread::Thread {
+                crate::ps::thread::get_current_ethread()
+            }
+        }
         pub mod syscall_frame {
             #[derive(Default)]
             pub struct SyscallFrame {
@@ -98,6 +161,7 @@ mod arch {
 
 mod mm {
     pub mod pool {
+        use std::cell::Cell;
         use std::{
             alloc::{alloc_zeroed, dealloc, Layout},
             collections::BTreeMap,
@@ -105,16 +169,37 @@ mod mm {
         };
         static ALLOCATIONS: LazyLock<Mutex<BTreeMap<usize, Layout>>> =
             LazyLock::new(|| Mutex::new(BTreeMap::new()));
+        thread_local! {
+            static FAIL_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+            static BALANCE: Cell<isize> = const { Cell::new(0) };
+        }
+        pub fn fail_after(successes: usize) {
+            FAIL_AFTER.set(Some(successes));
+        }
+        pub fn balance() -> isize {
+            BALANCE.get()
+        }
         pub enum PoolType {
             NonPaged,
         }
         pub fn allocate(_: PoolType, size: usize) -> *mut u8 {
+            if FAIL_AFTER.with(|remaining| match remaining.get() {
+                Some(0) => { remaining.set(None); true }
+                Some(count) => { remaining.set(Some(count - 1)); false }
+                None => false,
+            }) {
+                return core::ptr::null_mut();
+            }
             let layout = Layout::from_size_align(size, 16).unwrap();
             let pointer = unsafe { alloc_zeroed(layout) };
+            if pointer.is_null() {
+                return pointer;
+            }
+            BALANCE.set(BALANCE.get() + 1);
             ALLOCATIONS.lock().unwrap().insert(pointer as usize, layout);
             pointer
         }
-        pub fn free(pointer: *mut u8) -> Result<(), ()> {
+        pub unsafe fn free(pointer: *mut u8) -> Result<(), ()> {
             let layout = ALLOCATIONS
                 .lock()
                 .unwrap()
@@ -123,6 +208,7 @@ mod mm {
             unsafe {
                 dealloc(pointer, layout);
             }
+            BALANCE.set(BALANCE.get() - 1);
             Ok(())
         }
     }
@@ -148,6 +234,9 @@ mod mm {
                     Err(0xc0000005u32 as i32)
                 }
             })
+        }
+        pub fn probe_user_read(address: u64, size: usize) -> Result<(), i32> {
+            probe(address, size, false)
         }
         pub fn probe_user_write(address: u64, size: usize) -> Result<(), i32> {
             probe(address, size, true)
@@ -953,7 +1042,7 @@ fn packed_surface_rows_are_dword_aligned_and_reject_unsupported_pixel_access() {
     }
 }
 
-fn user_pointer<T>(value: &T, writable: bool) -> u64 {
+fn user_pointer<T>(value: *const T, writable: bool) -> u64 {
     let pointer = value as *const T as u64;
     mm::user_copy::allow(pointer, core::mem::size_of::<T>(), writable);
     pointer
@@ -978,7 +1067,7 @@ fn transform_composition_preserves_translation_order_and_supports_aliases() {
         dy: 13.0,
     };
     let mut output = first;
-    let output_ptr = user_pointer(&output, true);
+    let output_ptr = user_pointer(&mut output, true);
     assert_eq!(
         call(
             transforms::nt_gdi_combine_transform,
@@ -1097,7 +1186,7 @@ fn native_point_arrays_transform_in_place_and_failure_preserves_output() {
         dc.window_org = dc::PointL::new(1, 2);
     }
     let mut points = [dc::PointL::new(4, 5), dc::PointL::new(-3, -2)];
-    let pointer = user_pointer(&points, true);
+    let pointer = user_pointer(&mut points, true);
     assert_eq!(
         call(
             transforms::nt_gdi_transform_points,
@@ -1141,7 +1230,7 @@ fn native_point_arrays_transform_in_place_and_failure_preserves_output() {
     assert_eq!(
         call(
             transforms::nt_gdi_get_transform,
-            &[fixture.handle, 0x402, user_pointer(&output, true)]
+            &[fixture.handle, 0x402, user_pointer(&mut output, true)]
         ),
         0
     );
@@ -1156,7 +1245,7 @@ fn native_point_arrays_transform_in_place_and_failure_preserves_output() {
 fn native_dc_point_and_move_to_return_structures_and_restore_position() {
     let fixture = DrawingFixture::new();
     let mut point = dc::PointL::new(-1, -1);
-    let pointer = user_pointer(&point, true);
+    let pointer = user_pointer(&mut point, true);
     assert_eq!(
         call(
             transforms::nt_gdi_get_dc_point,
@@ -1202,7 +1291,7 @@ fn native_selection_validates_type_and_saved_states_retain_objects() {
     let brush = objects::gdi_create_solid_brush(0x123456);
     assert_eq!(
         call(selection::nt_gdi_select_pen, &[fixture.handle, first]),
-        0
+        objects::gdi_get_stock_object(7)
     );
     assert_eq!(dc::get_dc(fixture.handle).unwrap().pen, first);
     assert!(!objects::gdi_delete_object(first));
@@ -1229,7 +1318,7 @@ fn native_selection_validates_type_and_saved_states_retain_objects() {
     assert!(objects::gdi_delete_object(second));
     assert_eq!(
         call(selection::nt_gdi_select_brush, &[fixture.handle, brush]),
-        0
+        objects::gdi_get_stock_object(0)
     );
     assert!(!objects::gdi_delete_object(brush));
     drop(fixture);
@@ -1250,7 +1339,7 @@ fn discarded_saved_states_and_dc_deletion_release_every_selection_reference() {
     }
     assert_eq!(
         call(selection::nt_gdi_select_font, &[fixture.handle, font]),
-        0
+        objects::gdi_get_stock_object(13)
     );
     assert!(dc::gre_restore_dc(fixture.handle, 1));
     assert!(objects::gdi_delete_object(font));
@@ -1284,6 +1373,7 @@ fn ext_create_region_applies_axis_aligned_transform_and_rejects_shear() {
     assert_ne!(output, 0);
     assert_eq!(bounds(output), (2, Rect::new(2, 1, 8, 13)));
     transform.m21 = 0.5;
+    let pointer = user_pointer(&transform, false);
     assert_eq!(
         call(nt_gdi_ext_create_region, &[pointer, size, data_pointer]),
         0
@@ -1291,3 +1381,61 @@ fn ext_create_region_applies_axis_aligned_transform_and_rejects_shear() {
     assert!(objects::gdi_delete_object(source));
     assert!(objects::gdi_delete_object(output));
 }
+
+mod ps {
+    pub mod process {
+        pub fn gui_resource_process(handle: u64) -> Option<u64> {
+            (handle == u64::MAX).then(|| super::thread::IDENTITY.with(|id| id.get().0))
+        }
+    }
+    pub mod thread {
+        pub struct ClientId { pub unique_process: u64, pub unique_thread: u64 }
+        pub struct Kthread { pub teb: *mut u8 }
+        pub struct Thread { pub client_id: ClientId, pub kthread: Kthread }
+        std::thread_local! {
+            pub static IDENTITY: core::cell::Cell<(u64, u64)> = const { core::cell::Cell::new((1, 1)) };
+            static THREAD: core::cell::UnsafeCell<Thread> = const { core::cell::UnsafeCell::new(Thread { client_id: ClientId { unique_process: 1, unique_thread: 1 }, kthread: Kthread { teb: core::ptr::null_mut() } }) };
+        }
+        pub fn find_thread_by_tid(tid: u64) -> Option<*mut Thread> {
+            (tid == IDENTITY.with(|id| id.get().1)).then(get_current_ethread)
+        }
+        pub fn get_current_ethread() -> *mut Thread {
+            THREAD.with(|thread| {
+                let pointer = thread.get();
+                let (process, id) = IDENTITY.with(|value| value.get());
+                // SAFETY: the fixture only accesses its calling thread's cell.
+                unsafe { (*pointer).client_id = ClientId { unique_process: process, unique_thread: id }; }
+                pointer
+            })
+        }
+    }
+}
+
+mod input_context_cases;
+
+#[path = "../src/win32k/input_services.rs"]
+pub mod input_services;
+#[path = "../src/win32k/raw_input.rs"]
+pub mod raw_input;
+
+// Exercise the production queue, including cross-thread delivery and WM_INPUT
+// cleanup; the existing window fixtures retain their lightweight transport.
+#[path = "../src/win32k/message.rs"]
+pub mod message;
+#[path = "../src/win32k/display_config.rs"]
+pub mod display_config;
+#[path = "../src/win32k/color_space.rs"]
+pub mod color_space;
+
+#[path = "../src/win32k/resources.rs"]
+pub mod resources;
+
+#[path = "native_service_cases.rs"]
+mod native_service_cases;
+
+// Execute in-tree user32 input wrappers against production USER services.
+#[path = "../../../libs/user32/src/user32/input.rs"]
+pub mod user32_input;
+#[path = "../../../libs/user32/src/user32/types.rs"]
+pub mod types;
+pub mod user32_message_fixture;
