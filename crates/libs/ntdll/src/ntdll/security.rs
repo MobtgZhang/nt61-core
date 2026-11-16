@@ -15,14 +15,14 @@
 
 use super::file::{alloc_handle, lookup_handle, HandleKind};
 use super::status::{
-    STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS,
+    STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_HANDLE,
     STATUS_INVALID_PARAMETER, STATUS_NO_TOKEN, STATUS_SUCCESS,
 };
-use super::types::{ObjectAttributes, HANDLE, NTSTATUS, PVOID};
+use super::types::{HANDLE, NTSTATUS};
 use core::ptr;
 
 use crate::mm::user_copy::{
-    copy_from_user, copy_to_user, probe_user_read, probe_user_write, read_user, write_user_object,
+    copy_from_user, copy_to_user, probe_user_read, probe_user_write, write_user_object,
 };
 
 #[repr(u32)]
@@ -57,30 +57,18 @@ pub const SE_PRIVILEGE_ENABLED: u32 = 0x00000002;
 pub const SE_PRIVILEGE_REMOVED: u32 = 0x00000004;
 pub const SE_PRIVILEGE_USED_FOR_ACCESS: u32 = 0x80000000;
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TOKEN_PRIVILEGES {
-    pub privilege_count: u32,
-    pub privileges: [LuidAndAttributes; 1], // Variable length
-}
+pub use super::token_privileges::{
+    check_privileges_for_caller, nt_adjust_privileges_token, nt_adjust_privileges_token_kernel,
+    nt_privilege_check, nt_privilege_check_kernel, LuidAndAttributes,
+    PrivilegeSet, TOKEN_PRIVILEGES,
+};
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct LuidAndAttributes {
-    pub luid: u64, // LUID as u64
-    pub attributes: u32,
-}
+pub use super::token_groups::{nt_adjust_groups_token, SidAndAttributes, TOKEN_GROUPS};
 
-#[repr(C)]
-pub struct SecurityDescriptor {
-    pub revision: u8,
-    pub sbz1: u8,
-    pub control: u16,
-    pub owner: PVOID,
-    pub group: PVOID,
-    pub sacl: PVOID,
-    pub dacl: PVOID,
-}
+pub use super::access_check::{
+    check_access_for_caller, nt_access_check, nt_access_check_kernel,
+    GenericMapping, SecurityDescriptor,
+};
 
 pub const OWNER_SECURITY_INFORMATION: u32 = 0x00000001;
 pub const GROUP_SECURITY_INFORMATION: u32 = 0x00000002;
@@ -188,522 +176,7 @@ pub fn nt_open_thread_token_kernel(
     STATUS_NO_TOKEN
 }
 
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// nt_duplicate_token — duplicate an existing token handle.
-pub unsafe extern "C" fn nt_duplicate_token(
-    existing_token_handle: HANDLE,
-    desired_access: u32,
-    _object_attributes: *mut ObjectAttributes,
-    effective_only: u32,
-    impersonation_level: u32,
-    duplicate_token_handle: *mut HANDLE,
-) -> NTSTATUS {
-    if duplicate_token_handle.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if crate::mm::user_copy::probe_user_write(
-        duplicate_token_handle as u64,
-        core::mem::size_of::<HANDLE>(),
-    )
-    .is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let mut handle = HANDLE::default();
-    let status = nt_duplicate_token_kernel(
-        existing_token_handle,
-        desired_access,
-        effective_only,
-        impersonation_level,
-        &mut handle,
-    );
-    if status == STATUS_SUCCESS
-        && crate::mm::user_copy::write_user_object(duplicate_token_handle as u64, &handle).is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-    status
-}
-
-/// Trusted-kernel entry point for `nt_duplicate_token`.
-pub fn nt_duplicate_token_kernel(
-    existing_token_handle: HANDLE,
-    desired_access: u32,
-    effective_only: u32,
-    impersonation_level: u32,
-    duplicate_token_handle: &mut HANDLE,
-) -> NTSTATUS {
-    let entry = match lookup_handle(existing_token_handle) {
-        Some(e) if e.kind == HandleKind::Token => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    let _ = (desired_access, effective_only, impersonation_level);
-
-    let duplicate = alloc_handle(HandleKind::Token, entry.target);
-    if duplicate.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    *duplicate_token_handle = duplicate;
-    STATUS_SUCCESS
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe extern "C" fn nt_adjust_privileges_token(
-    token_handle: HANDLE,
-    disable_all_privileges: u8,
-    new_state: *const TOKEN_PRIVILEGES,
-    buffer_length: u32,
-    previous_state: *mut TOKEN_PRIVILEGES,
-    return_length: *mut u32,
-) -> NTSTATUS {
-    if token_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    if disable_all_privileges == 0 {
-        if new_state.is_null() {
-            return STATUS_INVALID_PARAMETER;
-        }
-        if probe_user_read(new_state as u64, core::mem::size_of::<TOKEN_PRIVILEGES>()).is_err() {
-            return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-        }
-    }
-    if !return_length.is_null()
-        && probe_user_write(return_length as u64, core::mem::size_of::<u32>()).is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-    if !previous_state.is_null()
-        && buffer_length >= core::mem::size_of::<TOKEN_PRIVILEGES>() as u32
-        && probe_user_write(
-            previous_state as u64,
-            core::mem::size_of::<TOKEN_PRIVILEGES>(),
-        )
-        .is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let mut kernel_new_state = TOKEN_PRIVILEGES {
-        privilege_count: 0,
-        privileges: [LuidAndAttributes {
-            luid: 0,
-            attributes: 0,
-        }],
-    };
-    if disable_all_privileges == 0
-        && copy_from_user(
-            unsafe {
-                core::slice::from_raw_parts_mut(
-                    &mut kernel_new_state as *mut TOKEN_PRIVILEGES as *mut u8,
-                    core::mem::size_of::<TOKEN_PRIVILEGES>(),
-                )
-            },
-            new_state as u64,
-        )
-        .is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let kernel_previous_state = if previous_state.is_null()
-        || buffer_length < core::mem::size_of::<TOKEN_PRIVILEGES>() as u32
-    {
-        None
-    } else {
-        Some(unsafe { &mut *previous_state })
-    };
-    let kernel_return_length = if return_length.is_null() {
-        None
-    } else {
-        Some(unsafe { &mut *return_length })
-    };
-
-    nt_adjust_privileges_token_kernel(
-        token_handle,
-        disable_all_privileges,
-        if disable_all_privileges == 0 {
-            Some(&kernel_new_state)
-        } else {
-            None
-        },
-        kernel_previous_state,
-        kernel_return_length,
-    )
-}
-
-/// Trusted-kernel entry point for `nt_adjust_privileges_token`.
-pub fn nt_adjust_privileges_token_kernel(
-    token_handle: HANDLE,
-    disable_all_privileges: u8,
-    new_state: Option<&TOKEN_PRIVILEGES>,
-    mut previous_state: Option<&mut TOKEN_PRIVILEGES>,
-    return_length: Option<&mut u32>,
-) -> NTSTATUS {
-    if token_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    let token_entry = match lookup_handle(token_handle) {
-        Some(e) if e.kind == HandleKind::Token => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    let token = token_entry.target as *mut crate::se::token::Token;
-    if token.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    if disable_all_privileges != 0 {
-        let token = unsafe { &mut *token };
-        for (index, privilege) in token
-            .privileges
-            .iter_mut()
-            .take(token.privilege_count)
-            .enumerate()
-        {
-            if let Some(previous_state) = previous_state.as_deref_mut() {
-                if index == 0 {
-                    previous_state.privilege_count = token.privilege_count as u32;
-                }
-                previous_state.privileges[index] = LuidAndAttributes {
-                    luid: privilege.luid.to_u64(),
-                    attributes: privilege.attributes,
-                };
-            }
-            privilege.attributes &= !SE_PRIVILEGE_ENABLED;
-        }
-        if let Some(return_length) = return_length {
-            *return_length = 0;
-        }
-        return STATUS_SUCCESS;
-    }
-
-    if let Some(new_state) = new_state {
-        if new_state.privilege_count > 0 {
-            let requested = new_state.privileges[0];
-            let requested_luid = crate::se::token::luid::from_u64(requested.luid);
-            let token = unsafe { &mut *token };
-            let mut found = false;
-            for privilege in token.privileges.iter_mut().take(token.privilege_count) {
-                if privilege.luid.equals(&requested_luid) {
-                    if let Some(previous_state) = previous_state.as_deref_mut() {
-                        previous_state.privilege_count = 1;
-                        previous_state.privileges[0] = LuidAndAttributes {
-                            luid: privilege.luid.to_u64(),
-                            attributes: privilege.attributes,
-                        };
-                    }
-                    privilege.attributes = requested.attributes;
-                    found = true;
-                }
-            }
-            if !found {
-                return crate::libs::ntdll::status::STATUS_INVALID_PARAMETER;
-            }
-        }
-    }
-
-    if let Some(previous_state) = previous_state.as_deref_mut() {
-        previous_state.privilege_count = 0;
-    }
-    if let Some(return_length) = return_length {
-        if previous_state.is_some() {
-            *return_length = core::mem::size_of::<TOKEN_PRIVILEGES>() as u32;
-        } else {
-            *return_length = 0;
-        }
-    }
-
-    STATUS_SUCCESS
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe extern "C" fn nt_access_check(
-    security_descriptor: *const SecurityDescriptor,
-    client_token: HANDLE,
-    desired_access: u32,
-    generic_mapping: *const GenericMapping,
-    _privilege_set: *mut PrivilegeSet,
-    _privilege_set_length: *mut u32,
-    granted_access: *mut u32,
-    access_status: *mut NTSTATUS,
-) -> NTSTATUS {
-    if security_descriptor.is_null()
-        || client_token.is_null()
-        || granted_access.is_null()
-        || access_status.is_null()
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if probe_user_read(
-        security_descriptor as u64,
-        core::mem::size_of::<SecurityDescriptor>(),
-    )
-    .is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-    if !generic_mapping.is_null()
-        && probe_user_read(
-            generic_mapping as u64,
-            core::mem::size_of::<GenericMapping>(),
-        )
-        .is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-    if probe_user_write(granted_access as u64, core::mem::size_of::<u32>()).is_err() {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-    if probe_user_write(access_status as u64, core::mem::size_of::<NTSTATUS>()).is_err() {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let mut kernel_granted_access = 0u32;
-    let mut kernel_access_status = 0;
-    let status = nt_access_check_kernel(
-        Some(core::slice::from_raw_parts(
-            security_descriptor as *const u8,
-            core::mem::size_of::<SecurityDescriptor>(),
-        )),
-        client_token,
-        desired_access,
-        if generic_mapping.is_null() {
-            None
-        } else {
-            Some(unsafe { &*generic_mapping })
-        },
-        &mut kernel_granted_access,
-        &mut kernel_access_status,
-    );
-
-    if write_user_object(granted_access as u64, &kernel_granted_access).is_err()
-        || write_user_object(access_status as u64, &kernel_access_status).is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    status
-}
-
-/// Trusted-kernel entry point for `nt_access_check`.
-pub fn nt_access_check_kernel(
-    security_descriptor: Option<&[u8]>,
-    client_token: HANDLE,
-    desired_access: u32,
-    _generic_mapping: Option<&GenericMapping>,
-    granted_access: &mut u32,
-    access_status: &mut NTSTATUS,
-) -> NTSTATUS {
-    unsafe {
-        if client_token.is_null() || security_descriptor.is_none() {
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        let token_entry = match lookup_handle(client_token) {
-            Some(entry) if entry.kind == HandleKind::Token => entry,
-            _ => return STATUS_INVALID_HANDLE,
-        };
-        let client_token = token_entry.target as *const crate::se::token::Token;
-        if client_token.is_null() {
-            return STATUS_INVALID_HANDLE;
-        }
-
-        let bytes = security_descriptor.unwrap();
-        if bytes.len() < 40 {
-            return STATUS_INVALID_PARAMETER;
-        }
-
-        // Parse the user-mode SECURITY_DESCRIPTOR (pointer-sized fields at
-        // offsets 8/16/24/32 after revision+sbz1+control).
-        let read_u64 = |off: usize| -> u64 {
-            u64::from_le_bytes([
-                bytes[off],
-                bytes[off + 1],
-                bytes[off + 2],
-                bytes[off + 3],
-                bytes[off + 4],
-                bytes[off + 5],
-                bytes[off + 6],
-                bytes[off + 7],
-            ])
-        };
-        let control = u16::from_le_bytes([bytes[2], bytes[3]]);
-        let owner_ptr = read_u64(8);
-        let dacl_ptr = read_u64(32);
-
-        // Deny-by-default when the descriptor has no DACL (matches the
-        // kernel refmon policy in se/refmon.rs).
-        if dacl_ptr == 0 || (control & 0x0004) == 0 {
-            *granted_access = 0;
-            *access_status = crate::libs::ntdll::status::STATUS_ACCESS_DENIED;
-            return STATUS_SUCCESS;
-        }
-
-        // Read the ACL header to learn its size.
-        let mut acl_header = [0u8; 8];
-        if crate::mm::user_copy::copy_from_user(&mut acl_header, dacl_ptr).is_err() {
-            *granted_access = 0;
-            *access_status = crate::libs::ntdll::status::STATUS_ACCESS_DENIED;
-            return STATUS_SUCCESS;
-        }
-        let acl_size = u16::from_le_bytes([acl_header[2], acl_header[3]]) as usize;
-        if !(8..=1024).contains(&acl_size) {
-            *granted_access = 0;
-            *access_status = crate::libs::ntdll::status::STATUS_ACCESS_DENIED;
-            return STATUS_SUCCESS;
-        }
-
-        // Copy the ACL into a kernel-side Acl (inline ACE storage).
-        let mut kernel_dacl = crate::se::acl::Acl::new();
-        let copy_len = acl_size.min(core::mem::size_of::<crate::se::acl::Acl>());
-        let acl_bytes = {
-            core::slice::from_raw_parts_mut(
-                &mut kernel_dacl as *mut crate::se::acl::Acl as *mut u8,
-                copy_len,
-            )
-        };
-        if crate::mm::user_copy::copy_from_user(acl_bytes, dacl_ptr).is_err() {
-            *granted_access = 0;
-            *access_status = crate::libs::ntdll::status::STATUS_ACCESS_DENIED;
-            return STATUS_SUCCESS;
-        }
-        kernel_dacl.acl_size = copy_len as u16;
-
-        // Read the owner SID (fixed 40-byte se::sid layout).
-        let mut owner_sid = crate::se::sid::sid::new();
-        if owner_ptr != 0 {
-            let sid_bytes = {
-                core::slice::from_raw_parts_mut(
-                    &mut owner_sid as *mut crate::se::sid::sid as *mut u8,
-                    core::mem::size_of::<crate::se::sid::sid>(),
-                )
-            };
-            let _ = crate::mm::user_copy::copy_from_user(sid_bytes, owner_ptr);
-        }
-
-        // Build a kernel SecurityDescriptor on the stack — se_access_check
-        // completes synchronously and does not retain the pointer.
-        let kernel_sd = crate::se::seaccess::SecurityDescriptor {
-            revision: 1,
-            sbz1: 0,
-            control: 0x8004, // SE_DACL_PRESENT | SE_SELF_RELATIVE
-            owner: owner_sid,
-            group: owner_sid,
-            sacl: core::ptr::null(),
-            dacl: &kernel_dacl as *const crate::se::acl::Acl,
-        };
-
-        let (result, granted) = crate::se::seaccess::se_access_check(
-            crate::se::seaccess::ObTypeIndex::Null,
-            &kernel_sd as *const crate::se::seaccess::SecurityDescriptor,
-            desired_access,
-            client_token,
-        );
-
-        *granted_access = granted;
-        *access_status = match result {
-            crate::se::seaccess::AccessCheckResult::Allowed => STATUS_SUCCESS,
-            crate::se::seaccess::AccessCheckResult::Denied => {
-                crate::libs::ntdll::status::STATUS_ACCESS_DENIED
-            }
-        };
-
-        STATUS_SUCCESS
-    }
-}
-
-#[repr(C)]
-pub struct GenericMapping {
-    pub generic_read: u32,
-    pub generic_write: u32,
-    pub generic_execute: u32,
-    pub generic_all: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PrivilegeSet {
-    pub privilege_count: u32,
-    pub control: u32,
-    pub privilege: [LuidAndAttributes; 1], // Variable length
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe extern "C" fn nt_privilege_check(
-    client_token: HANDLE,
-    required_privileges: *const PrivilegeSet,
-    result: *mut u8,
-) -> NTSTATUS {
-    if client_token.is_null() || required_privileges.is_null() || result.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if probe_user_read(
-        required_privileges as u64,
-        core::mem::size_of::<PrivilegeSet>(),
-    )
-    .is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-    if probe_user_write(result as u64, core::mem::size_of::<u8>()).is_err() {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let mut kernel_privileges = PrivilegeSet {
-        privilege_count: 0,
-        control: 0,
-        privilege: [LuidAndAttributes {
-            luid: 0,
-            attributes: 0,
-        }],
-    };
-    if read_user(required_privileges as u64, &mut kernel_privileges).is_err() {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-    let mut kernel_result = 0u8;
-    let status =
-        nt_privilege_check_kernel(client_token, Some(&kernel_privileges), &mut kernel_result);
-    if write_user_object(result as u64, &kernel_result).is_err() {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    status
-}
-
-/// Trusted-kernel entry point for `nt_privilege_check`.
-pub fn nt_privilege_check_kernel(
-    client_token: HANDLE,
-    _required_privileges: Option<&PrivilegeSet>,
-    result: &mut u8,
-) -> NTSTATUS {
-    if client_token.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    let _token_entry = match lookup_handle(client_token) {
-        Some(e) if e.kind == HandleKind::Token => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    *result = 1; // TRUE
-
-    STATUS_SUCCESS
-}
+pub use super::token_duplicate::{nt_duplicate_token, nt_duplicate_token_kernel, SecurityQualityOfService};
 
 /// # Safety
 ///
@@ -908,151 +381,113 @@ pub unsafe extern "C" fn nt_impersonate_thread(
     STATUS_SUCCESS
 }
 
-#[repr(C)]
-pub struct SecurityQualityOfService {
-    pub length: u32,
-    pub impersonation_level: u32,
-    pub context_tracking_mode: u8,
-    pub effective_only: u8,
-}
+pub use super::token_information::{
+    nt_query_information_token, nt_query_information_token_kernel,
+    nt_set_information_token, nt_set_information_token_kernel,
+};
 
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe extern "C" fn nt_query_information_token(
-    token_handle: HANDLE,
-    token_information_class: u32,
-    token_information: PVOID,
-    token_information_length: u32,
-    return_length: *mut u32,
+/// The Ex forms accept only OBJ_INHERIT and retain the requested access on the
+/// returned handle. Pointer faults after allocation retire the new handle.
+unsafe fn open_token_ex(
+    object: HANDLE,
+    access: u32,
+    attributes: u32,
+    output: *mut HANDLE,
+    thread: bool,
+    as_self: u8,
 ) -> NTSTATUS {
-    if token_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
+    use super::status::*;
+    if attributes & !2 != 0 { return STATUS_INVALID_PARAMETER; }
+    if access & !(0x1f01ff | 0xf2000000) != 0 { return STATUS_ACCESS_DENIED; }
+    if let Err(status) = probe_user_write(output as u64, core::mem::size_of::<HANDLE>()) { return status; }
+    let current = crate::ps::thread::get_current_ethread();
+    if current.is_null() { return STATUS_INVALID_HANDLE; }
+    // SAFETY: a syscall's current thread and owning process remain live.
+    let (pid, process) = unsafe { ((*current).client_id.unique_process, (*current).threads_process) };
+    let pseudo = if thread { -2i64 as u64 } else { -1i64 as u64 };
+    if object as u64 != pseudo {
+        let entry = match lookup_handle(object) {
+            Some(entry) => entry,
+            None => return STATUS_INVALID_HANDLE,
+        };
+        let expected = if thread { HandleKind::Thread } else { HandleKind::Process };
+        if entry.kind != expected { return STATUS_OBJECT_TYPE_MISMATCH; }
+        // Tokens do not yet have an independent object security descriptor.
+        // Until that is implemented, never grant access to another process's
+        // token based on the token's default DACL (which protects new objects).
+        if !thread && entry.target != pid { return STATUS_ACCESS_DENIED; }
     }
-
-    if !return_length.is_null()
-        && probe_user_write(return_length as u64, core::mem::size_of::<u32>()).is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
+    if thread {
+        let _ = as_self;
+        return STATUS_NO_TOKEN;
     }
-    if !token_information.is_null()
-        && token_information_length > 0
-        && probe_user_write(token_information as u64, token_information_length as usize).is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let mut kernel_return_length = 0u32;
-    let status = nt_query_information_token_kernel(
-        token_handle,
-        token_information_class,
-        if token_information.is_null() {
-            None
-        } else {
-            Some(&mut [])
-        },
-        &mut kernel_return_length,
-    );
-
-    if !return_length.is_null()
-        && write_user_object(return_length as u64, &kernel_return_length).is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    status
-}
-
-/// Trusted-kernel entry point for `nt_query_information_token`.
-pub fn nt_query_information_token_kernel(
-    token_handle: HANDLE,
-    token_information_class: u32,
-    token_information: Option<&mut [u8]>,
-    return_length: &mut u32,
-) -> NTSTATUS {
-    if token_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    let _token_entry = match lookup_handle(token_handle) {
-        Some(e) if e.kind == HandleKind::Token => e,
-        _ => return STATUS_INVALID_HANDLE,
+    let token = if process.is_null() { core::ptr::null() } else {
+        unsafe { (*process).get_token() }
     };
-
-    // The supported classes are TOKEN_USER (1), TOKEN_GROUPS (2),
-    // TOKEN_PRIVILEGES (3), TOKEN_OWNER (4), TOKEN_PRIMARY_GROUP (5),
-    // TOKEN_DEFAULT_DACL (6), TOKEN_SOURCE (7), TOKEN_TYPE (8),
-    // TOKEN_IMPERSONATION_LEVEL (9), TOKEN_STATISTICS (10),
-    // TOKEN_RESTRICTED_SIDS (11), TOKEN_SESSION_ID (12),
-    // TOKEN_GROUPS_AND_PRIVILEGES (13), TOKEN_SAND_BOX_INERT (15),
-    // TOKEN_AUDIT_POLICY (16), TOKEN_ORIGIN (17), TOKEN_ELEVATION_TYPE (18),
-    // TOKEN_LINKED_TOKEN (19), TOKEN_ELEVATION (20), TOKEN_HAS_RESTRICTIONS (21),
-    // TOKEN_ACCESS_INFORMATION (22), TOKEN_VIRTUALIZATION_ALLOWED (23),
-    // TOKEN_VIRTUALIZATION_ENABLED (24), TOKEN_INTEGRITY_LEVEL (25),
-    // TOKEN_UIACCESS (26), TOKEN_MANDATORY_POLICY (27),
-    // TOKEN_LOGON_SID (28).
-    let _ = (token_information_class, token_information);
-
-    *return_length = 0;
-
-    // Return STATUS_INVALID_INFO_CLASS for unsupported subclasses,
-    // matching real NT 6.1 behaviour.
-    STATUS_INVALID_INFO_CLASS
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe extern "C" fn nt_set_information_token(
-    token_handle: HANDLE,
-    token_information_class: u32,
-    token_information: PVOID,
-    token_information_length: u32,
-) -> NTSTATUS {
-    if token_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    if !token_information.is_null()
-        && token_information_length > 0
-        && probe_user_read(token_information as u64, token_information_length as usize).is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let kernel_information = if token_information.is_null() {
-        None
-    } else {
-        let mut bytes = alloc::vec![0u8; token_information_length as usize];
-        if copy_from_user(&mut bytes, token_information as u64).is_err() {
-            return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-        }
-        Some(bytes)
+    if token.is_null() { return STATUS_NO_TOKEN; }
+    let mut granted = access & 0x001f01ff;
+    if access & 0x02000000 != 0 { return STATUS_NOT_SUPPORTED; }
+    if access & 0x10000000 != 0 { granted |= 0xf01ff; }
+    if access & 0x80000000 != 0 { granted |= 0x20008; }
+    if access & 0x40000000 != 0 { granted |= 0x200e0; }
+    if access & 0x20000000 != 0 { granted |= 0x20000; }
+    let handle = match super::file::alloc_access_handle(HandleKind::Token, token as u64, granted, attributes & 2 != 0) {
+        Ok(handle) => handle,
+        Err(status) => return status,
     };
-
-    nt_set_information_token_kernel(
-        token_handle,
-        token_information_class,
-        kernel_information.as_deref(),
-    )
-}
-
-/// Trusted-kernel entry point for `nt_set_information_token`.
-pub fn nt_set_information_token_kernel(
-    token_handle: HANDLE,
-    token_information_class: u32,
-    token_information: Option<&[u8]>,
-) -> NTSTATUS {
-    if token_handle.is_null() {
-        return STATUS_INVALID_HANDLE;
+    if let Err(status) = write_user_object(output as u64, &handle) {
+        super::file::free_handle(handle);
+        return status;
     }
-
-    let _token_entry = match lookup_handle(token_handle) {
-        Some(e) if e.kind == HandleKind::Token => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    let _ = (token_information_class, token_information);
-
     STATUS_SUCCESS
+}
+
+/// # Safety
+/// Output points to caller memory.
+pub unsafe extern "C" fn nt_open_process_token_ex(process: HANDLE, access: u32, attributes: u32, output: *mut HANDLE) -> NTSTATUS {
+    unsafe { open_token_ex(process, access, attributes, output, false, 0) }
+}
+
+/// # Safety
+/// Output points to caller memory.
+pub unsafe extern "C" fn nt_open_thread_token_ex(thread: HANDLE, access: u32, as_self: u8, attributes: u32, output: *mut HANDLE) -> NTSTATUS {
+    unsafe { open_token_ex(thread, access, attributes, output, true, as_self) }
+}
+
+/// Compare security content, ignoring token IDs and modification counters.
+pub extern "C" fn nt_compare_tokens(first: HANDLE, second: HANDLE, output: *mut u8) -> NTSTATUS {
+    use super::status::*;
+    let result = super::file::with_sync_handles_access(&[first, second], 8, |entries| {
+        if entries.iter().any(|entry| entry.kind != HandleKind::Token) { return Err(STATUS_OBJECT_TYPE_MISMATCH); }
+        // The table guard pins both payloads, including owned duplicated tokens,
+        // and prevents close/reuse while comparing security content.
+        let (Some(a), Some(b)) = (unsafe { (entries[0].target as *const crate::se::token::Token).as_ref() }, unsafe { (entries[1].target as *const crate::se::token::Token).as_ref() }) else {
+            return Err(STATUS_INVALID_HANDLE);
+        };
+        let equal = a.user.equals(&b.user) && a.primary_group.equals(&b.primary_group)
+            && a.authentication_id == b.authentication_id && a.token_type == b.token_type
+            && a.impersonation_level == b.impersonation_level && a.session_id == b.session_id
+            && a.flags == b.flags && a.integrity_level_rid == b.integrity_level_rid
+            && equal_token_acl(a.default_dacl, b.default_dacl)
+            && a.group_count == b.group_count && a.privilege_count == b.privilege_count
+            && a.groups[..a.group_count.min(a.groups.len())].iter().all(|group| b.groups[..b.group_count.min(b.groups.len())].iter().any(|other| group.sid.equals(&other.sid) && group.attributes == other.attributes))
+            && a.privileges[..a.privilege_count.min(a.privileges.len())].iter().all(|privilege| b.privileges[..b.privilege_count.min(b.privileges.len())].iter().any(|other| privilege.luid == other.luid && privilege.attributes == other.attributes));
+        Ok(u8::from(equal))
+    });
+    match result {
+        Ok(equal) => write_user_object(output as u64, &equal).err().unwrap_or(STATUS_SUCCESS),
+        Err(status) => status,
+    }
+}
+
+fn equal_token_acl(first: *const crate::se::acl::Acl, second: *const crate::se::acl::Acl) -> bool {
+    if first == second { return true; }
+    // SAFETY: token-owned ACL storage has the same lifetime as the tokens.
+    let (Some(a), Some(b)) = (unsafe { first.as_ref() }, unsafe { second.as_ref() }) else {
+        return false;
+    };
+    let length = usize::from(a.acl_size).saturating_sub(8);
+    a.acl_size >= 8 && b.acl_size == a.acl_size && a.revision == b.revision
+        && a.ace_count == b.ace_count && length <= a.data.len()
+        && a.data[..length] == b.data[..length]
 }

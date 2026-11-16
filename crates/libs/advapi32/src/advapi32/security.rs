@@ -198,52 +198,10 @@ pub unsafe extern "C" fn OpenThreadToken(
     }
 }
 
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-#[no_mangle]
-pub unsafe extern "C" fn SetTokenInformation(
-    token_handle: HANDLE,
-    token_information_class: DWORD,
-    token_information: PVOID,
-    token_information_length: DWORD,
-) -> LONG {
-    if token_handle.is_null() {
-        return 0; // FALSE
-    }
-
-    let status = crate::libs::ntdll::security::nt_set_information_token(
-        token_handle,
-        token_information_class,
-        token_information,
-        token_information_length,
-    );
-
-    if status < 0 {
-        0 // FALSE
-    } else {
-        1 // TRUE
-    }
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-#[no_mangle]
-pub unsafe extern "C" fn AdjustTokenPrivileges(
-    token_handle: HANDLE,
-    _disable_all_privileges: LONG,
-    _new_state: *const PVOID,
-    _buffer_length: DWORD,
-    _previous_state: PVOID,
-    _return_length: *mut DWORD,
-) -> LONG {
-    if token_handle.is_null() {
-        return 0; // FALSE
-    }
-
-    1 // TRUE
-}
+pub use super::token_calls::{
+    AccessCheck, AdjustTokenGroups, AdjustTokenPrivileges, GetTokenInformation, PrivilegeCheck,
+    SetTokenInformation,
+};
 
 /// # Safety
 ///
@@ -258,19 +216,23 @@ pub unsafe extern "C" fn DuplicateToken(
         return 0; // FALSE
     }
 
-    let status = crate::libs::ntdll::security::nt_duplicate_token_kernel(
-        existing_token_handle,
-        0, // desired_access (0 = same as original)
-        0, // EffectiveOnly
+    let mut qos = crate::libs::ntdll::security::SecurityQualityOfService {
+        length: core::mem::size_of::<crate::libs::ntdll::security::SecurityQualityOfService>() as u32,
         impersonation_level,
-        &mut *duplicate_token_handle,
+        context_tracking_mode: 0,
+        effective_only: 0,
+    };
+    let mut attributes = crate::libs::ntdll::types::ObjectAttributes::new();
+    attributes.security_quality_of_service = (&mut qos as *mut _) as PVOID;
+    let status = crate::libs::ntdll::security::nt_duplicate_token(
+        existing_token_handle,
+        0x000a, // TOKEN_IMPERSONATE | TOKEN_QUERY
+        &mut attributes,
+        0,
+        2, // TokenImpersonation
+        duplicate_token_handle,
     );
-
-    if status < 0 {
-        0 // FALSE
-    } else {
-        1 // TRUE
-    }
+    i32::from(status >= 0)
 }
 
 /// # Safety
@@ -280,8 +242,8 @@ pub unsafe extern "C" fn DuplicateToken(
 pub unsafe extern "C" fn DuplicateTokenEx(
     h_existing_token: HANDLE,
     dw_desired_access: DWORD,
-    _lp_token_attributes: PVOID,
-    _impersonation_level: DWORD,
+    lp_token_attributes: PVOID,
+    impersonation_level: DWORD,
     token_type: DWORD,
     ph_new_token: *mut HANDLE,
 ) -> LONG {
@@ -289,19 +251,37 @@ pub unsafe extern "C" fn DuplicateTokenEx(
         return 0; // FALSE
     }
 
-    let status = crate::libs::ntdll::security::nt_duplicate_token_kernel(
+    let mut qos = crate::libs::ntdll::security::SecurityQualityOfService {
+        length: core::mem::size_of::<crate::libs::ntdll::security::SecurityQualityOfService>() as u32,
+        impersonation_level,
+        context_tracking_mode: 0,
+        effective_only: 0,
+    };
+    let mut attributes = crate::libs::ntdll::types::ObjectAttributes::new();
+    attributes.security_quality_of_service = (&mut qos as *mut _) as PVOID;
+    if !lp_token_attributes.is_null() {
+        #[repr(C)]
+        struct SecurityAttributes {
+            length: u32,
+            descriptor: PVOID,
+            inherit: i32,
+        }
+        let security = &*(lp_token_attributes as *const SecurityAttributes);
+        if security.length as usize != core::mem::size_of::<SecurityAttributes>() {
+            return 0;
+        }
+        attributes.security_descriptor = security.descriptor;
+        if security.inherit != 0 { attributes.attributes |= 2; }
+    }
+    let status = crate::libs::ntdll::security::nt_duplicate_token(
         h_existing_token,
         dw_desired_access,
-        0, // EffectiveOnly
+        &mut attributes,
+        0,
         token_type,
-        &mut *ph_new_token,
+        ph_new_token,
     );
-
-    if status < 0 {
-        0 // FALSE
-    } else {
-        1 // TRUE
-    }
+    i32::from(status >= 0)
 }
 
 /// # Safety
@@ -352,50 +332,6 @@ pub unsafe extern "C" fn LookupPrivilegeNameW(
         *lp_name.add(i) = priv_name[i];
     }
     *cch_name = priv_name.len() as DWORD;
-
-    1 // TRUE
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-#[no_mangle]
-pub unsafe extern "C" fn PrivilegeCheck(
-    client_token: HANDLE,
-    _required_privileges: PVOID,
-    pf_result: *mut LONG,
-) -> LONG {
-    if client_token.is_null() || pf_result.is_null() {
-        return 0; // FALSE
-    }
-
-    *pf_result = 0;
-
-    1 // TRUE
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-#[no_mangle]
-pub unsafe extern "C" fn AccessCheck(
-    p_security_descriptor: PsecurityDescriptor,
-    client_token: HANDLE,
-    desired_access: DWORD,
-    _generic_mapping: PVOID,
-    _privilege_set: PVOID,
-    _privilege_set_length: *mut DWORD,
-    granted_access: *mut DWORD,
-    access_status: *mut LONG,
-) -> LONG {
-    if p_security_descriptor.is_null() || client_token.is_null() || access_status.is_null() {
-        return 0; // FALSE
-    }
-
-    if !granted_access.is_null() {
-        *granted_access = desired_access;
-    }
-    *access_status = 1; // TRUE (access granted)
 
     1 // TRUE
 }
