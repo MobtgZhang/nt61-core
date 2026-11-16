@@ -2,7 +2,17 @@
 
 extern crate alloc;
 
-use super::types::{BOOL, FALSE, TRUE};
+use super::types::BOOL;
+use crate::arch::common::syscall_frame::SyscallFrame;
+use crate::libs::win32k::input_services;
+
+pub use input_services::history::MouseMovePoint;
+
+fn input_call(handler: extern "C" fn(&SyscallFrame) -> u64, arguments: &[u64]) -> u64 {
+    let mut frame = SyscallFrame::default();
+    frame.args[..arguments.len()].copy_from_slice(arguments);
+    handler(&frame)
+}
 
 /// System metrics. The bootstrap reports a deterministic
 /// 1024x768 screen.
@@ -156,44 +166,77 @@ pub extern "C" fn get_system_metrics(index: i32) -> i32 {
     }
 }
 
-/// `get_async_key_state` — return 0 (key not pressed) for
-/// every key.
-pub extern "C" fn get_async_key_state(_vk: i32) -> i16 {
-    0
+/// Query instantaneous hardware state; bit 0 consumes the session press latch.
+pub extern "C" fn get_async_key_state(vk: i32) -> i16 {
+    input_services::keyboard::async_key_state(vk)
 }
-/// `get_key_state` — return 0.
-pub extern "C" fn get_key_state(_vk: i32) -> i16 {
-    0
+
+/// Query the calling thread's state at its last removed input message.
+pub extern "C" fn get_key_state(vk: i32) -> i16 {
+    input_call(
+        input_services::keyboard::nt_user_get_key_state,
+        &[vk as u64],
+    ) as i16
 }
-/// # Safety
+
+/// Copy the calling thread's 256 virtual-key states.
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// `get_keyboard_state` — fill the buffer with zeros and
-/// return non-zero.
-pub unsafe extern "C" fn get_keyboard_state(buf: *mut u8) -> BOOL {
-    if buf.is_null() {
-        return FALSE;
-    }
-    for i in 0..256 {
-        *buf.add(i) = 0;
-    }
-    TRUE
-}
 /// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// `get_cursor_pos` — return 0,0.
-pub unsafe extern "C" fn get_cursor_pos(p: *mut i32) -> BOOL {
-    if p.is_null() {
-        return FALSE;
-    }
-    *p = 0;
-    *p.add(1) = 0;
-    TRUE
+/// `buffer` must designate 256 writable bytes in the calling process.
+pub unsafe extern "C" fn get_keyboard_state(buffer: *mut u8) -> BOOL {
+    input_call(
+        input_services::keyboard::nt_user_get_keyboard_state,
+        &[buffer as u64],
+    ) as BOOL
 }
-/// `set_cursor_pos` — placeholder.
-pub extern "C" fn set_cursor_pos(_x: i32, _y: i32) -> BOOL {
-    TRUE
+
+/// Replace only the calling thread's state, leaving hardware and other queues
+/// unchanged. This does not change keyboard LEDs.
+///
+/// # Safety
+/// `buffer` must designate 256 readable bytes in the calling process.
+pub unsafe extern "C" fn set_keyboard_state(buffer: *const u8) -> BOOL {
+    input_call(
+        input_services::keyboard::nt_user_set_keyboard_state,
+        &[buffer as u64],
+    ) as BOOL
+}
+
+/// Read the shared cursor position in screen coordinates.
+///
+/// # Safety
+/// `point` must designate two writable i32 coordinates in the calling process.
+pub unsafe extern "C" fn get_cursor_pos(point: *mut i32) -> BOOL {
+    BOOL::from(input_services::get_cursor(point as u64))
+}
+
+/// Move the cursor, respecting its clip rectangle and input-blocking owner.
+pub extern "C" fn set_cursor_pos(x: i32, y: i32) -> BOOL {
+    BOOL::from(input_services::set_cursor(x, y))
+}
+
+/// Query up to 64 retained pointer positions, newest first.
+///
+/// # Safety
+/// `input` must point to a readable MouseMovePoint; `output` must accommodate
+/// `count` writable entries. The buffers may overlap.
+pub unsafe extern "C" fn get_mouse_move_points_ex(
+    size: u32,
+    input: *const MouseMovePoint,
+    output: *mut MouseMovePoint,
+    count: i32,
+    resolution: u32,
+) -> i32 {
+    input_call(
+        input_services::history::nt_user_get_mouse_move_points_ex,
+        &[
+            u64::from(size),
+            input as u64,
+            output as u64,
+            count as u64,
+            u64::from(resolution),
+        ],
+    ) as i32
 }
 /// `get_double_click_time` — return 500 ms.
 pub extern "C" fn get_double_click_time() -> u32 {
@@ -203,11 +246,67 @@ pub extern "C" fn get_double_click_time() -> u32 {
 pub extern "C" fn get_message_extra_info() -> usize {
     0
 }
-/// `map_virtual_key_w` — return 0 (no mapping).
-pub extern "C" fn map_virtual_key_w(_code: u32, _map: u32) -> u32 {
-    0
+/// Convert between a virtual key, scan code, or character in the active layout.
+pub extern "C" fn map_virtual_key_w(code: u32, mode: u32) -> u32 {
+    map_virtual_key_ex_w(code, mode, 0)
 }
-/// `get_keyboard_layout` — return 0x0409 (English US).
+
+/// Convert using an installed layout. The native call has a separate keyboard
+/// ID slot before the HKL; the public API does not expose that slot.
+pub extern "C" fn map_virtual_key_ex_w(code: u32, mode: u32, layout: u64) -> u32 {
+    input_call(
+        input_services::layout::nt_user_map_virtual_key_ex,
+        &[u64::from(code), u64::from(mode), 0, layout],
+    ) as u32
+}
+
+/// Find the virtual key and Shift/Ctrl modifiers that produce one UTF-16 unit.
+pub extern "C" fn vk_key_scan_ex_w(character: u16, layout: u64) -> i16 {
+    input_call(
+        input_services::layout::nt_user_vk_key_scan_ex,
+        &[u64::from(character), layout, 1],
+    ) as i16
+}
+
+/// Enumerate the installed keyboard layouts.
+///
+/// # Safety
+/// `layouts` must hold `count` writable HKL slots when both are nonzero.
+pub unsafe extern "C" fn get_keyboard_layout_list(count: i32, layouts: *mut u64) -> i32 {
+    input_call(
+        input_services::layout::nt_user_get_keyboard_layout_list,
+        &[count as u64, layouts as u64],
+    ) as i32
+}
+
+/// Convert a key using the supplied 256-byte keyboard state.
+///
+/// # Safety
+/// `state` must hold 256 readable bytes and `output` must hold `count` writable
+/// UTF-16 units. Output is not guaranteed to be NUL-terminated.
+pub unsafe extern "C" fn to_unicode_ex(
+    key: u32,
+    scan: u32,
+    state: *const u8,
+    output: *mut u16,
+    count: i32,
+    flags: u32,
+    layout: u64,
+) -> i32 {
+    input_call(
+        input_services::layout::nt_user_to_unicode_ex,
+        &[
+            u64::from(key),
+            u64::from(scan),
+            state as u64,
+            output as u64,
+            count as u64,
+            u64::from(flags),
+            layout,
+        ],
+    ) as i32
+}
+/// Return the sole installed US layout handle.
 pub extern "C" fn get_keyboard_layout(_id: u32) -> *mut core::ffi::c_void {
-    0x0409 as *mut core::ffi::c_void
+    input_services::layout::US_LAYOUT as *mut core::ffi::c_void
 }

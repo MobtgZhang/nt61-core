@@ -10,6 +10,9 @@ extern crate alloc;
 use crate::ke::sync::Spinlock;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+#[path = "user_state/menu_services.rs"]
+pub mod menu_services;
+
 use core::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,8 +50,9 @@ pub struct UserState {
     cursors: BTreeMap<u64, CursorEntry>,
     current_cursor: u64,
     carets: BTreeMap<u64, Caret>,
+    caret_threads: BTreeMap<u64, (u64, [i32; 2])>,
     hot_keys: BTreeMap<(u64, u32), HotKey>,
-    event_hooks: BTreeMap<u64, bool>,
+    event_hooks: BTreeMap<u64, u64>,
     thread_messages: BTreeMap<u32, Vec<ThreadMessage>>,
     deferred_positions: BTreeMap<u64, Vec<DeferredWindowPosition>>,
     deferred_hwnds: Vec<u64>,
@@ -59,7 +63,10 @@ pub struct UserState {
 
 #[derive(Debug)]
 pub struct MenuEntry {
+    pub process_id: u64,
+    pub right_to_left: bool,
     pub popup: bool,
+    pub context_help_id: u32,
     pub destroyed: bool,
     pub items: Vec<MenuItemEntry>,
 }
@@ -74,6 +81,7 @@ pub struct MenuItemEntry {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CursorEntry {
+    pub process_id: u64,
     pub active: bool,
 }
 
@@ -98,6 +106,7 @@ impl UserState {
             cursors: BTreeMap::new(),
             current_cursor: 0,
             carets: BTreeMap::new(),
+            caret_threads: BTreeMap::new(),
             hot_keys: BTreeMap::new(),
             event_hooks: BTreeMap::new(),
             thread_messages: BTreeMap::new(),
@@ -107,6 +116,12 @@ impl UserState {
             active_menu: 0,
             double_click_time: 500,
         }
+    }
+
+    pub fn count_for_process(&self, process: u64) -> usize {
+        self.menus.values().filter(|entry| entry.process_id == process).count()
+            + self.cursors.values().filter(|entry| entry.process_id == process).count()
+            + self.event_hooks.values().filter(|&&owner| owner == process).count()
     }
 
     fn allocate_cursor_handle() -> u64 {
@@ -120,7 +135,10 @@ impl UserState {
                 .insert(
                     handle,
                     MenuEntry {
+                        process_id: super::window::input_context::caller_identity().0,
+                        right_to_left: false,
                         popup,
+                        context_help_id: 0,
                         destroyed: false,
                         items: Vec::new(),
                     },
@@ -146,6 +164,7 @@ impl UserState {
         if entry.destroyed {
             return false;
         }
+        let flags = flags | if entry.right_to_left { 0x2000 } else { 0 };
         if flags & MF_BYPOSITION != 0 {
             let position = id as usize;
             if position > entry.items.len() {
@@ -236,7 +255,7 @@ impl UserState {
     }
 
     pub fn set_event_hook(&mut self, handle: u64) -> bool {
-        handle != 0 && self.event_hooks.insert(handle, true).is_none()
+        handle != 0 && self.event_hooks.insert(handle, super::window::input_context::caller_identity().0).is_none()
     }
 
     pub fn remove_event_hook(&mut self, handle: u64) -> bool {
@@ -246,7 +265,7 @@ impl UserState {
     pub fn create_cursor(&mut self) -> u64 {
         let handle = Self::allocate_cursor_handle();
         if handle != 0 {
-            self.cursors.insert(handle, CursorEntry { active: true });
+            self.cursors.insert(handle, CursorEntry { process_id: super::window::input_context::caller_identity().0, active: true });
         }
         handle
     }
@@ -272,7 +291,10 @@ impl UserState {
         if caret.hwnd == 0 || (caret.width <= 0 && caret.height <= 0 && caret.bitmap == 0) {
             return false;
         }
-        self.carets.insert(caret.hwnd, caret).is_none()
+        let (_, thread) = super::window::input_context::caller_identity();
+        if let Some((previous, _)) = self.caret_threads.insert(thread, (caret.hwnd, [0, 0])) { self.carets.remove(&previous); }
+        self.carets.insert(caret.hwnd, caret);
+        true
     }
 
     pub fn show_caret(&mut self, hwnd: u64, visible: bool) -> bool {
@@ -286,6 +308,7 @@ impl UserState {
     }
 
     pub fn destroy_caret(&mut self, hwnd: u64) -> bool {
+        self.caret_threads.retain(|_, (owner, _)| *owner != hwnd);
         self.carets.remove(&hwnd).is_some()
     }
 
@@ -472,4 +495,16 @@ pub fn defer_window_position(handle: u64, position: DeferredWindowPosition) -> O
 
 pub fn end_deferred_positions(handle: u64, flags: u32) -> bool {
     with_user_state(|state| state.end_deferred_positions(handle, flags))
+}
+
+impl UserState {
+    pub fn current_cursor(&self) -> u64 { self.current_cursor }
+    pub fn caret_position(&self, thread: u64) -> Option<[i32; 2]> {
+        self.caret_threads.get(&thread).map(|entry| entry.1)
+    }
+    pub fn set_caret_position(&mut self, thread: u64, x: i32, y: i32) -> bool {
+        let Some(entry) = self.caret_threads.get_mut(&thread) else { return false; };
+        entry.1 = [x, y];
+        true
+    }
 }

@@ -90,6 +90,7 @@ pub fn init() {
     let _g = KEYBOARD_LOCK.lock();
     unsafe {
         KEYBOARDS[0].valid = true;
+        crate::libs::win32k::raw_input::publish_device(true);
     }
 }
 
@@ -105,6 +106,8 @@ pub fn post_key_event(device_id: usize, scan_code: u8, key_down: bool) {
             return;
         }
 
+        if !crate::libs::win32k::input_services::hardware_allowed() { return; }
+        crate::libs::win32k::raw_input::capture_keyboard(scan_code, key_down);
         let next_head = (kbd.event_head + 1) % EVENT_BUFFER_SIZE;
         if next_head != kbd.event_tail {
             kbd.events[kbd.event_head] = KeyEvent {

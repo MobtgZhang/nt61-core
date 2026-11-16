@@ -15,6 +15,22 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+#[path = "window/services.rs"]
+pub mod services;
+#[path = "window/placement.rs"]
+pub mod placement;
+#[path = "window/attributes.rs"]
+pub mod attributes;
+#[path = "window/input_context.rs"]
+pub(crate) mod input_context;
+#[path = "window/coordinates.rs"]
+pub mod coordinates;
+#[path = "window/classes.rs"]
+pub mod class_services;
+
+#[path = "window/native_state.rs"]
+pub mod native_state;
+
 /// Maximum number of windows in the system.
 pub const MAX_WINDOWS: usize = 4096;
 
@@ -242,7 +258,7 @@ pub enum WindowMessage {
 pub use crate::libs::win32k::objects::Rect;
 
 /// Window class structure
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct WindowClass {
     pub name: [u16; 64],
     pub instance: u64,
@@ -254,12 +270,21 @@ pub struct WindowClass {
     pub h_cursor: u64,
     pub h_brbackground: u64,
     pub menu_name: u64,
+    pub atom: u16,
+    pub small_icon: u64,
+    pub extra: Vec<u8>,
 }
 
 /// Window object
 #[derive(Debug, Clone)]
 pub struct WindowObject {
     pub hwnd: u64,
+    /// Stable class identity, independent of mutable GCLP_HMODULE.
+    pub class_atom: u16,
+    pub thread_id: u64,
+    pub process_id: u64,
+    pub input_context: u64,
+    pub ime_level: u32,
     pub class_name: [u16; 64],
     pub title: [u16; 256],
     pub style: u32,
@@ -277,12 +302,27 @@ pub struct WindowObject {
     pub wndproc: u64,
     pub user_data: u64,
     pub control_id: u32,
+    /// Native USER properties are keyed by ATOM, not caller string addresses.
+    /// Entries retain insertion order for BuildPropList enumeration.
+    pub properties: Vec<(u16, u64)>,
+    pub instance: u64,
+    pub extra: Vec<u8>,
+    pub normal_rect: Rect,
+    pub minimize_point: (i32, i32),
+    pub maximize_point: (i32, i32),
+    pub placement_flags: u32,
+    pub native: native_state::NativeWindowState,
 }
 
 impl WindowObject {
     pub fn new(hwnd: u64) -> Self {
         Self {
             hwnd,
+            class_atom: 0,
+            thread_id: 0,
+            process_id: 0,
+            input_context: 0,
+            ime_level: 0,
             class_name: [0; 64],
             title: [0; 256],
             style: 0,
@@ -310,31 +350,36 @@ impl WindowObject {
             wndproc: 0,
             user_data: 0,
             control_id: 0,
+            properties: Vec::new(),
+            instance: 0,
+            extra: Vec::new(),
+            normal_rect: Rect::default(),
+            minimize_point: (-1, -1),
+            maximize_point: (-1, -1),
+            placement_flags: 0,
+            native: native_state::NativeWindowState::default(),
         }
     }
 
     pub fn set_rect(&mut self, x: i32, y: i32, width: i32, height: i32) {
         self.rect.left = x;
         self.rect.top = y;
-        self.rect.right = x + width;
-        self.rect.bottom = y + height;
+        self.rect.right = x.saturating_add(width.max(0));
+        self.rect.bottom = y.saturating_add(height.max(0));
         self.dirty = true;
         self.update_client_rect();
     }
 
     pub fn update_client_rect(&mut self) {
-        // Subtract window chrome (caption, border)
-        let caption_height = if self.style & 0x00C00000 != 0 { 20 } else { 0 };
-        let _ = &caption_height;
-        let _ = &caption_height;
-        let border_width = if self.style & 0x00800000 != 0 { 2 } else { 0 };
-        let _ = &border_width;
-        let _ = &border_width;
+        let caption = if self.style & WindowStyle::CAPTION != 0 { 20 } else { 0 };
+        let border = if self.style & WindowStyle::BORDER != 0 { 2 } else { 0 };
+        let width = self.rect.right.saturating_sub(self.rect.left).max(0);
+        let height = self.rect.bottom.saturating_sub(self.rect.top).max(0);
         self.client_rect = Rect {
-            left: border_width,
-            top: caption_height + border_width,
-            right: self.rect.width() - border_width,
-            bottom: self.rect.height() - border_width,
+            left: border.min(width),
+            top: (caption + border).min(height),
+            right: width.saturating_sub(border).max(border.min(width)),
+            bottom: height.saturating_sub(border).max((caption + border).min(height)),
         };
     }
 }
@@ -342,6 +387,14 @@ impl WindowObject {
 /// Window manager state
 pub struct WindowManager {
     windows: Vec<Option<WindowObject>>,
+    contexts: Vec<input_context::InputContext>,
+    next_context: u32,
+    ime_disabled_threads: Vec<(u64, u64)>,
+    ime_disabled_processes: Vec<u64>,
+    z_order: Vec<u64>,
+    dpi_aware_processes: Vec<u64>,
+    shell_window: u64,
+    shell_list_view: u64,
     /// Sorted hwnd -> slot-index map so HWND lookup is O(log n) in the
     /// number of live windows instead of a linear scan of the table.
     hwnd_index: BTreeMap<u64, usize>,
@@ -419,6 +472,14 @@ impl WindowManager {
     pub const fn new() -> Self {
         Self {
             windows: Vec::new(),
+            contexts: Vec::new(),
+            next_context: 0x5000_0000,
+            ime_disabled_threads: Vec::new(),
+            ime_disabled_processes: Vec::new(),
+            z_order: Vec::new(),
+            dpi_aware_processes: Vec::new(),
+            shell_window: 0,
+            shell_list_view: 0,
             hwnd_index: BTreeMap::new(),
             next_hwnd: AtomicU64::new(1), // HWND 0 is invalid
             window_count: AtomicUsize::new(0),
@@ -459,10 +520,24 @@ impl WindowManager {
         wndproc: u64,
         control_id: u32,
     ) -> Option<u64> {
+        if parent.is_some_and(|handle| self.get_window(handle).is_none()) {
+            return None;
+        }
+        if style & WindowStyle::CHILD != 0 && parent.is_none() {
+            return None;
+        }
+        if self.window_count.load(Ordering::Relaxed) >= MAX_WINDOWS {
+            return None;
+        }
+        self.z_order.try_reserve(1).ok()?;
         let hwnd = self.alloc_hwnd()?;
         let _ = &hwnd;
         let _ = &hwnd;
         let mut window = WindowObject::new(hwnd);
+        let (process, thread) = input_context::caller_identity();
+        window.process_id = process;
+        window.thread_id = thread;
+        window.input_context = self.default_input_context(process, thread).unwrap_or(0);
 
         // Copy class name
         for (i, &c) in class_name.iter().take(63).enumerate() {
@@ -477,25 +552,48 @@ impl WindowManager {
         window.style = style;
         window.ex_style = ex_style;
         window.set_rect(x, y, width, height);
-        window.parent = parent;
-        window.wndproc = wndproc;
+        window.normal_rect = window.rect;
+        if let Some(class) = self.classes.iter().flatten().find(|class| class_services::same_class_name(&class.name, &window.class_name)) {
+            window.extra.try_reserve_exact(class.wnd_extra as usize).ok()?;
+            window.extra.resize(class.wnd_extra as usize, 0);
+            window.class_atom = class.atom;
+            window.instance = class.instance;
+            if window.wndproc == 0 { window.wndproc = class.wndproc; }
+        }
+        if style & WindowStyle::CHILD != 0 {
+            window.parent = parent;
+        } else {
+            // CreateWindow's hWndParent denotes an owner for top-level windows.
+            window.owner = parent;
+        }
+        if wndproc != 0 { window.wndproc = wndproc; }
         window.control_id = control_id;
         window.visible = style & 0x10000000 != 0;
         window.enabled = style & 0x08000000 == 0;
 
         // Add to children list if has parent
-        if let Some(parent_hwnd) = parent {
+        if let Some(parent_hwnd) = window.parent {
             if let Some(parent_window) = self.get_window_mut(parent_hwnd) {
+                parent_window.children.try_reserve(1).ok()?;
                 parent_window.children.push(hwnd);
             }
         }
 
         // Add to windows Vec and register in index
-        let index = self.windows.len();
-        let _ = &index;
-        let _ = &index;
-        self.windows.push(Some(window));
+        let index = if let Some(index) = self.windows.iter().position(Option::is_none) {
+            self.windows[index] = Some(window);
+            index
+        } else {
+            if self.windows.try_reserve(1).is_err() {
+                if let Some(parent) = parent { self.get_window_mut(parent)?.children.retain(|h| *h != hwnd); }
+                return None;
+            }
+            let index = self.windows.len();
+            self.windows.push(Some(window));
+            index
+        };
         self.hwnd_index.insert(hwnd, index);
+        self.z_order.push(hwnd);
         self.window_count.fetch_add(1, Ordering::Relaxed);
 
         // kprintln!("[win32k] CreateWindow: hwnd={:#x}, class={:?}, style={:#x}",
@@ -516,55 +614,60 @@ impl WindowManager {
         self.windows.get_mut(idx)?.as_mut()
     }
 
-    /// Destroy a window and all its children.
+    /// Destroy descendants and owned windows without recursion on the kernel stack.
     pub fn destroy_window(&mut self, hwnd: u64) -> bool {
-        // Step 1: Find window index
-        let window_index = self.hwnd_index.get(&hwnd).copied();
-        let _ = &window_index;
-
-        let window_index = match window_index {
-            Some(idx) => idx,
-            None => return false, // Window doesn't exist
-        };
-
-        let _ = &window_index;
-
-        // Get window info before we modify anything
-        let (parent_hwnd, children) = {
-            if let Some(window) = self.windows[window_index].as_ref() {
-                (window.parent, window.children.clone())
-            } else {
-                return false;
-            }
-        };
-
-        // Step 2: Recursively destroy children first
-        for child_hwnd in children {
-            self.destroy_window(child_hwnd);
+        if self.get_window(hwnd).is_none() {
+            return false;
         }
-
-        // Step 3: Remove from parent's children list
-        if let Some(p_hwnd) = parent_hwnd {
-            if let Some(&idx) = self.hwnd_index.get(&p_hwnd) {
-                if let Some(w) = self.windows.get_mut(idx) {
-                    if let Some(w) = w.as_mut() {
-                        w.children.retain(|&h| h != hwnd);
-                    }
+        // Reserve before changing state: allocation failure must leave the graph intact.
+        let mut pending = Vec::new();
+        if pending.try_reserve_exact(self.hwnd_index.len()).is_err() {
+            return false;
+        }
+        pending.push(hwnd);
+        let mut index = 0;
+        while index < pending.len() {
+            let parent = pending[index];
+            for window in self.windows.iter().flatten() {
+                if (window.parent == Some(parent) || window.owner == Some(parent))
+                    && !pending.contains(&window.hwnd)
+                {
+                    pending.push(window.hwnd);
                 }
             }
+            index += 1;
         }
-
-        // Step 4: Send WmDestroy message before removal
-        self.post_message(hwnd, WindowMessage::WmDestroy as u32, 0, 0);
-
-        // Step 5: Remove from index
-        self.hwnd_index.remove(&hwnd);
-
-        // Step 6: Mark slot as None (don't shift Vec elements)
-        self.windows[window_index] = None;
-        self.window_count.fetch_sub(1, Ordering::Relaxed);
-
-        // kprintln!("[win32k] destroy_window: hwnd={:#x}", hwnd);
+        // Children/owned popups must lose their handles before their parents.
+        for hwnd in pending.into_iter().rev() {
+            crate::libs::win32k::clipboard::detach_window(hwnd);
+            if self.shell_window == hwnd { self.shell_window = 0; }
+            if self.shell_list_view == hwnd { self.shell_list_view = 0; }
+            for context in &mut self.contexts {
+                if context.ime_window == hwnd { context.ime_window = 0; }
+            }
+            self.z_order.retain(|handle| *handle != hwnd);
+            let Some(index) = self.hwnd_index.remove(&hwnd) else {
+                continue;
+            };
+            let Some(window) = self.windows[index].take() else {
+                continue;
+            };
+            if let Some(parent) = window.parent {
+                if let Some(parent) = self.get_window_mut(parent) {
+                    parent.children.retain(|child| *child != hwnd);
+                }
+            }
+            self.post_message(hwnd, WindowMessage::WmDestroy as u32, 0, 0);
+            self.window_count.fetch_sub(1, Ordering::Relaxed);
+            for handle in [
+                &self.foreground_window,
+                &self.active_window,
+                &self.capture_window,
+                &self.focus_window,
+            ] {
+                let _ = handle.compare_exchange(hwnd, 0, Ordering::AcqRel, Ordering::Relaxed);
+            }
+        }
         true
     }
 
@@ -575,6 +678,8 @@ impl WindowManager {
             let _ = &was_visible;
             let _ = &was_visible;
             window.visible = show;
+            if show { window.style |= WindowStyle::VISIBLE; }
+            else { window.style &= !WindowStyle::VISIBLE; }
             window.dirty = true;
 
             if show && !was_visible {
@@ -629,11 +734,13 @@ impl WindowManager {
     }
 
     /// Post a message to a window's message queue.
+    pub fn count_for_process(&self, process: u64) -> usize {
+        self.windows.iter().flatten().filter(|window| window.process_id == process).count()
+    }
+
     pub fn post_message(&mut self, hwnd: u64, msg: u32, wparam: u64, lparam: i64) -> bool {
-        // Enqueue into the calling thread's message queue so WM_PAINT,
-        // WM_DESTROY, WM_SHOWWINDOW and friends are actually delivered by
-        // the thread's message pump instead of being silently dropped.
-        crate::libs::win32k::message::post_message(hwnd, msg, wparam, lparam)
+        let Some(window) = self.get_window(hwnd) else { return false; };
+        crate::libs::win32k::message::post_thread_message(window.thread_id, hwnd, msg, wparam, lparam)
     }
 
     /// Send a message directly to a window procedure.
@@ -744,6 +851,9 @@ impl WindowManager {
 
     /// Set active window.
     pub fn set_active_window(&mut self, hwnd: u64) -> Option<u64> {
+        if hwnd != 0 {
+            self.get_window(hwnd)?;
+        }
         let old = self.active_window.swap(hwnd, Ordering::SeqCst);
         let _ = &old;
         let _ = &old;
@@ -996,3 +1106,6 @@ pub fn update_window_internal(hwnd: u64) -> bool {
     let mut wm = WINDOW_MANAGER.lock();
     wm.update_window(hwnd)
 }
+
+#[path = "window/session_services.rs"]
+pub mod session_services;

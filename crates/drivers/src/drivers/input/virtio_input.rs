@@ -17,6 +17,12 @@ const VENDOR_VIRTIO: u16 = 0x1AF4;
 const DEVICE_INPUT_MODERN: u16 = 0x1040 + 18;
 const DEVICE_INPUT_LEGACY: u16 = 0x1000 + 18;
 const MOUSE_ABS_RANGE: i32 = 0x7FFF;
+// Preserve unaccelerated relative motion until SYN_REPORT, independently of
+// the screen-clamped desktop cursor.
+static RAW_MOUSE_DX: AtomicI32 = AtomicI32::new(0);
+static RAW_MOUSE_DY: AtomicI32 = AtomicI32::new(0);
+static RAW_MOUSE_WHEEL: AtomicI16 = AtomicI16::new(0);
+static RAW_MOUSE_CAPTURED_EVENTS: AtomicU32 = AtomicU32::new(0);
 
 // Modern virtio-pci common-configuration offsets
 // (VirtIO 1.x spec, "Common configuration structure layout";
@@ -242,21 +248,55 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
     let event_type = u16::from_le_bytes([event[0], event[1]]);
     let code = u16::from_le_bytes([event[2], event[3]]);
     let value = i32::from_le_bytes([event[4], event[5], event[6], event[7]]);
+    if !crate::libs::win32k::input_services::hardware_allowed() {
+        return;
+    }
     // EV_SYN / SYN_REPORT closes one atomic pointer report. Reading only the
     // final device state after draining the ring loses a complete click when
     // both button edges arrived during a software-rendered frame.
     if event_type == 0 && code == 0 {
         let events = MOUSE_EVENTS.load(Ordering::Acquire);
+        // Raw delivery is independent of the bounded legacy desktop queue.
+        // Retrying a full queue must not publish the same wheel notch twice.
+        if events != RAW_MOUSE_CAPTURED_EVENTS.load(Ordering::Relaxed) {
+            let (_, _, buttons) = get_mouse_state();
+            let wheel = RAW_MOUSE_WHEEL.swap(0, Ordering::Relaxed);
+            let absolute = MOUSE_ABSOLUTE.load(Ordering::Acquire);
+            let dx = RAW_MOUSE_DX.swap(0, Ordering::Relaxed);
+            let dy = RAW_MOUSE_DY.swap(0, Ordering::Relaxed);
+            let normalize = |value: i32| {
+                (i64::from(value.clamp(0, MOUSE_ABS_RANGE)) * 65535 / i64::from(MOUSE_ABS_RANGE))
+                    as i32
+            };
+            let (raw_x, raw_y) = if absolute {
+                (
+                    normalize(MOUSE_ABS_X.load(Ordering::Relaxed)),
+                    normalize(MOUSE_ABS_Y.load(Ordering::Relaxed)),
+                )
+            } else {
+                (dx, dy)
+            };
+            crate::libs::win32k::raw_input::capture_pointer(raw_x, raw_y, absolute, wheel, buttons);
+            let (x, y, _) = get_mouse_state();
+            crate::libs::win32k::input_services::position_hardware_cursor_with_resolution(
+                i32::from(x),
+                i32::from(y),
+                absolute.then_some((raw_x as u16, raw_y as u16)),
+            );
+            RAW_MOUSE_CAPTURED_EVENTS.store(events, Ordering::Relaxed);
+        }
         if events != MOUSE_QUEUED_EVENTS.load(Ordering::Relaxed) {
-            let (x, y, buttons) = get_mouse_state();
+            let (_, _, buttons) = get_mouse_state();
             let wheel = MOUSE_WHEEL.swap(0, Ordering::Relaxed);
-            if MOUSE_REPORTS.push(x, y, buttons, wheel) {
+            let (x, y) = crate::libs::win32k::input_services::cursor_position();
+            if MOUSE_REPORTS.push(x as i16, y as i16, buttons, wheel) {
                 MOUSE_QUEUED_EVENTS.store(events, Ordering::Relaxed);
             } else {
                 // Keep scroll notches pending if userspace has not drained
                 // the completed reports yet.
-                let _ = MOUSE_WHEEL.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-                    |pending| Some(pending.saturating_add(wheel)));
+                let _ = MOUSE_WHEEL.try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                    Some(pending.saturating_add(wheel))
+                });
             }
         }
         return;
@@ -265,14 +305,25 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         MOUSE_EVENTS.fetch_add(1, Ordering::AcqRel);
         let delta = i16::try_from(value).unwrap_or(0);
         if code == 0 {
+            let _ = RAW_MOUSE_DX.try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                Some(pending.saturating_add(value))
+            });
             let x = MOUSE_X.load(Ordering::Relaxed);
             MOUSE_X.store(x.saturating_add(delta).max(0), Ordering::Relaxed);
         } else if code == 1 {
+            let _ = RAW_MOUSE_DY.try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                Some(pending.saturating_add(value))
+            });
             let y = MOUSE_Y.load(Ordering::Relaxed);
             MOUSE_Y.store(y.saturating_add(delta).max(0), Ordering::Relaxed);
-        } else if code == 8 { // Linux REL_WHEEL: positive means away/up.
-            let _ = MOUSE_WHEEL.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-                |pending| Some(pending.saturating_add(delta)));
+        } else if code == 8 {
+            // Linux REL_WHEEL: positive means away/up.
+            let _ = RAW_MOUSE_WHEEL.try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                Some(pending.saturating_add(delta))
+            });
+            let _ = MOUSE_WHEEL.try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                Some(pending.saturating_add(delta))
+            });
         }
         return;
     }
@@ -302,17 +353,54 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         }
         return;
     }
+    // Linux key codes 1..=83 retain set-1 make codes; navigation and right
+    // modifiers require E0. Unknown/media keys have no set-1 representation.
+    let scan = match code {
+        1..=83 => Some((code as u8, false)),
+        87 | 88 => Some((code as u8, false)),
+        96 => Some((0x1c, true)),
+        97 => Some((0x1d, true)),
+        98 => Some((0x35, true)),
+        100 => Some((0x38, true)),
+        102 => Some((0x47, true)),
+        103 => Some((0x48, true)),
+        104 => Some((0x49, true)),
+        105 => Some((0x4b, true)),
+        106 => Some((0x4d, true)),
+        107 => Some((0x4f, true)),
+        108 => Some((0x50, true)),
+        109 => Some((0x51, true)),
+        110 => Some((0x52, true)),
+        111 => Some((0x53, true)),
+        125 => Some((0x5b, true)),
+        126 => Some((0x5c, true)),
+        127 => Some((0x5d, true)),
+        _ => None,
+    };
+    if let Some((scan, extended)) = scan {
+        crate::libs::win32k::raw_input::capture_keyboard_extended(
+            scan,
+            value != KEY_VALUE_RELEASE,
+            extended,
+        );
+    }
     // Control keys produce ASCII control bytes for the shared desktop ABI.
     if code == 29 || code == 97 {
         let bit = if code == 29 { 1 } else { 2 };
-        if value == KEY_VALUE_RELEASE { CONTROL_KEYS.fetch_and(!bit, Ordering::Relaxed); }
-        else { CONTROL_KEYS.fetch_or(bit, Ordering::Relaxed); }
+        if value == KEY_VALUE_RELEASE {
+            CONTROL_KEYS.fetch_and(!bit, Ordering::Relaxed);
+        } else {
+            CONTROL_KEYS.fetch_or(bit, Ordering::Relaxed);
+        }
         return;
     }
     if code == 56 || code == 100 {
         let bit = if code == 56 { 1 } else { 2 };
-        if value == KEY_VALUE_RELEASE { ALT_KEYS.fetch_and(!bit, Ordering::Relaxed); }
-        else { ALT_KEYS.fetch_or(bit, Ordering::Relaxed); }
+        if value == KEY_VALUE_RELEASE {
+            ALT_KEYS.fetch_and(!bit, Ordering::Relaxed);
+        } else {
+            ALT_KEYS.fetch_or(bit, Ordering::Relaxed);
+        }
         return;
     }
     // Shift releases must clear the modifier state; every other
@@ -329,7 +417,9 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         set_caps_lock(!caps_lock());
     } else {
         let bytes = translate_key(code);
-        if !bytes.is_empty() && ALT_KEYS.load(Ordering::Relaxed) != 0 { enqueue_byte(27); }
+        if !bytes.is_empty() && ALT_KEYS.load(Ordering::Relaxed) != 0 {
+            enqueue_byte(27);
+        }
         for byte in bytes {
             enqueue_byte(*byte);
         }
@@ -379,47 +469,146 @@ pub fn has_mouse_update() -> bool {
 }
 
 pub fn pop_mouse_report() -> Option<(i16, i16, u8, i16)> {
-    MOUSE_REPORTS
-        .pop()
-        .or_else(|| has_mouse_update().then(|| {
+    MOUSE_REPORTS.pop().or_else(|| {
+        has_mouse_update().then(|| {
             let (x, y, buttons) = get_mouse_state();
             (x, y, buttons, MOUSE_WHEEL.swap(0, Ordering::Relaxed))
-        }))
+        })
+    })
 }
 
 fn translate_key(code: u16) -> &'static [u8] {
     if control_state() {
-        match code { 35 => return b"\x8e", 102 => return b"\x1b[1;5H", 107 => return b"\x1b[1;5F", _ => {} }
+        match code {
+            35 => return b"\x8e",
+            102 => return b"\x1b[1;5H",
+            107 => return b"\x1b[1;5F",
+            _ => {}
+        }
         let control: u8 = match code {
-            30=>1,48=>2,46=>3,32=>4,18=>5,33=>6,34=>7,35=>8,23=>9,
-            36=>10,37=>11,38=>12,50=>13,49=>14,24=>15,25=>16,16=>17,
-            19=>18,31=>19,20=>20,22=>21,47=>22,17=>23,45=>24,21=>25,44=>26,
-            _=>0,
+            30 => 1,
+            48 => 2,
+            46 => 3,
+            32 => 4,
+            18 => 5,
+            33 => 6,
+            34 => 7,
+            35 => 8,
+            23 => 9,
+            36 => 10,
+            37 => 11,
+            38 => 12,
+            50 => 13,
+            49 => 14,
+            24 => 15,
+            25 => 16,
+            16 => 17,
+            19 => 18,
+            31 => 19,
+            20 => 20,
+            22 => 21,
+            47 => 22,
+            17 => 23,
+            45 => 24,
+            21 => 25,
+            44 => 26,
+            _ => 0,
         };
         if control != 0 {
-            const BYTES: [u8;26] = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26];
-            return &BYTES[usize::from(control-1)..usize::from(control)];
+            const BYTES: [u8; 26] = [
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24, 25, 26,
+            ];
+            return &BYTES[usize::from(control - 1)..usize::from(control)];
         }
     }
     let shift = shift_state();
     if shift {
-        match code {103=>return b"\x1b[1;2A",108=>return b"\x1b[1;2B",105=>return b"\x1b[1;2D",106=>return b"\x1b[1;2C",102=>return b"\x1b[1;2H",107=>return b"\x1b[1;2F",_=>{}}
+        match code {
+            103 => return b"\x1b[1;2A",
+            108 => return b"\x1b[1;2B",
+            105 => return b"\x1b[1;2D",
+            106 => return b"\x1b[1;2C",
+            102 => return b"\x1b[1;2H",
+            107 => return b"\x1b[1;2F",
+            _ => {}
+        }
     }
     let caps = caps_lock();
     let letter_upper = shift != caps;
     let use_shift = shift;
     match code {
         1 => b"\x1b",
-        2 => if use_shift { b"!" } else { b"1" },
-        3 => if use_shift { b"@" } else { b"2" },
-        4 => if use_shift { b"#" } else { b"3" },
-        5 => if use_shift { b"$" } else { b"4" },
-        6 => if use_shift { b"%" } else { b"5" },
-        7 => if use_shift { b"^" } else { b"6" },
-        8 => if use_shift { b"&" } else { b"7" },
-        9 => if use_shift { b"*" } else { b"8" },
-        10 => if use_shift { b"(" } else { b"9" },
-        11 => if use_shift { b")" } else { b"0" },
+        2 => {
+            if use_shift {
+                b"!"
+            } else {
+                b"1"
+            }
+        }
+        3 => {
+            if use_shift {
+                b"@"
+            } else {
+                b"2"
+            }
+        }
+        4 => {
+            if use_shift {
+                b"#"
+            } else {
+                b"3"
+            }
+        }
+        5 => {
+            if use_shift {
+                b"$"
+            } else {
+                b"4"
+            }
+        }
+        6 => {
+            if use_shift {
+                b"%"
+            } else {
+                b"5"
+            }
+        }
+        7 => {
+            if use_shift {
+                b"^"
+            } else {
+                b"6"
+            }
+        }
+        8 => {
+            if use_shift {
+                b"&"
+            } else {
+                b"7"
+            }
+        }
+        9 => {
+            if use_shift {
+                b"*"
+            } else {
+                b"8"
+            }
+        }
+        10 => {
+            if use_shift {
+                b"("
+            } else {
+                b"9"
+            }
+        }
+        11 => {
+            if use_shift {
+                b")"
+            } else {
+                b"0"
+            }
+        }
         12 => {
             if use_shift {
                 b"_"
@@ -683,12 +872,12 @@ fn translate_key(code: u16) -> &'static [u8] {
             }
         }
         57 => b" ",
-        59 => b"\x1bOP", // F1
-        61 => b"\x1bOR", // F3
-        60 => b"\x1bOQ", // F2
+        59 => b"\x1bOP",   // F1
+        61 => b"\x1bOR",   // F3
+        60 => b"\x1bOQ",   // F2
         63 => b"\x1b[15~", // F5
-        102 => b"\x1b[H", // Home
-        107 => b"\x1b[F", // End
+        102 => b"\x1b[H",  // Home
+        107 => b"\x1b[F",  // End
         104 => b"\x1b[5~", // Page Up
         109 => b"\x1b[6~", // Page Down
         111 => b"\x1b[3~", // Delete
@@ -989,6 +1178,7 @@ pub fn init() {
                     if current.is_null() || replace_relative {
                         MOUSE_DEVICE_ABSOLUTE.store(absolute, Ordering::Release);
                         MOUSE_DEVICE.store(device, Ordering::Release);
+                        crate::libs::win32k::raw_input::publish_device(false);
                         if absolute {
                             trace("virtio-input: absolute mouse ATTACHED\r\n");
                         } else {
@@ -998,6 +1188,7 @@ pub fn init() {
                 }
                 InputDeviceKind::Keyboard if DEVICE.load(Ordering::Acquire).is_null() => {
                     DEVICE.store(device, Ordering::Release);
+                    crate::libs::win32k::raw_input::publish_device(true);
                     trace("virtio-input: keyboard ATTACHED\r\n");
                 }
                 InputDeviceKind::Keyboard => {}
@@ -1279,9 +1470,7 @@ fn input_device_kind(device_config: Option<*mut u8>) -> InputDeviceKind {
     for (index, byte) in name.iter_mut().enumerate().take(length) {
         *byte = read_u8(config, 8 + index as u64);
     }
-    if contains_ignore_ascii_case(&name, b"mouse")
-        || contains_ignore_ascii_case(&name, b"tablet")
-    {
+    if contains_ignore_ascii_case(&name, b"mouse") || contains_ignore_ascii_case(&name, b"tablet") {
         if contains_ignore_ascii_case(&name, b"tablet")
             || contains_ignore_ascii_case(&name, b"absolute")
         {

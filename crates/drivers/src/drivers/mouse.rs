@@ -99,6 +99,7 @@ pub fn init() {
     unsafe {
         // Register PS/2 mouse (device 0)
         MICE[0].valid = true;
+        crate::libs::win32k::raw_input::publish_device(false);
     }
 }
 
@@ -115,8 +116,11 @@ pub fn post_mouse_event(device_id: usize, dx: i16, dy: i16, dz: i16, buttons: u8
             return;
         }
 
-        mouse.x = mouse.x.saturating_add(dx as i32);
-        mouse.y = mouse.y.saturating_add(dy as i32);
+        if !crate::libs::win32k::input_services::hardware_allowed() { return; }
+        let position = crate::libs::win32k::input_services::move_hardware_cursor(dx, dy);
+        mouse.x = position.0;
+        mouse.y = position.1;
+        crate::libs::win32k::raw_input::capture_mouse(dx, dy, dz, buttons);
 
         let next_head = (mouse.event_head + 1) % EVENT_BUFFER_SIZE;
         if next_head != mouse.event_tail {

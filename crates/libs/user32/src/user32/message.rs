@@ -338,19 +338,30 @@ pub unsafe extern "C" fn translate_message(lp_msg: *const MSG) -> i32 {
     }
 
     let msg = &*lp_msg;
-    let is_keydown = msg.message == wm::WM_KEYDOWN || msg.message == wm::WM_SYSKEYDOWN;
-    if !is_keydown {
+    if !matches!(
+        msg.message,
+        wm::WM_KEYDOWN | wm::WM_KEYUP | wm::WM_SYSKEYDOWN | wm::WM_SYSKEYUP
+    ) {
         return 0;
     }
-    if !VK_TRANSLATABLE_RANGE.contains(&msg.wparam) {
-        return 0;
-    }
-    let char_message = if msg.message == wm::WM_SYSKEYDOWN {
-        wm::WM_SYSCHAR
-    } else {
-        wm::WM_CHAR
+    let native = crate::libs::win32k::message::Msg {
+        hwnd: msg.hwnd as u64,
+        message: msg.message,
+        wparam: msg.wparam as u64,
+        lparam: msg.lparam as i64,
+        time: msg.time,
+        pt_x: msg.pt.x,
+        pt_y: msg.pt.y,
     };
-    post_message_w(msg.hwnd, char_message, msg.wparam, msg.lparam);
+    if let Some(translated) = crate::libs::win32k::message::MessageQueue::translate_message(&native)
+    {
+        let character = MSG {
+            message: translated.message,
+            wparam: translated.wparam as usize,
+            ..*msg
+        };
+        MESSAGE_QUEUES.lock()[current_thread_slot()].post(character);
+    }
     1
 }
 
@@ -378,11 +389,6 @@ pub unsafe extern "C" fn wait_message() -> i32 {
         }
     }
 }
-
-/// VK code range the default layout translates straight to a
-/// character: VK_SPACE (0x20) through VK_Z (0x5A); the digit
-/// keys 0x30..0x39 sit inside.
-const VK_TRANSLATABLE_RANGE: core::ops::RangeInclusive<WPARAM> = 0x20..=0x5A;
 
 pub mod wm {
     pub const WM_NULL: u32 = 0x0000;

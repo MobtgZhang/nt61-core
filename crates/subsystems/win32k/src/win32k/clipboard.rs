@@ -3,6 +3,9 @@
 //! Implements clipboard operations for win32k.sys
 //! Reference: Windows SDK, ReactOS win32ss/user
 
+#[path = "clipboard/services.rs"]
+pub mod services;
+
 use crate::ke::sync::Spinlock;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,12 +38,20 @@ const MAX_CLIPBOARD_FORMATS: usize = 8;
 pub struct ClipboardDataInner {
     /// (format, bytes) pairs in insertion order.
     entries: Vec<(u32, Vec<u8>)>,
+    opener: u64,
+    modified: bool,
+    listeners: Vec<u64>,
+    viewer: u64,
 }
 
 impl ClipboardDataInner {
     pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
+            opener: 0,
+            modified: false,
+            listeners: Vec::new(),
+            viewer: 0,
         }
     }
 }
@@ -86,27 +97,56 @@ impl Default for ClipboardState {
 /// Global clipboard state
 static CLIPBOARD: ClipboardState = ClipboardState::new();
 
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Open the clipboard for a window
 pub fn open_clipboard(owner: u64) -> bool {
-    // Check if already open
-    if CLIPBOARD.is_open.load(Ordering::SeqCst) {
-        return false;
-    }
-
-    CLIPBOARD.is_open.store(true, Ordering::SeqCst);
-    CLIPBOARD.owner.store(owner, Ordering::SeqCst);
+    let mut inner = CLIPBOARD.data.lock();
+    if CLIPBOARD.is_open.load(Ordering::Acquire) { return false; }
+    inner.opener = owner;
+    inner.modified = false;
+    CLIPBOARD.is_open.store(true, Ordering::Release);
     true
 }
 
-/// close the clipboard
+/// Notify once on close if data changed. A read-only open/close must neither
+/// change persistent ownership nor manufacture a new clipboard sequence.
 pub fn close_clipboard() -> bool {
-    if !CLIPBOARD.is_open.load(Ordering::SeqCst) {
-        return false;
+    let (listeners, viewer) = {
+        let mut inner = CLIPBOARD.data.lock();
+        if !CLIPBOARD.is_open.load(Ordering::Acquire) { return false; }
+        let mut listeners = Vec::new();
+        if inner.modified {
+            if listeners.try_reserve_exact(inner.listeners.len()).is_err() { return false; }
+            listeners.extend_from_slice(&inner.listeners);
+        }
+        let viewer = if inner.modified { inner.viewer } else { 0 };
+        inner.opener = 0;
+        inner.modified = false;
+        CLIPBOARD.is_open.store(false, Ordering::Release);
+        (listeners, viewer)
+    };
+    for hwnd in listeners {
+        crate::libs::win32k::message::post_message(hwnd, 0x031d, 0, 0);
     }
-
-    CLIPBOARD.is_open.store(false, Ordering::SeqCst);
-    CLIPBOARD.sequence.fetch_add(1, Ordering::SeqCst);
+    if viewer != 0 { crate::libs::win32k::message::post_message(viewer, 0x0308, 0, 0); }
     true
+}
+
+pub fn get_open_window() -> u64 {
+    let inner = CLIPBOARD.data.lock();
+    if is_open() { inner.opener } else { 0 }
+}
+
+/// Called while the window manager lock is held, matching listener registration
+/// lock order. Never acquire the window manager from inside the clipboard lock.
+pub(super) fn detach_window(hwnd: u64) {
+    let mut inner = CLIPBOARD.data.lock();
+    inner.listeners.retain(|listener| *listener != hwnd);
+    if inner.viewer == hwnd { inner.viewer = 0; }
+    if inner.opener == hwnd { inner.opener = 0; }
+    if get_owner() == hwnd { CLIPBOARD.owner.store(0, Ordering::Release); }
 }
 
 /// Check if clipboard is open
@@ -131,32 +171,22 @@ pub fn get_sequence_number() -> u64 {
 /// representations of the same user object. An empty object or one
 /// larger than MAX_CLIPBOARD_DATA is rejected.
 pub fn set_clipboard_data(format: u32, data: &[u8]) -> bool {
-    if !CLIPBOARD.is_open.load(Ordering::SeqCst) {
-        return false;
-    }
-    if format == 0 || data.is_empty() || data.len() > MAX_CLIPBOARD_DATA {
-        return false;
-    }
-
+    if format == 0 || data.is_empty() || data.len() > MAX_CLIPBOARD_DATA { return false; }
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(data.len()).is_err() { return false; }
+    bytes.extend_from_slice(data);
     let mut inner = CLIPBOARD.data.lock();
+    if !is_open() { return false; }
     match inner.entries.iter_mut().find(|(f, _)| *f == format) {
-        Some((_, bytes)) => {
-            bytes.clear();
-            bytes.extend_from_slice(data);
-        }
+        Some((_, existing)) => *existing = bytes,
         None => {
-            if inner.entries.len() >= MAX_CLIPBOARD_FORMATS {
-                drop(inner);
-                return false;
-            }
-            inner.entries.push((format, data.to_vec()));
+            if inner.entries.len() >= MAX_CLIPBOARD_FORMATS || inner.entries.try_reserve(1).is_err() { return false; }
+            inner.entries.push((format, bytes));
         }
     }
-    drop(inner);
-
-    CLIPBOARD.has_data.store(true, Ordering::SeqCst);
-    CLIPBOARD.sequence.fetch_add(1, Ordering::SeqCst);
-
+    inner.modified = true;
+    CLIPBOARD.has_data.store(true, Ordering::Release);
+    CLIPBOARD.sequence.fetch_add(1, Ordering::AcqRel);
     true
 }
 
@@ -192,6 +222,12 @@ pub fn get_clipboard_format() -> u32 {
     inner.entries.first().map(|(f, _)| *f).unwrap_or(0)
 }
 
+/// Snapshot available formats in their enumeration order. All query services
+/// use this lock-protected data rather than a separate cached availability bit.
+pub fn formats() -> Vec<u32> {
+    CLIPBOARD.data.lock().entries.iter().map(|(format, _)| *format).collect()
+}
+
 /// Check if a format is available ('0' means "any format").
 pub fn is_format_available(format: u32) -> bool {
     if !CLIPBOARD.has_data.load(Ordering::SeqCst) {
@@ -204,17 +240,13 @@ pub fn is_format_available(format: u32) -> bool {
 
 /// Empty the clipboard
 pub fn empty_clipboard() -> bool {
-    if !CLIPBOARD.is_open.load(Ordering::SeqCst) {
-        return false;
-    }
-
     let mut inner = CLIPBOARD.data.lock();
+    if !is_open() { return false; }
     inner.entries.clear();
-    drop(inner);
-
-    CLIPBOARD.has_data.store(false, Ordering::SeqCst);
-    CLIPBOARD.sequence.fetch_add(1, Ordering::SeqCst);
-
+    inner.modified = true;
+    CLIPBOARD.owner.store(inner.opener, Ordering::Release);
+    CLIPBOARD.has_data.store(false, Ordering::Release);
+    CLIPBOARD.sequence.fetch_add(1, Ordering::AcqRel);
     true
 }
 
@@ -227,11 +259,13 @@ mod tests {
     /// test threads would interfere with each other.
     #[test]
     fn clipboard_multi_format_lifecycle() {
+        let _guard = TEST_LOCK.lock().unwrap();
         if is_open() {
             close_clipboard();
         }
 
         assert!(open_clipboard(0x1111));
+        assert!(empty_clipboard());
         assert_eq!(get_owner(), 0x1111);
 
         // Two formats coexist; format 0 reads the preferred one.
@@ -281,10 +315,10 @@ mod tests {
         assert_eq!(get_clipboard_format(), 0);
         assert_eq!(get_sequence_number(), seq + 1);
 
-        // Closing bumps the sequence and disables updates.
+        // Closing publishes notifications and disables updates.
         let seq = get_sequence_number();
         assert!(close_clipboard());
-        assert_eq!(get_sequence_number(), seq + 1);
+        assert_eq!(get_sequence_number(), seq);
         assert!(!set_clipboard_data(CF_TEXT, b"nope"));
         assert!(!empty_clipboard());
 

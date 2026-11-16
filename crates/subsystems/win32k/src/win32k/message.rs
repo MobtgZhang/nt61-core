@@ -4,9 +4,13 @@
 //! Messages are posted to a per-thread message queue and retrieved
 //! by GetMessage/PeekMessage.
 
+use super::input_services::keyboard::KeyboardSnapshot;
+
+#[path = "message/services.rs"]
+pub mod services;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 /// Maximum messages in a queue.
 const MAX_QUEUE_MESSAGES: usize = 256;
@@ -24,17 +28,24 @@ pub struct Msg {
     pub pt_y: i32,
 }
 
+/// A posted message has no input snapshot. Only class-driver messages may
+/// update a queue's keyboard state when removed by GetMessage/PeekMessage.
+#[derive(Clone, Copy)]
+struct QueuedMessage {
+    message: Msg,
+    keyboard: Option<KeyboardSnapshot>,
+}
+
 /// Message queue for a thread
 pub struct MessageQueue {
-    messages: VecDeque<Msg>,
+    messages: VecDeque<QueuedMessage>,
+    keyboard: KeyboardSnapshot,
     quit_flag: AtomicBool,
     exit_code: AtomicI32,
     /// Paint rectangles pending WmPaint
     paint_rects: Vec<crate::libs::win32k::window::Rect>,
     /// Current message being processed
     current_msg: Option<Msg>,
-    /// Posted message count
-    msg_count: AtomicU32,
     /// Event signaled when message is available
     has_messages: AtomicBool,
 }
@@ -43,23 +54,37 @@ impl MessageQueue {
     pub fn new() -> Self {
         Self {
             messages: VecDeque::with_capacity(MAX_QUEUE_MESSAGES),
+            keyboard: KeyboardSnapshot::empty(),
             quit_flag: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
             paint_rects: Vec::new(),
             current_msg: None,
-            msg_count: AtomicU32::new(0),
             has_messages: AtomicBool::new(false),
         }
     }
 
     /// Post a message to the queue.
     pub fn post_message(&mut self, msg: Msg) -> bool {
+        self.enqueue(msg, None)
+    }
+
+    pub fn keyboard_state(&self) -> KeyboardSnapshot {
+        self.keyboard
+    }
+
+    pub fn set_keyboard_state(&mut self, state: KeyboardSnapshot) {
+        self.keyboard = state;
+    }
+
+    fn enqueue(&mut self, msg: Msg, keyboard: Option<KeyboardSnapshot>) -> bool {
         if self.messages.len() >= MAX_QUEUE_MESSAGES {
             // kprintln!("[msgq] PostMessage: queue full");
             return false;
         }
-        self.messages.push_back(msg);
-        self.msg_count.fetch_add(1, Ordering::SeqCst);
+        self.messages.push_back(QueuedMessage {
+            message: msg,
+            keyboard,
+        });
         // Signal that a message is available
         self.has_messages.store(true, Ordering::SeqCst);
         // kprintln!("[msgq] PostMessage: msg={:#x}, hwnd={:#x}, count={}",
@@ -107,113 +132,75 @@ impl MessageQueue {
         }
     }
 
-    /// Helper to check if a message matches the filter criteria.
-    fn matches_filter(msg: &Msg, hwnd_filter: u64, min: u32, max: u32) -> bool {
-        if hwnd_filter != 0 && msg.hwnd != hwnd_filter {
-            return false;
+    /// HWND(-1) restricts retrieval to thread messages. WM_QUIT always bypasses
+    /// both the window and numeric filters, including an explicitly posted quit.
+    fn matches_filter(msg: &Msg, hwnd: u64, min: u32, max: u32) -> bool {
+        if msg.message == 0x12 {
+            return true;
         }
-        if min != 0 && msg.message < min {
-            return false;
-        }
-        if max != 0 && msg.message > max {
-            return false;
-        }
-        true
+        let window_matches = match hwnd {
+            0 => true,
+            u64::MAX | 0xffff_ffff => msg.hwnd == 0,
+            _ => msg.hwnd == hwnd,
+        };
+        window_matches && ((min == 0 && max == 0) || (min..=max).contains(&msg.message))
     }
 
-    /// Get next message (blocking with event synchronization).
-    /// Returns None when no messages are available (non-blocking) or on timeout.
-    pub fn get_message(
-        &mut self,
-        hwnd_filter: u64,
-        msg_filter_min: u32,
-        msg_filter_max: u32,
-        timeout_ms: u32,
-    ) -> Option<Msg> {
-        loop {
-            // Check for quit first
-            if self.quit_flag.load(Ordering::SeqCst) {
-                return Some(Msg {
-                    hwnd: 0,
-                    message: 0x0012, // WmQuit
-                    wparam: self.exit_code.load(Ordering::SeqCst) as u64,
-                    lparam: 0,
-                    time: 0,
-                    pt_x: 0,
-                    pt_y: 0,
-                });
-            }
-
-            // Try to find a matching message
-            for i in 0..self.messages.len() {
-                if let Some(msg) = self.messages.get(i).copied() {
-                    if Self::matches_filter(&msg, hwnd_filter, msg_filter_min, msg_filter_max) {
-                        self.messages.remove(i);
-                        self.current_msg = Some(msg);
-
-                        // Clear flag if no more messages
-                        if self.messages.is_empty() && !self.quit_flag.load(Ordering::SeqCst) {
-                            self.has_messages.store(false, Ordering::SeqCst);
-                        }
-                        return Some(msg);
-                    }
-                }
-            }
-
-            // No matching message found
-            // Check if non-blocking mode
-            if timeout_ms == 0 {
-                return None;
-            }
-
-            // For blocking mode, we would wait on the event here
-            // Since we don't have full scheduler integration yet,
-            // we'll yield to other threads with a spin hint
-            if !self.has_messages.load(Ordering::SeqCst) {
-                // kprintln!("[msgq] GetMessage: waiting for message...");
-                // In a full implementation, this would block on the event
-                // For now, use spin loop hint (would integrate with scheduler)
-                for _ in 0..1000 {
-                    core::hint::spin_loop();
-                    if self.has_messages.load(Ordering::SeqCst) {
-                        break;
-                    }
-                }
-            }
-
-            // If still no message and timeout not infinite, return
-            if timeout_ms != 0xFFFFFFFF && !self.has_messages.load(Ordering::SeqCst) {
-                return None;
-            }
-        }
+    /// Retrieve a matching message immediately. Waiting must happen outside
+    /// the thread queue lock, so producers can enqueue the awaited message.
+    pub fn get_message(&mut self, hwnd: u64, min: u32, max: u32, _timeout_ms: u32) -> Option<Msg> {
+        self.peek_message(hwnd, min, max, true)
     }
 
-    /// Peek at a message without blocking.
-    pub fn peek_message(
+    pub fn peek_message(&mut self, hwnd: u64, min: u32, max: u32, remove: bool) -> Option<Msg> {
+        self.peek_filtered(
+            |message| Self::matches_filter(message, hwnd, min, max),
+            remove,
+        )
+    }
+
+    /// Apply a previously captured window hierarchy without acquiring the
+    /// window lock while holding the queue lock. Window-manager posts acquire
+    /// those locks in the opposite order.
+    pub(super) fn peek_filtered(
         &mut self,
-        hwnd_filter: u64,
-        msg_filter_min: u32,
-        msg_filter_max: u32,
+        mut matches: impl FnMut(&Msg) -> bool,
         remove: bool,
     ) -> Option<Msg> {
-        // Find a matching message
-        for i in 0..self.messages.len() {
-            if let Some(msg) = self.messages.get(i).copied() {
-                if hwnd_filter != 0 && msg.hwnd != hwnd_filter {
-                    continue;
+        if let Some(index) = self
+            .messages
+            .iter()
+            .position(|entry| matches(&entry.message))
+        {
+            let entry = self.messages[index];
+            if remove {
+                self.messages.remove(index);
+                self.current_msg = Some(entry.message);
+                if let Some(state) = entry.keyboard {
+                    self.keyboard = state;
                 }
-                if msg_filter_min != 0 && msg.message < msg_filter_min {
-                    continue;
-                }
-                if msg_filter_max != 0 && msg.message > msg_filter_max {
-                    continue;
-                }
-
-                if remove {
-                    self.messages.remove(i);
-                }
-                return Some(msg);
+                self.clear_message_flag();
             }
+            return Some(entry.message);
+        }
+        // PostQuitMessage is a coalesced low-priority request. Posted messages
+        // take precedence; PM_NOREMOVE leaves the quit request pending.
+        if self.quit_flag.load(Ordering::SeqCst) {
+            let message = Msg {
+                hwnd: 0,
+                message: 0x12,
+                wparam: self.exit_code.load(Ordering::SeqCst) as u32 as u64,
+                lparam: 0,
+                time: crate::ke::time::get_tick_count(),
+                pt_x: 0,
+                pt_y: 0,
+            };
+            if remove {
+                self.quit_flag.store(false, Ordering::SeqCst);
+                self.current_msg = Some(message);
+                self.clear_message_flag();
+            }
+            return Some(message);
         }
         None
     }
@@ -227,204 +214,32 @@ impl MessageQueue {
         wm.send_message(msg.hwnd, msg.message, msg.wparam, msg.lparam)
     }
 
-    /// Translate keyboard message.
-    /// Converts WmKeydown to WmChar if appropriate.
-    /// Handles extended keys, shift state, and special characters.
-    pub fn translate_message(msg: &Msg) -> Option<Msg> {
-        match msg.message {
-            0x0100 => {
-                // WmKeydown
-                let vk = msg.wparam as u32;
-                let _ = &vk;
-                let _ = &vk;
-                let lparam = msg.lparam;
-                let _ = &lparam;
-                let _ = &lparam;
-
-                // Check for extended key (bit 24)
-                let extended = (lparam & 0x01000000) != 0;
-                let _ = &extended;
-                let _ = &extended;
-
-                // Check for key repeat (bits 0-15 of lparam)
-                let repeat_count = (lparam & 0xFFFF) as u32;
-                let _ = &repeat_count;
-                let _ = &repeat_count;
-                if repeat_count > 1 {
-                    // Don't translate repeated keys to WmChar
-                    return None;
-                }
-
-                // Check shift state from lparam bits 16-23 (scan code or shift flags)
-                let shift_pressed = (lparam & 0xFF0000) != 0;
-                let _ = &shift_pressed;
-                let _ = &shift_pressed;
-
-                // Virtual key to character translation
-                let ch = match vk {
-                    // Numbers 0-9
-                    0x30..=0x39 if !shift_pressed => vk as u16,
-                    0x30..=0x39 if shift_pressed => match vk {
-                        0x30 => ')' as u16, // shift+0
-                        0x31 => '!' as u16,
-                        0x32 => '@' as u16,
-                        0x33 => '#' as u16,
-                        0x34 => '$' as u16,
-                        0x35 => '%' as u16,
-                        0x36 => '^' as u16,
-                        0x37 => '&' as u16,
-                        0x38 => '*' as u16,
-                        0x39 => '(' as u16,
-                        _ => 0,
-                    },
-
-                    // Letters A-Z (uppercase without shift, lowercase with shift)
-                    0x41..=0x5A if !shift_pressed => (vk + 0x20) as u16, // lowercase
-                    0x41..=0x5A if shift_pressed => vk as u16,           // uppercase
-
-                    // Space
-                    0x20 => 0x20,
-
-                    // punctuation and special characters
-                    0xBA => {
-                        if shift_pressed {
-                            ':' as u16
-                        } else {
-                            ';' as u16
-                        }
-                    } // ;:
-                    0xBB => {
-                        if shift_pressed {
-                            '+' as u16
-                        } else {
-                            '=' as u16
-                        }
-                    } // =+
-                    0xBC => {
-                        if shift_pressed {
-                            '<' as u16
-                        } else {
-                            ',' as u16
-                        }
-                    } // ,<
-                    0xBD => {
-                        if shift_pressed {
-                            '_' as u16
-                        } else {
-                            '-' as u16
-                        }
-                    } // -_
-                    0xBE => {
-                        if shift_pressed {
-                            '>' as u16
-                        } else {
-                            '.' as u16
-                        }
-                    } // .>
-                    0xBF => {
-                        if shift_pressed {
-                            '?' as u16
-                        } else {
-                            '/' as u16
-                        }
-                    } // /?
-                    0xC0 => {
-                        if shift_pressed {
-                            '~' as u16
-                        } else {
-                            '`' as u16
-                        }
-                    } // `~
-                    0xDB => {
-                        if shift_pressed {
-                            '{' as u16
-                        } else {
-                            '[' as u16
-                        }
-                    } // [{
-                    0xDC => {
-                        if shift_pressed {
-                            '|' as u16
-                        } else {
-                            '\\' as u16
-                        }
-                    } // \|
-                    0xDD => {
-                        if shift_pressed {
-                            '}' as u16
-                        } else {
-                            ']' as u16
-                        }
-                    } // ]}
-                    0xDE => {
-                        if shift_pressed {
-                            '"' as u16
-                        } else {
-                            '\'' as u16
-                        }
-                    } // '"
-
-                    // Extended keys - these typically don't translate to characters
-                    // but we log them for debugging
-                    _ if extended => {
-                        match vk {
-                            0x21..=0x29 => {
-                                // Page Up/Down, Home, End, Arrow keys
-                                // kprintln!("[msgq] translate: extended vk=0x{:02x}", vk);
-                                return None;
-                            }
-                            0x2D..=0x2F => {
-                                // Insert, Delete, Help
-                                // kprintln!("[msgq] translate: extended vk=0x{:02x}", vk);
-                                return None;
-                            }
-                            0x5B..=0x5C => {
-                                // Windows keys
-                                return None;
-                            }
-                            _ => return None,
-                        }
-                    }
-
-                    // Function keys don't translate
-                    0x70..=0x87 => return None, // F1-F24
-
-                    // Navigation and control keys don't translate
-                    0x01..=0x2F => return None, // Mouse, shift, ctrl, alt, etc.
-
-                    _ => {
-                        // kprintln!("[msgq] translate: unhandled vk=0x{:02x}", vk);
-                        return None;
-                    }
-                };
-
-                if ch != 0 {
-                    return Some(Msg {
-                        hwnd: msg.hwnd,
-                        message: 0x0102, // WmChar
-                        wparam: ch as u64,
-                        lparam: msg.lparam,
-                        time: msg.time,
-                        pt_x: msg.pt_x,
-                        pt_y: msg.pt_y,
-                    });
-                }
-            }
-            0x0101 => { // WmKeyup
-                 // WmChar is not generated on key up in Windows
-            }
-            0x0104 => {
-                // WmSyskeydown (Alt key combinations)
-                // handle system key combinations
-                let vk = msg.wparam as u32;
-                let _ = &vk;
-                let _ = &vk;
-                // For Alt+<key>, we might want to handle accelarators
-                // but for now, just pass through
-            }
-            _ => {}
+    /// Translate against this queue's synchronous state. The scan byte in
+    /// lParam describes the physical key; it is never a Shift-state bitfield.
+    pub fn translate_keyboard_message(&self, message: &Msg) -> Option<Msg> {
+        if !matches!(message.message, 0x100 | 0x104) {
+            return None;
         }
-        None // No translation
+        let value = if message.wparam as u32 == 0xe7 {
+            // KEYEVENTF_UNICODE delivers VK_PACKET with a UTF-16 scan unit.
+            (message.lparam as u64 >> 16) as u16
+        } else {
+            super::input_services::layout::character(message.wparam as u32, &self.keyboard.bytes())?
+        };
+        Some(Msg {
+            message: if message.message == 0x104 {
+                0x106
+            } else {
+                0x102
+            },
+            wparam: u64::from(value),
+            ..*message
+        })
+    }
+
+    /// Translate using the calling thread's state at its last removed message.
+    pub fn translate_message(message: &Msg) -> Option<Msg> {
+        with_current_queue(|queue| queue.translate_keyboard_message(message))
     }
 
     /// Dispatch a message to a window procedure.
@@ -452,6 +267,9 @@ impl MessageQueue {
         self.messages.clear();
         self.paint_rects.clear();
         self.current_msg = None;
+        self.quit_flag.store(false, Ordering::SeqCst);
+        self.exit_code.store(0, Ordering::SeqCst);
+        self.has_messages.store(false, Ordering::SeqCst);
     }
 }
 
@@ -471,10 +289,8 @@ struct ThreadQueueEntry {
     queue: MessageQueue,
 }
 
-/// Upper bound on tracked per-thread queues. When the table is full the
-/// oldest entry is evicted; messages for an evicted (exited) thread are
-/// discarded, which is acceptable because only the owning thread could
-/// have drained them anyway.
+/// Bound queues created by cross-thread posts. Existing live queues must
+/// never be evicted: only thread teardown discards their pending messages.
 const THREAD_QUEUE_MAX: usize = 64;
 
 /// Per-thread message queues, serialized by a spinlock. Every message-queue
@@ -503,9 +319,6 @@ pub fn with_current_queue<R>(f: impl FnOnce(&mut MessageQueue) -> R) -> R {
     let slot = match table.iter_mut().find(|e| e.thread_id == tid) {
         Some(entry) => entry,
         None => {
-            if table.len() >= THREAD_QUEUE_MAX {
-                table.remove(0);
-            }
             table.push(ThreadQueueEntry {
                 thread_id: tid,
                 queue: MessageQueue::new(),
@@ -516,19 +329,88 @@ pub fn with_current_queue<R>(f: impl FnOnce(&mut MessageQueue) -> R) -> R {
     f(&mut slot.queue)
 }
 
-/// Post a message to the current thread's queue.
-pub fn post_message(hwnd: u64, message: u32, wparam: u64, lparam: i64) -> bool {
-    let msg = Msg {
-        hwnd,
-        message,
-        wparam,
-        lparam,
-        time: 0, // Would get from system time
-        pt_x: 0,
-        pt_y: 0,
+/// Post directly to the window owner's queue. Callers holding WINDOW_MANAGER
+/// use this entry point with the captured TID, avoiding recursive USER locks.
+pub fn post_thread_message(
+    thread_id: u64,
+    hwnd: u64,
+    message: u32,
+    wparam: u64,
+    lparam: i64,
+) -> bool {
+    enqueue_thread_message(
+        thread_id,
+        Msg {
+            hwnd,
+            message,
+            wparam,
+            lparam,
+            time: crate::ke::time::get_tick_count(),
+            pt_x: 0,
+            pt_y: 0,
+        },
+        None,
+    )
+}
+
+/// Hardware transport only: callers capture the state at event generation,
+/// rather than sampling newer hardware state when a thread eventually wakes.
+pub(super) fn post_keyboard_input(thread_id: u64, message: Msg, state: KeyboardSnapshot) -> bool {
+    enqueue_thread_message(thread_id, message, Some(state))
+}
+
+fn enqueue_thread_message(
+    thread_id: u64,
+    message: Msg,
+    keyboard: Option<KeyboardSnapshot>,
+) -> bool {
+    let mut table = THREAD_QUEUES.lock();
+    let index = if let Some(index) = table.iter().position(|entry| entry.thread_id == thread_id) {
+        index
+    } else {
+        if table.len() >= THREAD_QUEUE_MAX || table.try_reserve(1).is_err() {
+            return false;
+        }
+        table.push(ThreadQueueEntry {
+            thread_id,
+            queue: MessageQueue::new(),
+        });
+        table.len() - 1
     };
-    let _ = &msg;
-    with_current_queue(|queue| queue.post_message(msg))
+    table[index].queue.enqueue(message, keyboard)
+}
+
+pub fn release_thread(thread_id: u64) {
+    THREAD_QUEUES
+        .lock()
+        .retain(|entry| entry.thread_id != thread_id);
+}
+
+pub fn remove_raw_input(thread_id: u64, handle: u64) {
+    if let Some(entry) = THREAD_QUEUES
+        .lock()
+        .iter_mut()
+        .find(|entry| entry.thread_id == thread_id)
+    {
+        entry
+            .queue
+            .messages
+            .retain(|entry| entry.message.message != 0xff || entry.message.lparam as u64 != handle);
+    }
+}
+
+/// Resolve HWND ownership before posting; HWND zero targets the calling thread.
+pub fn post_message(hwnd: u64, message: u32, wparam: u64, lparam: i64) -> bool {
+    let thread = if hwnd == 0 {
+        current_thread_id()
+    } else {
+        let manager = super::window::WINDOW_MANAGER.lock();
+        let Some(window) = manager.get_window(hwnd) else {
+            return false;
+        };
+        window.thread_id
+    };
+    post_thread_message(thread, hwnd, message, wparam, lparam)
 }
 
 /// Post a quit message.
@@ -556,6 +438,10 @@ pub fn default_wndproc(hwnd: u64, msg: u32, wparam: u64, lparam: i64) -> i64 {
     let _ = (hwnd, wparam, lparam);
 
     match msg {
+        0x00ff => {
+            super::raw_input::release(lparam as u64);
+            0
+        }
         0x0001 => {
             // WmCreate
             // kprintln!("[wndproc] WmCreate hwnd={:#x}", hwnd);
