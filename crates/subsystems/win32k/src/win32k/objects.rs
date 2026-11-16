@@ -360,6 +360,15 @@ pub struct GdiPen {
     pub style: u32,
     pub width: i32,
     pub brush_lined: u64,
+    /// Original brush description, distinct from any realized brush handle.
+    pub brush_style: u32,
+    pub client_hatch: u64,
+    pub hatch: u64,
+    pub legacy: bool,
+    pub user_style_count: u8,
+    pub realized_style_count: u8,
+    pub user_styles: [u32; 16],
+    pub realized_styles: [f32; 16],
 }
 
 impl GdiPen {
@@ -373,6 +382,14 @@ impl GdiPen {
             style: style as u32,
             width,
             brush_lined: 0,
+            brush_style: 0,
+            client_hatch: 0,
+            hatch: 0,
+            legacy: true,
+            user_style_count: 0,
+            realized_style_count: 0,
+            user_styles: [0; 16],
+            realized_styles: [0.0; 16],
         }
     }
 }
@@ -481,6 +498,9 @@ pub struct GdiFont {
     pub quality: u8,
     pub pitch_and_family: u8,
     pub face_name: [u16; 32],
+    /// Captured ENUMLOGFONTEXW + zero-axis DESIGNVECTOR header. Keep all
+    /// names/style/script/reserved bytes; LOGFONT alone cannot answer GetObject.
+    pub(super) captured_description: Option<[u8; 356]>,
 }
 
 impl GdiFont {
@@ -504,7 +524,25 @@ impl GdiFont {
             quality: FontQuality::Default as u8,
             pitch_and_family: 0,
             face_name: [0; 32],
+            captured_description: None,
         }
+    }
+
+    /// Preserve the native logical description independently of font realization.
+    pub(super) fn logical_description(&self) -> [u8; 356] {
+        if let Some(bytes) = self.captured_description { return bytes; }
+        let mut bytes = [0; 356];
+        for (slot, value) in bytes[..20].chunks_exact_mut(4).zip([
+            self.height, self.width, self.escapement, self.orientation, self.weight,
+        ]) { slot.copy_from_slice(&value.to_le_bytes()); }
+        bytes[20..28].copy_from_slice(&[
+            self.italic, self.underline, self.strike_out, self.charset,
+            self.out_precision, self.clip_precision, self.quality, self.pitch_and_family,
+        ]);
+        for (slot, unit) in bytes[28..92].chunks_exact_mut(2).zip(self.face_name) {
+            slot.copy_from_slice(&unit.to_le_bytes());
+        }
+        bytes
     }
 
     pub fn set_face_name(&mut self, name: &[u16]) {
@@ -788,41 +826,53 @@ impl GdiRegion {
 
 /// create a pen
 pub fn gdi_create_pen(style: PenStyle, width: i32, color: u32) -> u64 {
-    let pen = crate::mm::pool::allocate(
+    let input = super::pen_services::PenParameters {
+        style: style as u32, width: width as u32, brush_style: 0, color,
+        client_hatch: 0, hatch: 0, style_count: 0, old_style: true,
+    };
+    match super::pen_services::validate_pen(input, None) {
+        Ok(Some(pen)) => gdi_publish_pen(pen),
+        // Stock initialization calls this constructor for NULL_PEN itself;
+        // requesting the stock handle here would recurse through its lock.
+        Ok(None) => gdi_publish_pen(GdiPen::new(PenStyle::Null, 0, 0)),
+        Err(_) => 0,
+    }
+}
+
+/// Publish a fully captured pen. All subordinate state is embedded, so failed
+/// publication and deletion require a single pool release.
+pub(super) fn gdi_publish_pen(pen: GdiPen) -> u64 {
+    let memory = crate::mm::pool::allocate(
         crate::mm::pool::PoolType::NonPaged,
         core::mem::size_of::<GdiPen>(),
     );
-
-    if pen.is_null() {
-        // kprintln!("[win32k] gdi_create_pen: failed to allocate memory");
-        return 0;
-    }
-
-    unsafe {
-        let p = &mut *(pen as *mut GdiPen);
-        let _ = &p;
-        *p = GdiPen::new(style, width, color);
-    }
-
-    let mut handle_table = get_handle_table();
-    let _ = &handle_table;
-    let handle = handle_table.allocate(
-        GdiObjectType::Pen,
-        pen as u64,
+    if memory.is_null() { return 0; }
+    let kind = if pen.legacy { GdiObjectType::Pen } else { GdiObjectType::ExtPen };
+    // SAFETY: fresh aligned pool allocation, not yet exposed through a handle.
+    unsafe { memory.cast::<GdiPen>().write(pen); }
+    let handle = get_handle_table().allocate(
+        kind, memory as u64,
         super::window::input_context::caller_identity().0 as u32,
     );
     if handle == 0 {
-        // SAFETY: the fresh allocation was never published as a GDI object.
-        unsafe {
-            let _ = crate::mm::pool::free(pen);
-        }
+        // SAFETY: no handle was published; GdiPen owns only embedded values.
+        unsafe { let _ = crate::mm::pool::free(memory); }
     }
-    let _ = &handle;
-
-    // kprintln!("[win32k] gdi_create_pen: style=0x{:x}, width={}, color=0x{:08x} -> handle=0x{:016x}",
-    //               style as u32, width, color, handle);
-
     handle
+}
+
+/// Copy pen state while its handle is locked, avoiding a pointer surviving
+/// concurrent deletion or handle reuse.
+pub fn gdi_get_pen(handle: u64) -> Option<GdiPen> {
+    let table = get_handle_table();
+    let entry = table.get(handle)?;
+    if !matches!(entry.get_type(), Some(GdiObjectType::Pen | GdiObjectType::ExtPen))
+        || entry.obj_ptr == 0
+        || entry.process_id != 0
+            && entry.process_id != super::window::input_context::caller_identity().0 as u32
+    { return None; }
+    // SAFETY: the validated pen-family entry remains protected by table guard.
+    Some(unsafe { *(entry.obj_ptr as *const GdiPen) })
 }
 
 /// create a solid brush
@@ -923,6 +973,17 @@ pub fn gdi_create_font(
     italic: bool,
     face_name: &[u16],
 ) -> u64 {
+    let mut description = GdiFont::new();
+    description.height = height;
+    description.width = width;
+    description.weight = weight;
+    description.italic = u8::from(italic);
+    description.set_face_name(face_name);
+    gdi_create_logical_font(description)
+}
+
+/// Publish a captured logical font with the caller's process ownership.
+pub(super) fn gdi_create_logical_font(description: GdiFont) -> u64 {
     let font = crate::mm::pool::allocate(
         crate::mm::pool::PoolType::NonPaged,
         core::mem::size_of::<GdiFont>(),
@@ -933,16 +994,9 @@ pub fn gdi_create_font(
         return 0;
     }
 
-    unsafe {
-        let f = &mut *(font as *mut GdiFont);
-        let _ = &f;
-        *f = GdiFont::new();
-        f.height = height;
-        f.width = width;
-        f.weight = weight;
-        f.italic = if italic { 1 } else { 0 };
-        f.set_face_name(face_name);
-    }
+    // SAFETY: this fresh pool allocation has space and alignment for GdiFont;
+    // no handle can observe it until the initialized object is published.
+    unsafe { (font as *mut GdiFont).write(description); }
 
     let mut handle_table = get_handle_table();
     let _ = &handle_table;
@@ -1096,6 +1150,12 @@ pub fn gdi_create_palette() -> u64 {
 
 /// Delete a GDI object
 pub fn gdi_delete_object(handle: u64) -> bool {
+    // Win7 NtGdiDeleteObjectApp dispatches DCs to bDeleteDCInternal as
+    // well as deleting brush/pen/font objects. Our DC table currently has
+    // its own monotonically allocated 32-bit handle namespace.
+    if (0x8000_0000..=u32::MAX as u64).contains(&handle) {
+        return super::dc::gre_delete_dc(handle);
+    }
     delete_object_checked(handle, None)
 }
 
@@ -1137,13 +1197,14 @@ pub(super) fn delete_object_checked(handle: u64, expected: Option<GdiObjectType>
         // Free the object memory
         if obj_ptr != 0 {
             match obj_type {
-                Some(GdiObjectType::ColorSpace) | Some(GdiObjectType::Pen) => {
+                Some(GdiObjectType::ColorSpace | GdiObjectType::Pen | GdiObjectType::ExtPen) => {
                     let _ = crate::mm::pool::free(obj_ptr as *mut u8);
                 }
                 Some(GdiObjectType::Brush) => {
                     let _ = crate::mm::pool::free(obj_ptr as *mut u8);
                 }
                 Some(GdiObjectType::Font) => {
+                    super::font_services::resources::forget_font(handle);
                     let _ = crate::mm::pool::free(obj_ptr as *mut u8);
                 }
                 Some(GdiObjectType::Bitmap) => {
@@ -1252,30 +1313,12 @@ pub fn gdi_get_handle_entry(handle: u64) -> Option<GdiHandleEntry> {
 
 /// Get pen color
 pub fn gdi_get_pen_color(handle: u64) -> u32 {
-    let handle_table = get_handle_table();
-    let _ = &handle_table;
-    if let Some(entry) = handle_table.get(handle) {
-        if let Some(GdiObjectType::Pen) = entry.get_type() {
-            let pen = unsafe { &*(entry.obj_ptr as *const GdiPen) };
-            let _ = &pen;
-            return pen.color;
-        }
-    }
-    0
+    gdi_get_pen(handle).map_or(0, |pen| pen.color)
 }
 
-/// Get pen width
+/// Get normalized pen width for either native pen family.
 pub fn gdi_get_pen_width(handle: u64) -> i32 {
-    let handle_table = get_handle_table();
-    let _ = &handle_table;
-    if let Some(entry) = handle_table.get(handle) {
-        if let Some(GdiObjectType::Pen) = entry.get_type() {
-            let pen = unsafe { &*(entry.obj_ptr as *const GdiPen) };
-            let _ = &pen;
-            return pen.width;
-        }
-    }
-    1 // Default pen width
+    gdi_get_pen(handle).map_or(1, |pen| pen.width)
 }
 
 /// Get brush color

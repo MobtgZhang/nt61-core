@@ -9,6 +9,9 @@ use crate::{arch::common::syscall_frame::SyscallFrame, mm::user_copy};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+#[path = "palette/halftone.rs"]
+pub mod halftone;
+
 // The palette policy is device-wide, rather than a saved DC attribute.
 static SYSTEM_PALETTE_USE: AtomicU32 = AtomicU32::new(1); // SYSPAL_STATIC
 

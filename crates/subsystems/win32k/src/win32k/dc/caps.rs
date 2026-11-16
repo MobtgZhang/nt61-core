@@ -29,6 +29,11 @@ fn snapshot() -> [u32; 36] {
     // No palette, printer geometry, refresh/EDID, ICM or alpha acceleration.
     caps
 }
+
+/// NUMCOLORS of the current real display backend, also used by EnumObjects.
+pub(crate) fn device_color_count() -> u32 {
+    snapshot()[12]
+}
 pub extern "C" fn nt_gdi_get_device_caps(frame: &SyscallFrame) -> u64 {
     let Some(_dc) = get_dc(frame.args[0]) else {
         return 0;
