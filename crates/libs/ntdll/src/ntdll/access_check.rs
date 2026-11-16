@@ -1,7 +1,7 @@
 //! Captured NtAccessCheck buffers and ordered discretionary access evaluation.
 //!
-//! Object/callback ACE evaluation, restricted tokens and auditing still require
-//! additional kernel models. Such requests must not silently grant access.
+//! Captures basic/object ACEs and object type trees. Callback/conditional ACEs
+//! and auditing still require additional kernel models.
 
 use super::file::{with_sync_access, HandleKind};
 use super::status::*;
@@ -16,6 +16,15 @@ use crate::se::token::{luid, ImpersonationLevel, Token, TokenTypeEnum};
 mod capture;
 #[path = "access_check/evaluate.rs"]
 mod evaluate;
+#[path = "access_check/object_types.rs"]
+mod object_types;
+pub use object_types::ObjectTypeList;
+#[path = "access_check/by_type.rs"]
+mod by_type;
+pub use by_type::{nt_access_check_by_type, nt_access_check_by_type_result_list};
+#[cfg(test)]
+#[path = "access_check/object_tests.rs"]
+mod object_tests;
 
 const STATUS_INVALID_SECURITY_DESCR: NTSTATUS = 0xc000_0079u32 as i32;
 const STATUS_INVALID_ACL: NTSTATUS = 0xc000_0077u32 as i32;
@@ -65,6 +74,7 @@ impl GenericMapping {
 }
 
 /// Access denial is a successfully executed check with a failing access status.
+#[derive(Clone, Copy)]
 pub struct AccessDecision {
     pub granted: u32,
     pub status: NTSTATUS,
@@ -97,6 +107,15 @@ fn check(
     if desired & 0xf000_0000 != 0 {
         return Err(STATUS_GENERIC_NOT_MAPPED);
     }
+    with_token(handle, |token| {
+        evaluate::evaluate(descriptor, token, desired, mapping)
+    })
+}
+
+fn with_token<R>(
+    handle: HANDLE,
+    operation: impl FnOnce(&Token) -> Result<R, NTSTATUS>,
+) -> Result<R, NTSTATUS> {
     with_sync_access(handle, 8, |entries| {
         if entries[0].kind != HandleKind::Token {
             return Err(STATUS_OBJECT_TYPE_MISMATCH);
@@ -113,7 +132,7 @@ fn check(
         if token.flags & crate::se::token::TOKEN_WRITE_RESTRICTED != 0 {
             return Err(STATUS_NOT_SUPPORTED);
         }
-        evaluate::evaluate(descriptor, token, desired, mapping)
+        operation(token)
     })
 }
 
@@ -139,6 +158,16 @@ pub fn check_access_for_caller(
     let result = check(&descriptor, token, desired, &mapping)?;
     // NT requires at least sizeof(PRIVILEGE_SET), including its first entry,
     // even when PrivilegeCount is zero. On success its input length is retained.
+    write_privileges(&result, privileges, privilege_length, available)?;
+    Ok(result)
+}
+
+fn write_privileges(
+    result: &AccessDecision,
+    privileges: *mut PrivilegeSet,
+    privilege_length: *mut u32,
+    available: u32,
+) -> Result<(), NTSTATUS> {
     let required = 8 + result.privilege_count.max(1) * 12;
     if (available as usize) < required {
         write_user_object(privilege_length as u64, &(required as u32))?;
@@ -158,7 +187,7 @@ pub fn check_access_for_caller(
         privileges as u64,
         &output[..8 + result.privilege_count * 12],
     )?;
-    Ok(result)
+    Ok(())
 }
 
 /// # Safety

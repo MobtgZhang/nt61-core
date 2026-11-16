@@ -210,6 +210,77 @@ fn owners_get_read_control_and_write_dac_without_acl_grants() {
 }
 
 #[test]
+fn restricted_access_requires_both_sid_sets_and_intersects_maximum_access() {
+    let _guard = state_guard();
+    let mut token = token();
+    let user = token.user;
+    let restricted = sid::well_known(WellKnownSid::Users);
+    token.filter(0, &[], &[], &[TokenGroup::new(restricted, 0)]).unwrap();
+    let handle = handle(&mut token, 8);
+    let other = sid::well_known(WellKnownSid::World);
+    for entries in [vec![(0, 0, 7, user)], vec![(0, 0, 7, restricted)]] {
+        let entries = acl(&entries);
+        let sd = descriptor(&other, Some(&entries), true);
+        assert_eq!((call(&sd, handle, 1).1, call(&sd, handle, 1).2), (0, STATUS_ACCESS_DENIED));
+    }
+    let entries = acl(&[(0, 0, 3, user), (0, 0, 6, restricted)]);
+    let sd = descriptor(&other, Some(&entries), true);
+    let (_, granted, status, _) = call(&sd, handle, MAXIMUM);
+    assert_eq!((granted, status), (2, STATUS_SUCCESS));
+    let (_, granted, status, _) = call(&sd, handle, MAXIMUM | 1);
+    assert_eq!((granted, status), (0, STATUS_ACCESS_DENIED));
+    assert!(free_handle(handle));
+}
+
+#[test]
+fn restricting_deny_aces_and_disabled_user_cannot_be_bypassed_by_ordinary_grants() {
+    let _guard = state_guard();
+    let other = sid::well_known(WellKnownSid::World);
+    let restricted = sid::well_known(WellKnownSid::Users);
+    let mut token = token();
+    let user = token.user;
+    token.filter(0, &[], &[], &[TokenGroup::new(restricted, 0)]).unwrap();
+    let handle = handle(&mut token, 8);
+    let entries = acl(&[(1, 0, 1, restricted), (0, 0, 7, user), (0, 0, 7, restricted)]);
+    let sd = descriptor(&other, Some(&entries), true);
+    let (_, granted, status, _) = call(&sd, handle, 1);
+    assert_eq!((granted, status), (0, STATUS_ACCESS_DENIED));
+    let (_, granted, status, _) = call(&sd, handle, MAXIMUM);
+    assert_eq!((granted, status), (6, STATUS_SUCCESS));
+    assert!(free_handle(handle));
+    token.filter(0, &[TokenGroup::new(user, 0)], &[], &[]).unwrap();
+    let handle = self::handle(&mut token, 8);
+    let entries = acl(&[(0, 0, 7, user), (0, 0, 7, restricted)]);
+    let sd = descriptor(&user, Some(&entries), true);
+    let (_, granted, status, _) = call(&sd, handle, READ_CONTROL | WRITE_DAC);
+    assert_eq!((granted, status), (0, STATUS_ACCESS_DENIED));
+    let (_, granted, status, _) = call(&sd, handle, 1);
+    assert_eq!((granted, status), (0, STATUS_ACCESS_DENIED));
+    assert!(free_handle(handle));
+}
+
+#[test]
+fn empty_restricting_intersection_stays_restricted_through_duplicate_and_query() {
+    let _guard = state_guard();
+    let mut token = token();
+    let user = token.user;
+    token.filter(0, &[], &[], &[TokenGroup::new(user, 0)]).unwrap();
+    token.filter(0, &[], &[], &[TokenGroup::new(sid::well_known(WellKnownSid::World), 0)]).unwrap();
+    assert_eq!(token.restricted_count, 0);
+    let handle = handle(&mut token, 0xa);
+    let mut copy = ptr::null_mut();
+    assert_eq!(crate::ntdll::token_duplicate::nt_duplicate_token_kernel(
+        handle, 8, 0, 2, &mut copy), STATUS_SUCCESS);
+    let entries = acl(&[(0, 0, 7, user)]);
+    let sd = descriptor(&user, Some(&entries), true);
+    for value in [handle, copy] {
+        let (_, granted, status, _) = call(&sd, value, MAXIMUM);
+        assert_eq!((granted, status), (0, STATUS_ACCESS_DENIED));
+        assert!(free_handle(value));
+    }
+}
+
+#[test]
 fn security_and_take_ownership_privileges_are_reported_with_nt_layout() {
     let _guard = state_guard();
     let other = sid::well_known(WellKnownSid::World);

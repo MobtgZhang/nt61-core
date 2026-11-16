@@ -67,6 +67,7 @@ pub(super) struct Ace {
     pub flags: u8,
     pub mask: u32,
     pub sid: Vec<u8>,
+    pub object_type: Option<[u8; 16]>,
 }
 
 pub(super) struct Descriptor {
@@ -81,7 +82,7 @@ fn sid_length(bytes: &[u8]) -> Result<usize, NTSTATUS> {
     Ok(8 + bytes[1] as usize * 4)
 }
 
-fn sid(memory: Memory<'_>, offset: usize) -> Result<Vec<u8>, NTSTATUS> {
+pub(super) fn sid(memory: Memory<'_>, offset: usize) -> Result<Vec<u8>, NTSTATUS> {
     let header = memory.read(offset, 8)?;
     let length = sid_length(&header)?;
     let value = memory.read(offset, length)?;
@@ -119,12 +120,43 @@ fn acl(memory: Memory<'_>, offset: usize) -> Result<Vec<Ace>, NTSTATUS> {
         }
         let ace = bytes.get(offset..offset + size).ok_or(STATUS_INVALID_ACL)?;
         offset += size;
-        if !matches!(ace[0], 0 | 1) {
-            // Conditions, GUIDs and compound identities need their own models.
+        if !matches!(ace[0], 0 | 1 | 5 | 6) {
+            // Conditions and compound identities need their own models.
             // Never reinterpret these as an unconditional grant.
             return Err(STATUS_NOT_SUPPORTED);
         }
-        let sid_bytes = ace.get(8..).ok_or(STATUS_INVALID_ACL)?;
+        let (sid_offset, object_type) = if matches!(ace[0], 5 | 6) {
+            let flags = u32::from_le_bytes(
+                ace.get(8..12)
+                    .ok_or(STATUS_INVALID_ACL)?
+                    .try_into()
+                    .unwrap(),
+            );
+            if flags & !3 != 0 {
+                return Err(STATUS_INVALID_ACL);
+            }
+            let mut sid_offset = 12;
+            let object_type = if flags & 1 != 0 {
+                let guid = ace
+                    .get(sid_offset..sid_offset + 16)
+                    .ok_or(STATUS_INVALID_ACL)?;
+                sid_offset += 16;
+                Some(guid.try_into().unwrap())
+            } else {
+                None
+            };
+            // InheritedObjectType selects children when the ACL is inherited;
+            // it does not restrict access to the object carrying this ACL.
+            if flags & 2 != 0 {
+                ace.get(sid_offset..sid_offset + 16)
+                    .ok_or(STATUS_INVALID_ACL)?;
+                sid_offset += 16;
+            }
+            (sid_offset, object_type)
+        } else {
+            (8, None)
+        };
+        let sid_bytes = ace.get(sid_offset..).ok_or(STATUS_INVALID_ACL)?;
         let sid_size = sid_length(sid_bytes).map_err(|_| STATUS_INVALID_ACL)?;
         if sid_size != sid_bytes.len() {
             return Err(STATUS_INVALID_ACL);
@@ -139,6 +171,7 @@ fn acl(memory: Memory<'_>, offset: usize) -> Result<Vec<Ace>, NTSTATUS> {
             flags: ace[1],
             mask: u32::from_le_bytes(ace[4..8].try_into().unwrap()),
             sid: captured_sid,
+            object_type,
         });
     }
     // ACLs may reserve unused capacity after their last ACE.
