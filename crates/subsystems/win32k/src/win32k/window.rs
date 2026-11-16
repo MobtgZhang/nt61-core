@@ -30,6 +30,8 @@ pub mod class_services;
 
 #[path = "window/native_state.rs"]
 pub mod native_state;
+#[path = "window/text.rs"]
+pub mod text;
 
 /// Maximum number of windows in the system.
 pub const MAX_WINDOWS: usize = 4096;
@@ -286,7 +288,7 @@ pub struct WindowObject {
     pub input_context: u64,
     pub ime_level: u32,
     pub class_name: [u16; 64],
-    pub title: [u16; 256],
+    pub title: Vec<u16>,
     pub style: u32,
     pub ex_style: u32,
     pub rect: Rect,
@@ -324,7 +326,7 @@ impl WindowObject {
             input_context: 0,
             ime_level: 0,
             class_name: [0; 64],
-            title: [0; 256],
+            title: Vec::new(),
             style: 0,
             ex_style: 0,
             rect: Rect {
@@ -544,10 +546,8 @@ impl WindowManager {
             window.class_name[i] = c;
         }
 
-        // Copy title
-        for (i, &c) in title.iter().take(255).enumerate() {
-            window.title[i] = c;
-        }
+        window.title.try_reserve_exact(title.len()).ok()?;
+        window.title.extend_from_slice(title);
 
         window.style = style;
         window.ex_style = ex_style;

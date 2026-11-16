@@ -517,3 +517,338 @@ mod keyboard_state_cases;
 
 #[path = "keyboard_layout_cases.rs"]
 mod keyboard_layout_cases;
+
+#[repr(C)]
+struct ObjectAttributes64 {
+    length: u32,
+    padding: u32,
+    root: u64,
+    name: u64,
+    flags: u32,
+    padding2: u32,
+    security: u64,
+    qos: u64,
+}
+#[repr(C)]
+struct ObjectName64 {
+    length: u16,
+    maximum: u16,
+    padding: u32,
+    buffer: u64,
+}
+fn open_user_object(text: &str, root: u64, desktop: bool) -> u64 {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    mm::user_copy::allow(units.as_ptr() as u64, units.len() * 2, false);
+    let name = ObjectName64 {
+        length: (units.len() * 2) as u16,
+        maximum: (units.len() * 2) as u16,
+        padding: 0,
+        buffer: units.as_ptr() as u64,
+    };
+    let attributes = ObjectAttributes64 {
+        length: 48,
+        padding: 0,
+        root,
+        name: user_pointer(&name, false),
+        flags: 0x40,
+        padding2: 0,
+        security: 0,
+        qos: 0,
+    };
+    if desktop {
+        call(
+            nt_user_open_desktop,
+            &[user_pointer(&attributes, false), 0, 0x10000000],
+        )
+    } else {
+        call(
+            nt_user_open_window_station,
+            &[user_pointer(&attributes, false), 0x10000000],
+        )
+    }
+}
+
+#[test]
+fn window_station_handles_have_process_ownership_assignment_and_teardown() {
+    let _serial = SERVICES.lock().unwrap();
+    let _identity = Identity::enter(930, 930);
+    assert_eq!(
+        call(nt_user_get_process_window_station, &[]),
+        DEFAULT_WINDOW_STATION
+    );
+    assert_eq!(call(nt_user_open_window_station, &[1, 0]), 0);
+    assert_eq!(open_user_object("Missing", 0, false), 0);
+    let first = open_user_object("winsta0", 0, false);
+    let second = open_user_object("WinSta0", 0, false);
+    assert_ne!(first, 0);
+    assert_ne!(first, second);
+    assert_eq!(call(nt_user_set_process_window_station, &[first]), 1);
+    assert_eq!(call(nt_user_get_process_window_station, &[]), first);
+    assert_eq!(call(nt_user_close_window_station, &[first]), 0);
+    {
+        let _other = Identity::enter(931, 931);
+        assert_eq!(call(nt_user_set_process_window_station, &[first]), 0);
+        assert_eq!(call(nt_user_close_window_station, &[second]), 0);
+        assert_eq!(open_user_object("Default", first, true), 0);
+    }
+    assert_eq!(
+        call(
+            nt_user_set_process_window_station,
+            &[DEFAULT_WINDOW_STATION]
+        ),
+        1
+    );
+    assert_eq!(call(nt_user_close_window_station, &[first]), 1);
+    assert_eq!(call(nt_user_close_window_station, &[first]), 0);
+    window::session_services::release_process(930);
+    assert_eq!(call(nt_user_close_window_station, &[second]), 0);
+    assert_eq!(
+        call(nt_user_get_process_window_station, &[]),
+        DEFAULT_WINDOW_STATION
+    );
+}
+
+#[test]
+fn object_queries_report_utf16_sizes_probe_buffers_and_reject_foreign_handles() {
+    let _serial = SERVICES.lock().unwrap();
+    let _identity = Identity::enter(932, 932);
+    let station = open_user_object("WinSta0", 0, false);
+    let desktop = open_user_object("default", station, true);
+    assert_ne!(desktop, 0);
+    let mut length = 0u32;
+    let length_pointer = user_pointer(&mut length, true);
+    let mut output = [0xccccu16; 32];
+    let output_pointer = user_pointer(&mut output, true);
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[desktop, 2, output_pointer, 2, length_pointer]
+        ),
+        0
+    );
+    assert_eq!(length, 16);
+    assert_eq!(output, [0xcccc; 32]);
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[desktop, 2, output_pointer, 16, length_pointer]
+        ),
+        1
+    );
+    assert_eq!(&output[..8], "Default\0".encode_utf16().collect::<Vec<_>>());
+    assert_eq!(output[8], 0xcccc);
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[station, 3, output_pointer, 64, length_pointer]
+        ),
+        1
+    );
+    assert_eq!(length, 28);
+    assert_eq!(
+        &output[..14],
+        "WindowStation\0".encode_utf16().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[station, 1, output_pointer, 12, length_pointer]
+        ),
+        1
+    );
+    assert_eq!(&output[..6], &[0, 0, 0, 0, 1, 0]);
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[desktop, 6, output_pointer, 4, length_pointer]
+        ),
+        1
+    );
+    assert_eq!(&output[..2], &[1, 0]);
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[desktop, 2, 1, 16, length_pointer]
+        ),
+        0
+    );
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[desktop, 2, output_pointer, 16, 1]
+        ),
+        0
+    );
+    {
+        let _other = Identity::enter(933, 933);
+        assert_eq!(
+            call(
+                nt_user_get_object_information,
+                &[desktop, 2, output_pointer, 64, length_pointer]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                nt_user_get_object_information,
+                &[station, 2, output_pointer, 64, length_pointer]
+            ),
+            0
+        );
+    }
+    window::session_services::release_process(932);
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[desktop, 2, output_pointer, 64, length_pointer]
+        ),
+        0
+    );
+}
+
+#[test]
+fn user_object_query_errors_are_published_in_the_callers_teb() {
+    let _serial = SERVICES.lock().unwrap();
+    let _identity = Identity::enter(934, 934);
+    let teb = mouse_history_cases::CallerTeb::new();
+    let station = open_user_object("WinSta0", 0, false);
+    let mut output = [0u16; 32];
+    let pointer = user_pointer(&mut output, true);
+    let mut length = 0u32;
+    let result = user_pointer(&mut length, true);
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[station, 2, pointer, 1, result]
+        ),
+        0
+    );
+    assert_eq!(teb.error(), 122);
+    assert_eq!(length, 16);
+    assert_eq!(output, [0; 32]);
+    assert_eq!(
+        call(nt_user_get_object_information, &[station, 2, 1, 16, result]),
+        0
+    );
+    assert_eq!(teb.error(), 998);
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[station, 99, pointer, 64, result]
+        ),
+        0
+    );
+    assert_eq!(teb.error(), 87);
+    assert_eq!(call(nt_user_close_window_station, &[station]), 1);
+    assert_eq!(
+        call(
+            nt_user_get_object_information,
+            &[station, 2, pointer, 64, result]
+        ),
+        0
+    );
+    assert_eq!(teb.error(), 6);
+}
+
+#[test]
+fn native_window_text_captures_counted_unicode_and_bounds_terminated_reads() {
+    use window::text::*;
+    let _serial = SERVICES.lock().unwrap();
+    let _identity = Identity::enter(971, 971);
+    let hwnd = create_window(None, WindowStyle::VISIBLE, 0);
+    #[repr(C)]
+    struct LargeString {
+        length: u32,
+        maximum: u32,
+        buffer: u64,
+    }
+    let title: Vec<u16> = (0..600).map(|i| 0x4e00 + i).collect();
+    mm::user_copy::allow(title.as_ptr() as u64, title.len() * 2, false);
+    let mut descriptor = LargeString {
+        length: 1200,
+        maximum: 1200,
+        buffer: title.as_ptr() as u64,
+    };
+    let desc = user_pointer(&descriptor, false);
+    assert_eq!(call(nt_user_def_set_text, &[hwnd, desc]), 1);
+    assert_eq!(WINDOW_MANAGER.lock().get_window(hwnd).unwrap().title, title);
+    let mut output = [0xccccu16; 605];
+    let address = user_pointer(&mut output, true) + 2;
+    assert_eq!(
+        call(nt_user_internal_get_window_text, &[hwnd, address, 601]),
+        600
+    );
+    assert_eq!(&output[1..601], title.as_slice());
+    assert_eq!(output[601], 0);
+    assert_eq!(output[0], 0xcccc);
+    assert_eq!(output[602], 0xcccc);
+    output.fill(0xcccc);
+    assert_eq!(
+        call(nt_user_internal_get_window_text, &[hwnd, address, 4]),
+        3
+    );
+    assert_eq!(&output[1..5], &[title[0], title[1], title[2], 0]);
+    assert_eq!(output[5], 0xcccc);
+    output.fill(0xcccc);
+    for capacity in [0, u32::MAX as u64] {
+        assert_eq!(
+            call(nt_user_internal_get_window_text, &[hwnd, address, capacity]),
+            0
+        );
+        assert!(output.iter().all(|unit| *unit == 0xcccc));
+    }
+    assert_eq!(
+        call(nt_user_internal_get_window_text, &[hwnd, address, 1]),
+        0
+    );
+    assert_eq!(output[1], 0);
+    assert_eq!(output[2], 0xcccc);
+    descriptor.buffer = 1;
+    let invalid = user_pointer(&descriptor, false);
+    assert_eq!(call(nt_user_def_set_text, &[hwnd, invalid]), 0);
+    assert_eq!(WINDOW_MANAGER.lock().get_window(hwnd).unwrap().title, title);
+    descriptor.buffer = title.as_ptr() as u64;
+    descriptor.length = 1199;
+    let invalid = user_pointer(&descriptor, false);
+    assert_eq!(call(nt_user_def_set_text, &[hwnd, invalid]), 0);
+    assert_eq!(call(nt_user_internal_get_window_text, &[hwnd, 1, 8]), 0);
+    assert_eq!(call(nt_user_def_set_text, &[hwnd, 0]), 1);
+    assert!(WINDOW_MANAGER
+        .lock()
+        .get_window(hwnd)
+        .unwrap()
+        .title
+        .is_empty());
+    assert_eq!(
+        call(nt_user_internal_get_window_text, &[hwnd, address, 10]),
+        0
+    );
+    assert_eq!(output[1], 0);
+    assert!(window::destroy_window_internal(hwnd));
+    assert_eq!(
+        call(nt_user_internal_get_window_text, &[hwnd, address, 10]),
+        0
+    );
+}
+
+#[test]
+fn window_creation_retains_long_titles_and_text_reads_stop_at_embedded_nul() {
+    use window::text::*;
+    let _serial = SERVICES.lock().unwrap();
+    let _identity = Identity::enter(972, 972);
+    let mut title = vec![0x4e00u16; 400];
+    title[3] = 0;
+    let hwnd = WINDOW_MANAGER
+        .lock()
+        .create_window(&[], &title, 0, 0, 0, 0, 10, 10, None, 0, 0)
+        .unwrap();
+    assert_eq!(WINDOW_MANAGER.lock().get_window(hwnd).unwrap().title, title);
+    let mut output = [0xccccu16; 10];
+    let address = user_pointer(&mut output, true);
+    assert_eq!(
+        call(nt_user_internal_get_window_text, &[hwnd, address, 10]),
+        3
+    );
+    assert_eq!(&output[..5], &[0x4e00, 0x4e00, 0x4e00, 0, 0xcccc]);
+    assert!(window::destroy_window_internal(hwnd));
+}

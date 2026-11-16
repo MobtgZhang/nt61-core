@@ -78,6 +78,7 @@ pub fn release_thread(thread: u64) {
         .retain(|entry| entry.0 != thread);
 }
 pub fn release_process(process: u64) {
+    object_services::release_process(process);
     let mut state = DESKTOPS.lock();
     // Remove assignments before their process-owned handles disappear.
     let DesktopState {
@@ -318,3 +319,7 @@ pub extern "C" fn nt_user_calculate_popup_window_position(frame: &SyscallFrame) 
     let rect = super::super::objects::Rect::new(x as i32, y as i32, right, bottom);
     u64::from(write_user_object(frame.args[4], &rect).is_ok())
 }
+
+#[path = "object_services.rs"]
+mod object_services;
+pub use object_services::*;

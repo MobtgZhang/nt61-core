@@ -7,13 +7,13 @@ use crate::{call, ke, mm, ps, user_pointer};
 
 const FAILURE: u64 = u32::MAX as u64;
 
-struct CallerTeb {
+pub(super) struct CallerTeb {
     words: Box<[u32; 28]>,
     previous: *mut u8,
 }
 
 impl CallerTeb {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let mut words = Box::new([0u32; 28]);
         words[26] = 0xdeadbeef;
         let pointer = user_pointer(&mut *words, true);
@@ -23,7 +23,7 @@ impl CallerTeb {
         Self { words, previous }
     }
 
-    fn error(&self) -> u32 {
+    pub(super) fn error(&self) -> u32 {
         self.words[26]
     }
 }

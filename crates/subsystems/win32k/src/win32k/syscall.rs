@@ -15,34 +15,32 @@
 extern crate alloc;
 
 pub use super::bitmap::*;
-pub use super::window::native_state::*;
-pub use super::window::coordinates::*;
-pub use super::user_state::menu_services::*;
-pub use super::window::class_services::*;
-pub use super::window::attributes::*;
-pub use super::window::placement::*;
-pub use super::window::attributes::nt_user_window_from_physical_point as nt_user_window_from_point;
 pub use super::clipboard::services::*;
-pub use super::window::input_context::*;
 pub use super::font_services::{
-    nt_gdi_get_glyph_outline,
-    nt_gdi_get_realization_info, nt_gdi_get_font_file_data, nt_gdi_get_font_file_info,
-    nt_gdi_get_font_data, nt_gdi_get_font_unicode_ranges,
-    nt_gdi_get_glyph_indices_w, nt_gdi_get_glyph_indices_w_internal,
-    nt_gdi_get_char_width_w, nt_gdi_get_char_abc_widths_w,
-    nt_gdi_get_text_extent_ex_w, nt_gdi_get_char_width_info, nt_gdi_get_kerning_pairs,
-    nt_gdi_get_rasterizer_caps,
+    nt_gdi_get_char_abc_widths_w, nt_gdi_get_char_width_info, nt_gdi_get_char_width_w,
+    nt_gdi_get_font_data, nt_gdi_get_font_file_data, nt_gdi_get_font_file_info,
+    nt_gdi_get_font_unicode_ranges, nt_gdi_get_glyph_indices_w,
+    nt_gdi_get_glyph_indices_w_internal, nt_gdi_get_glyph_outline, nt_gdi_get_kerning_pairs,
+    nt_gdi_get_rasterizer_caps, nt_gdi_get_realization_info, nt_gdi_get_text_extent_ex_w,
 };
+pub use super::user_state::menu_services::*;
+pub use super::window::attributes::nt_user_window_from_physical_point as nt_user_window_from_point;
+pub use super::window::attributes::*;
+pub use super::window::class_services::*;
+pub use super::window::coordinates::*;
+pub use super::window::input_context::*;
+pub use super::window::native_state::*;
+pub use super::window::placement::*;
 
 pub use super::clipping::*;
+pub use super::dc::bounds::*;
 pub use super::dc::caps::*;
 pub use super::dc::services::*;
-pub use super::objects::nt_gdi_get_stock_object;
 pub use super::objects::nt_gdi_create_hatch_brush_internal;
+pub use super::objects::nt_gdi_get_stock_object;
 pub use super::palette::*;
 pub use super::path::services::*;
 pub use super::path::shapes::*;
-pub use super::dc::bounds::*;
 pub use super::polygon::services::*;
 pub use super::region::services::*;
 pub use super::selection::*;
@@ -315,7 +313,9 @@ pub extern "C" fn nt_gdi_stretch_blt(frame: &SyscallFrame) -> u64 {
     super::raster::stretch::nt_gdi_stretch_blt(frame)
 }
 
-pub use super::font_services::{nt_gdi_ext_text_out, nt_gdi_poly_text_out, nt_gdi_set_text_justification};
+pub use super::font_services::{
+    nt_gdi_ext_text_out, nt_gdi_poly_text_out, nt_gdi_set_text_justification,
+};
 
 /// NT_GDI_RESTORE_DC - Restore device context
 pub extern "C" fn nt_gdi_restore_dc(frame: &SyscallFrame) -> u64 {
@@ -863,7 +863,10 @@ pub extern "C" fn nt_user_get_dcex(frame: &SyscallFrame) -> u64 {
 /// Capture the counted LARGE_UNICODE_STRING used by native USER services.
 /// The high bit of MaximumLength denotes an ANSI buffer, which this path
 /// does not yet convert. Reject it rather than interpreting bytes as UTF-16.
-fn capture_user_large_unicode_string(address: u64, dst: &mut [u16]) -> Result<usize, i32> {
+fn capture_user_large_unicode_string(
+    address: u64,
+    maximum_chars: usize,
+) -> Result<alloc::vec::Vec<u16>, i32> {
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct LargeString {
@@ -872,7 +875,7 @@ fn capture_user_large_unicode_string(address: u64, dst: &mut [u16]) -> Result<us
         buffer: u64,
     }
     if address == 0 {
-        return Ok(0);
+        return Ok(alloc::vec![0]);
     }
     let header: LargeString = crate::mm::user_copy::read_user_object(address)?;
     let maximum = header.maximum_length_and_ansi & 0x7fff_ffff;
@@ -880,19 +883,23 @@ fn capture_user_large_unicode_string(address: u64, dst: &mut [u16]) -> Result<us
     if header.maximum_length_and_ansi & 0x8000_0000 != 0
         || header.length & 1 != 0
         || header.length > maximum
-        || chars >= dst.len()
+        || chars > maximum_chars
     {
         return Err(crate::libs::ntdll::status::STATUS_INVALID_PARAMETER);
     }
-    for (index, unit) in dst[..chars].iter_mut().enumerate() {
+    let mut captured = alloc::vec::Vec::new();
+    captured
+        .try_reserve_exact(chars + 1)
+        .map_err(|_| crate::libs::ntdll::status::STATUS_NO_MEMORY)?;
+    captured.resize(chars + 1, 0);
+    for (index, unit) in captured[..chars].iter_mut().enumerate() {
         let source = header
             .buffer
             .checked_add(index as u64 * 2)
             .ok_or(crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION)?;
         crate::mm::user_copy::read_user(source, unit)?;
     }
-    dst[chars] = 0;
-    Ok(chars)
+    Ok(captured)
 }
 
 /// NtUserCreateWindowEx uses fifteen native parameters, including a class
@@ -917,19 +924,17 @@ pub extern "C" fn nt_user_create_window_ex(frame: &SyscallFrame) -> u64 {
     if class_name_ptr <= 0xffff || class_version_ptr > 0xffff {
         return 0;
     }
-    let mut class_name_buf = [0u16; 64];
-    let mut title_buf = [0u16; 256];
-    let class_length = match capture_user_large_unicode_string(class_name_ptr, &mut class_name_buf)
-    {
-        Ok(length) => length,
+    let class_name_buf = match capture_user_large_unicode_string(class_name_ptr, 63) {
+        Ok(name) => name,
         Err(_) => return 0,
     };
-    if class_length == 0 || class_name_buf[0] == 0 {
+    if class_name_buf[0] == 0 {
         return 0;
     }
-    if capture_user_large_unicode_string(window_name_ptr, &mut title_buf).is_err() {
-        return 0;
-    }
+    let title_buf = match capture_user_large_unicode_string(window_name_ptr, 32767) {
+        Ok(title) => title,
+        Err(_) => return 0,
+    };
 
     crate::libs::win32k::window::create_window_internal(
         &class_name_buf,
@@ -1057,8 +1062,7 @@ pub extern "C" fn nt_user_set_window_pos(frame: &SyscallFrame) -> u64 {
 }
 
 pub use super::message::services::{
-    nt_user_get_message, nt_user_peek_message, nt_user_post_message,
-    nt_user_post_thread_message,
+    nt_user_get_message, nt_user_peek_message, nt_user_post_message, nt_user_post_thread_message,
 };
 
 /// NT_USER_SET_FOCUS - Set focus window
@@ -1099,8 +1103,8 @@ pub extern "C" fn nt_user_set_foreground_window(frame: &SyscallFrame) -> u64 {
 }
 
 pub use super::input_services::keyboard::{
-    nt_user_get_async_key_state, nt_user_get_key_state,
-    nt_user_get_keyboard_state, nt_user_set_keyboard_state,
+    nt_user_get_async_key_state, nt_user_get_key_state, nt_user_get_keyboard_state,
+    nt_user_set_keyboard_state,
 };
 
 /// NT_USER_SEND_INPUT - Send input events
@@ -1451,10 +1455,14 @@ pub extern "C" fn nt_user_call_two_param(frame: &SyscallFrame) -> u64 {
         0x69 => u64::from(super::input_services::get_cursor(frame.args[0])),
         0x73 => {
             let (_, thread) = super::window::input_context::caller_identity();
-            u64::from(super::user_state::with_user_state(|state| state.set_caret_position(
-                thread, frame.args[0] as i32, frame.args[1] as i32)))
+            u64::from(super::user_state::with_user_state(|state| {
+                state.set_caret_position(thread, frame.args[0] as i32, frame.args[1] as i32)
+            }))
         }
-        0x74 => u64::from(super::input_services::set_cursor(frame.args[0] as i32, frame.args[1] as i32)),
+        0x74 => u64::from(super::input_services::set_cursor(
+            frame.args[0] as i32,
+            frame.args[1] as i32,
+        )),
         _ => 0,
     }
 }
@@ -1549,12 +1557,6 @@ pub extern "C" fn nt_user_get_class_name(frame: &SyscallFrame) -> u64 {
     // Return the number of characters copied
     0
 }
-
-/// NT_USER_GET_PROP - Get window property
-
-
-/// NT_USER_SET_PROP - Set window property
-
 
 /// NT_USER_REDRAW_WINDOW - Redraw window
 pub extern "C" fn nt_user_redraw_window(frame: &SyscallFrame) -> u64 {
@@ -1771,9 +1773,6 @@ pub extern "C" fn nt_user_reply_message(frame: &SyscallFrame) -> u64 {
     1
 }
 
-/// NT_USER_WINDOW_FROM_POINT - Get window from point
-
-
 /// NT_USER_FIND_WINDOW_EX - Find window (extended)
 pub extern "C" fn nt_user_find_window_ex(frame: &SyscallFrame) -> u64 {
     let hwnd_parent = unsafe { get_arg0(frame) };
@@ -1805,9 +1804,6 @@ pub extern "C" fn nt_user_find_window(frame: &SyscallFrame) -> u64 {
     // FindWindow: return 0 (no matching window).
     0
 }
-
-/// NT_USER_SET_PARENT - Set parent window
-
 
 /// NT_USER_GET_ACTIVE_WINDOW - Get active window
 pub extern "C" fn nt_user_get_active_window(_frame: &SyscallFrame) -> u64 {
@@ -1844,9 +1840,6 @@ pub extern "C" fn nt_user_release_capture(_frame: &SyscallFrame) -> u64 {
     1
 }
 
-/// NT_USER_SET_WINDOW_LONG - Set window long
-
-
 /// NT_USER_GET_CONTROL_BRUSH - Get control brush
 pub extern "C" fn nt_user_get_control_brush(frame: &SyscallFrame) -> u64 {
     let hwnd = unsafe { get_arg0(frame) };
@@ -1882,10 +1875,7 @@ pub extern "C" fn nt_user_get_system_menu(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_INTERNAL_GET_WINDOW_TEXT - internal get window text
-pub extern "C" fn nt_user_internal_get_window_text(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_INTERNAL_GET_WINDOW_TEXT");
-    0
-}
+pub use super::window::text::nt_user_internal_get_window_text;
 
 /// NT_USER_GET_WINDOW_DC - Get window DC
 pub extern "C" fn nt_user_get_window_dc(frame: &SyscallFrame) -> u64 {
@@ -1921,12 +1911,6 @@ pub extern "C" fn nt_user_scroll_dc(frame: &SyscallFrame) -> u64 {
     1
 }
 
-/// NT_USER_GET_OBJECT_INFORMATION - Get object information
-pub extern "C" fn nt_user_get_object_information(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_GET_OBJECT_INFORMATION");
-    0
-}
-
 /// NT_USER_UNHOOK_WINDOWS_HOOK_EX - Unhook windows hook (extended) (P2 Enhancement)
 pub extern "C" fn nt_user_unhook_windows_hook_ex(frame: &SyscallFrame) -> u64 {
     let hhk = unsafe { get_arg0(frame) };
@@ -1956,9 +1940,6 @@ pub extern "C" fn nt_user_get_title_bar_info(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_USER_GET_TITLE_BAR_INFO");
     0
 }
-
-/// NT_USER_SET_THREAD_DESKTOP - Set thread desktop
-
 
 /// NT_USER_GET_SCROLL_BAR_INFO - Get scroll bar info
 pub extern "C" fn nt_user_get_scroll_bar_info(_frame: &SyscallFrame) -> u64 {
@@ -1997,50 +1978,6 @@ pub extern "C" fn nt_user_thunked_menu_item_info(_frame: &SyscallFrame) -> u64 {
     0
 }
 
-/// NT_USER_OPEN_WINDOW_STATION - Open window station
-pub extern "C" fn nt_user_open_window_station(frame: &SyscallFrame) -> u64 {
-    let s = unsafe { get_arg0(frame) };
-    let _ = &s;
-    let flags = unsafe { get_arg1(frame) };
-    let _ = &flags;
-
-    // kprintln!("[win32k] NT_USER_OPEN_WINDOW_STATION");
-
-    // OpenWindowStation: return a pseudo-handle.
-    0x000E_0001
-}
-
-/// NT_USER_CLOSE_DESKTOP - close desktop
-
-
-/// NT_USER_OPEN_DESKTOP - Open desktop
-pub extern "C" fn nt_user_open_desktop(frame: &SyscallFrame) -> u64 {
-    let s = unsafe { get_arg0(frame) };
-    let _ = &s;
-    let flags = unsafe { get_arg1(frame) };
-    let _ = &flags;
-    let access = unsafe { get_arg2(frame) };
-    let _ = &access;
-    let valid_apps = unsafe { get_arg3(frame) };
-    let _ = &valid_apps;
-
-    // kprintln!("[win32k] NT_USER_OPEN_DESKTOP");
-
-    // OpenDesktop: return a pseudo-handle.
-    0x000F_0001
-}
-
-/// NT_USER_SET_PROCESS_WINDOW_STATION - Set process window station
-pub extern "C" fn nt_user_set_process_window_station(frame: &SyscallFrame) -> u64 {
-    let h_win_sta = unsafe { get_arg0(frame) };
-    let _ = &h_win_sta;
-
-    // kprintln!("[win32k] NT_USER_SET_PROCESS_WINDOW_STATION");
-
-    // SetProcessWindowStation: return TRUE.
-    1
-}
-
 /// NT_USER_GET_ATOM_NAME - Get atom name
 pub extern "C" fn nt_user_get_atom_name(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_USER_GET_ATOM_NAME");
@@ -2051,23 +1988,6 @@ pub extern "C" fn nt_user_get_atom_name(_frame: &SyscallFrame) -> u64 {
 pub extern "C" fn nt_user_set_cursor_icon_data(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_USER_SET_CURSOR_ICON_DATA");
     0
-}
-
-/// NT_USER_REGISTER_CLASS_EX_WOW - Register class (extended WOW)
-
-
-/// NT_USER_GET_ANCESTOR - Get ancestor window
-
-
-/// NT_USER_CLOSE_WINDOW_STATION - close window station
-pub extern "C" fn nt_user_close_window_station(frame: &SyscallFrame) -> u64 {
-    let h_win_sta = unsafe { get_arg0(frame) };
-    let _ = &h_win_sta;
-
-    // kprintln!("[win32k] NT_USER_CLOSE_WINDOW_STATION");
-
-    // CloseWindowStation: return TRUE.
-    1
 }
 
 /// NT_USER_GET_DOUBLE_CLICK_TIME - Get double click time
@@ -2111,9 +2031,6 @@ pub extern "C" fn nt_user_scroll_window_ex(_frame: &SyscallFrame) -> u64 {
     0
 }
 
-/// NT_USER_SET_CLASS_LONG - Set class long
-
-
 /// NT_USER_GET_MENU_BAR_INFO - Get menu bar info
 pub extern "C" fn nt_user_get_menu_bar_info(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_USER_GET_MENU_BAR_INFO");
@@ -2139,13 +2056,7 @@ pub use super::input_services::layout::nt_user_map_virtual_key_ex;
 pub use super::input_services::layout::nt_user_to_unicode_ex;
 
 /// NT_USER_DEF_SET_TEXT - Default set text
-pub extern "C" fn nt_user_def_set_text(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_DEF_SET_TEXT");
-    0
-}
-
-/// NT_USER_GET_THREAD_DESKTOP - Get thread desktop
-
+pub use super::window::text::nt_user_def_set_text;
 
 /// NT_USER_GET_ICON_SIZE - Get icon size
 pub extern "C" fn nt_user_get_icon_size(frame: &SyscallFrame) -> u64 {
@@ -2246,10 +2157,15 @@ pub extern "C" fn nt_user_destroy_cursor(frame: &SyscallFrame) -> u64 {
 
 /// NT_USER_MESSAGE_CALL - Message call
 pub extern "C" fn nt_user_message_call(frame: &SyscallFrame) -> u64 {
-    if frame.args[5] as u32 != 0x029e { return 0; }
-    super::message::default_wndproc(frame.args[0], frame.args[1] as u32,
-        frame.args[2], frame.args[3] as i64) as u64
-
+    if frame.args[5] as u32 != 0x029e {
+        return 0;
+    }
+    super::message::default_wndproc(
+        frame.args[0],
+        frame.args[1] as u32,
+        frame.args[2],
+        frame.args[3] as i64,
+    ) as u64
 }
 
 /// NT_USER_END_MENU - End menu
@@ -2336,14 +2252,6 @@ pub extern "C" fn nt_user_call_hwnd_lock(_frame: &SyscallFrame) -> u64 {
     0
 }
 
-/// NT_USER_GET_PROCESS_WINDOW_STATION - Get process window station
-pub extern "C" fn nt_user_get_process_window_station(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_GET_PROCESS_WINDOW_STATION");
-
-    // GetProcessWindowStation: return a pseudo-handle.
-    0x0012_0001
-}
-
 /// NT_USER_CALL_HWND_PARAM_LOCK - Call with hwnd and param lock
 pub extern "C" fn nt_user_call_hwnd_param_lock(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_USER_CALL_HWND_PARAM_LOCK");
@@ -2380,9 +2288,6 @@ pub extern "C" fn nt_user_set_scroll_info(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_USER_SET_SCROLL_INFO");
     0
 }
-
-/// NT_USER_REMOVE_PROP - Remove property
-
 
 /// NT_USER_REGISTER_HOT_KEY - Register hot key
 pub extern "C" fn nt_user_register_hot_key(frame: &SyscallFrame) -> u64 {
@@ -2490,9 +2395,6 @@ pub extern "C" fn nt_user_invalidate_rgn(frame: &SyscallFrame) -> u64 {
     1 // TRUE
 }
 
-/// NT_USER_GET_CLIPBOARD_OWNER - Get clipboard owner window
-
-
 /// NT_USER_SET_WINDOW_RGN - Set window region
 pub extern "C" fn nt_user_set_window_rgn(frame: &SyscallFrame) -> u64 {
     super::window::native_state::nt_user_set_window_rgn_ex(frame)
@@ -2574,12 +2476,6 @@ pub extern "C" fn nt_user_alter_window_style(frame: &SyscallFrame) -> u64 {
     1 // TRUE
 }
 
-/// NT_USER_GET_WINDOW_PLACEMENT - Get window placement
-
-
-/// NT_USER_GET_OPEN_CLIPBOARD_WINDOW - Get open clipboard window
-
-
 /// NT_USER_SET_THREAD_STATE - Set thread state
 pub extern "C" fn nt_user_set_thread_state(frame: &SyscallFrame) -> u64 {
     let state = unsafe { get_arg0(frame) };
@@ -2635,9 +2531,6 @@ pub extern "C" fn nt_user_set_information_thread(frame: &SyscallFrame) -> u64 {
     1 // TRUE
 }
 
-/// NT_USER_SET_WINDOW_PLACEMENT - Set window placement
-
-
 /// NT_USER_GET_CONTROL_COLOR - Get control color
 pub extern "C" fn nt_user_get_control_color(frame: &SyscallFrame) -> u64 {
     let hwnd = unsafe { get_arg0(frame) };
@@ -2650,9 +2543,6 @@ pub extern "C" fn nt_user_get_control_color(frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_USER_GET_CONTROL_COLOR");
     0 // Default brush
 }
-
-/// NT_USER_SET_WINDOW_WORD - Set window word
-
 
 /// NT_USER_GET_CLIPBOARD_FORMAT_NAME - Get clipboard format name
 pub extern "C" fn nt_user_get_clipboard_format_name(frame: &SyscallFrame) -> u64 {
@@ -2770,7 +2660,6 @@ pub extern "C" fn nt_user_process_connect(frame: &SyscallFrame) -> u64 {
     // USER shared-info mapping is not implemented. This native call returns
     // NTSTATUS; returning TRUE used to conceal an uninitialized connect block.
     0xc00000bb
-
 }
 
 /// NT_USER_ENUM_DISPLAY_DEVICES - Enum display devices
@@ -2980,12 +2869,6 @@ pub extern "C" fn nt_user_paint_desktop(frame: &SyscallFrame) -> u64 {
     1 // TRUE
 }
 
-/// NT_USER_CHANGE_CLIPBOARD_CHAIN - Change clipboard chain
-
-
-/// NT_USER_SET_CLIPBOARD_VIEWER - Set clipboard viewer
-
-
 /// NT_USER_SHOW_WINDOW_ASYNC - Show window async
 pub extern "C" fn nt_user_show_window_async(frame: &SyscallFrame) -> u64 {
     let hwnd = unsafe { get_arg0(frame) };
@@ -3133,8 +3016,8 @@ pub extern "C" fn nt_user_set_dlg_item_int(frame: &SyscallFrame) -> u64 {
     let Some(window) = manager.get_window_mut(child) else {
         return 0;
     };
-    let length = title.len().min(window.title.len());
-    window.title[..length].copy_from_slice(&title[..length]);
+    window.title = title;
+    window.dirty = true;
     1
 }
 
@@ -3334,9 +3217,13 @@ pub extern "C" fn nt_user_unhook_win_event(frame: &SyscallFrame) -> u64 {
     crate::libs::win32k::user_state::remove_event_hook(h_win_event_hook) as u64
 }
 
-pub use super::raster::{nt_gdi_fill_rgn, nt_gdi_frame_rgn, nt_gdi_get_pixel, nt_gdi_invert_rgn, nt_gdi_set_pixel};
-pub use super::raster::extended::{nt_gdi_ext_flood_fill, nt_gdi_gradient_fill, nt_gdi_transparent_blt};
+pub use super::raster::extended::{
+    nt_gdi_ext_flood_fill, nt_gdi_gradient_fill, nt_gdi_transparent_blt,
+};
 pub use super::raster::parallelogram::nt_gdi_plg_blt;
+pub use super::raster::{
+    nt_gdi_fill_rgn, nt_gdi_frame_rgn, nt_gdi_get_pixel, nt_gdi_invert_rgn, nt_gdi_set_pixel,
+};
 
 // Shared USER state services; each export retains the window lifetime guard.
 pub use super::window::services::*;
@@ -3348,16 +3235,16 @@ pub extern "C" fn nt_gdi_flush(_frame: &SyscallFrame) -> u64 {
     1
 }
 
-pub use super::objects::attributes::*;
 pub use super::dc::pixel_format::*;
 pub use super::font_services::linking::*;
+pub use super::objects::attributes::*;
 
-pub use super::input_services::{
-    nt_user_block_input, nt_user_clip_cursor, nt_user_get_caret_pos,
-    nt_user_get_clip_cursor, nt_user_get_key_name_text, nt_user_get_keyboard_layout_name,
-    nt_user_get_thread_state, nt_user_unload_keyboard_layout,
-};
 pub use super::input_services::history::nt_user_get_mouse_move_points_ex;
+pub use super::input_services::{
+    nt_user_block_input, nt_user_clip_cursor, nt_user_get_caret_pos, nt_user_get_clip_cursor,
+    nt_user_get_key_name_text, nt_user_get_keyboard_layout_name, nt_user_get_thread_state,
+    nt_user_unload_keyboard_layout,
+};
 
 pub use super::raw_input::{
     nt_user_get_raw_input_buffer, nt_user_get_raw_input_data, nt_user_get_raw_input_device_info,
