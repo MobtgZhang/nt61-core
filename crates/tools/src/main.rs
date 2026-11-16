@@ -393,14 +393,11 @@ fn build_boot_only(build_dir: &Path, arch: &str) -> error::Result<()> {
 }
 
 fn build_kernel_only(build_dir: &Path, arch: &str) -> error::Result<()> {
-    // "kernel" in the user's terminology means winload.efi + ntoskrnl.exe.
-    // We don't have a real ntoskrnl.exe yet, so build the kernel crate and
-    // the winload for completeness.
     let k_target = fs::build::kernel_target_for(arch);
     let u_target = fs::build::uefi_target_for(arch);
     fs::build::build_kernel(k_target)?;
-    fs::build::build_winload(u_target)?;
-    let _ = build_dir;
+    let winload = fs::build::build_winload(u_target)?;
+    fs::build::stage_kernel_and_loader(arch, &build_dir.join("system"), &winload)?;
     Ok(())
 }
 

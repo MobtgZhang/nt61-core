@@ -2852,6 +2852,21 @@ pub fn build_userland_images(arch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refresh the staged kernel and loader after an incremental kernel build.
+/// Use the same ELF-to-PE conversion and checksum as the full image build;
+/// packaging an image must never silently retain the previous kernel.
+pub fn stage_kernel_and_loader(arch: &str, system_dir: &Path, winload: &Path) -> Result<()> {
+    set_pe_arch(arch);
+    let kernel = refresh_pe_checksum(real_pe("nt61-kernel.efi"));
+    let loader = std::fs::read(winload).map_err(BuildError::Io)?;
+    let system32 = system_dir.join("Windows").join("System32");
+    std::fs::create_dir_all(&system32).map_err(BuildError::Io)?;
+    std::fs::write(system32.join("ntoskrnl.exe"), kernel).map_err(BuildError::Io)?;
+    std::fs::write(system32.join("winload.efi"), loader).map_err(BuildError::Io)?;
+    log::success(&format!("Kernel and loader staged: {}", system32.display()));
+    Ok(())
+}
+
 fn generate_system_pe_files(arch: &str, system_dir: &Path) -> Result<()> {
     let system32 = system_dir.join("Windows").join("System32");
     std::fs::create_dir_all(&system32)?;
