@@ -32,8 +32,16 @@ pub mod string {
 pub mod se {
     pub use crate::{acl, descriptor, integrity, seaccess, sid, token, tokenmgmt};
 }
+#[path = "../../libs/ntdll/src/ntdll/locale.rs"]
+pub mod locale;
 #[path = "../../libs/ntdll/src/ntdll/registry.rs"]
 pub mod registry;
+pub mod privilege {
+    // Locale privilege APIs are not exercised by this registry harness.
+    pub fn enabled(_: u32) -> bool {
+        false
+    }
+}
 #[path = "../../libs/ntdll/src/ntdll/status.rs"]
 pub mod status;
 #[path = "../../libs/ntdll/src/ntdll/types.rs"]
@@ -69,6 +77,9 @@ pub mod arch {
     }
 }
 pub mod ke {
+    pub mod sync {
+        pub use ::spin::Mutex as Spinlock;
+    }
     pub mod time {
         pub fn get_system_time() -> u64 {
             123456789
@@ -208,6 +219,10 @@ mod mutation_cases {
         allow(address, core::mem::size_of::<T>(), write);
         address
     }
+    fn writable<T>(value: &mut T) -> *mut T {
+        allow(value as *mut T as u64, core::mem::size_of::<T>(), true);
+        value
+    }
     struct Name {
         units: Vec<u16>,
         header: UnicodeString,
@@ -274,6 +289,135 @@ mod mutation_cases {
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
                 .collect(),
         )
+    }
+    #[test]
+    fn install_language_flush_and_user_keys_share_one_absolute_namespace() {
+        let _serial = REGISTRY_TEST_LOCK.lock();
+        use crate::locale::*;
+        let mut language = 0u16;
+        let output = writable(&mut language);
+        assert_eq!(nt_query_install_ui_language(output), STATUS_SUCCESS);
+        assert_eq!(language, 0x409);
+        assert_eq!(nt_is_ui_language_comitted(), STATUS_OBJECT_NAME_NOT_FOUND);
+        assert_eq!(
+            flush_install_ui_language(false, 0x804, 1),
+            STATUS_UNSUCCESSFUL
+        );
+        // The installed bootstrap image lacks this configuration. A failed
+        // open still leaves the new install-language value visible.
+        assert_eq!(
+            nt_flush_install_ui_language_from_user(0x804, 0),
+            STATUS_OBJECT_NAME_NOT_FOUND
+        );
+        assert_eq!(nt_query_install_ui_language(output), STATUS_SUCCESS);
+        assert_eq!(language, 0x804);
+        assert_eq!(nt_query_default_ui_language(output), STATUS_SUCCESS);
+        assert_eq!(language, 0x804);
+
+        let key = create(
+            "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\NLS\\Language",
+            0xf003f,
+        );
+        let name = Name::new("InstallLanguage");
+        let old = [0x12u8, 0, 0xfe, 0x33, 0x45];
+        allow(old.as_ptr() as u64, old.len(), false);
+        assert_eq!(
+            unsafe {
+                nt_set_value_key(
+                    key,
+                    name.address() as _,
+                    0,
+                    3,
+                    old.as_ptr() as _,
+                    old.len() as u32,
+                )
+            },
+            STATUS_SUCCESS
+        );
+        assert_eq!(
+            nt_flush_install_ui_language_from_user(0xabcd_0411, 1),
+            STATUS_SUCCESS
+        );
+        assert_eq!(nt_query_install_ui_language(output), STATUS_SUCCESS);
+        assert_eq!(language, 0x411);
+        assert_eq!(nt_query_default_ui_language(output), STATUS_SUCCESS);
+        assert_eq!(language, 0x411);
+        assert_eq!(nt_is_ui_language_comitted(), STATUS_SUCCESS);
+        assert_eq!(
+            nt_flush_install_ui_language_from_user(0xabcd_0411, 0),
+            STATUS_UNSUCCESSFUL
+        );
+        assert_eq!(
+            nt_flush_install_ui_language_from_user(0x411, 0),
+            STATUS_SUCCESS
+        );
+
+        let lower =
+            Name::new("\\registry\\machine\\system\\currentcontrolset\\control\\nls\\language");
+        let mut attributes = ObjectAttributes::new();
+        attributes.object_name = lower.address() as _;
+        let mut opened = core::ptr::null_mut();
+        assert_eq!(
+            unsafe { nt_open_key(writable(&mut opened), 1, pointer(&attributes, false) as _) },
+            STATUS_SUCCESS
+        );
+        for (text, expected) in [
+            (
+                "InstallLanguage",
+                b"0\x004\x001\x001\x00\x00\x00".as_slice(),
+            ),
+            ("PreviousInstallLanguage", old.as_slice()),
+        ] {
+            let name = Name::new(text);
+            let mut bytes = [0xa5u64; 8];
+            let mut required = 0u32;
+            assert_eq!(
+                unsafe {
+                    nt_query_value_key(
+                        opened,
+                        name.address() as _,
+                        2,
+                        writable(&mut bytes) as _,
+                        64,
+                        writable(&mut required),
+                    )
+                },
+                STATUS_SUCCESS
+            );
+            let bytes = unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), 64) };
+            assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 1);
+            assert_eq!(
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize,
+                expected.len()
+            );
+            assert_eq!(&bytes[12..12 + expected.len()], expected);
+        }
+        // KEY_NAME_INFORMATION must contain just one object-manager prefix.
+        let mut bytes = [0u64; 128];
+        let mut required = 0u32;
+        assert_eq!(
+            unsafe {
+                nt_query_key(
+                    opened,
+                    3,
+                    writable(&mut bytes) as _,
+                    1024,
+                    writable(&mut required),
+                )
+            },
+            STATUS_SUCCESS
+        );
+        let bytes = unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), 1024) };
+        let units: Vec<u16> = bytes[4..required as usize]
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect();
+        assert_eq!(
+            String::from_utf16(&units).unwrap(),
+            "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\NLS\\Language"
+        );
+        assert_eq!(unsafe { nt_reg_close_key(opened) }, STATUS_SUCCESS);
+        assert_eq!(unsafe { nt_reg_close_key(key) }, STATUS_SUCCESS);
     }
     #[test]
     fn rename_preserves_handles_children_and_values_and_reports_collisions() {

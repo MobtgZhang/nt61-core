@@ -3,17 +3,21 @@
 use super::{status::*, types::NTSTATUS};
 use crate::{ke::sync::Spinlock, mm::user_copy::write_user_object};
 
+#[path = "locale/install_language.rs"]
+pub mod install_language;
+use install_language::INSTALL_LANGUAGE;
+
 struct Defaults {
     system: u32,
     user: u32,
-    language: u16,
+    language: Option<u16>,
     pending: Option<u16>,
 }
 
 static DEFAULTS: Spinlock<Defaults> = Spinlock::new(Defaults {
     system: 0x409,
     user: 0x409,
-    language: 0x409,
+    language: None,
     pending: None,
 });
 
@@ -53,13 +57,16 @@ pub extern "C" fn nt_set_default_locale(user: u8, locale: u32) -> NTSTATUS {
 }
 
 pub extern "C" fn nt_query_install_ui_language(output: *mut u16) -> NTSTATUS {
-    write_user_object(output as u64, &0x409u16)
+    write_user_object(output as u64, &INSTALL_LANGUAGE.language())
         .err()
         .unwrap_or(STATUS_SUCCESS)
 }
 
 pub extern "C" fn nt_query_default_ui_language(output: *mut u16) -> NTSTATUS {
-    let language = DEFAULTS.lock().language;
+    let language = DEFAULTS
+        .lock()
+        .language
+        .unwrap_or_else(|| INSTALL_LANGUAGE.language());
     write_user_object(output as u64, &language)
         .err()
         .unwrap_or(STATUS_SUCCESS)
@@ -71,9 +78,30 @@ pub extern "C" fn nt_set_default_ui_language(language: u16) -> NTSTATUS {
         let Some(pending) = state.pending else {
             return STATUS_OBJECT_NAME_NOT_FOUND;
         };
-        state.language = pending;
+        state.language = Some(pending);
     } else {
         state.pending = Some(language);
     }
     STATUS_SUCCESS
+}
+
+/// The caller mode comes from the trusted dispatch boundary, never a service
+/// argument. Kernel callers of the original Nt entry are rejected.
+pub fn flush_install_ui_language(user_mode: bool, language: u32, commit: u32) -> NTSTATUS {
+    INSTALL_LANGUAGE.flush(
+        user_mode,
+        language,
+        commit,
+        super::registry::persist_install_ui_language,
+    )
+}
+
+/// User SSDT adapter. The project's system-call entry captures user arguments;
+/// kernel code must use `flush_install_ui_language` with its actual caller mode.
+pub extern "C" fn nt_flush_install_ui_language_from_user(language: u32, commit: u32) -> NTSTATUS {
+    flush_install_ui_language(true, language, commit)
+}
+
+pub extern "C" fn nt_is_ui_language_comitted() -> NTSTATUS {
+    INSTALL_LANGUAGE.committed_status()
 }

@@ -132,6 +132,9 @@ pub unsafe extern "C" fn nt_query_multiple_value_key(
 
 /// # Safety
 /// Object attributes and the count point to caller memory.
+///
+/// This volatile-tree implementation does not yet model the hive-root check or
+/// the KEY_BODY enumeration used by Windows 7; its handle count is approximate.
 pub unsafe extern "C" fn nt_query_open_sub_keys(
     attributes: *mut ObjectAttributes,
     output: *mut u32,
@@ -150,13 +153,14 @@ pub unsafe extern "C" fn nt_query_open_sub_keys(
         let path = read_user_unicode_string(attributes.object_name as u64, MAX_VALUE_NAME_LEN * 2)?;
         let root = REGISTRY_ROOT.lock();
         let mut key = root.ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
-        for part in path
+        for part in path[registry_path_start(&attributes, &path)..]
             .split(|unit| *unit == 92)
             .filter(|part| !part.is_empty())
         {
             key = unsafe { find_subkey(key, part) }.ok_or(STATUS_OBJECT_NAME_NOT_FOUND)?;
         }
-        if !registry_access_allowed(key, 8) {
+        // Windows 7 SP1 opens the target with KEY_READ (ntoskrnl RVA 0x4cafe9).
+        if !registry_access_allowed(key, 0x0002_0019) {
             return Err(STATUS_ACCESS_DENIED);
         }
         let table = KEY_HANDLE_TABLE.lock();

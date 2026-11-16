@@ -552,7 +552,7 @@ pub unsafe fn find_subkey(parent: *mut RegistryKey, name: &[u16]) -> Option<*mut
                 if child_name_len == name.len() {
                     let mut match_found = true;
                     for j in 0..child_name_len {
-                        if (*child).name[j] != name[j] {
+                        if !same_value_unit((*child).name[j], name[j]) {
                             match_found = false;
                             break;
                         }
@@ -742,11 +742,7 @@ pub unsafe extern "C" fn nt_create_key(
     };
     let mut created = false;
 
-    // Skip leading backslashes.
-    let mut start = 0;
-    while start < path.len() && path[start] == BACKSLASH_U16 {
-        start += 1;
-    }
+    let mut start = registry_path_start(&attributes, &path);
 
     // Walk path components.
     while start < path.len() {
@@ -867,10 +863,7 @@ pub unsafe extern "C" fn nt_open_key(
         Err(status) => return status,
     };
 
-    let mut start = 0;
-    while start < path.len() && path[start] == BACKSLASH_U16 {
-        start += 1;
-    }
+    let mut start = registry_path_start(&attributes, &path);
 
     while start < path.len() {
         let mut end = start;
@@ -1879,6 +1872,39 @@ fn same_value_unit(left: u16, right: u16) -> bool {
     };
     lower(left) == lower(right)
 }
+
+/// REGISTRY_ROOT is already the object named \\REGISTRY. Consume that prefix
+/// once for absolute object-manager paths, retaining the provider's existing
+/// short-path support. Relative names never consume a REGISTRY child component.
+fn registry_path_start(attributes: &ObjectAttributes, path: &[u16]) -> usize {
+    let mut start = 0;
+    while start < path.len() && path[start] == BACKSLASH_U16 {
+        start += 1;
+    }
+    if attributes.root_directory.is_null() && start != 0 {
+        let end = path[start..]
+            .iter()
+            .position(|unit| *unit == BACKSLASH_U16)
+            .map_or(path.len(), |offset| start + offset);
+        let prefix = b"REGISTRY";
+        if end - start == prefix.len()
+            && path[start..end]
+                .iter()
+                .zip(prefix)
+                .all(|(unit, byte)| same_value_unit(*unit, u16::from(*byte)))
+        {
+            start = end;
+            while start < path.len() && path[start] == BACKSLASH_U16 {
+                start += 1;
+            }
+        }
+    }
+    start
+}
+
+#[path = "registry_install_language.rs"]
+mod install_language;
+pub use install_language::persist as persist_install_ui_language;
 
 fn key_access_mask(mut access: u32) -> Result<u32, NTSTATUS> {
     // WOW64 view selectors choose a namespace; this single view has no
