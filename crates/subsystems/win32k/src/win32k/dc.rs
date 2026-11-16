@@ -48,12 +48,17 @@ pub mod services;
 pub mod caps;
 #[path = "dc/bounds.rs"]
 pub mod bounds;
+#[path = "dc/info.rs"]
+pub mod info;
+#[path = "dc/mirror.rs"]
+pub mod mirror;
 
 /// DC type flags
 const DC_TYPE_WINDOW: u32 = 0x00000001;
 const DC_TYPE_MEMORY: u32 = 0x00000002;
 pub const DC_TYPE_METAFILE: u32 = 0x00000004;
 pub const DC_TYPE_PRINTER: u32 = 0x00000008;
+pub const DC_TYPE_INFORMATION: u32 = 0x00000010;
 const DC_TYPE_DISPLAY: u32 = DC_TYPE_WINDOW;
 
 /// Mapping modes
@@ -153,6 +158,8 @@ impl SizeL {
 /// saved drawing state, unlike the device's EPS and print-copy settings.
 #[derive(Clone, Copy)]
 pub struct DcAttributes {
+    pub layout: u32,
+    pub mirrored_window_origin_x: Option<i32>,
     pub color_space: u64,
     pub brush_origin: PointL,
     pub relative_mode: u32,
@@ -160,6 +167,8 @@ pub struct DcAttributes {
     pub arc_direction: u32,
     pub color_adjustment: services::ColorAdjustment,
     pub virtual_resolution: [u32; 4],
+    /// Native SetSizeDevice metrics, used by virtual isotropic mapping.
+    pub size_device: SizeL,
     pub text_justification_extra: i32,
     pub text_justification_breaks: i32,
 }
@@ -167,6 +176,8 @@ pub struct DcAttributes {
 impl Default for DcAttributes {
     fn default() -> Self {
         Self {
+            layout: 0,
+            mirrored_window_origin_x: None,
             color_space: 0,
             brush_origin: PointL::default(),
             relative_mode: 1,
@@ -174,6 +185,7 @@ impl Default for DcAttributes {
             arc_direction: 1,
             color_adjustment: services::ColorAdjustment::default(),
             virtual_resolution: [0; 4],
+            size_device: SizeL::default(),
             text_justification_extra: 0,
             text_justification_breaks: 0,
         }
@@ -276,6 +288,9 @@ pub struct DcObject {
 
     // Surface
     pub surface: u64,
+    // Device-owned surface detached by MakeInfoDC. This is DC lifetime state,
+    // independent of the attributes captured by SaveDC/RestoreDC.
+    information: Option<info::DetachedSurface>,
 
     // Clipping region
     pub clip_region: u64,
@@ -342,6 +357,7 @@ impl DcObject {
             dc_type: DC_TYPE_DISPLAY,
             hwnd: 0,
             surface: 0,
+            information: None,
             clip_region: 0,
             application_clip: None,
             meta_clip: None,
@@ -466,6 +482,9 @@ impl DcObject {
             self.palette_handle = state.palette_handle;
             self.region = state.region;
             self.bitmap = state.bitmap;
+            if self.dc_type == DC_TYPE_MEMORY {
+                self.reset_bitmap_bounds();
+            }
             self.text_color = state.text_color;
             self.bg_color = state.bg_color;
             self.text_align = state.text_align;
@@ -484,6 +503,23 @@ impl DcObject {
             false
         }
     }
+
+    fn reset_bitmap_bounds(&mut self) {
+        let size = bitmap_size(self.bitmap).unwrap_or(SizeL::new(1, 1));
+        self.bounds = super::objects::Rect::new(0, 0, size.cx, size.cy);
+    }
+}
+
+fn bitmap_size(handle: u64) -> Option<SizeL> {
+    super::objects::with_handle_table(|table| {
+        let entry = table.get(handle)?;
+        if entry.get_type()? != super::objects::GdiObjectType::Bitmap || entry.obj_ptr == 0 {
+            return None;
+        }
+        // SAFETY: the table guard retains this validated bitmap allocation.
+        let bitmap = unsafe { &*(entry.obj_ptr as *const super::objects::GdiBitmap) };
+        Some(SizeL::new(bitmap.width, bitmap.height.wrapping_abs()))
+    })
 }
 
 impl Default for DcObject {
@@ -529,6 +565,17 @@ impl DcHandleTable {
         let mut object = DcObject::new();
         object.dc_type = dc_type;
         object.surface = surface;
+        let size = if dc_type == DC_TYPE_MEMORY {
+            // The default memory device is the one-pixel monochrome device.
+            SizeL::new(1, 1)
+        } else if surface != 0 {
+            // SAFETY: creation receives a live display-owned surface binding.
+            let surface = unsafe { &*(surface as *const super::surface::GdiSurface) };
+            SizeL::new(surface.width, surface.height)
+        } else {
+            mapping::DisplayMetrics::current().pixels
+        };
+        object.bounds = super::objects::Rect::new(0, 0, size.cx, size.cy);
         for (slot, index) in [(0, 7), (1, 0), (2, 13), (3, 15)] {
             let handle = super::objects::gdi_get_stock_object(index);
             let Some(reference) = super::objects::ObjectReference::acquire(handle) else {
@@ -908,7 +955,18 @@ pub fn select_typed_object(
         return 0;
     };
     let object_type = reference.object_type();
-    if required.is_some_and(|kind| kind != object_type) {
+    if required.is_some_and(|kind| {
+        kind != object_type
+            && !(kind == GdiObjectType::Pen && object_type == GdiObjectType::ExtPen)
+    }) {
+        return 0;
+    }
+    // GreSelectBitmap only accepts memory DCs (Win7 x64 RVA 0xc68cd).
+    // In particular an information DC keeps its device size while detached.
+    if object_type == GdiObjectType::Bitmap && dc.dc_type != DC_TYPE_MEMORY {
+        return 0;
+    }
+    if object_type == GdiObjectType::Font && !super::font_services::bind_logical_font(object_handle) {
         return 0;
     }
     let (slot, old) = match object_type {
@@ -918,7 +976,11 @@ pub fn select_typed_object(
         GdiObjectType::Brush => (1, core::mem::replace(&mut dc.brush, object_handle)),
         GdiObjectType::Font => (2, core::mem::replace(&mut dc.font, object_handle)),
         GdiObjectType::Palette => (3, core::mem::replace(&mut dc.palette_handle, object_handle)),
-        GdiObjectType::Bitmap => (5, core::mem::replace(&mut dc.bitmap, object_handle)),
+        GdiObjectType::Bitmap => {
+            let Some(size) = bitmap_size(object_handle) else { return 0 };
+            dc.bounds = super::objects::Rect::new(0, 0, size.cx, size.cy);
+            (5, core::mem::replace(&mut dc.bitmap, object_handle))
+        }
         _ => return 0,
     };
     dc.selected_references[slot] = Some(reference);
@@ -1051,7 +1113,15 @@ pub fn gre_set_window_ext_ex(
     };
     if let Some(size) = old_size {
         *size = dc.window_ext;
+        if dc.attributes.layout & mirror::LAYOUT_RTL != 0 {
+            size.cx = size.cx.wrapping_neg();
+        }
     }
+    let cx = if dc.attributes.layout & mirror::LAYOUT_RTL != 0 {
+        cx.wrapping_neg()
+    } else {
+        cx
+    };
     mapping::set_extent(&mut dc, SizeL::new(cx, cy), false)
 }
 
@@ -1068,6 +1138,19 @@ pub fn gre_set_viewport_org_ex(
     if let Some(dc) = table.get(dc_handle) {
         if let Some(origin) = old_origin {
             *origin = dc.viewport_org;
+            if dc.attributes.layout & mirror::LAYOUT_RTL != 0 {
+                origin.x = origin.x.wrapping_neg();
+            }
+        }
+        let x = if dc.attributes.layout & mirror::LAYOUT_RTL != 0 {
+            x.wrapping_neg()
+        } else {
+            x
+        };
+        if !(-0x7fffffe..=0x7fffffe).contains(&x)
+            || !(-0x7fffffe..=0x7fffffe).contains(&y)
+        {
+            return false;
         }
         dc.viewport_org = PointL::new(x, y);
         true

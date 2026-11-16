@@ -233,11 +233,7 @@ const CHAR_WIDTHS_8X8: &[u8] = &[
 
 /// Get DC surface
 fn get_dc_surface(dc: &DcObject) -> *mut GdiSurface {
-    if dc.surface != 0 {
-        dc.surface as *mut GdiSurface
-    } else {
-        crate::libs::win32k::surface::get_primary_surface()
-    }
+    dc.drawing_surface()
 }
 
 /// Set pixel on surface

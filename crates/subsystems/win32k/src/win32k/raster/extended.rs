@@ -30,6 +30,9 @@ pub extern "C" fn nt_gdi_transparent_blt(frame: &SyscallFrame) -> u64 {
     let Some(source_dc) = table.get(frame.args[5]) else {
         return 0;
     };
+    if source_dc.is_information_dc() {
+        return 0;
+    }
     let mut source = DcObject::new();
     source.surface = source_dc.surface;
     source.world_transform = source_dc.world_transform;
@@ -37,6 +40,8 @@ pub extern "C" fn nt_gdi_transparent_blt(frame: &SyscallFrame) -> u64 {
     source.window_ext = source_dc.window_ext;
     source.viewport_org = source_dc.viewport_org;
     source.window_org = source_dc.window_org;
+    source.attributes.layout = source_dc.attributes.layout;
+    source.attributes.mirrored_window_origin_x = source_dc.attributes.mirrored_window_origin_x;
     let Some(destination) = table.get(frame.args[0]) else {
         return 0;
     };

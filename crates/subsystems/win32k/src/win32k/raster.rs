@@ -10,7 +10,7 @@ use super::clipping;
 use super::dc::{DcObject, PointL};
 use super::objects::{self, GdiBrush, GdiObjectType, Rect};
 use super::region_geometry::{Region, RegionCombineMode};
-use super::surface::{self, GdiSurface, PIXEL_FORMAT_32BPP, PIXEL_FORMAT_32BPP_ARGB};
+use super::surface::{GdiSurface, PIXEL_FORMAT_32BPP, PIXEL_FORMAT_32BPP_ARGB};
 use alloc::vec::Vec;
 
 const MAX_CAPTURE_PIXELS: usize = 16 * 1024 * 1024;
@@ -31,11 +31,7 @@ pub mod dib;
 pub mod pattern;
 
 fn bound_surface(dc: &DcObject) -> Option<&GdiSurface> {
-    let pointer = if dc.surface == 0 {
-        surface::get_primary_surface()
-    } else {
-        dc.surface as *mut GdiSurface
-    };
+    let pointer = dc.drawing_surface();
     // The DC guard serializes binding changes; the display subsystem owns it.
     let surface = unsafe { pointer.as_ref()? };
     if !matches!(surface.format, PIXEL_FORMAT_32BPP | PIXEL_FORMAT_32BPP_ARGB)
@@ -509,14 +505,14 @@ pub(super) fn pen_color(handle: u64) -> Option<Option<u32>> {
     }
     objects::with_handle_table(|table| {
         let entry = table.get(handle)?;
-        if entry.get_type()? != GdiObjectType::Pen || entry.obj_ptr == 0 {
+        if !matches!(entry.get_type()?, GdiObjectType::Pen | GdiObjectType::ExtPen) || entry.obj_ptr == 0 {
             return None;
         }
         let pen = unsafe { &*(entry.obj_ptr as *const objects::GdiPen) };
-        if pen.style == objects::PenStyle::Null as u32 {
+        if pen.style & 0xf == objects::PenStyle::Null as u32 {
             return Some(None);
         }
-        if pen.style != objects::PenStyle::Solid as u32 || pen.width > 1 {
+        if pen.style & 0xf != objects::PenStyle::Solid as u32 || pen.width > 1 || pen.brush_style != 0 {
             return None;
         }
         Some(Some(swap_red_blue(pen.color)))

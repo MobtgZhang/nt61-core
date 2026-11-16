@@ -82,6 +82,26 @@ pub extern "C" fn nt_gdi_set_virtual_resolution(frame: &SyscallFrame) -> u64 {
     1
 }
 
+/// Win7 reads the device/window boundary, independently of drawing bounds,
+/// clipping, mapping extents, and the SetSizeDevice virtual-device metrics.
+pub extern "C" fn nt_gdi_get_device_width(frame: &SyscallFrame) -> u64 {
+    get_dc(frame.args[0]).map_or(u32::MAX as u64, |dc| {
+        dc.bounds.right.wrapping_sub(dc.bounds.left) as u32 as u64
+    })
+}
+
+/// Both arguments are DWORDs. Win7 rejects zero, but accepts signed encodings
+/// and stores the metrics without resizing the actual surface or boundary.
+pub extern "C" fn nt_gdi_set_size_device(frame: &SyscallFrame) -> u64 {
+    let size = super::SizeL::new(frame.args[1] as i32, frame.args[2] as i32);
+    if size.cx == 0 || size.cy == 0 {
+        return 0;
+    }
+    let Some(mut dc) = get_dc(frame.args[0]) else { return 0 };
+    dc.attributes.size_device = size;
+    1
+}
+
 /// Brush origins use device coordinates and belong to the saved drawing state.
 pub extern "C" fn nt_gdi_set_brush_org(frame: &SyscallFrame) -> u64 {
     let Some(mut dc) = get_dc(frame.args[0]) else {
@@ -175,7 +195,10 @@ pub extern "C" fn nt_gdi_scale_window_ext_ex(frame: &SyscallFrame) -> u64 {
     let Some(mut dc) = get_dc(frame.args[0]) else {
         return 0;
     };
-    let previous = dc.window_ext;
+    let mut previous = dc.window_ext;
+    if dc.attributes.layout & super::mirror::LAYOUT_RTL != 0 {
+        previous.cx = previous.cx.wrapping_neg();
+    }
     if !scale_dc_extent(&mut dc, frame, false) {
         return 0;
     }

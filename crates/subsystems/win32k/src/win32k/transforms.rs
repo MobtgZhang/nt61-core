@@ -11,6 +11,9 @@ use crate::arch::common::syscall_frame::SyscallFrame;
 use crate::mm::user_copy;
 use alloc::vec::Vec;
 
+#[path = "transforms/metafile.rs"]
+pub mod metafile;
+
 const MAX_POINTS: usize = 65_536;
 
 pub fn finite(transform: Xform) -> bool {
@@ -72,13 +75,14 @@ pub fn page_to_device(dc: &DcObject) -> Option<Xform> {
     let viewport = dc::mapping::effective_viewport(dc)?;
     let sx = viewport.cx as f32 / dc.window_ext.cx as f32;
     let sy = viewport.cy as f32 / dc.window_ext.cy as f32;
+    let origin = dc.effective_window_origin();
     let result = Xform {
         m11: sx,
         m12: 0.0,
         m21: 0.0,
         m22: sy,
-        dx: dc.viewport_org.x as f32 - dc.window_org.x as f32 * sx,
-        dy: dc.viewport_org.y as f32 - dc.window_org.y as f32 * sy,
+        dx: dc.viewport_org.x as f32 - origin.x as f32 * sx,
+        dy: dc.viewport_org.y as f32 - origin.y as f32 * sy,
     };
     finite(result).then_some(result)
 }
@@ -237,8 +241,22 @@ pub extern "C" fn nt_gdi_get_dc_point(frame: &SyscallFrame) -> u64 {
             dc.viewport_ext = viewport;
             PointL::new(viewport.cx, viewport.cy)
         }
-        2 => PointL::new(dc.window_ext.cx, dc.window_ext.cy),
-        4 => dc.viewport_org,
+        2 => PointL::new(
+            if dc.attributes.layout & dc::mirror::LAYOUT_RTL != 0 {
+                dc.window_ext.cx.wrapping_neg()
+            } else {
+                dc.window_ext.cx
+            },
+            dc.window_ext.cy,
+        ),
+        4 => PointL::new(
+            if dc.attributes.layout & dc::mirror::LAYOUT_RTL != 0 {
+                dc.viewport_org.x.wrapping_neg()
+            } else {
+                dc.viewport_org.x
+            },
+            dc.viewport_org.y,
+        ),
         8 => dc.window_org,
         16 => PointL::new(dc.cur_x, dc.cur_y),
         // Current bindings are surface-local. The client-origin variant

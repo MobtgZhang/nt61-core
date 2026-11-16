@@ -12,6 +12,9 @@ use crate::arch::common::syscall_frame::SyscallFrame;
 use crate::mm::user_copy;
 
 pub fn visible_region(dc: &DcObject) -> Result<Region, RegionError> {
+    if dc.is_information_dc() {
+        return Region::rectangle(dc.bounds);
+    }
     let surface = if dc.surface != 0 {
         dc.surface as *const super::surface::GdiSurface
     } else {
@@ -244,19 +247,20 @@ pub extern "C" fn nt_gdi_get_app_clip_box(frame: &SyscallFrame) -> u64 {
         return 0;
     }
     if effective.complexity() != 1 {
+        let origin = dc.effective_window_origin();
         let inverse = |x: i32, y: i32| -> Option<PointL> {
             Some(PointL::new(
                 super::transforms::nearest_integer(
                     ((f64::from(x) - f64::from(dc.viewport_org.x)) * f64::from(dc.window_ext.cx)
                         / f64::from(dc.viewport_ext.cx)
-                        + f64::from(dc.window_org.x)
+                        + f64::from(origin.x)
                         - f64::from(transform.dx))
                         / f64::from(transform.m11),
                 )?,
                 super::transforms::nearest_integer(
                     ((f64::from(y) - f64::from(dc.viewport_org.y)) * f64::from(dc.window_ext.cy)
                         / f64::from(dc.viewport_ext.cy)
-                        + f64::from(dc.window_org.y)
+                        + f64::from(origin.y)
                         - f64::from(transform.dy))
                         / f64::from(transform.m22),
                 )?,

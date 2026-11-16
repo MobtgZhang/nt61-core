@@ -73,11 +73,7 @@ pub fn rop_srcinvert(dest: u32, src: u32, pat: u32) -> u32 {
 
 /// Get DC's surface
 fn get_dc_surface(dc: &DcObject) -> *mut GdiSurface {
-    if dc.surface != 0 {
-        dc.surface as *mut GdiSurface
-    } else {
-        crate::libs::win32k::surface::get_primary_surface()
-    }
+    dc.drawing_surface()
 }
 
 /// bit_blt - Block Transfer

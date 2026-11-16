@@ -130,12 +130,17 @@ pub extern "C" fn nt_gdi_mask_blt(frame: &SyscallFrame) -> u64 {
         let Some(dc) = table.get(frame.args[5]) else {
             return 0;
         };
+        if dc.is_information_dc() {
+            return 0;
+        }
         source.surface = dc.surface;
         source.world_transform = dc.world_transform;
         source.viewport_ext = dc.viewport_ext;
         source.window_ext = dc.window_ext;
         source.viewport_org = dc.viewport_org;
         source.window_org = dc.window_org;
+        source.attributes.layout = dc.attributes.layout;
+        source.attributes.mirrored_window_origin_x = dc.attributes.mirrored_window_origin_x;
     }
     let Some(destination) = table.get(frame.args[0]) else {
         return 0;
