@@ -484,10 +484,15 @@ impl Shell {
             (l.power_arrow(), CONTROL_POWER_ARROW, ""),
         ] {
             aero::blend_rounded_rect(frame, button, 3, 0xFF162F43);
-            aero::blend_rounded_rect(frame, inset(button, 1), 2, 0xFF52728B);
-            if self.model.controls.hot() == id {
-                aero::blend_rounded_rect(frame, inset(button, 1), 2, 0x408FCEFA);
-            }
+            let hot=self.model.controls.hot()==id;
+            let pressed=self.model.controls.pressed()==id;
+            let top=if pressed{0xFF497799}else if hot{0xFFA5D7F9}else{0xFF8FAABF};
+            let bottom=if pressed{0xFF729CBC}else if hot{0xFF4C8EBB}else{0xFF3C5F7C};
+            let inner=inset(button,1);
+            for row in 0..inner.height {let color=nt61_desktop::graphics::lerp_color(top,bottom,row*255/inner.height.max(1));frame.fill_rect(inner.x,inner.y+row as i32,inner.width,1,color);}
+            frame.fill_rect(inner.x+1,inner.y,inner.width.saturating_sub(2),1,0xC0F2FAFF);
+            frame.blend_rect(Rect::new(inner.x,inner.y,inner.width,inner.height/2),0x28FFFFFF);
+            if self.model.controls.focus()==id {frame.stroke_rounded_rect(inset(button,2),2,1,0xFFB3D9F2);}
             self.centered(
                 frame,
                 title,
@@ -674,7 +679,7 @@ impl Shell {
                 );
             }
             Flyout::Power => {
-                for (i, title) in ["Lock", "Log off", "Restart", "Shut down"]
+                for (i, title) in ["Switch user", "Log off", "Lock", "Restart", "Sleep", "Shut down"]
                     .iter()
                     .enumerate()
                 {

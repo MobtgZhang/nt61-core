@@ -353,6 +353,13 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         }
         return;
     }
+    if value != KEY_VALUE_RELEASE {
+        let usage = match code { 111 => 0x4c, 62 => 0x3d, 1 => 0x29, _ => 0 };
+        let modifiers = u8::from(CONTROL_KEYS.load(Ordering::Relaxed) != 0)
+            | (u8::from(ALT_KEYS.load(Ordering::Relaxed) != 0) << 2)
+            | (u8::from(shift_state()) << 1);
+        if crate::hal::common::desktop_hotkeys::intercept(usage, modifiers) { return; }
+    }
     // Linux key codes 1..=83 retain set-1 make codes; navigation and right
     // modifiers require E0. Unknown/media keys have no set-1 representation.
     let scan = match code {

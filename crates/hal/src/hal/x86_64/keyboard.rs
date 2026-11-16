@@ -268,7 +268,15 @@ pub fn process_scancode(sc: u8) {
     if sc == 0xE0 { EXTENDED_PREFIX.store(true, Ordering::Relaxed); return; }
     let release = (sc & 0x80) != 0;
     let code = sc & 0x7F;
-    if EXTENDED_PREFIX.swap(false, Ordering::Relaxed) {
+    let extended = EXTENDED_PREFIX.swap(false, Ordering::Relaxed);
+    if !release {
+        let usage = match (code, extended) { (0x53, true) => 0x4c, (0x3e, false) => 0x3d, (0x01, false) => 0x29, _ => 0 };
+        let modifiers = u8::from(CTRL_DOWN.load(Ordering::Relaxed))
+            | (u8::from(ALT_DOWN.load(Ordering::Relaxed)) << 2)
+            | (u8::from(SHIFT_DOWN.load(Ordering::Relaxed)) << 1);
+        if crate::hal::common::desktop_hotkeys::intercept(usage, modifiers) { return; }
+    }
+    if extended {
         if code == 0x1D { CTRL_DOWN.store(!release, Ordering::Relaxed); return; }
         if code == 0x38 { ALT_DOWN.store(!release, Ordering::Relaxed); return; }
         if release { return; }

@@ -155,6 +155,8 @@ fn desktop_main() -> ! {
     let mut next_directory_poll = 0u64;
     let mut next_process_poll = 0u64;
     let mut directory_poll_index = 0usize;
+    let mut session_decoder=nt61_desktop::applications::explorer::input::Decoder::default();
+    let mut committed_power:Option<(nt61_desktop::shell::PowerAction,u64)>=None;
     let mut frame_rgba = alloc::vec![0u8; frame.pixels().len() * 4];
     shell.compose_desktop(&framebuffer, &mut frame);
     fade_desktop(&frame, &mut frame_rgba, 450);
@@ -166,6 +168,24 @@ fn desktop_main() -> ! {
     loop {
         let mut redraw = false;
         let ticks = arch::shell_ticks();
+        if let Some((action,due))=committed_power.filter(|(_,due)|ticks>=*due) {
+            let _=due;committed_power=None;
+            use nt61_desktop::{platform::services,session::Screen,shell::PowerAction};
+            let operation=match action {PowerAction::LogOff=>"logoff",PowerAction::Restart=>"restart",_=>"shutdown"};
+            let result=services::session(operation,&[]);
+            if action==PowerAction::LogOff && result.is_ok(){
+                shell.model.session.show(Screen::Credentials);shell.model.session.logged_off=true;shell.model.session.locked=true;shell.model.session.switching=true;shell.model.session.user.clear();
+            }else{shell.model.session.show(Screen::ShutDown);shell.model.session.message=alloc::format!("The operation could not be completed (0x{:08X}).",result.err().unwrap_or(0));}
+            shell.scene_dirty.set(true);redraw=true;
+        }
+        if let Ok(keys)=nt61_desktop::platform::services::desktop_hotkeys(){if keys!=0{shell.model.session_hotkeys(keys);session_decoder=Default::default();shell.scene_dirty.set(true);redraw=true;}}
+        if shell.model.session.screen!=nt61_desktop::session::Screen::Desktop {
+            if let Some(key)=session_decoder.expire(ticks){let intent=shell.model.session.key(key);shell.model.session_intent(intent);shell.scene_dirty.set(true);redraw=true;}
+        }
+        if shell.model.poll_guest_dialogs() {
+            shell.scene_dirty.set(true);
+            redraw = true;
+        }
         for app in &mut shell.model.applications {
             app.input_time = ticks;
         }
@@ -186,6 +206,11 @@ fn desktop_main() -> ! {
         for _ in 0..64 {
             if unsafe { arch::poll_mouse(&mut mouse) == 0 } {
                 break;
+            }
+            if shell.model.session.screen!=nt61_desktop::session::Screen::Desktop {
+                cursor_x=mouse.x.clamp(0,framebuffer.width.saturating_sub(1)as i32);cursor_y=mouse.y.clamp(0,framebuffer.height.saturating_sub(1)as i32);
+                if mouse.buttons&1!=0 && previous_buttons&1==0 {let intent=shell.model.session.hit(cursor_x,cursor_y,framebuffer.width,framebuffer.height);shell.model.session_intent(intent);shell.scene_dirty.set(true);pointer_full=true;}
+                pointer_moved|=cursor_x!=previous_cursor_x||cursor_y!=previous_cursor_y;previous_buttons=mouse.buttons;continue;
             }
             let previous_scene = shell.window_geometry();
             cursor_x = mouse.x.clamp(0, framebuffer.width.saturating_sub(1) as i32);
@@ -516,7 +541,10 @@ fn desktop_main() -> ! {
             if !key_pending {
                 break;
             }
-            let changed = if shell.model.context_menu.is_some()
+            let changed = if shell.model.session.screen!=nt61_desktop::session::Screen::Desktop {
+                if let Some(decoded)=session_decoder.feed(key,ticks){let decoded=match decoded{nt61_desktop::applications::explorer::input::UP=>0x26,nt61_desktop::applications::explorer::input::DOWN=>0x28,_=>decoded};let intent=shell.model.session.key(decoded);shell.model.session_intent(intent);}
+                shell.scene_dirty.set(true);true
+            } else if shell.model.context_menu.is_some()
                 || shell.model.start_menu.open
                 || shell.model.flyout.is_some()
             {
@@ -620,13 +648,10 @@ fn desktop_main() -> ! {
         if old_audio != (shell.model.volume, shell.model.muted) {
             let _ = arch::shell_audio(shell.model.volume, shell.model.muted);
         }
-        if shell.model.power_action.is_some() {
-            shell.model.show_power_unavailable();
-            shell
-                .model
-                .refresh_controls(framebuffer.width, framebuffer.height);
-            redraw = true;
-        }
+        let old_session=shell.model.session.screen;
+        let closing=shell.model.session.pending_close.is_some() || shell.model.power_action.is_some();
+        if let Some(action)=shell.model.advance_session(){committed_power=Some((action,ticks.saturating_add(250)));}
+        if closing || old_session!=shell.model.session.screen {shell.scene_dirty.set(true);redraw=true;shell.model.refresh_controls(framebuffer.width,framebuffer.height);}
         if redraw {
             shell.draw_desktop(&framebuffer, &mut frame, &mut frame_rgba);
             present_surface_region(&frame, &mut frame_rgba, previous_cursor_bounds);
@@ -897,7 +922,7 @@ impl Shell {
     ) {
         self.compose_desktop(framebuffer, frame);
         let damage = self.scene.borrow().damage();
-        let has_overlay = self.model.start_menu.open
+        let has_overlay = self.model.session.screen!=nt61_desktop::session::Screen::Desktop || self.model.start_menu.open
             || self.model.context_menu.is_some()
             || self.model.flyout.is_some();
         if let Some(region) = damage.filter(|_| !has_overlay) {
@@ -955,6 +980,7 @@ impl Shell {
         }
         self.draw_context_menu(frame, framebuffer);
         self.draw_flyout(frame, framebuffer);
+        nt61_desktop::session::draw(&self.model.session,frame,|frame,text,b,color|self.label(frame,text,b,color));
     }
 
     fn current_cursor(&self) -> &CursorImage {

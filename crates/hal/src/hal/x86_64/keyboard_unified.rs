@@ -168,6 +168,7 @@ pub fn hid_emit(usage:u8,shift:bool,caps:bool){hid_emit_modifiers(usage,if shift
 
 /// Preserve Control/Alt and navigation when decoding USB boot keyboard reports.
 pub fn hid_emit_modifiers(usage:u8,modifiers:u8,caps:bool){
+    if crate::hal::common::desktop_hotkeys::intercept(usage, modifiers) { return; }
     let shift=hid_shift_state(modifiers);
     let control=modifiers&0x11!=0;
     let alt=modifiers&0x44!=0;

@@ -146,7 +146,7 @@ impl ShellLayout {
             Flyout::Network => (300, 208, self.tray(2)),
             Flyout::Volume => (160, 264, self.tray(3)),
             Flyout::Clock => (310, 316, self.clock()),
-            Flyout::Power => (180, 148, self.power_arrow()),
+            Flyout::Power => (180, 212, self.power_arrow()),
         };
         let width = width.min(self.width);
         let height = height.min(self.height.saturating_sub(TASKBAR_HEIGHT + 4));

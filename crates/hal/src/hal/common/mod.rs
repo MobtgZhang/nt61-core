@@ -9,6 +9,7 @@ pub mod dma;
 pub mod framebuffer;
 pub mod framebuffer_impl;
 pub mod display_damage;
+pub mod desktop_hotkeys;
 pub mod interrupts;
 pub mod io_port;
 pub mod keyboard_input;

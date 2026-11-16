@@ -176,12 +176,12 @@ pub fn all_accounts() -> Vec<AccountEntry> {
 pub fn init() {
     RUNTIME_ACCOUNTS.lock().clear();
     for user in crate::registry::cm::sam_runtime_users() {
-        let account = AccountEntry {
+        let account = BUILTIN.iter().find(|a|a.rid==user.rid).copied().unwrap_or(AccountEntry {
             rid: user.rid,
             sid: sid::with_2subs([0, 0, 0, 0, 0, 5], 21, user.rid),
             kind: AccountKind::User,
             enabled: user.enabled,
-        };
+        });
         RUNTIME_ACCOUNTS.lock().push(UserRecord {
             name: user.name,
             entry: account,
@@ -278,7 +278,7 @@ pub fn verify_runtime_password(name: &str, password: &[u8]) -> bool {
 /// login account. Blank Administrator passwords are local-interactive only.
 pub fn verify_interactive_password(name: &str, password: &[u8]) -> bool {
     let Some(account) = lookup_by_name(name).filter(|entry|entry.enabled) else {return false;};
-    if account.rid == 500 {return password.is_empty();}
+    if account.rid == 500 && !RUNTIME_ACCOUNTS.lock().iter().any(|r|r.entry.rid==500) {return password.is_empty();}
     verify_runtime_password(name,password)
 }
 
@@ -349,4 +349,30 @@ mod tests {
         assert!(!verify_runtime_password("runtime-user", b"wrong"));
         assert!(create_user("Runtime-User", b"secret", true).is_err());
     }
+}
+
+/// Owned account name, including dynamically created users.
+pub fn account_name(identity:&sid)->Option<String>{
+    if let Some(name)=RUNTIME_ACCOUNTS.lock().iter().find(|r|r.entry.sid.equals(identity)).map(|r|r.name.clone()){return Some(name);}
+    BUILTIN.iter().find(|a|a.sid.equals(identity)).map(|a|String::from(builtin_name(a)))
+}
+/// Verify and replace a local interactive credential atomically. SAM stores
+/// only the salted digest; callers own and erase the plaintext input.
+pub fn change_interactive_password(name:&str,old:&[u8],new:&[u8])->bool{
+    if new.len()>32{return false;}
+    let Some(entry)=lookup_by_name(name).filter(|a|a.enabled && a.kind!=AccountKind::System && a.rid!=544)else{return false;};
+    let mut salt=[0u8;16];if !csprng::fill(&mut salt){return false;}
+    let digest=password_hash(new,&salt);
+    let mut records=RUNTIME_ACCOUNTS.lock();
+    if let Some(record)=records.iter_mut().find(|r|r.name.eq_ignore_ascii_case(name)){
+        if !constant_time_eq(&record.password_hash,&password_hash(old,&record.salt)){return false;}
+        record.salt=salt;record.password_hash=digest;
+    }else{
+        if entry.rid!=500 || !old.is_empty(){return false;}
+        records.push(UserRecord{name:String::from(name),entry,salt,password_hash:digest});
+    }
+    drop(records);
+    crate::registry::cm::add_sam_runtime_user(crate::registry::cm::SamRuntimeUser{rid:entry.rid,name:String::from(name),enabled:entry.enabled,salt,password_hash:digest});
+    let _=crate::registry::flush::flush_sam_hive();
+    true
 }

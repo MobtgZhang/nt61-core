@@ -707,6 +707,8 @@ pub struct ShellModel {
     pub muted: bool,
     pub calendar_month: Option<CalendarDate>,
     pub power_action: Option<PowerAction>,
+    pub session: crate::session::Session,
+    pub saved_desktops: Vec<crate::session::SavedDesktop>,
 }
 
 impl ShellModel {
@@ -740,6 +742,8 @@ impl ShellModel {
             audio_available: false,
             calendar_month: None,
             power_action: None,
+            session: crate::session::Session::default(),
+            saved_desktops: Vec::new(),
         }
     }
 
@@ -766,7 +770,7 @@ impl ShellModel {
         if self.flyout.is_some() {
             let id = self.controls.focus();
             if !((CONTROL_FLYOUT_LINK..=CONTROL_CALENDAR_NEXT).contains(&id)
-                || (CONTROL_POWER_BASE..CONTROL_POWER_BASE + 4).contains(&id))
+                || (CONTROL_POWER_BASE..CONTROL_POWER_BASE + 6).contains(&id))
             {
                 self.controls
                     .set_focus(if self.flyout == Some(Flyout::Power) {
@@ -903,7 +907,7 @@ impl ShellModel {
                     );
                 }
                 Flyout::Power => {
-                    for index in 0..4 {
+                    for index in 0..6 {
                         c.add(
                             CONTROL_POWER_BASE + index,
                             ControlKind::Button,
@@ -1024,11 +1028,13 @@ impl ShellModel {
                 self.toggle_desktop();
                 true
             }
-            id if (CONTROL_POWER_BASE..CONTROL_POWER_BASE + 4).contains(&id) => {
+            id if (CONTROL_POWER_BASE..CONTROL_POWER_BASE + 6).contains(&id) => {
                 self.power_action = Some(match id - CONTROL_POWER_BASE {
-                    0 => PowerAction::Lock,
+                    0 => PowerAction::SwitchUser,
                     1 => PowerAction::LogOff,
-                    2 => PowerAction::Restart,
+                    2 => PowerAction::Lock,
+                    3 => PowerAction::Restart,
+                    4 => PowerAction::Sleep,
                     _ => PowerAction::ShutDown,
                 });
                 true
@@ -1887,6 +1893,19 @@ impl ShellModel {
     }
 
     pub fn close_window(&mut self, id: u32) {
+        if let Some(modal) = self.guest_modal_for(id) { self.select_window(modal); return; }
+        if let Some(scene)=self.applications.iter_mut().find(|a|a.window_id==id).and_then(|a|a.guest_window.as_mut()) {
+            scene.close_request();return;
+        }
+        if let Some(app) = self.applications.iter_mut().find(|a|a.window_id==id) {
+            if let Some(request) = &mut app.guest_dialog {
+                if request.packet.values[1] == nt61_abi::dialog_bridge::PENDING {
+                    request.packet.values[1] = nt61_abi::dialog_bridge::CANCELLED;
+                }
+                if crate::applications::guest_dialog::complete(request).is_err() { return; }
+                app.guest_dialog = None;
+            }
+        }
         if self.drag_window == Some(id) { self.release_window_drag(); }
         self.applications.retain(|app|app.window_id!=id);
         self.explorers.retain(|app|app.window_id!=id);
@@ -1902,6 +1921,7 @@ impl ShellModel {
     }
 
     pub fn select_window(&mut self, id: u32) {
+        let id = self.guest_modal_for(id).unwrap_or(id);
         if self.taskbar.windows.iter().any(|window| window.id == id) {
             self.selected_window = Some(id);
             self.focus_window(id);
@@ -2201,7 +2221,7 @@ impl ShellModel {
         }
         if self.flyout == Some(Flyout::Power) && (key == 0x26 || key == 0x28) {
             let current = self.controls.focus().saturating_sub(CONTROL_POWER_BASE) as i32;
-            let next = (current + if key == 0x26 { -1 } else { 1 }).rem_euclid(4);
+            let next = (current + if key == 0x26 { -1 } else { 1 }).rem_euclid(6);
             self.controls.set_focus(CONTROL_POWER_BASE + next as u32);
             return true;
         }
@@ -2227,7 +2247,7 @@ impl ShellModel {
                     if self.flyout.is_some() {
                         c.id == CONTROL_FLYOUT_LINK
                             || (CONTROL_MUTE..=CONTROL_CALENDAR_NEXT).contains(&c.id)
-                            || (CONTROL_POWER_BASE..CONTROL_POWER_BASE + 4).contains(&c.id)
+                            || (CONTROL_POWER_BASE..CONTROL_POWER_BASE + 6).contains(&c.id)
                     } else if self.context_menu.is_some() {
                         (CONTROL_CONTEXT_MENU_BASE..CONTROL_START_LINK_BASE).contains(&c.id)
                     } else {
@@ -2425,6 +2445,8 @@ impl ShellModel {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PowerAction {
+    SwitchUser,
+    Sleep,
     Lock,
     LogOff,
     Restart,
@@ -2957,7 +2979,7 @@ mod shell_popup_tests {
         assert!(shell.controls.control(CONTROL_FLYOUT_LINK).is_none());
         assert_eq!(shell.controls.focus(), CONTROL_POWER_BASE);
         shell.handle_popup_key(0x26);
-        assert_eq!(shell.controls.focus(), CONTROL_POWER_BASE + 3);
+        assert_eq!(shell.controls.focus(), CONTROL_POWER_BASE + 5);
         shell.handle_popup_key(0x28);
         assert_eq!(shell.controls.focus(), CONTROL_POWER_BASE);
         shell.handle_popup_key(9);

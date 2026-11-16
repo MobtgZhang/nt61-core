@@ -43,12 +43,16 @@ fn exchange_with(
     }
     let output = matches!(
         operation,
-        LIST | READ | READ_AT | COMMAND | PROCESSES | DISKPART
+        LIST | READ | READ_AT | COMMAND | PROCESSES | DISKPART | nt61_abi::dialog_bridge::POLL | nt61_abi::dialog_bridge::COMMAND_POLL
     );
     let capacity = if operation == VOLUME_SPACE {
         16
-    } else if operation == COMMAND {
+    } else if operation == nt61_abi::session_bridge::HOTKEYS {4
+    } else if operation == nt61_abi::session_bridge::SESSION && path=="user" {128
+    } else if matches!(operation,nt61_abi::session_bridge::MONITOR|nt61_abi::session_bridge::SERVICES) {65536
+    } else if matches!(operation, COMMAND | nt61_abi::dialog_bridge::COMMAND_POLL) {
         CWD_BYTES + 65536
+    } else if operation == nt61_abi::dialog_bridge::PRINT_WRITE { input.len().max(4)
     } else if output {
         65536
     } else {
@@ -201,3 +205,27 @@ pub fn diskpart(
     let output = core::str::from_utf8(&bytes[16..]).map_err(|_| STATUS_INVALID_PARAMETER)?;
     Ok((state, code, output.into(), flags & COMMAND_EXIT != 0))
 }
+
+/// Start command execution without blocking the compositor or modal input.
+pub fn command_start(line:&str,directory:&str)->Result<u64,u32>{
+    if directory.len()>=CWD_BYTES{return Err(STATUS_INVALID_PARAMETER);}
+    let mut input=[0;CWD_BYTES];input[..directory.len()].copy_from_slice(directory.as_bytes());
+    let (bytes,_)=exchange(nt61_abi::dialog_bridge::COMMAND_START,line,&input)?;
+    Ok(u64::from_le_bytes(bytes.as_slice().try_into().map_err(|_|STATUS_INVALID_PARAMETER)?))
+}
+pub fn command_poll(id:u64)->Result<Option<CommandOutput>,u32>{
+    let (bytes,flags)=exchange(nt61_abi::dialog_bridge::COMMAND_POLL,&alloc::format!("{id}"),&[])?;
+    if bytes.is_empty(){return Ok(None);}
+    if bytes.len()<CWD_BYTES{return Err(STATUS_INVALID_PARAMETER);}
+    let n=bytes[..CWD_BYTES].iter().position(|b|*b==0).unwrap_or(CWD_BYTES);
+    let directory=core::str::from_utf8(&bytes[..n]).map_err(|_|STATUS_INVALID_PARAMETER)?.into();
+    Ok(Some(CommandOutput{directory,bytes:bytes[CWD_BYTES..].to_vec(),exit:flags&COMMAND_EXIT!=0}))
+}
+
+pub fn session(action:&str,input:&[u8])->Result<Vec<u8>,u32>{
+    // Passwords borrow caller storage. Never clone them into exchange's buffer.
+    if action=="user" {return transfer(nt61_abi::session_bridge::SESSION,action,input);}
+    submit(&mut Request{version:VERSION,operation:nt61_abi::session_bridge::SESSION,path:action.as_ptr()as u64,path_length:action.len()as u64,data:input.as_ptr()as u64,capacity:input.len()as u64,..Request::default()})?;
+    Ok(Vec::new())
+}
+pub fn desktop_hotkeys()->Result<u32,u32>{let b=transfer(nt61_abi::session_bridge::HOTKEYS,"",&[])?;Ok(u32::from_le_bytes(b.as_slice().try_into().map_err(|_|STATUS_INVALID_PARAMETER)?))}

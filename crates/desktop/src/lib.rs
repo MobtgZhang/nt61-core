@@ -36,3 +36,5 @@ pub const NT_VERSION: (u16, u16, u16) = (6, 1, 7601);
 #[cfg(test)]
 #[path = "ico_test.rs"]
 mod ico_tests;
+
+pub mod session;
