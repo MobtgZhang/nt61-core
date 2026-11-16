@@ -12,6 +12,9 @@ mod cmos {
         pub weekday: u8,
     }
     impl TimeFields {
+        pub const fn second(&self) -> u8 {
+            self.second
+        }
         pub const fn new(
             year: u16,
             month: u8,
@@ -45,6 +48,57 @@ const CALENDARS: [(u64, Time); 7] = [
     (4_107_542_400, Time::new(2100, 3, 1, 0, 0, 0, 2)),
     (253_402_300_799, Time::new(9999, 12, 31, 23, 59, 59, 6)),
 ];
+
+#[test]
+fn calendar_encoding_roundtrips_and_rejects_invalid_input_before_writes() {
+    for (seconds, time) in CALENDARS {
+        assert_eq!(rtc::time_fields_to_unix_seconds(&time), Some(seconds));
+        assert_eq!(
+            rtc::time_fields_to_nt_seconds(&time),
+            Some(seconds + 11_644_473_600)
+        );
+    }
+    let mut writes = Vec::new();
+    for time in [
+        Time::new(2100, 2, 29, 0, 0, 0, 1),
+        Time::new(2000, 0, 1, 0, 0, 0, 1),
+        Time::new(2000, 1, 0, 0, 0, 0, 1),
+    ] {
+        assert!(!rtc::write_goldfish(&time, |a, v| writes.push((a, v))));
+        assert!(!rtc::write_ls7a(&time, |a, v| writes.push((a, v))));
+    }
+    assert!(writes.is_empty());
+}
+
+#[test]
+fn goldfish_write_encodes_nanoseconds_high_then_low_and_rejects_overflow() {
+    for (seconds, time) in CALENDARS {
+        let mut writes = Vec::new();
+        let result = rtc::write_goldfish(&time, |a, v| writes.push((a, v)));
+        if seconds > i64::MAX as u64 / 1_000_000_000 {
+            assert!(!result);
+            assert!(writes.is_empty());
+        } else {
+            let nanos = seconds * 1_000_000_000;
+            assert!(result);
+            assert_eq!(writes, [(4, (nanos >> 32) as u32), (0, nanos as u32)]);
+        }
+    }
+}
+
+#[test]
+fn ls7a_write_uses_year_before_calendar_and_never_writes_read_registers() {
+    let time = Time::new(2000, 2, 29, 23, 59, 58, 3);
+    let mut writes = Vec::new();
+    assert!(rtc::write_ls7a(&time, |a, v| writes.push((a, v))));
+    assert_eq!(writes, [(0x28, 100), (0x24, fields(time))]);
+    writes.clear();
+    assert!(!rtc::write_ls7a(
+        &Time::new(1899, 1, 1, 0, 0, 0, 1),
+        |a, v| writes.push((a, v))
+    ));
+    assert!(writes.is_empty());
+}
 fn fields(time: Time) -> u32 {
     u32::from(time.month) << 26
         | u32::from(time.day) << 21

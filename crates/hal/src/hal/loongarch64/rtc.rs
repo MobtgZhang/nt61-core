@@ -25,3 +25,28 @@ pub fn query_real_time_clock() -> Option<TimeFields> {
     }
     rtc::read_ls7a(|offset| unsafe { read_volatile((base + offset) as *const u32) })
 }
+
+pub fn set_real_time_clock(time: &TimeFields) -> bool {
+    // Validate before touching the oscillator control register.
+    if time.year < 1900 || rtc::time_fields_to_nt_seconds(time).is_none() {
+        return false;
+    }
+    let _guard = RTC_LOCK.lock();
+    let base = if crate::arch::loongarch64::paging::paging_enabled() {
+        crate::arch::loongarch64::paging::mmio_virt(RTC_BASE)
+    } else {
+        RTC_BASE
+    } as usize;
+    // SAFETY: the platform RTC page is mapped in the MMIO segment. Preserve
+    // alarm controls and enable the time-of-year oscillator before loading it.
+    unsafe {
+        let control = read_volatile((base + RTC_CONTROL) as *const u32);
+        write_volatile((base + RTC_CONTROL) as *mut u32, control | TOY_ENABLE);
+        core::arch::asm!("dbar 0", options(nostack, preserves_flags));
+    }
+    rtc::write_ls7a(time, |offset, value| unsafe {
+        // SAFETY: offsets are the two TOY write registers in the mapped page.
+        write_volatile((base + offset) as *mut u32, value);
+        core::arch::asm!("dbar 0", options(nostack, preserves_flags));
+    })
+}

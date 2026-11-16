@@ -23,6 +23,67 @@ fn month_days(year: u16) -> [u8; 12] {
     ]
 }
 
+/// Encode a Gregorian calendar in NT-epoch seconds. Validate before device I/O.
+pub(crate) fn time_fields_to_nt_seconds(time: &TimeFields) -> Option<u64> {
+    if !(1601..=9999).contains(&time.year)
+        || !(1..=12).contains(&time.month)
+        || time.day == 0
+        || time.day > month_days(time.year)[usize::from(time.month - 1)]
+        || time.hour > 23
+        || time.minute > 59
+        || time.second() > 59
+    {
+        return None;
+    }
+    let mut days = 0u64;
+    for year in 1601..time.year {
+        days += if leap_year(year) { 366 } else { 365 };
+    }
+    for &count in &month_days(time.year)[..usize::from(time.month - 1)] {
+        days += u64::from(count);
+    }
+    days += u64::from(time.day - 1);
+    Some(
+        days * 86_400
+            + u64::from(time.hour) * 3600
+            + u64::from(time.minute) * 60
+            + u64::from(time.second()),
+    )
+}
+
+pub(crate) fn time_fields_to_unix_seconds(time: &TimeFields) -> Option<u64> {
+    time_fields_to_nt_seconds(time)?.checked_sub(11_644_473_600)
+}
+
+/// Goldfish time halves are independent writable registers. Serialize both
+/// writes with reads; HIGH then LOW leaves the desired low part at commit.
+pub(crate) fn write_goldfish(time: &TimeFields, mut write: impl FnMut(usize, u32)) -> bool {
+    let Some(nanos) = time_fields_to_unix_seconds(time)
+        .and_then(|value| value.checked_mul(1_000_000_000))
+        .filter(|&value| value <= i64::MAX as u64)
+    else {
+        return false;
+    };
+    write(4, (nanos >> 32) as u32);
+    write(0, nanos as u32);
+    true
+}
+
+/// LS7A writes year first so a new February 29 is interpreted in its new year.
+pub(crate) fn write_ls7a(time: &TimeFields, mut write: impl FnMut(usize, u32)) -> bool {
+    if time.year < 1900 || time_fields_to_nt_seconds(time).is_none() {
+        return false;
+    }
+    let fields = u32::from(time.month) << 26
+        | u32::from(time.day) << 21
+        | u32::from(time.hour) << 16
+        | u32::from(time.minute) << 10
+        | u32::from(time.second()) << 4;
+    write(0x28, u32::from(time.year - 1900));
+    write(0x24, fields);
+    true
+}
+
 /// Decode an unsigned Unix timestamp, rejecting dates outside the NT range.
 pub(crate) fn unix_seconds_to_time_fields(timestamp: u64) -> Option<TimeFields> {
     // 10000-01-01, beyond the last date representable by SYSTEMTIME.
