@@ -87,6 +87,7 @@ struct HandleObject {
     entry: HandleEntry,
     handles: usize,
     waits: usize,
+    file_pins: usize,
     permanent: bool,
     parent: Option<u64>,
     /// Optional owner for payloads whose lifetime ends with this object.
@@ -221,6 +222,7 @@ impl HandleTable {
             },
             handles: 1,
             waits: 0,
+            file_pins: 0,
             permanent: false,
             parent: None,
             release: None,
@@ -640,7 +642,7 @@ fn remove_handle(handle: HANDLE, protect: bool) -> Result<(HandleEntry, bool), N
         .as_ref()
         .ok_or(STATUS_INVALID_HANDLE)?;
     let last_handle = object.handles == 0 && !object.permanent;
-    let retire = last_handle && object.waits == 0;
+    let retire = last_handle && object.waits == 0 && object.file_pins == 0;
     if last_handle {
         table.links.retain(|(identity, _)| *identity != entry.identity);
         table.names.retain(|(index, _)| *index != slot.object);
@@ -692,6 +694,84 @@ pub(crate) fn lookup_handle(handle: HANDLE) -> Option<HandleEntry> {
         .get(decode_handle(handle))
         .and_then(|slot| *slot)?;
     table.objects[slot.object].map(|object| object.entry)
+}
+
+/// A file payload retained independently of its handle slot. A final close
+/// removes the slot immediately, but teardown waits for the final pin. Driver
+/// calls and waits can therefore run without holding the handle-table lock.
+pub(crate) struct FileHandleReference {
+    object: usize,
+    entry: HandleEntry,
+    retire: unsafe fn(HandleEntry),
+}
+
+impl FileHandleReference {
+    pub(crate) fn entry(&self) -> HandleEntry {
+        self.entry
+    }
+}
+
+impl Drop for FileHandleReference {
+    fn drop(&mut self) {
+        let mut table = HANDLE_TABLE.lock();
+        let Some(object) = table.objects[self.object].as_mut() else {
+            return;
+        };
+        debug_assert_eq!(object.entry.identity, self.entry.identity);
+        debug_assert!(object.file_pins != 0);
+        object.file_pins -= 1;
+        let retired = object.file_pins == 0 && object.handles == 0
+            && object.waits == 0 && !object.permanent;
+        if retired {
+            table.objects[self.object] = None;
+        }
+        drop(table);
+        if retired {
+            // SAFETY: this pin owned the final file-object reference; its
+            // creator supplied the same teardown used by final handle close.
+            unsafe { (self.retire)(self.entry); }
+        }
+    }
+}
+
+/// Retain a file handle with desired access zero, as required by native device
+/// queries. Object kind validation and pin acquisition are atomic with close.
+///
+/// # Safety
+/// `retire` must destroy the file payload exactly as its final handle close
+/// would, and every pin for that payload must use the same teardown contract.
+pub(crate) unsafe fn reference_file_handle(
+    handle: HANDLE,
+    retire: unsafe fn(HandleEntry),
+) -> Result<FileHandleReference, NTSTATUS> {
+    // SAFETY: forwards the caller's teardown contract without changing it.
+    unsafe { reference_file_handle_with_access(handle, 0, retire) }
+}
+
+/// Acquire the payload pin and validate granted access in the same transaction.
+///
+/// # Safety
+/// `retire` has the same final-payload ownership contract as
+/// `reference_file_handle`.
+pub(crate) unsafe fn reference_file_handle_with_access(
+    handle: HANDLE,
+    required_access: u32,
+    retire: unsafe fn(HandleEntry),
+) -> Result<FileHandleReference, NTSTATUS> {
+    use super::super::status::{STATUS_ACCESS_DENIED, STATUS_INSUFFICIENT_RESOURCES, STATUS_OBJECT_TYPE_MISMATCH};
+    let mut table = HANDLE_TABLE.lock();
+    let slot = table.slots.get(decode_handle(handle))
+        .and_then(|slot| *slot).ok_or(STATUS_INVALID_HANDLE)?;
+    let object = table.objects[slot.object].as_mut().ok_or(STATUS_INVALID_HANDLE)?;
+    if object.entry.kind != HandleKind::File {
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    if slot.access & required_access != required_access {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    object.file_pins = object.file_pins.checked_add(1)
+        .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+    Ok(FileHandleReference { object: slot.object, entry: object.entry, retire })
 }
 
 /// Run a synchronization transaction without allowing concurrent close/reuse.

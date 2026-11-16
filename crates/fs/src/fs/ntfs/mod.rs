@@ -71,6 +71,7 @@ static NTFS_MOUNTED: Spinlock<bool> = Spinlock::new(false);
 
 /// NTFS pagefile support module
 pub mod pagefile;
+pub mod upcase;
 
 /// NTFS boot sector
 #[repr(C, packed(1))]
@@ -1698,6 +1699,10 @@ pub struct DirectoryEntry {
     pub creation_time: u64,
     /// Modification time
     pub modification_time: u64,
+    pub change_time: u64,
+    pub access_time: u64,
+    pub allocated_size: u64,
+    pub file_attributes: u32,
 }
 
 impl DirectoryEntry {
@@ -1711,6 +1716,10 @@ impl DirectoryEntry {
             file_size: 0,
             creation_time: 0,
             modification_time: 0,
+            change_time: 0,
+            access_time: 0,
+            allocated_size: 0,
+            file_attributes: 0,
         }
     }
 }
@@ -1899,6 +1908,10 @@ pub fn parse_index_entry(buffer: &[u8], offset: usize) -> Option<(DirectoryEntry
     entry.file_size = file_size;
     entry.creation_time = creation_time;
     entry.modification_time = modification_time;
+    entry.change_time = u64::from_le_bytes(buffer[fn_off + 0x18..fn_off + 0x20].try_into().ok()?);
+    entry.access_time = u64::from_le_bytes(buffer[fn_off + 0x20..fn_off + 0x28].try_into().ok()?);
+    entry.allocated_size = u64::from_le_bytes(buffer[fn_off + 0x28..fn_off + 0x30].try_into().ok()?);
+    entry.file_attributes = file_attributes;
 
     Some((entry, offset + entry_size))
 }
@@ -2012,35 +2025,8 @@ pub fn parse_index_root(index_root_data: &[u8]) -> ([DirectoryEntry; 64], usize)
     (entries, count)
 }
 
-/// internal raw directory entry used for cross-filesystem enumeration.
-/// Populated by NTFS (via DirectoryEntry) and later serialized into
-/// the caller's FileDirectoryInformation buffer.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct RawDirEntry {
-    pub name: [u16; 256],
-    pub name_len: u16,
-    pub is_dir: bool,
-    pub size: u64,
-    pub alloc_size: u64,
-    pub creation_time: i64,
-    pub last_write_time: i64,
-    pub mft_ref: u64,
-}
-impl RawDirEntry {
-    pub const fn empty() -> Self {
-        Self {
-            name: [0; 256],
-            name_len: 0,
-            is_dir: false,
-            size: 0,
-            alloc_size: 0,
-            creation_time: 0,
-            last_write_time: 0,
-            mft_ref: 0,
-        }
-    }
-}
+mod raw_directory_entry;
+pub use raw_directory_entry::RawDirEntry;
 
 /// Enumerate directory entries from an NTFS directory by MFT record.
 ///
@@ -2108,15 +2094,49 @@ pub fn list_ntfs_directory(
         entries[count].name_len = name_len as u16;
         entries[count].is_dir = dir_entry.is_directory;
         entries[count].size = dir_entry.file_size;
-        entries[count].alloc_size = dir_entry.file_size; // NTFS rounds up; simplified
+        entries[count].alloc_size = dir_entry.allocated_size;
         entries[count].creation_time = dir_entry.creation_time as i64;
         entries[count].last_write_time = dir_entry.modification_time as i64;
+        entries[count].last_access_time = dir_entry.access_time as i64;
+        entries[count].change_time = dir_entry.change_time as i64;
+        entries[count].file_attributes = dir_entry.file_attributes;
         entries[count].mft_ref = dir_entry.record_number;
 
         count += 1;
     }
 
     count
+}
+
+/// Checked enumeration for native directory requests. Unlike the legacy fixed
+/// buffer adapter, this reads INDEX_ROOT and INDEX_ALLOCATION and preserves
+/// filesystem failures instead of returning an apparently empty directory.
+pub fn list_raw_directory_checked(
+    fs: &NtfsFileSystem,
+    mft_ref: u64,
+) -> Result<Vec<RawDirEntry>, NTSTATUS> {
+    let entries = list_directory_checked(fs, mft_ref)?;
+    let mut raw_entries = Vec::new();
+    raw_entries.try_reserve(entries.len()).map_err(|_| 0xc000009au32 as NTSTATUS)?;
+    for entry in entries {
+        if entry.name.len() > 255 {
+            return Err(0xc0000102u32 as NTSTATUS); // STATUS_FILE_CORRUPT_ERROR
+        }
+        let mut raw = RawDirEntry::empty();
+        raw.name[..entry.name.len()].copy_from_slice(&entry.name);
+        raw.name_len = entry.name.len() as u16;
+        raw.is_dir = entry.is_directory;
+        raw.size = entry.file_size;
+        raw.alloc_size = entry.allocated_size;
+        raw.creation_time = entry.creation_time as i64;
+        raw.last_write_time = entry.modification_time as i64;
+        raw.last_access_time = entry.access_time as i64;
+        raw.change_time = entry.change_time as i64;
+        raw.file_attributes = entry.file_attributes;
+        raw.mft_ref = entry.record_number;
+        raw_entries.push(raw);
+    }
+    Ok(raw_entries)
 }
 
 /// Get file by MFT record number.
@@ -3252,7 +3272,8 @@ fn write_file_with_runs(
 
             let cluster_in_run = offset_in_run / bytes_per_cluster;
             let cluster = start_cluster + cluster_in_run;
-            let first_sector = cluster_to_sector(cluster, ntfs.ntfs_data.cluster_size);
+            let first_sector = ntfs.ntfs_data.hidden_sectors
+                + cluster_to_sector(cluster, ntfs.ntfs_data.cluster_size);
             let mut sector_offset = offset_in_cluster;
             let cluster_end = offset_in_cluster + bytes_in_cluster;
 
@@ -3273,11 +3294,9 @@ fn write_file_with_runs(
                 sector_buf[offset_in_sector..offset_in_sector + copy_len]
                     .copy_from_slice(&buffer[bytes_written..bytes_written + copy_len]);
 
-                let write_ok = if let Some(device_id) = ntfs.ntfs_data.device_id {
-                    crate::drivers::storage::block::write_block(device_id, sector, &sector_buf)
-                } else {
-                    write_sector(core::ptr::null_mut(), sector, &sector_buf).is_ok()
-                };
+                // Use the same mounted volume for the read and the write.
+                // A boot RAM snapshot has no legacy raw-device writer.
+                let write_ok = write_mounted_sector(&ntfs.ntfs_data, sector, &sector_buf);
                 if !write_ok {
                     return None;
                 }
@@ -3527,10 +3546,15 @@ fn build_index_root(entries: &[DirectoryEntry]) -> Vec<u8> {
         );
         // The index caches FILE_NAME sizes; preserve them when another entry
         // is inserted instead of resetting every existing file to zero bytes.
-        entry_bytes_current[16 + 0x28..16 + 0x30]
-            .copy_from_slice(&entry.file_size.to_le_bytes());
-        entry_bytes_current[16 + 0x30..16 + 0x38]
-            .copy_from_slice(&entry.file_size.to_le_bytes());
+        for (offset, value) in [
+            (0x08, entry.creation_time), (0x10, entry.modification_time),
+            (0x18, entry.change_time), (0x20, entry.access_time),
+            (0x28, entry.allocated_size), (0x30, entry.file_size),
+        ] {
+            entry_bytes_current[16 + offset..24 + offset].copy_from_slice(&value.to_le_bytes());
+        }
+        let attributes = entry.file_attributes | if entry.is_directory { 0x10 } else { 0 };
+        entry_bytes_current[16 + 0x38..16 + 0x3c].copy_from_slice(&attributes.to_le_bytes());
         entry_bytes.extend_from_slice(&entry_bytes_current);
     }
     entry_bytes.extend_from_slice(&build_index_entry(0, 0, &[], false, true));
@@ -3616,7 +3640,8 @@ fn persist_directory_entries(ntfs:&NtfsFileSystem,number:u64,entries:&[Directory
     let mut sorted=entries.to_vec();sorted.sort_by(|a,b|a.name.iter().copied().map(utf16_ascii_upper).cmp(b.name.iter().copied().map(utf16_ascii_upper)));
     let mut keys:Vec<Vec<u8>>=sorted.iter().map(|e|{
         let mut key=build_index_entry(e.record_number,e.parent_record,&e.name,e.is_directory,false);
-        for (at,value)in [(24,e.creation_time),(32,e.modification_time),(56,e.file_size),(64,e.file_size)]{key[at..at+8].copy_from_slice(&value.to_le_bytes());}
+        for (at,value)in [(24,e.creation_time),(32,e.modification_time),(40,e.change_time),(48,e.access_time),(56,e.allocated_size),(64,e.file_size)]{key[at..at+8].copy_from_slice(&value.to_le_bytes());}
+        key[72..76].copy_from_slice(&(e.file_attributes | if e.is_directory { 0x10 } else { 0 }).to_le_bytes());
         // The upper 16 reference bits are the record's sequence number.
         if let Some(record)=read_mft_record(&ntfs.ntfs_data,e.record_number){
             key[6..8].copy_from_slice(&record[16..18]);
@@ -4020,7 +4045,9 @@ pub fn replace_file_contents(ntfs: &mut NtfsFileSystem, path: &[u16], data: &[u8
             record.get_mut(value+48..value+56).ok_or(STATUS_UNSUCCESSFUL)?.copy_from_slice(&(data.len()as u64).to_le_bytes());
         }
         let mut entries=list_directory_checked(ntfs,parent)?;
-        entries.iter_mut().find(|e|e.record_number==number).ok_or(STATUS_UNSUCCESSFUL)?.file_size=data.len()as u64;
+        let entry = entries.iter_mut().find(|e|e.record_number==number).ok_or(STATUS_UNSUCCESSFUL)?;
+        entry.file_size = data.len() as u64;
+        entry.allocated_size = allocated;
         release_new=false;
         if let Err(error)=write_mft_record(&ntfs.ntfs_data,number,&record){
             release_new=write_mft_record(&ntfs.ntfs_data,number,&original).is_ok();

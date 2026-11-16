@@ -24,8 +24,7 @@ use super::status::{
     STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION,
     STATUS_SUCCESS,
 };
-use super::types::{FileInformationClass, IoStatusBlock, UnicodeString, HANDLE, NTSTATUS, PVOID};
-use crate::fs::ntfs::RawDirEntry;
+use super::types::{IoStatusBlock, UnicodeString, HANDLE, NTSTATUS, PVOID};
 use crate::ke::sync::Spinlock;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -58,6 +57,7 @@ mod handles;
 pub use handles::handle_count;
 pub(crate) use handles::namespace::{directory_entries, symbolic_link_target, set_object_permanent};
 pub(crate) use handles::{
+    FileHandleReference,
     create_named_handle, directory_root,
     create_object_handle,
     alert_user_thread, take_user_alert, terminate_user_alert, thread_alert_target,
@@ -103,16 +103,6 @@ const FILE_SHARE_VALID_FLAGS: u32 = 0x0000_0007;
 /// IoCreateFile wires a FILE_OBJECT into the driver's stack location.
 fn file_object_of(target: u64) -> *mut crate::io::FileObject {
     target as *mut crate::io::FileObject
-}
-
-/// The filesystem device backing native file I/O: the `\\FileSystem\\Ntfs`
-/// driver object registered in `io::init`, whose device is `\\Device\\Fs`.
-fn fs_device() -> *mut crate::io::DeviceObject {
-    let driver = crate::io::find_registered_driver(b"\\FileSystem\\Ntfs");
-    if driver.is_null() {
-        return core::ptr::null_mut();
-    }
-    unsafe { (*driver).device_object }
 }
 
 /// One entry in the share-access table: every successfully opened File
@@ -212,35 +202,6 @@ fn file_fcb_of(entry: HandleEntry) -> Option<*mut crate::fs::ntfs::NtfsHandle> {
     }
 }
 
-/// Context filled by `create_completion_capture` while the CREATE IRP
-/// unwinds, before IoCompleteRequest frees it.
-#[repr(C)]
-struct CreateIosbCapture {
-    status: i32,
-    information: usize,
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Completion routine for the CREATE IRP: copies the filesystem driver's
-/// IoStatus (final status and FILE_OPENED/FILE_CREATED information code)
-/// out of the IRP into the issuer's context. It runs inside
-/// IoCompleteRequest while the IRP is still alive; returning
-/// STATUS_SUCCESS lets the I/O manager keep unwinding and free the IRP.
-unsafe extern "C" fn create_completion_capture(
-    _device: *mut crate::io::DeviceObject,
-    irp: *mut crate::io::Irp,
-    context: *mut (),
-) -> i32 {
-    if !context.is_null() && !irp.is_null() {
-        let capture = context as *mut CreateIosbCapture;
-        (*capture).status = (*irp).io_status.status as i32;
-        (*capture).information = (*irp).io_status.information;
-    }
-    STATUS_SUCCESS
-}
-
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
@@ -251,8 +212,7 @@ unsafe extern "C" fn create_completion_capture(
 /// means "use the current file position". Explicit offsets — including
 /// 0 — are pre-seeked into the FileObject, so an explicit seek to 0 is
 /// honoured while a null/absent offset leaves the position alone.
-/// Returns (status, bytes transferred), the latter derived from the
-/// FileObject's byte-offset delta as the I/O manager would report it.
+/// Waits for completion and returns the driver's final status/byte count.
 unsafe fn file_transfer_irp(
     file_object: *mut crate::io::FileObject,
     major: u8,
@@ -260,10 +220,26 @@ unsafe fn file_transfer_irp(
     length: usize,
     byte_offset: Option<i64>,
 ) -> (i32, usize) {
+    let _request = (*file_object).request_lock.lock();
     let device = (*file_object).device_object;
     if device.is_null() {
         return (STATUS_INVALID_DEVICE_REQUEST, 0);
     }
+    let byte_offset = match byte_offset {
+        None | Some(-2) => None, // FILE_USE_FILE_POINTER_POSITION
+        Some(-1) if major == crate::io::major::IRP_MJ_WRITE => {
+            if (*file_object).fcb.is_null() {
+                return (STATUS_INVALID_DEVICE_REQUEST, 0);
+            }
+            let end = (*((*file_object).fcb as *const crate::fs::ntfs::NtfsHandle)).file_size;
+            let Ok(end) = i64::try_from(end) else {
+                return (STATUS_INVALID_PARAMETER, 0);
+            };
+            Some(end) // FILE_WRITE_TO_END_OF_FILE
+        }
+        Some(offset) if offset < 0 => return (STATUS_INVALID_PARAMETER, 0),
+        offset => offset,
+    };
     let irp = crate::io::allocate_irp(1);
     if irp.is_null() {
         return (STATUS_NO_MEMORY, 0);
@@ -278,16 +254,14 @@ unsafe fn file_transfer_irp(
         key: 0,
     };
     (*irp).user_buffer = buffer as *mut ();
-    let previous = (*file_object).current_byte_offset;
+    // Both native entry points capture into owned kernel storage before this
+    // call. Preserve that provenance even when the kernel heap uses low VAs.
+    (*irp).requestor_mode = 0;
     if let Some(offset) = byte_offset {
-        (*file_object).current_byte_offset = if offset < 0 { 0 } else { offset as u64 };
+        (*file_object).current_byte_offset = offset as u64;
     }
-    let status = crate::io::io_call_driver(device, irp);
-    let transferred = (*file_object)
-        .current_byte_offset
-        .wrapping_sub(previous)
-        .min(length as u64) as usize;
-    (status, transferred)
+    let (status, transferred) = crate::io::synchronous_request::submit_and_wait(device, irp);
+    (status, transferred.min(length))
 }
 
 /// # Safety
@@ -308,7 +282,7 @@ unsafe fn file_close_irp(file_object: *mut crate::io::FileObject) -> i32 {
     (*stack).major_function = crate::io::major::IRP_MJ_CLOSE;
     (*stack).device_object = device;
     (*stack).file_object = file_object;
-    crate::io::io_call_driver(device, irp)
+    crate::io::synchronous_request::submit_and_wait(device, irp).0
 }
 
 /// # Safety
@@ -448,9 +422,27 @@ unsafe fn free_file_object(file_object: *mut crate::io::FileObject) {
         let _ = crate::mm::pool::free(name.buffer as *mut u8);
     }
     if !(*file_object).fcb.is_null() {
+        core::ptr::drop_in_place((*file_object).fcb as *mut crate::fs::ntfs::NtfsHandle);
         let _ = crate::mm::pool::free((*file_object).fcb as *mut u8);
     }
+    core::ptr::drop_in_place(file_object);
     let _ = crate::mm::pool::free(file_object as *mut u8);
+}
+
+/// Keep FILE_OBJECT storage alive while an I/O manager request can block.
+pub(crate) fn reference_file(handle: HANDLE) -> Result<FileHandleReference, NTSTATUS> {
+    // SAFETY: both paths use retire_file for the same final-close teardown.
+    unsafe { handles::reference_file_handle(handle, retire_file) }
+}
+
+unsafe fn retire_file(entry: HandleEntry) {
+    // SAFETY: the handle table transferred its final reference to this path.
+    unsafe {
+        let file_object = file_object_of(entry.target);
+        let _ = file_close_irp(file_object);
+        free_file_object(file_object);
+    }
+    remove_share_entry(entry.identity);
 }
 
 // ---------------------------------------------------------------------------
@@ -508,10 +500,11 @@ fn file_open_common(
             return (STATUS_OBJECT_NAME_INVALID, None, 0);
         }
 
-        let device = fs_device();
-        if device.is_null() {
-            return (STATUS_DEVICE_NOT_READY, None, 0);
-        }
+        let binding = match crate::io::file_device_binding::FileDeviceBinding::find(b"\\FileSystem\\Ntfs") {
+            Ok(binding) => binding,
+            Err(_) => return (STATUS_DEVICE_NOT_READY, None, 0),
+        };
+        let device = binding.device_ptr();
 
         // Share-mode arbitration against other opens of the same name.
         // FILE_CREATE on a not-yet-existing name cannot conflict: a
@@ -540,6 +533,7 @@ fn file_open_common(
         }
         {
             core::ptr::write(file_object, crate::io::FileObject::new());
+            (*file_object).bind_device(binding);
             core::ptr::copy_nonoverlapping(path_u16.as_ptr(), name_storage, path_u16.len());
             *name_storage.add(path_u16.len()) = 0;
             (*file_object).file_name = crate::io::UnicodeString {
@@ -567,20 +561,9 @@ fn file_open_common(
             };
         }
 
-        // Capture the driver IoStatus while the IRP completes;
-        // IoCompleteRequest frees the IRP immediately afterwards.
-        let mut capture = CreateIosbCapture {
-            status: STATUS_SUCCESS,
-            information: 0,
-        };
-        {
-            let stack = (*irp).current_stack;
-            (*stack).completion_routine = Some(create_completion_capture);
-            (*stack).completion_context = core::ptr::addr_of_mut!(capture) as *mut ();
-            (*stack).control = crate::io::irp_stack::SL_INVOKE_ON_SUCCESS;
-        }
-
-        let status = crate::io::io_call_driver(device, irp);
+        // Keep the object and completion capture alive for pending CREATEs;
+        // the dispatch return is not the final IoStatus.
+        let (status, information) = crate::io::synchronous_request::submit_and_wait(device, irp);
         if status < 0 {
             {
                 free_file_object(file_object)
@@ -595,12 +578,14 @@ fn file_open_common(
             let target_is_dir = { (*fcb).is_directory };
             if is_directory && !target_is_dir {
                 {
+                    let _ = file_close_irp(file_object);
                     free_file_object(file_object)
                 };
                 return (STATUS_NOT_A_DIRECTORY, None, 0);
             }
             if is_non_directory && target_is_dir {
                 {
+                    let _ = file_close_irp(file_object);
                     free_file_object(file_object)
                 };
                 return (STATUS_FILE_IS_A_DIRECTORY, None, 0);
@@ -610,12 +595,13 @@ fn file_open_common(
         let handle = alloc_handle(HandleKind::File, file_object as u64);
         if handle.is_null() {
             {
+                let _ = file_close_irp(file_object);
                 free_file_object(file_object)
             };
             return (STATUS_NO_MEMORY, None, 0);
         }
         record_share_entry(handle, path_u16, desired_access, share_access);
-        (STATUS_SUCCESS, Some(handle), capture.information)
+        (status, Some(handle), information)
     }
 }
 
@@ -827,8 +813,7 @@ fn check_file_access(name_chars: &[u16], desired_access: u32) -> bool {
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// `nt_read_file` — read `length` bytes from `file_handle` into
-/// `buffer` at `byte_offset`. The byte offset is updated to
-/// reflect the new file position.
+/// `buffer` at the captured input `byte_offset`.
 pub unsafe extern "C" fn nt_read_file(
     file_handle: HANDLE,
     _event: HANDLE,
@@ -849,42 +834,24 @@ pub unsafe extern "C" fn nt_read_file(
     {
         return STATUS_ACCESS_VIOLATION;
     }
-    if !byte_offset.is_null()
-        && crate::mm::user_copy::probe_user_write(byte_offset as u64, size_of_i64()).is_err()
-    {
-        return STATUS_ACCESS_VIOLATION;
-    }
+    let offset = match capture_file_byte_offset(byte_offset) {
+        Ok(offset) => offset,
+        Err(status) => return status,
+    };
     if lookup_handle(file_handle).is_none() {
         return STATUS_INVALID_HANDLE;
     }
 
     let mut kernel_buffer = alloc::vec![0u8; length as usize];
-    let mut offset = if byte_offset.is_null() {
-        None
-    } else {
-        match crate::mm::user_copy::read_user_object(byte_offset as u64) {
-            Ok(v) => Some(v),
-            Err(status) => return status,
-        }
-    };
     let (status, bytes) = read_file_common(file_handle, &mut kernel_buffer, offset);
     if crate::mm::user_copy::copy_to_user(buffer as u64, &kernel_buffer[..bytes]).is_err() {
         return STATUS_ACCESS_VIOLATION;
-    }
-    if bytes > 0 {
-        if let Some(value) = offset.as_mut() {
-            *value += bytes as i64;
-        }
     }
     let iosb = IoStatusBlock {
         status,
         information: bytes,
     };
-    if crate::mm::user_copy::write_user_object(io_status_block as u64, &iosb).is_err()
-        || (!byte_offset.is_null()
-            && crate::mm::user_copy::write_user_object(byte_offset as u64, &offset.unwrap_or(0))
-                .is_err())
-    {
+    if crate::mm::user_copy::write_user_object(io_status_block as u64, &iosb).is_err() {
         return STATUS_ACCESS_VIOLATION;
     }
     status
@@ -914,11 +881,10 @@ pub unsafe extern "C" fn nt_write_file(
     {
         return STATUS_ACCESS_VIOLATION;
     }
-    if !byte_offset.is_null()
-        && crate::mm::user_copy::probe_user_write(byte_offset as u64, size_of_i64()).is_err()
-    {
-        return STATUS_ACCESS_VIOLATION;
-    }
+    let offset = match capture_file_byte_offset(byte_offset) {
+        Ok(offset) => offset,
+        Err(status) => return status,
+    };
     if lookup_handle(file_handle).is_none() {
         return STATUS_INVALID_HANDLE;
     }
@@ -927,29 +893,12 @@ pub unsafe extern "C" fn nt_write_file(
     if crate::mm::user_copy::copy_from_user(&mut kernel_buffer, buffer as u64).is_err() {
         return STATUS_ACCESS_VIOLATION;
     }
-    let mut offset = if byte_offset.is_null() {
-        None
-    } else {
-        match crate::mm::user_copy::read_user_object(byte_offset as u64) {
-            Ok(v) => Some(v),
-            Err(status) => return status,
-        }
-    };
     let (status, bytes) = write_file_common(file_handle, &kernel_buffer, offset);
-    if bytes > 0 {
-        if let Some(value) = offset.as_mut() {
-            *value += bytes as i64;
-        }
-    }
     let iosb = IoStatusBlock {
         status,
         information: bytes,
     };
-    if crate::mm::user_copy::write_user_object(io_status_block as u64, &iosb).is_err()
-        || (!byte_offset.is_null()
-            && crate::mm::user_copy::write_user_object(byte_offset as u64, &offset.unwrap_or(0))
-                .is_err())
-    {
+    if crate::mm::user_copy::write_user_object(io_status_block as u64, &iosb).is_err() {
         return STATUS_ACCESS_VIOLATION;
     }
     status
@@ -1259,10 +1208,7 @@ pub unsafe extern "C" fn nt_close(handle: HANDLE) -> NTSTATUS {
     };
 
     if retired && entry.kind == HandleKind::File {
-        let file_object = file_object_of(entry.target);
-        let _ = file_close_irp(file_object);
-        free_file_object(file_object);
-        remove_share_entry(entry.identity);
+        retire_file(entry);
     }
 
     STATUS_SUCCESS
@@ -1388,100 +1334,12 @@ pub unsafe extern "C" fn nt_set_volume_information_file(
 // Directory enumeration — nt_query_directory_file
 // ---------------------------------------------------------------------------
 
-/// Serialize a `RawDirEntry` into a `FILE_DIRECTORY_INFORMATION` buffer.
-/// Returns the total number of bytes written for this entry.
-fn serialize_file_directory_info(
-    out: &mut super::types::FileDirectoryInformation,
-    raw: &RawDirEntry,
-) -> u32 {
-    out.next_entry_offset = 0; // Caller sets this for chained entries
-    out.file_index = 0;
-    out.creation_time = raw.creation_time;
-    out.last_access_time = 0;
-    out.last_write_time = raw.last_write_time;
-    out.change_time = 0;
-    out.end_of_file = raw.size as i64;
-    out.allocation_size = raw.alloc_size as i64;
-    out.file_attributes = if raw.is_dir { 0x10 } else { 0x20 }; // FILE_ATTRIBUTE_DIRECTORY / FILE_ATTRIBUTE_NORMAL
-    out.file_name_length = (raw.name_len * 2) as u32;
-    out.ea_size = 0;
-
-    // Copy the name into the flexible array after the fixed header.
-    let name_len = raw.name_len as usize;
-    for i in 0..name_len {
-        out.file_name[i] = raw.name[i];
-    }
-
-    // Entry size = fixed header (0x48) + name in bytes, rounded up to 8.
-    let name_bytes = (name_len * 2) as u32;
-    ((0x48u32 + name_bytes) + 7) & !7u32
-}
-
-/// Serialize a `RawDirEntry` into a `FILE_BOTH_DIRECTORY_INFORMATION` buffer.
-/// Returns the total number of bytes written for this entry.
-fn serialize_file_both_dir_info(
-    out: &mut super::types::FileBothDirectoryInformation,
-    raw: &RawDirEntry,
-) -> u32 {
-    out.next_entry_offset = 0;
-    out.file_index = 0;
-    out.creation_time = raw.creation_time;
-    out.last_access_time = 0;
-    out.last_write_time = raw.last_write_time;
-    out.change_time = 0;
-    out.end_of_file = raw.size as i64;
-    out.allocation_size = raw.alloc_size as i64;
-    out.file_attributes = if raw.is_dir { 0x10 } else { 0x20 };
-    out.file_name_length = (raw.name_len * 2) as u32;
-    out.ea_size = 0;
-    out.short_name_length = 0;
-    out._pad0 = [0; 1];
-    out.short_name = [0; 12];
-
-    let name_len = raw.name_len as usize;
-    for i in 0..name_len {
-        out.file_name[i] = raw.name[i];
-    }
-
-    let name_bytes = (name_len * 2) as u32;
-    ((0x60u32 + name_bytes) + 7) & !7u32
-}
-
-/// Serialize a `RawDirEntry` into a `FILE_ID_BOTH_DIRECTORY_INFORMATION` buffer.
-/// Returns the total number of bytes written for this entry.
-fn serialize_file_id_both_dir_info(
-    out: &mut super::types::FileIdBothDirectoryInformation,
-    raw: &RawDirEntry,
-) -> u32 {
-    out.next_entry_offset = 0;
-    out.file_index = 0;
-    out.creation_time = raw.creation_time;
-    out.last_access_time = 0;
-    out.last_write_time = raw.last_write_time;
-    out.change_time = 0;
-    out.end_of_file = raw.size as i64;
-    out.allocation_size = raw.alloc_size as i64;
-    out.file_attributes = if raw.is_dir { 0x10 } else { 0x20 };
-    out.file_name_length = (raw.name_len * 2) as u32;
-    out.ea_size = 0;
-    out.short_name_length = 0;
-    out._pad0 = [0; 1];
-    out.short_name = [0; 12];
-    out.file_id = raw.mft_ref as i64;
-
-    let name_len = raw.name_len as usize;
-    for i in 0..name_len {
-        out.file_name[i] = raw.name[i];
-    }
-
-    let name_bytes = (name_len * 2) as u32;
-    ((0x70u32 + name_bytes) + 7) & !7u32
-}
+#[path = "file/directory_query.rs"]
+mod directory_query;
 
 /// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// `nt_query_directory_file` — enumerate directory entries.
+/// The file payload remains pinned until all metadata reads and copyout finish.
+/// User buffers are accessed exclusively through the user-copy interface.
 pub unsafe extern "C" fn nt_query_directory_file(
     file_handle: HANDLE,
     _event: HANDLE,
@@ -1491,137 +1349,161 @@ pub unsafe extern "C" fn nt_query_directory_file(
     file_information: PVOID,
     length: u32,
     file_information_class: u32,
-    _return_single_entry: u8,
-    _file_name: *mut UnicodeString,
-    _restart_scan: u8,
+    return_single_entry: u8,
+    file_name: *mut UnicodeString,
+    restart_scan: u8,
 ) -> NTSTATUS {
-    // 1. Parameter validation.
-    if io_status_block.is_null() || file_information.is_null() {
-        return STATUS_INVALID_PARAMETER;
+    // Win7's I/O front end touches IOSB, validates the class/minimum length,
+    // probes the output, then captures the name on every request before lookup.
+    if crate::mm::user_copy::probe_user_write(io_status_block as u64, size_of_iosb()).is_err() {
+        return STATUS_ACCESS_VIOLATION;
     }
-    if crate::mm::user_copy::probe_user_write(io_status_block as u64, size_of_iosb()).is_err()
-        || crate::mm::user_copy::probe_user_write(file_information as u64, length as usize).is_err()
-    {
-        return super::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    // 2. Resolve the file handle.
-    let entry = lookup_handle(file_handle);
-    let file_object = match entry {
-        Some(e) if e.kind == HandleKind::File => file_object_of(e.target),
-        _ => return STATUS_INVALID_HANDLE,
+    let (minimum, alignment) = match file_information_class {
+        1 | 2 => (0x48, 8),
+        3 => (0x60, 8),
+        12 => (0x10, 4),
+        37 => (0x70, 8),
+        38 => (0x58, 8),
+        _ => return super::status::STATUS_INVALID_INFO_CLASS,
     };
-
-    // 3. Directory check.
+    if length < minimum {
+        return super::status::STATUS_INFO_LENGTH_MISMATCH;
+    }
+    if file_information as usize & (alignment - 1) != 0 {
+        return super::status::STATUS_DATATYPE_MISALIGNMENT;
+    }
+    if crate::mm::user_copy::probe_user_write(file_information as u64, length as usize).is_err() {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let expression = if !file_name.is_null() {
+        let header: UnicodeString = match crate::mm::user_copy::read_user_object(file_name as u64) {
+            Ok(header) => header,
+            Err(status) => return status,
+        };
+        if header.length & 1 != 0 {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if header.length == 0 {
+            None
+        } else {
+            if (header.buffer as u64).checked_add(u64::from(header.length))
+                .is_none_or(|end| end > crate::mm::constants::USER_LIMIT)
+            {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            if header.length > 0x200 {
+                return STATUS_INVALID_PARAMETER;
+            }
+            let mut captured = Vec::new();
+            if captured.try_reserve_exact(usize::from(header.length) / 2).is_err() {
+                return super::status::STATUS_INSUFFICIENT_RESOURCES;
+            }
+            captured.resize(usize::from(header.length) / 2, 0u16);
+            let bytes = core::slice::from_raw_parts_mut(captured.as_mut_ptr().cast::<u8>(), captured.len() * 2);
+            if crate::mm::user_copy::copy_from_user(bytes, header.buffer as u64).is_err() {
+                return STATUS_ACCESS_VIOLATION;
+            }
+            Some(captured)
+        }
+    } else { None };
+    // Check FILE_LIST_DIRECTORY and retain the payload atomically with close.
+    let reference = match handles::reference_file_handle_with_access(file_handle, 1, retire_file) {
+        Ok(reference) => reference,
+        Err(status) => return status,
+    };
+    let file_object = file_object_of(reference.entry().target);
+    let _request = (*file_object).request_lock.lock();
     if (*file_object).fcb.is_null() {
         return STATUS_INVALID_DEVICE_REQUEST;
     }
-    let ntfs_handle = (*file_object).fcb as *mut crate::fs::ntfs::NtfsHandle;
-    if !(*ntfs_handle).is_directory {
+    let ntfs_handle = &*((*file_object).fcb as *const crate::fs::ntfs::NtfsHandle);
+    if !ntfs_handle.is_directory {
         return STATUS_NOT_A_DIRECTORY;
     }
-
-    // 4. Route to the appropriate filesystem driver.
-    let mut raw_entries = [RawDirEntry::empty(); 64];
-    let n = match crate::fs::ntfs::get_mounted_fs() {
-        Some(fs) => {
-            crate::fs::ntfs::list_ntfs_directory(fs, (*ntfs_handle).mft_record, &mut raw_entries)
-        }
+    let filesystem = match crate::fs::ntfs::get_mounted_fs() {
+        Some(filesystem) => filesystem,
         None => return STATUS_DEVICE_NOT_READY,
     };
-
-    // 5. Serialize into the caller's buffer.
-    let info_class = match FileInformationClass::from_u32(file_information_class) {
-        Some(c) => c,
-        None => return STATUS_INVALID_PARAMETER,
+    let entries = match crate::fs::ntfs::list_raw_directory_checked(filesystem, ntfs_handle.mft_record) {
+        Ok(entries) => entries,
+        Err(status) => return status as NTSTATUS,
     };
-
-    let mut written: u32 = 0;
-    let mut cur_ptr = file_information as usize;
-    let mut prev_entry_ptr: usize = 0;
-    let mut _prev_entry_size: u32 = 0;
-
-    for i in 0..n {
-        if written + 8 > length {
-            break;
+    // request_lock protects both the cursor and first-expression capture. The
+    // payload pin ensures close cannot retire this state during user copyout.
+    let search = &mut (*file_object).directory_search;
+    let first_query = search.expression().is_none();
+    // Subsequent names have already been validated/captured by the front
+    // end, but the filesystem retains the first query's expression.
+    let expression = if first_query { expression } else { None };
+    // Non-ASCII collation comes from this NTFS volume, never the host's Unicode
+    // version. ASCII's case mapping is fixed by the NTFS $UpCase contract.
+    let needs_table = expression.as_deref().or_else(|| search.expression())
+        .is_some_and(|pattern| pattern.iter().any(|&unit| unit >= 0x80))
+        || entries.iter().any(|raw| raw.name[..usize::from(raw.name_len)].iter().any(|&unit| unit >= 0x80));
+    let table = if needs_table {
+        match crate::fs::ntfs::upcase::read_table(filesystem) {
+            Ok(table) => Some(table),
+            Err(status) => return status as NTSTATUS,
         }
-
-        let raw = &raw_entries[i];
-        let remaining: u32 = length - written;
-        let name_bytes: u32 = (raw.name_len as u32) * 2;
-        let entry_size: u32 = match info_class {
-            FileInformationClass::FileDirectoryInformation => {
-                let needed = ((0x48 + name_bytes) + 7) & !7u32;
-                if remaining < needed {
-                    break;
-                }
-                needed
-            }
-            FileInformationClass::FileBothDirectoryInformation => {
-                let needed = ((0x60 + name_bytes) + 7) & !7u32;
-                if remaining < needed {
-                    break;
-                }
-                needed
-            }
-            FileInformationClass::FileIdBothDirectoryInformation => {
-                let needed = ((0x70 + name_bytes) + 7) & !7u32;
-                if remaining < needed {
-                    break;
-                }
-                needed
-            }
-            _ => break,
-        };
-
-        // Update previous entry's next_entry_offset.
-        if prev_entry_ptr != 0 {
-            match info_class {
-                FileInformationClass::FileDirectoryInformation => {
-                    (*(prev_entry_ptr as *mut super::types::FileDirectoryInformation))
-                        .next_entry_offset = entry_size;
-                }
-                FileInformationClass::FileBothDirectoryInformation => {
-                    (*(prev_entry_ptr as *mut super::types::FileBothDirectoryInformation))
-                        .next_entry_offset = entry_size;
-                }
-                FileInformationClass::FileIdBothDirectoryInformation => {
-                    (*(prev_entry_ptr as *mut super::types::FileIdBothDirectoryInformation))
-                        .next_entry_offset = entry_size;
-                }
-                _ => {}
-            }
-        }
-
-        match info_class {
-            FileInformationClass::FileDirectoryInformation => {
-                let out = &mut *(cur_ptr as *mut super::types::FileDirectoryInformation);
-                serialize_file_directory_info(out, raw);
-            }
-            FileInformationClass::FileBothDirectoryInformation => {
-                let out = &mut *(cur_ptr as *mut super::types::FileBothDirectoryInformation);
-                serialize_file_both_dir_info(out, raw);
-            }
-            FileInformationClass::FileIdBothDirectoryInformation => {
-                let out = &mut *(cur_ptr as *mut super::types::FileIdBothDirectoryInformation);
-                serialize_file_id_both_dir_info(out, raw);
-            }
-            _ => break,
-        };
-
-        prev_entry_ptr = cur_ptr;
-        cur_ptr += entry_size as usize;
-        written += entry_size;
+    } else { None };
+    let upcase = |unit: u16| -> u16 {
+        if let Some(table) = &table { crate::fs::ntfs::upcase::lookup(table, unit) }
+        else if (b'a' as u16..=b'z' as u16).contains(&unit) { unit - 32 }
+        else { unit }
+    };
+    if let Err(status) = search.begin(expression.as_deref(), restart_scan != 0, upcase) {
+        return status;
     }
-
-    let iosb = IoStatusBlock {
-        status: STATUS_SUCCESS,
-        information: written as usize,
+    let mut matching = Vec::new();
+    let mut positions = Vec::new();
+    for (index, raw) in entries.iter().enumerate().skip(search.position()) {
+        let matches = match search.matches(&raw.name[..usize::from(raw.name_len)], upcase) {
+            Ok(matches) => matches,
+            Err(status) => return status,
+        };
+        if matches {
+            if matching.try_reserve(1).is_err() || positions.try_reserve(1).is_err() {
+                return super::status::STATUS_INSUFFICIENT_RESOURCES;
+            }
+            matching.push(*raw);
+            positions.push(index + 1);
+            if return_single_entry != 0 { break; }
+        }
+    }
+    let mut output = match directory_query::serialize(
+        &matching, file_information_class, length as usize, return_single_entry != 0,
+    ) {
+        Ok(output) => output,
+        Err(status) => return status,
     };
+    let status = if matching.is_empty() {
+        if first_query { super::status::STATUS_NO_SUCH_FILE }
+        else { super::status::STATUS_NO_MORE_FILES }
+    } else if !first_query && matches!(output.disposition,
+        directory_query::Disposition::PartialName | directory_query::Disposition::HeaderTooSmall)
+    {
+        // NT's subsequent-query short-buffer contract is SUCCESS with zero
+        // bytes and the pending entry retained for a larger-buffer retry.
+        output.bytes.clear();
+        STATUS_SUCCESS
+    } else {
+        output.status()
+    };
+    if !output.bytes.is_empty()
+        && crate::mm::user_copy::copy_to_user(file_information as u64, &output.bytes).is_err()
+    {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    let iosb = IoStatusBlock { status, information: output.bytes.len() };
     if crate::mm::user_copy::write_user_object(io_status_block as u64, &iosb).is_err() {
-        return super::status::STATUS_ACCESS_VIOLATION;
+        return STATUS_ACCESS_VIOLATION;
     }
-    STATUS_SUCCESS
+    if matching.is_empty() {
+        search.commit(entries.len(), 0);
+    } else if output.entries_written != 0 {
+        search.commit(positions[output.entries_written - 1], output.entries_written);
+    }
+    status
 }
 
 // ---------------------------------------------------------------------------
@@ -1677,8 +1559,16 @@ fn size_of_iosb() -> usize {
     core::mem::size_of::<IoStatusBlock>()
 }
 
-fn size_of_i64() -> usize {
-    core::mem::size_of::<i64>()
+/// Win7 captures LARGE_INTEGER input with DWORD alignment, including x64.
+/// Copy it once before resolving the handle, and never probe it for writing.
+fn capture_file_byte_offset(pointer: *const i64) -> Result<Option<i64>, NTSTATUS> {
+    if pointer.is_null() {
+        return Ok(None);
+    }
+    if pointer as usize & 3 != 0 {
+        return Err(super::status::STATUS_DATATYPE_MISALIGNMENT);
+    }
+    crate::mm::user_copy::read_user_object(pointer as u64).map(Some)
 }
 
 /// Common read routing. File handles transfer through an IRP_MJ_READ
@@ -1698,9 +1588,13 @@ fn read_file_common(
     };
     match entry.kind {
         HandleKind::File => {
+            let reference = match reference_file(file_handle) {
+                Ok(reference) => reference,
+                Err(status) => return (status, 0),
+            };
             let (status, bytes) = unsafe {
                 file_transfer_irp(
-                    file_object_of(entry.target),
+                    file_object_of(reference.entry().target),
                     crate::io::major::IRP_MJ_READ,
                     buffer.as_mut_ptr(),
                     buffer.len(),
@@ -1763,15 +1657,21 @@ fn write_file_common(
         None => return (STATUS_INVALID_HANDLE, 0),
     };
     match entry.kind {
-        HandleKind::File => unsafe {
-            file_transfer_irp(
-                file_object_of(entry.target),
-                crate::io::major::IRP_MJ_WRITE,
-                buffer.as_ptr() as *mut u8,
-                buffer.len(),
-                byte_offset,
-            )
-        },
+        HandleKind::File => {
+            let reference = match reference_file(file_handle) {
+                Ok(reference) => reference,
+                Err(status) => return (status, 0),
+            };
+            unsafe {
+                file_transfer_irp(
+                    file_object_of(reference.entry().target),
+                    crate::io::major::IRP_MJ_WRITE,
+                    buffer.as_ptr() as *mut u8,
+                    buffer.len(),
+                    byte_offset,
+                )
+            }
+        }
         HandleKind::Pipe => {
             if !pipe_is_write(entry.target) {
                 return (STATUS_INVALID_HANDLE, 0);
