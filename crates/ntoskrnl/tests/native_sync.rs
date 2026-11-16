@@ -2,6 +2,10 @@
 //! a host. Memory probes and the clock are supplied by the host fixture.
 #![allow(dead_code, non_camel_case_types)]
 extern crate alloc;
+#[path = "native_sync/legacy_service_cases.rs"]
+mod legacy_service_cases;
+#[path = "native_sync/file_pin_cases.rs"]
+mod file_pin_cases;
 #[path = "native_sync/ktm_cases.rs"]
 mod ktm_cases;
 #[path = "native_sync/uuid_cases.rs"]
@@ -17,6 +21,8 @@ pub mod se {
 }
 #[path = "native_sync/token_duplicate_cases.rs"]
 mod token_duplicate_cases;
+#[path = "native_sync/token_filter_cases.rs"]
+mod token_filter_cases;
 #[path = "native_sync/token_privilege_cases.rs"]
 mod token_privilege_cases;
 #[path = "native_sync/token_information_cases.rs"]

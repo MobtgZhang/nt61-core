@@ -17,6 +17,8 @@ extern crate alloc;
 pub use super::bitmap::*;
 pub use super::clipboard::services::*;
 pub use super::font_services::{
+    nt_gdi_add_font_mem_resource_ex, nt_gdi_remove_font_mem_resource_ex,
+    nt_gdi_hfont_create,
     nt_gdi_get_char_abc_widths_w, nt_gdi_get_char_width_info, nt_gdi_get_char_width_w,
     nt_gdi_get_font_data, nt_gdi_get_font_file_data, nt_gdi_get_font_file_info,
     nt_gdi_get_font_unicode_ranges, nt_gdi_get_glyph_indices_w,
@@ -36,17 +38,22 @@ pub use super::clipping::*;
 pub use super::dc::bounds::*;
 pub use super::dc::caps::*;
 pub use super::dc::services::*;
+pub use super::object_enumeration::nt_gdi_enum_objects;
 pub use super::objects::nt_gdi_create_hatch_brush_internal;
 pub use super::objects::nt_gdi_get_stock_object;
 pub use super::palette::*;
+pub use super::palette::halftone::nt_gdi_ht_get_8bpp_format_palette;
+pub use super::palette::halftone::nt_gdi_ht_get_8bpp_mask_palette;
 pub use super::path::services::*;
 pub use super::path::shapes::*;
 pub use super::polygon::services::*;
 pub use super::region::services::*;
+pub use super::retired_services::*;
+pub use super::server_metafile::*;
 pub use super::selection::*;
 pub use super::transforms::*;
+pub use super::transforms::metafile::nt_gdi_convert_metafile_rect;
 use crate::arch::common::syscall_frame::SyscallFrame;
-use crate::libs::win32k::objects::PenStyle;
 
 // Helper functions to call win32k::mod functions (since mod is a keyword)
 mod win32k_helpers {
@@ -225,14 +232,22 @@ pub extern "C" fn nt_gdi_bit_blt(frame: &SyscallFrame) -> u64 {
         let Some(source) = table.get(hdc_src) else {
             return 0;
         };
-        let mut snapshot = super::dc::DcObject::new();
-        snapshot.surface = source.surface;
-        snapshot.world_transform = source.world_transform;
-        snapshot.viewport_ext = source.viewport_ext;
-        snapshot.window_ext = source.window_ext;
-        snapshot.viewport_org = source.viewport_org;
-        snapshot.window_org = source.window_org;
-        Some(snapshot)
+        if source.is_information_dc() {
+            // A detached DC has no readable pixels. Passing no source lets
+            // raster::bit_blt preserve its zero-size and source-free ROP
+            // semantics without turning surface == 0 into the framebuffer.
+            None
+        } else {
+            let mut snapshot = super::dc::DcObject::new();
+            snapshot.surface = source.surface;
+            snapshot.world_transform = source.world_transform;
+            snapshot.viewport_ext = source.viewport_ext;
+            snapshot.window_ext = source.window_ext;
+            snapshot.viewport_org = source.viewport_org;
+            snapshot.window_org = source.window_org;
+            snapshot.attributes = source.attributes;
+            Some(snapshot)
+        }
     } else {
         None
     };
@@ -263,6 +278,8 @@ pub extern "C" fn nt_gdi_bit_blt(frame: &SyscallFrame) -> u64 {
 
 /// NT_GDI_GET_CHAR_SET - Get character set
 pub use super::font_services::nt_gdi_get_char_set;
+
+pub use super::dc::info::nt_gdi_make_info_dc;
 
 /// NT_GDI_SELECT_BITMAP - Select bitmap into DC
 pub extern "C" fn nt_gdi_select_object(frame: &SyscallFrame) -> u64 {
@@ -391,26 +408,7 @@ pub use super::font_services::nt_gdi_get_text_face_w;
 
 /// NT_GDI_EXT_GET_OBJECT_W - Get object information
 pub extern "C" fn nt_gdi_ext_get_object_w(frame: &SyscallFrame) -> u64 {
-    let h = unsafe { get_arg0(frame) };
-    let _ = &h;
-    let count = unsafe { get_arg1(frame) };
-    let _ = &count;
-    let buffer = unsafe { get_arg2(frame) };
-    let _ = &buffer;
-
-    // kprintln!("[win32k] NT_GDI_EXT_GET_OBJECT_W");
-
-    // ExtGetObjectW: return object type (1=BITMAP, 2=FONT, 3=BRUSH).
-    if h != 0 {
-        let buf = buffer as *mut u64;
-        if !buf.is_null() && count > 0 {
-            let value = [1u8; 8];
-            if crate::mm::user_copy::copy_to_user(buffer, &value).is_ok() {
-                return 1;
-            }
-        }
-    }
-    0
+    super::object_queries::nt_gdi_ext_get_object_w(frame)
 }
 
 /// NT_GDI_CREATE_COMPATIBLE_DC - create memory DC
@@ -428,19 +426,7 @@ pub extern "C" fn nt_gdi_create_compatible_dc(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_GDI_CREATE_PEN - create pen object
-pub extern "C" fn nt_gdi_create_pen(frame: &SyscallFrame) -> u64 {
-    let style = unsafe { get_arg0(frame) } as i32;
-    let _ = &style;
-    let width = unsafe { get_arg1(frame) } as i32;
-    let _ = &width;
-    let color = unsafe { get_arg2(frame) } as u32;
-    let _ = &color;
-
-    // kprintln!("[win32k] NT_GDI_CREATE_PEN: style={}, width={}, color=0x{:08x}", style, width, color);
-
-    // Call the GDI objects module to create a pen
-    crate::libs::win32k::objects::gdi_create_pen(PenStyle::from_raw(style), width, color)
-}
+pub use super::pen_services::nt_gdi_create_pen;
 
 /// NT_GDI_CREATE_BITMAP - create bitmap object
 pub extern "C" fn nt_gdi_create_bitmap(frame: &SyscallFrame) -> u64 {
@@ -475,19 +461,6 @@ pub extern "C" fn nt_gdi_pat_blt(frame: &SyscallFrame) -> u64 {
     } else {
         0
     }
-}
-
-/// NT_GDI_HFONT_CREATE - create font
-pub extern "C" fn nt_gdi_hfont_create(frame: &SyscallFrame) -> u64 {
-    let logfont = unsafe { get_arg0(frame) };
-    let _ = &logfont;
-    let flags = unsafe { get_arg1(frame) };
-    let _ = &flags;
-
-    // kprintln!("[win32k] NT_GDI_HFONT_CREATE");
-
-    // CreateFont: return a pseudo-handle for the font object.
-    0x0002_0002 // tagged font handle
 }
 
 /// NT_GDI_DRAW_STREAM - Draw stream
@@ -774,12 +747,7 @@ pub extern "C" fn nt_gdi_dd_reset_visrgn(_frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_GDI_EXT_CREATE_PEN - Extended pen creation
-pub extern "C" fn nt_gdi_ext_create_pen(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_EXT_CREATE_PEN");
-
-    // ExtCreatePen: return a pseudo-handle for the pen.
-    0x0007_0001
-}
+pub use super::pen_services::nt_gdi_ext_create_pen;
 
 /// NT_GDI_CREATE_PATTERN_BRUSH_INTERNAL - create pattern brush (internal)
 pub extern "C" fn nt_gdi_create_pattern_brush_internal(_frame: &SyscallFrame) -> u64 {

@@ -31,6 +31,7 @@ pub mod sync;
 pub mod time;
 pub mod timer;
 pub mod tlb_shootdown;
+pub mod instruction_shootdown;
 
 /// Initialize the kernel executive.
 ///

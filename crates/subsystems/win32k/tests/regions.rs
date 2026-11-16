@@ -18,6 +18,7 @@ mod clipboard_cases;
 pub mod font_services;
 #[path = "font_cases.rs"]
 mod font_cases;
+mod memory_font_cases;
 mod text_drawing_cases;
 
 #[path = "../src/win32k/bitmap.rs"]
@@ -28,14 +29,37 @@ mod bitmap_cases;
 
 #[path = "path_cases.rs"]
 mod path_cases;
+#[path = "../src/win32k/pen_services.rs"]
+pub mod pen_services;
+mod pen_cases;
+#[path = "../src/win32k/object_queries.rs"]
+pub mod object_queries;
+mod object_query_cases;
+#[path = "../src/win32k/object_enumeration.rs"]
+pub mod object_enumeration;
+mod object_enumeration_cases;
+#[path = "../src/win32k/system_colors.rs"]
+pub mod system_colors;
+mod system_color_cases;
 
 #[path = "mapping_cases.rs"]
 mod mapping_cases;
+mod metafile_rect_cases;
+#[path = "../src/win32k/server_metafile.rs"]
+pub mod server_metafile;
+mod server_metafile_cases;
+mod dc_delete_cases;
+mod dc_dimension_cases;
+#[path = "../src/win32k/retired_services.rs"]
+pub mod retired_services;
+mod retired_service_cases;
 
 #[path = "dc_query_cases.rs"]
 mod dc_query_cases;
 #[path = "palette_cases.rs"]
 mod palette_cases;
+mod halftone_format_cases;
+mod halftone_mask_cases;
 #[path = "brush_cases.rs"]
 mod brush_cases;
 #[path = "curve_region_cases.rs"]

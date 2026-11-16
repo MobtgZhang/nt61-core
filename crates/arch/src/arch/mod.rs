@@ -1353,19 +1353,19 @@ pub fn send_tlb_shootdown_ipi() {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        aarch64::gic::broadcast_tlb_shootdown();
+        crate::hal::aarch64::apic::broadcast_tlb_shootdown();
     }
     #[cfg(target_arch = "riscv64")]
     {
-        let current = riscv64::smp::current_hart_id() as u64;
-        let online_mask = (1u64 << riscv64::smp::cpu_count().min(63)).wrapping_sub(1);
-        riscv64::tlb::flush_remote(online_mask & !(1 << current));
+        let count = riscv64::smp::cpu_count().min(64);
+        let online_mask = u64::MAX >> (64 - count);
+        riscv64::tlb::flush_remote(online_mask);
     }
     #[cfg(target_arch = "loongarch64")]
     {
-        let current = loongarch64::smp::__smp_get_current_cpu_id() as u64;
-        let online_mask = (1u64 << loongarch64::smp::cpu_count().min(63)).wrapping_sub(1);
-        loongarch64::tlb::flush_remote(online_mask & !(1 << current));
+        let count = loongarch64::smp::cpu_count().min(64);
+        let online_mask = u64::MAX >> (64 - count);
+        loongarch64::tlb::flush_remote(online_mask);
     }
 }
 
@@ -1466,6 +1466,25 @@ pub unsafe fn swap_context(out_rsp: *mut u64, new_rsp: u64) {
     #[cfg(target_arch = "loongarch64")]
     {
         loongarch64::context_switch::swap_context(out_rsp, new_rsp);
+    }
+}
+
+/// Switch a stack together with its physical page-table root. A zero
+/// root retains the current address space.
+///
+/// # Safety
+/// Interrupts must be disabled. The switch code and kernel data must be
+/// mapped in both roots, and each stack must be live in its own root.
+pub unsafe fn swap_context_address_space(out_rsp: *mut u64, new_rsp: u64, root: u64) {
+    #[cfg(target_arch = "x86_64")]
+    x86_64::context_switch::swap_context_address_space(out_rsp, new_rsp, root);
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // These ports currently keep kernel stacks in shared mappings.
+        if root != 0 {
+            load_page_root(root >> 12);
+        }
+        swap_context(out_rsp, new_rsp);
     }
 }
 

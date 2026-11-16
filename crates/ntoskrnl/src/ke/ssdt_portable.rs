@@ -43,6 +43,10 @@ macro_rules! portable_services {
 }
 
 portable_services! {
+    ("NtCompleteConnectPort", portable_nt_complete_connect_port, legacy_services::nt_complete_connect_port, [0]);
+    ("NtQueryPortInformationProcess", portable_nt_query_port_information_process, legacy_services::nt_query_port_information_process, []);
+    ("NtSetLdtEntries", portable_nt_set_ldt_entries, legacy_services::nt_set_ldt_entries, [0, 1, 2, 3, 4, 5]);
+    ("NtFilterToken", portable_nt_filter_token, security::nt_filter_token, [0, 1, 2, 3, 4, 5]);
     ("NtRenameKey", portable_nt_rename_key, registry::nt_rename_key, [0, 1]);
     ("NtSetInformationKey", portable_nt_set_information_key, registry::nt_set_information_key, [0, 1, 2, 3]);
     ("NtDuplicateToken", portable_nt_duplicate_token, security::nt_duplicate_token, [0, 1, 2, 3, 4, 5]);
@@ -51,6 +55,8 @@ portable_services! {
     ("NtQueryDefaultUILanguage", portable_nt_query_default_ui_language, locale::nt_query_default_ui_language, [0]);
     ("NtSetDefaultUILanguage", portable_nt_set_default_ui_language, locale::nt_set_default_ui_language, [0]);
     ("NtQueryInstallUILanguage", portable_nt_query_install_ui_language, locale::nt_query_install_ui_language, [0]);
+    ("NtFlushInstallUILanguage", portable_nt_flush_install_ui_language, locale::nt_flush_install_ui_language_from_user, [0, 1]);
+    ("NtIsUILanguageComitted", portable_nt_is_ui_language_comitted, locale::nt_is_ui_language_comitted, []);
     ("NtQueryIntervalProfile", portable_nt_query_interval_profile, profile_interval::nt_query_interval_profile, [0, 1]);
     ("NtSetIntervalProfile", portable_nt_set_interval_profile, profile_interval::nt_set_interval_profile, [0, 1]);
     ("NtSetInformationResourceManager", portable_nt_set_information_resource_manager, ktm::nt_set_information_resource_manager, [0, 1, 2, 3]);
@@ -84,6 +90,7 @@ portable_services! {
     ("NtCreateTransactionManager", portable_nt_create_transaction_manager, ktm::nt_create_transaction_manager, [0, 1, 2, 3, 4, 5]);
     ("NtOpenTransactionManager", portable_nt_open_transaction_manager, ktm::nt_open_transaction_manager, [0, 1, 2, 3, 4, 5]);
     ("NtQueryInformationTransactionManager", portable_nt_query_information_transaction_manager, ktm::nt_query_information_transaction_manager, [0, 1, 2, 3, 4]);
+    ("NtSetInformationTransactionManager", portable_nt_set_information_transaction_manager, ktm::nt_set_information_transaction_manager, [0, 1, 2, 3]);
     ("NtCreateTransaction", portable_nt_create_transaction, ktm::nt_create_transaction, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     ("NtOpenTransaction", portable_nt_open_transaction, ktm::nt_open_transaction, [0, 1, 2, 3, 4]);
     ("NtQueryInformationTransaction", portable_nt_query_information_transaction, ktm::nt_query_information_transaction, [0, 1, 2, 3, 4]);
@@ -98,6 +105,7 @@ portable_services! {
     ("NtAllocateUuids", portable_nt_allocate_uuids, uuid::nt_allocate_uuids, [0, 1, 2, 3]);
     ("NtSetUuidSeed", portable_nt_set_uuid_seed, uuid::nt_set_uuid_seed, [0]);
     ("NtFlushProcessWriteBuffers", portable_nt_flush_process_write_buffers, system_services::nt_flush_process_write_buffers, []);
+    ("NtFlushInstructionCache", portable_nt_flush_instruction_cache, system_services::nt_flush_instruction_cache, [0, 1, 2]);
     ("NtTerminateJobObject", portable_nt_terminate_job_object, job::nt_terminate_job_object, [0, 1]);
     ("NtMakePermanentObject", portable_nt_make_permanent_object, namespace::nt_make_permanent_object, [0]);
     ("NtMakeTemporaryObject", portable_nt_make_temporary_object, namespace::nt_make_temporary_object, [0]);
@@ -146,6 +154,8 @@ portable_services! {
     ("NtQuerySystemTime", portable_nt_query_system_time, clock::nt_query_system_time, [0]);
     ("NtQueryPerformanceCounter", portable_nt_query_performance_counter, clock::nt_query_performance_counter, [0, 1]);
     ("NtAccessCheck", portable_nt_access_check, security::nt_access_check, [0, 1, 2, 3, 4, 5, 6, 7]);
+    ("NtAccessCheckByType", portable_nt_access_check_by_type, access_check::nt_access_check_by_type, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    ("NtAccessCheckByTypeResultList", portable_nt_access_check_by_type_result_list, access_check::nt_access_check_by_type_result_list, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     ("NtAdjustPrivilegesToken", portable_nt_adjust_privileges_token, security::nt_adjust_privileges_token, [0, 1, 2, 3, 4, 5]);
     ("NtAdjustGroupsToken", portable_nt_adjust_groups_token, security::nt_adjust_groups_token, [0, 1, 2, 3, 4, 5]);
     ("NtAllocateVirtualMemory", portable_nt_allocate_virtual_memory, virtual_mem::nt_allocate_virtual_memory, [0, 1, 2, 3, 4, 5]);

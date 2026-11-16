@@ -1,4 +1,6 @@
 pub mod file;
+#[path = "../../../libs/ntdll/src/ntdll/legacy_services.rs"]
+pub mod legacy_services;
 #[path = "../../../libs/ntdll/src/ntdll/uuid.rs"]
 pub mod uuid;
 #[path = "../../../libs/ntdll/src/ntdll/job.rs"]
@@ -59,6 +61,13 @@ pub mod ktm;
 
 #[path = "../../../libs/ntdll/src/ntdll/locale.rs"]
 pub mod locale;
+// This sync-only harness has no registry tree. The native_registry harness
+// separately exercises install-language writes against the production provider.
+pub mod registry {
+    pub fn persist_install_ui_language(_: u16) -> i32 {
+        super::status::STATUS_OBJECT_NAME_NOT_FOUND
+    }
+}
 #[path = "../../../libs/ntdll/src/ntdll/profile_interval.rs"]
 pub mod profile_interval;
 
@@ -86,3 +95,6 @@ pub mod security {
 
 #[path = "../../../libs/ntdll/src/ntdll/access_check.rs"]
 pub mod access_check;
+
+#[path = "../../../libs/ntdll/src/ntdll/token_filter.rs"]
+pub mod token_filter;

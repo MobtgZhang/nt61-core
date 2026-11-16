@@ -97,6 +97,14 @@ pub unsafe fn init_shadow_services() {
         };
     }
 
+    register!("NtGdiFullscreenControl", nt_gdi_fullscreen_control, 5);
+    register!("NtGdiGetSpoolMessage", nt_gdi_get_spool_message, 4);
+    register!("NtGdiUnloadPrinterDriver", nt_gdi_unload_printer_driver, 2);
+    register!("NtGdiInit", nt_gdi_init, 0);
+    register!("NtGdiInitSpool", nt_gdi_init_spool, 0);
+    register!("NtUserWaitForMsgAndEvent", nt_user_wait_for_msg_and_event, 1);
+    register!("NtGdiAddFontMemResourceEx", nt_gdi_add_font_mem_resource_ex, 5);
+    register!("NtGdiRemoveFontMemResourceEx", nt_gdi_remove_font_mem_resource_ex, 1);
     register!("NtUserSetLayeredWindowAttributes", nt_user_set_layered_window_attributes, 4);
     register!("NtUserGetLayeredWindowAttributes", nt_user_get_layered_window_attributes, 4);
     register!("NtUserGetWindowDisplayAffinity", nt_user_get_window_display_affinity, 2);
@@ -209,6 +217,8 @@ pub unsafe fn init_shadow_services() {
     register!("NtGdiSetSystemPaletteUse", nt_gdi_set_system_palette_use, 2);
     register!("NtGdiCreateHalftonePalette", nt_gdi_create_halftone_palette, 1);
     register!("NtGdiSetVirtualResolution", nt_gdi_set_virtual_resolution, 5);
+    register!("NtGdiGetDeviceWidth", nt_gdi_get_device_width, 1);
+    register!("NtGdiSetSizeDevice", nt_gdi_set_size_device, 3);
     register!("NtGdiCreateEllipticRgn", nt_gdi_create_elliptic_rgn, 4);
     register!("NtGdiCreateRoundRectRgn", nt_gdi_create_round_rect_rgn, 6);
     register!("NtGdiIntersectClipRect", nt_gdi_intersect_clip_rect, 5);
@@ -304,6 +314,7 @@ pub unsafe fn init_shadow_services() {
     register!("NtGdiSelectFont", nt_gdi_select_font, 2);
     register!("NtGdiRestoreDC", nt_gdi_restore_dc, 2);
     register!("NtGdiSaveDC", nt_gdi_save_dc, 1);
+    register!("NtGdiMakeInfoDC", nt_gdi_make_info_dc, 2);
     register!(
         "NtUserGetForegroundWindow",
         nt_user_get_foreground_window,
@@ -342,6 +353,7 @@ pub unsafe fn init_shadow_services() {
     register!("NtUserExcludeUpdateRgn", nt_user_exclude_update_rgn, 2);
     register!("NtUserSetFocus", nt_user_set_focus, 1);
     register!("NtGdiExtGetObjectW", nt_gdi_ext_get_object_w, 3);
+    register!("NtGdiEnumObjects", nt_gdi_enum_objects, 4);
     register!("NtUserDeferWindowPos", nt_user_defer_window_pos, 8);
     register!("NtUserGetUpdateRect", nt_user_get_update_rect, 3);
     register!("NtGdiCreateCompatibleDC", nt_gdi_create_compatible_dc, 1);
@@ -393,6 +405,11 @@ pub unsafe fn init_shadow_services() {
     register!("NtGdiGetNearestColor", nt_gdi_get_nearest_color, 2);
     register!("NtGdiTransformPoints", nt_gdi_transform_points, 5);
     register!("NtGdiCombineTransform", nt_gdi_combine_transform, 3);
+    register!("NtGdiConvertMetafileRect", nt_gdi_convert_metafile_rect, 2);
+    register!("NtGdiCreateServerMetaFile", nt_gdi_create_server_meta_file, 6);
+    register!("NtGdiGetServerMetaFileBits", nt_gdi_get_server_meta_file_bits, 7);
+    register!("NtGdiHT_Get8BPPFormatPalette", nt_gdi_ht_get_8bpp_format_palette, 4);
+    register!("NtGdiHT_Get8BPPMaskPalette", nt_gdi_ht_get_8bpp_mask_palette, 6);
     register!("NtGdiGetTransform", nt_gdi_get_transform, 3);
     register!("NtGdiMoveTo", nt_gdi_move_to, 4);
     register!("NtGdiBeginPath", nt_gdi_begin_path, 1);
