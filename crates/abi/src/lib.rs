@@ -23,6 +23,7 @@
 
 pub mod constants;
 pub mod desktop_bridge;
+pub mod dialog_bridge;
 pub mod error;
 pub mod gdi;
 pub mod structs;
@@ -35,3 +36,5 @@ pub use constants::*;
 pub use error::*;
 pub use structs::*;
 pub use types::*;
+
+pub mod session_bridge;
