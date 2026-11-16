@@ -127,6 +127,14 @@ pub struct TokenGroup {
     pub attributes: u32,
 }
 
+/// Group membership is fixed when a token is created. Adjustment can only
+/// change the enabled bit, subject to mandatory and deny-only restrictions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupAdjustmentError {
+    CannotDisableMandatory,
+    CannotEnableDenyOnly,
+}
+
 impl TokenGroup {
     pub fn new(sid: sid, attributes: u32) -> Self {
         Self { sid, attributes }
@@ -142,6 +150,32 @@ impl TokenGroup {
 
     pub fn is_logon_id(&self) -> bool {
         (self.attributes & SE_GROUP_LOGON_ID) != 0
+    }
+
+    pub fn adjusted_attributes(
+        &self,
+        reset_to_default: bool,
+        requested: Option<u32>,
+    ) -> Result<u32, GroupAdjustmentError> {
+        let enabled = if reset_to_default {
+            // Restricted groups remain deny-only, even if inherited defaults
+            // originally enabled them before the token was restricted.
+            if self.attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 {
+                return Ok(self.attributes & !SE_GROUP_ENABLED);
+            }
+            self.attributes & (SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_MANDATORY) != 0
+        } else if let Some(attributes) = requested {
+            attributes & SE_GROUP_ENABLED != 0
+        } else {
+            return Ok(self.attributes);
+        };
+        if !enabled && self.attributes & SE_GROUP_MANDATORY != 0 {
+            return Err(GroupAdjustmentError::CannotDisableMandatory);
+        }
+        if enabled && self.attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 {
+            return Err(GroupAdjustmentError::CannotEnableDenyOnly);
+        }
+        Ok((self.attributes & !SE_GROUP_ENABLED) | if enabled { SE_GROUP_ENABLED } else { 0 })
     }
 }
 
@@ -164,6 +198,21 @@ impl TokenPrivilege {
 
     pub fn enable(&mut self) {
         self.attributes |= SE_PRIVILEGE_ENABLED;
+    }
+
+    /// Only the enabled bit is adjustable. `None` means irreversible removal;
+    /// removed privileges must not appear in a restorable previous-state list.
+    pub fn adjusted_attributes(&self, disable_all: bool, requested: Option<u32>) -> Option<u32> {
+        if disable_all {
+            return Some(self.attributes & !SE_PRIVILEGE_ENABLED);
+        }
+        let Some(attributes) = requested else {
+            return Some(self.attributes);
+        };
+        if attributes & SE_PRIVILEGE_REMOVED != 0 {
+            return None;
+        }
+        Some((self.attributes & !SE_PRIVILEGE_ENABLED) | (attributes & SE_PRIVILEGE_ENABLED))
     }
 }
 
@@ -366,6 +415,21 @@ impl Token {
             }
         }
         false
+    }
+
+    /// Keep the fast privilege checks consistent after adjustment or removal.
+    pub fn refresh_privilege_flags(&mut self) {
+        for (number, flag) in [
+            (23, TOKEN_HAS_TRAVERSE_PRIVILEGE),
+            (17, TOKEN_HAS_BACKUP_PRIVILEGE),
+            (18, TOKEN_HAS_RESTORE_PRIVILEGE),
+            (29, TOKEN_HAS_IMPERSONATE_PRIVILEGE),
+        ] {
+            self.flags &= !flag;
+            if self.has_privilege(&luid::from_u64(number)) {
+                self.flags |= flag;
+            }
+        }
     }
 
     /// Check if the token belongs to the administrators group.
@@ -591,9 +655,14 @@ pub fn create_system_token() -> *mut Token {
     ) as *mut Token;
 
     if !token.is_null() {
+        // SYSTEM_LUID identifies the built-in LocalSystem logon session.
+        // A SYSTEM SID alone must not be used to infer this identity later.
+        let mut system_token = Token::new_primary(sid::well_known(WellKnownSid::LocalSystem));
+        system_token.authentication_id = luid::from_u64(0x3e7);
+        // SAFETY: allocation returned suitably aligned, exclusive storage for
+        // one Token. It is initialized before its pointer is published.
         unsafe {
-            let system_sid = sid::well_known(WellKnownSid::LocalSystem);
-            core::ptr::write(token, Token::new_primary(system_sid));
+            core::ptr::write(token, system_token);
         }
         // crate::kprintln!("[SEC] Created system token at 0x{:016x}", token as u64);
     }

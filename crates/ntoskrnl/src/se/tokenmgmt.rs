@@ -10,13 +10,12 @@
 //!
 //! References: Windows SDK, WRK
 
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::sid::sid;
 use super::token::{
     luid, ImpersonationLevel, Token, TokenGroup, TokenPrivilege, TokenTypeEnum, SE_GROUP_ENABLED,
-    SE_PRIVILEGE_ENABLED, TOKEN_MAX_GROUPS, TOKEN_MAX_PRIVILEGES,
+    TOKEN_MAX_GROUPS, TOKEN_MAX_PRIVILEGES,
 };
 
 pub const DUPLICATE_SAME_ACCESS: u32 = 0x00000002;
@@ -200,130 +199,9 @@ pub unsafe fn se_token_is_restricted(token: *const Token) -> bool {
     unsafe { ((*token).flags & super::token::TOKEN_WRITE_RESTRICTED) != 0 }
 }
 
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe fn se_adjust_privileges_token(
-    token: *mut Token,
-    disable_all_privileges: bool,
-    new_state: &[TokenPrivilege],
-    mut previous_state: Option<&mut Vec<TokenPrivilege>>,
-) -> bool {
-    if token.is_null() {
-        return false;
-    }
+pub use self::adjust::{se_adjust_groups_token, se_adjust_privileges_token};
 
-    unsafe {
-        let tok = &mut *token;
-
-        if disable_all_privileges {
-            for i in 0..tok.privilege_count {
-                if let Some(prev) = previous_state.as_mut() {
-                    prev.push(tok.privileges[i]);
-                }
-                tok.privileges[i].attributes &= !SE_PRIVILEGE_ENABLED;
-            }
-            return true;
-        }
-
-        let mut all_found = true;
-        for new_priv in new_state {
-            let mut found = false;
-            for i in 0..tok.privilege_count {
-                if tok.privileges[i].luid.equals(&new_priv.luid) {
-                    if let Some(prev) = previous_state.as_mut() {
-                        prev.push(tok.privileges[i]);
-                    }
-                    tok.privileges[i].attributes = new_priv.attributes;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                // NT semantics: SeAdjustPrivilegesToken also ADDS
-                // privileges the token does not hold yet. The token
-                // stores a fixed-size array, so appending is only
-                // possible while capacity remains; overflow is an
-                // explicit failure, never a silent skip.
-                if tok.privilege_count < TOKEN_MAX_PRIVILEGES {
-                    tok.privileges[tok.privilege_count] = TokenPrivilege {
-                        luid: new_priv.luid,
-                        attributes: new_priv.attributes,
-                    };
-                    tok.privilege_count += 1;
-                } else {
-                    all_found = false;
-                }
-            }
-        }
-
-        all_found
-    }
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe fn se_adjust_groups_token(
-    token: *mut Token,
-    reset_to_default: bool,
-    new_state: &[TokenGroup],
-    mut previous_state: Option<&mut Vec<TokenGroup>>,
-) -> bool {
-    if token.is_null() {
-        return false;
-    }
-
-    unsafe {
-        let tok = &mut *token;
-
-        if reset_to_default {
-            for i in 0..tok.group_count {
-                if let Some(prev) = previous_state.as_mut() {
-                    prev.push(tok.groups[i]);
-                }
-                if (tok.groups[i].attributes & super::token::SE_GROUP_ENABLED_BY_DEFAULT) != 0 {
-                    tok.groups[i].attributes |= SE_GROUP_ENABLED;
-                } else {
-                    tok.groups[i].attributes &= !SE_GROUP_ENABLED;
-                }
-            }
-            return true;
-        }
-
-        let mut all_found = true;
-        for new_group in new_state {
-            let mut found = false;
-            for i in 0..tok.group_count {
-                if tok.groups[i].sid.equals(&new_group.sid) {
-                    if let Some(prev) = previous_state.as_mut() {
-                        prev.push(tok.groups[i]);
-                    }
-                    tok.groups[i].attributes = new_group.attributes;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                // NT semantics: SeAdjustGroupsToken also ADDS groups the
-                // token does not carry yet. Append while the fixed-size
-                // array has room; overflow fails explicitly instead of
-                // silently dropping the group.
-                if tok.group_count < TOKEN_MAX_GROUPS {
-                    tok.groups[tok.group_count] = TokenGroup {
-                        sid: new_group.sid,
-                        attributes: new_group.attributes,
-                    };
-                    tok.group_count += 1;
-                } else {
-                    all_found = false;
-                }
-            }
-        }
-
-        all_found
-    }
-}
+mod adjust;
 
 /// # Safety
 ///
@@ -484,7 +362,7 @@ pub fn init() {}
 mod token_capacity_tests {
     use super::*;
     use crate::se::sid::{sid, WellKnownSid};
-    use crate::se::token::Token;
+    use crate::se::token::{Token, SE_PRIVILEGE_ENABLED};
 
     // Under libtest the kernel heap is never initialised, so the pool
     // allocation inside se_create_token would fail (same pattern as
@@ -551,7 +429,7 @@ mod token_capacity_tests {
     }
 
     #[test]
-    fn adjust_privileges_adds_unknown_privilege() {
+    fn adjust_privileges_rejects_unknown_privilege() {
         ensure_test_heap();
         let existing = [TokenPrivilege {
             luid: luid::from_u64(1),
@@ -564,10 +442,10 @@ mod token_capacity_tests {
             luid: luid::from_u64(2),
             attributes: SE_PRIVILEGE_ENABLED,
         }];
-        assert!(unsafe { se_adjust_privileges_token(token, false, &added, None) });
+        assert!(!unsafe { se_adjust_privileges_token(token, false, &added, None) });
         unsafe {
-            assert_eq!((*token).privilege_count, 2);
-            assert!((*token).privileges[1].luid.equals(&added[0].luid));
+            assert_eq!((*token).privilege_count, 1);
+            assert!((*token).privileges[0].luid.equals(&existing[0].luid));
         }
     }
 
@@ -594,7 +472,7 @@ mod token_capacity_tests {
     }
 
     #[test]
-    fn adjust_groups_adds_unknown_group() {
+    fn adjust_groups_rejects_unknown_group() {
         ensure_test_heap();
         let token = make_token(&[], &[]);
         assert!(!token.is_null());
@@ -603,10 +481,9 @@ mod token_capacity_tests {
             sid: sid::well_known(WellKnownSid::Administrators),
             attributes: SE_GROUP_ENABLED,
         }];
-        assert!(unsafe { se_adjust_groups_token(token, false, &added, None) });
+        assert!(!unsafe { se_adjust_groups_token(token, false, &added, None) });
         unsafe {
-            assert_eq!((*token).group_count, 1);
-            assert!((*token).groups[0].sid.equals(&added[0].sid));
+            assert_eq!((*token).group_count, 0);
         }
     }
 }

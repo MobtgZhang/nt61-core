@@ -7,47 +7,23 @@
 //! through an old writable (or reading a removed) mapping after the
 //! PTE was rewritten.
 //!
-//! ## Protocol
+//! Each sender publishes a generation after its stores. Targets sample that
+//! generation *before* a full local flush and memory fence, then acknowledge
+//! only the sampled generation. This also permits concurrent senders: a later
+//! acknowledgement subsumes every earlier request without a sender lock that
+//! could prevent another CPU from servicing IPIs.
 //!
-//! The kernel uses a generation-counter protocol, which needs no
-//! per-IPI payload and is immune to a delayed IPI being credited to
-//! the wrong shootdown:
-//!
-//! 1. The shooting CPU takes `SHOOTDOWN_LOCK` (senders are serialized,
-//!    so at most one generation is in flight) and bumps `GENERATION`.
-//! 2. It performs its own local flush, then asks the architecture to
-//!    interrupt every other online CPU.
-//! 3. Each target CPU services the interrupt with a *full* local TLB
-//!    flush and publishes its per-CPU progress: `DONE[cpu] = GENERATION`.
-//!    A full flush (rather than a per-VA flush) means a CPU that
-//!    services generation N implicitly also drops everything older.
-//! 4. The shooter waits until every remote CPU reports `DONE >= gen`,
-//!    with a bounded spin so a CPU stuck with interrupts disabled
-//!    cannot deadlock the shooter.
-//! 5. A CPU that services the IPI late (or never) is caught by the
-//!    lazy fallback: every timer tick, a CPU whose `DONE[cpu] <`
-//!    `GENERATION` performs the flush itself. This bounds staleness
-//!    for a CPU that was inside a critical section when the IPI
-//!    arrived.
-//!
-//! Single-CPU systems short-circuit: the local flush is the whole
-//! job, no IPI is sent.
+//! Page-table callers retain the historical bounded wait and lazy fallback.
+//! The native process write-buffer service uses an unbounded acknowledgement
+//! wait because returning before a remote memory fence violates its contract.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-
-use crate::ke::sync::Spinlock;
 
 /// Maximum CPUs tracked for shootdown acknowledgement. Matches
 /// `arch::common::percpu::MAX_PER_CPU`.
 const MAX_SHOOTDOWN_CPUS: usize = 64;
 
-/// Serialises senders. Only one generation may be in flight at a
-/// time; two concurrent senders with different flush requirements
-/// would otherwise race on the remote acknowledgement accounting.
-static SHOOTDOWN_LOCK: Spinlock<()> = Spinlock::new(());
-
-/// Current shootdown generation. Bumped by the sender while holding
-/// `SHOOTDOWN_LOCK`, read by targets to publish their progress.
+/// Current request, published after the sender's preceding stores.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Highest generation each CPU has fully flushed. Indexed by the
@@ -76,14 +52,21 @@ fn this_cpu_index() -> usize {
 /// Full local TLB flush plus per-CPU progress publication. This is
 /// the body both the IPI handler and the lazy tick fallback run.
 fn local_flush_and_publish() {
-    crate::arch::flush_tlb();
-    let idx = this_cpu_index();
+    // Keep the sampled CPU and the acknowledged CPU identical across a timer
+    // preemption. Interrupt handlers already enter with interrupts disabled.
+    let restore_interrupts = crate::arch::interrupts_enabled();
+    crate::arch::disable_interrupts();
+    // Loading after the flush could acknowledge a request published while
+    // this CPU was flushing, without executing a fence after its publication.
     let gen = GENERATION.load(Ordering::Acquire);
-    // Store the observed generation; a late handler may observe a
-    // newer generation than the IPI it is servicing, which is fine:
-    // a full flush performed now covers every PTE change that
-    // preceded this point.
+    core::sync::atomic::fence(Ordering::SeqCst);
+    crate::arch::flush_tlb();
+    core::sync::atomic::fence(Ordering::SeqCst);
+    let idx = this_cpu_index();
     DONE[idx].fetch_max(gen, Ordering::AcqRel);
+    if restore_interrupts {
+        crate::arch::enable_interrupts();
+    }
 }
 
 /// Called from the architecture IPI/SGI handler. Flushes this CPU's
@@ -114,12 +97,25 @@ pub fn invalidate_va_all_cpus(va: u64) {
     // with the new PTE.
     crate::arch::invalidate_tlb(va);
 
+    request_all_cpus(false);
+}
+
+/// Execute a full memory fence on every online processor before returning.
+/// Called at passive level with no dispatcher/object locks held. While waiting
+/// a concurrent sender also services incoming generations locally, even when
+/// entered with hardware interrupts disabled by the syscall entry path.
+pub fn flush_process_write_buffers() {
+    core::sync::atomic::fence(Ordering::SeqCst);
+    request_all_cpus(true);
+    core::sync::atomic::fence(Ordering::SeqCst);
+}
+
+fn request_all_cpus(require_completion: bool) {
     let cpu_count = crate::arch::common::smp::cpu_count() as usize;
     if cpu_count <= 1 {
         return;
     }
 
-    SHOOTDOWN_LOCK.lock();
     let gen = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     // Publish our target before the IPI goes out so a target that
     // services the interrupt immediately can observe the generation.
@@ -146,8 +142,10 @@ pub fn invalidate_va_all_cpus(va: u64) {
             SHOOTDOWN_COUNT.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        // No sender waits while withholding its own acknowledgement.
+        lazy_flush_if_pending();
         spin += 1;
-        if spin >= ACK_SPIN_LIMIT {
+        if !require_completion && spin >= ACK_SPIN_LIMIT {
             TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
             // One or more CPUs are still behind. Do not spin forever:
             // their next timer tick runs `lazy_flush_if_pending` and

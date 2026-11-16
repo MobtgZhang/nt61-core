@@ -107,6 +107,8 @@ pub mod flags {
 
     /// Job is nested under a parent job
     pub const NESTED: u32 = 0x0080;
+    /// Last native handle has closed; process membership keeps the job alive.
+    pub const NATIVE_CLOSED: u32 = 0x0200;
 }
 
 /// Job UI restriction flags (JOB_OBJECT_UI_RESTRICTIONS).
@@ -183,6 +185,7 @@ impl JobObject {
     /// # Safety
     /// The caller must ensure the process_id is valid.
     pub fn add_process(&self, process_id: u64) -> u32 {
+        let mut list = self.process_list.lock();
         let flags = self.flags.load(Ordering::Acquire);
 
         // Check if job is terminating
@@ -199,13 +202,12 @@ impl JobObject {
             }
         }
 
-        let mut list = self.process_list.lock();
-
         // Check if process is already in the job
         if list.contains(&process_id) {
             return STATUS_SUCCESS;
         }
 
+        if list.try_reserve(1).is_err() { return 0xc0000017; }
         list.push(process_id);
         self.active_process_count.fetch_add(1, Ordering::Release);
         self.total_process_count.fetch_add(1, Ordering::Release);
@@ -292,7 +294,7 @@ impl JobObject {
         }
 
         let current = self.active_process_memory.load(Ordering::Acquire);
-        current + additional_bytes <= limit
+        current.checked_add(additional_bytes).is_some_and(|total| total <= limit)
     }
 
     /// Check whether the job's CPU time limit has been exceeded.
@@ -397,6 +399,7 @@ pub fn create_job() -> Result<u64, u32> {
     let job = alloc::boxed::Box::new(JobObject::new(job_id));
 
     let mut table = JOB_TABLE.lock();
+    table.try_reserve(1).map_err(|_| 0xc0000017u32)?;
     table.push(job);
 
     Ok(job_id)
@@ -428,12 +431,34 @@ pub fn set_memory_limit_by_id(job_id: u64, limit_bytes: u64) -> bool {
 
 /// Remove a terminated process from every job that references it.
 pub fn remove_process_from_all_jobs(process_id: u64) {
-    let table = JOB_TABLE.lock();
+    let mut table = JOB_TABLE.lock();
     for job in table.iter() {
         if job.contains_process(process_id) {
             job.remove_process(process_id);
         }
     }
+    table.retain(|job| job.flags.load(Ordering::Acquire) & flags::NATIVE_CLOSED == 0
+        || job.active_process_count() != 0);
+}
+
+/// Called once when the handle object retires, including close-source duplicate.
+pub fn close_native_job(job_id: u64) {
+    let mut table = JOB_TABLE.lock();
+    if let Some(job) = table.iter().find(|job| job.job_id == job_id) {
+        job.flags.fetch_or(flags::NATIVE_CLOSED, Ordering::Release);
+    }
+    table.retain(|job| job.job_id != job_id || job.active_process_count() != 0);
+}
+
+/// Snapshot or update job state while retaining its table-owned lifetime.
+pub fn with_job<T>(job_id: u64, operation: impl FnOnce(&JobObject) -> T) -> Option<T> {
+    let table = JOB_TABLE.lock();
+    table.iter().find(|job| job.job_id == job_id).map(|job| operation(job))
+}
+
+pub fn process_job(process_id: u64) -> Option<u64> {
+    let table = JOB_TABLE.lock();
+    table.iter().find(|job| job.contains_process(process_id)).map(|job| job.job_id)
 }
 
 /// Open an existing job object by ID
@@ -459,6 +484,12 @@ pub fn open_job(job_id: u64) -> Option<*const JobObject> {
 pub fn assign_process_to_job(job_id: u64, process_id: u64) -> u32 {
     let table = JOB_TABLE.lock();
 
+    // Windows 7 has a single job membership per process. Nested jobs arrived
+    // in Windows 8; accepting them here would bypass the parent's limits.
+    if table.iter().any(|job| job.contains_process(process_id)) {
+        return STATUS_ACCESS_DENIED;
+    }
+
     if let Some(job) = table.iter().find(|j| j.job_id == job_id) {
         return job.add_process(process_id);
     }
@@ -471,13 +502,26 @@ pub fn assign_process_to_job(job_id: u64, process_id: u64) -> u32 {
 /// # Safety
 /// This is a privileged operation.
 pub fn terminate_job(job_id: u64, exit_code: u32) -> u32 {
-    let table = JOB_TABLE.lock();
-
-    if let Some(job) = table.iter().find(|j| j.job_id == job_id) {
-        return job.terminate_all(exit_code);
+    let process_ids = {
+        let table = JOB_TABLE.lock();
+        let Some(job) = table.iter().find(|job| job.job_id == job_id) else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        let list = job.process_list.lock();
+        let mut snapshot = Vec::new();
+        if snapshot.try_reserve_exact(list.len()).is_err() { return 0xc0000017; }
+        snapshot.extend_from_slice(&list);
+        job.flags.fetch_or(flags::TERMINATING, Ordering::Release);
+        snapshot
+    };
+    for pid in process_ids {
+        let _ = crate::ps::process::terminate_process(pid, exit_code as i32);
     }
-
-    STATUS_INVALID_PARAMETER
+    let table = JOB_TABLE.lock();
+    if let Some(job) = table.iter().find(|job| job.job_id == job_id) {
+        job.flags.fetch_and(!flags::TERMINATING, Ordering::Release);
+    }
+    STATUS_SUCCESS
 }
 
 /// Initialize the job object subsystem
