@@ -12,6 +12,41 @@ fn execute(request:&mut Request)->Result<Vec<u8>,u32>{
     let bytes=copy_input(request.path,request.path_length as usize)?;
     let path=core::str::from_utf8(&bytes).map_err(|_|STATUS_INVALID_PARAMETER)?;
     match request.operation{
+        nt61_abi::session_bridge::HOTKEYS=>super::session_service::hotkeys(),
+        nt61_abi::session_bridge::MONITOR=>super::session_service::monitor(),
+        nt61_abi::session_bridge::SERVICES=>super::session_service::services(),
+        op @ (nt61_abi::session_bridge::SESSION|nt61_abi::session_bridge::TASK_CONTROL|nt61_abi::session_bridge::SERVICE_CONTROL)=>{
+            if request.capacity>512{return Err(STATUS_INVALID_PARAMETER);}
+            let mut input=copy_input(request.data,request.capacity as usize)?;
+            let result=match op {
+                nt61_abi::session_bridge::SESSION=>super::session_service::session(path,&input),
+                nt61_abi::session_bridge::TASK_CONTROL=>super::session_service::task_control(path,&input),
+                _=>super::session_service::service_control(path,&input),
+            };
+            for byte in &mut input {unsafe{core::ptr::write_volatile(byte,0);}}
+            result
+        },
+        nt61_abi::dialog_bridge::POLL=>super::dialog_broker::poll(),
+        nt61_abi::dialog_bridge::COMPLETE=>{
+            let id=path.parse::<u64>().map_err(|_|STATUS_INVALID_PARAMETER)?;
+            let bytes=copy_input(request.data,request.capacity as usize)?;
+            super::dialog_broker::complete(id,super::dialog_broker::decode(&bytes)?)?;Ok(Vec::new())
+        },
+        nt61_abi::dialog_bridge::COMMAND_START=>{
+            if request.capacity<CWD_BYTES as u64{return Err(STATUS_INVALID_PARAMETER);}
+            let data=copy_input(request.data,CWD_BYTES)?;
+            let n=data.iter().position(|b|*b==0).unwrap_or(data.len());
+            Ok(super::dialog_broker::command_start(path,&data[..n])?.to_le_bytes().to_vec())
+        },
+        nt61_abi::dialog_bridge::COMMAND_POLL=>{
+            let id=path.parse::<u64>().map_err(|_|STATUS_INVALID_PARAMETER)?;
+            let (bytes,exit)=super::dialog_broker::command_poll(id)?;
+            request.flags=if exit{COMMAND_EXIT}else{0};Ok(bytes)
+        },
+        nt61_abi::dialog_bridge::PRINT_WRITE=>{
+            let bytes=copy_input(request.data,request.capacity as usize)?;
+            Ok(super::dialog_broker::spool(&bytes)?.to_le_bytes().to_vec())
+        },
         LIST=>{
             let mut output=Vec::new();
             for entry in crate::fs::system_volume::list(path)? {
@@ -76,7 +111,7 @@ fn execute(request:&mut Request)->Result<Vec<u8>,u32>{
             let mut output:Vec<u8>=state.focus().into_iter().flat_map(u32::to_le_bytes).collect();output.extend_from_slice(&code.to_le_bytes());output.extend_from_slice(text.as_bytes());request.flags=if exit{COMMAND_EXIT}else{0};Ok(output)
         },
         PROCESSES=>{
-            let processes=crate::ps::process_mgmt::get_all_processes().map_err(|e|e as u32)?;
+            let processes:Vec<_>=crate::ps::process_mgmt::get_all_processes().map_err(|e|e as u32)?.into_iter().filter(|p|p.status!="Terminated").collect();
             if processes.len()>MAX_PROCESSES {return Err(STATUS_BUFFER_TOO_SMALL);}
             let mut output=Vec::new();
             output.extend_from_slice(&crate::ke::scheduler::get_cpu_count().to_le_bytes());
@@ -133,6 +168,17 @@ pub unsafe fn dispatch(address:u64)->u64{
     // and every byte (including output fields) is overwritten by copy_from_user.
     let bytes=unsafe{core::slice::from_raw_parts_mut(core::ptr::from_mut(&mut request).cast::<u8>(),core::mem::size_of::<Request>())};
     if crate::mm::user_copy::copy_from_user(bytes,address).is_err(){return STATUS_INVALID_PARAMETER as u64;}
+    if crate::mm::user_copy::probe_user_write(address,core::mem::size_of::<Request>()).is_err(){return STATUS_INVALID_PARAMETER as u64;}
+    // Check result storage before consuming tickets, command results or writing jobs.
+    let required=match request.operation {
+        nt61_abi::session_bridge::HOTKEYS=>4,
+        nt61_abi::dialog_bridge::POLL=>8+nt61_abi::dialog_bridge::PACKET_SIZE,
+        nt61_abi::dialog_bridge::COMMAND_START=>CWD_BYTES,
+        nt61_abi::dialog_bridge::COMMAND_POLL=>CWD_BYTES+65536,
+        nt61_abi::dialog_bridge::PRINT_WRITE=>4,
+        _=>0,
+    };
+    if required!=0 && (request.capacity<required as u64 || crate::mm::user_copy::probe_user_write(request.data,required).is_err()) {return STATUS_INVALID_PARAMETER as u64;}
     request.length=0;request.flags=0;
     match execute(&mut request){
         Ok(output)=>{

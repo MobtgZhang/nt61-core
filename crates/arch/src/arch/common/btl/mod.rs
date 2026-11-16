@@ -7,6 +7,7 @@ pub mod abi;
 pub mod exec;
 pub mod ir;
 pub mod io;
+pub mod dialog_wire;
 pub mod memory;
 pub mod nt61;
 pub mod pe;

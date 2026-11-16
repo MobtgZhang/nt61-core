@@ -3,6 +3,14 @@
 //! a host pointer. Unsupported APIs stop explicitly rather than return success.
 #[path = "win32/advapi.rs"]
 mod advapi;
+#[path = "win32/gui.rs"]
+mod gui;
+#[path = "win32/dialogs.rs"]
+mod dialogs;
+#[path = "win32/printing.rs"]
+mod printing;
+#[path = "win32/user.rs"]
+mod user;
 #[path = "win32/catalog.rs"]
 pub mod catalog;
 use crate::arch::common::btl::{
@@ -38,6 +46,9 @@ pub struct Runtime {
     pub failures: Vec<(u32, u32, String)>,
     pub last_library_error: Option<String>,
     advapi: advapi::State,
+    gui: gui::State,
+    printing: printing::State,
+    user: user::State,
 }
 impl Runtime {
     pub(super) fn new(base: u64) -> Self {
@@ -52,12 +63,16 @@ impl Runtime {
             failures: Vec::new(),
             last_library_error: None,
             advapi: advapi::State::new(),
+            gui: gui::State::new(),
+            printing: printing::State::new(),
+            user: user::State::new(),
         }
     }
 }
 pub enum Outcome {
     Return(u64),
     Exit(u32),
+    Continue,
 }
 
 fn read(m: &mut dyn GuestMemory, p: u64, n: usize) -> Result<Vec<u8>, u32> {
@@ -468,6 +483,7 @@ pub fn dispatch(
     services: &mut dyn GuestServices,
 ) -> Result<Outcome, StopReason> {
     let id = number & 0xffff;
+    if id==user::CALLBACK_RETURN{return user::callback_return(image,services);}
     let api = catalog::resolve(id).ok_or(StopReason::UnsupportedApi { id })?;
     image.win32.last_api = Some(id);
     let abi = if image.thread.context.mode == DecodeMode::X86 {
@@ -501,6 +517,10 @@ pub fn dispatch(
     }
     match invoke(image, api, &a, services) {
         Ok(v) => {
+            if let Some((procedure,args))=image.win32.user.callback.take(){
+                user::enter_callback(image,procedure,args).map_err(|_|StopReason::DataFault{pc:image.thread.context.rip})?;
+                return Ok(Outcome::Continue);
+            }
             if abi == GuestAbi::X86_32 && api.name == "GetTickCount64" {
                 image
                     .thread
@@ -530,7 +550,7 @@ pub fn dispatch(
             error(image, e);
             Ok(Outcome::Return(match api.name {
                 "TlsAlloc" => u32::MAX as u64,
-                "LocalFree" | "FreeSid" => a[0],
+                "GlobalFree" | "LocalFree" | "FreeSid" => a[0],
                 "CreateFileA" | "CreateFileW" | "HeapSize" => {
                     if abi == GuestAbi::X86_32 {
                         u32::MAX as u64
@@ -563,6 +583,11 @@ fn invoke(
     a: &[u64],
     services: &mut dyn GuestServices,
 ) -> Result<u64, ApiError> {
+    if api.dll == "comdlg32.dll" || api.dll == "comctl32.dll" {
+        return gui::invoke(image, api.dll, api.name, a, services);
+    }
+    if api.dll == "user32.dll" { return user::invoke(image, api.name, a, services); }
+    if api.dll == "gdi32.dll" { return printing::invoke(image, api.name, a, services); }
     if api.dll == "advapi32.dll" {
         return advapi::invoke(image, api.name, a)
             .ok_or(ApiError::Unsupported)?
@@ -627,6 +652,15 @@ fn invoke(
             free(image, scratch)?;
             result?
         }
+        "GlobalAlloc" => {
+            if a[0]&!0x42!=0 || a[1]==0 {return Err(INVALID_PARAMETER.into());}
+            heap_allocate(image,a[1])?
+        }
+        "GlobalFree" => {heap_free(image,a[0])?;0}
+        "GlobalLock" => {
+            if !image.win32.heap_allocations.iter().any(|v|v.0==a[0]){return Err(6u32.into());}a[0]
+        }
+        "GlobalUnlock" => {if !image.win32.heap_allocations.iter().any(|v|v.0==a[0]){return Err(6u32.into());}error(image,0);0}
         "LocalAlloc" => {
             // Movable local-memory handles need a separate lock/handle model.
             if a[0] & !0x40 != 0 {

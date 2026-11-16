@@ -17,6 +17,14 @@ pub const STD_ERROR: u64 = 0x18;
 
 /// Host operations receive owned, validated values rather than guest pointers.
 pub trait IoHost {
+    fn printer_available(&mut self) -> bool { false }
+    fn print_document(&mut self, _data: &[u8]) -> Result<u32,u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+
+    /// Copied private desktop protocol. Never accepts a guest process pointer.
+    fn desktop_dialog(&mut self, _request: &[u8]) -> Result<alloc::vec::Vec<u8>, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+
     fn memory_status(&mut self) -> Result<nt61::MemoryStatus, u32> {
         Err(nt61::STATUS_NOT_IMPLEMENTED)
     }
@@ -230,6 +238,11 @@ impl<H: IoHost> IoServices<H> {
     }
 }
 impl<H: IoHost> GuestServices for IoServices<H> {
+    fn printer_available(&mut self) -> bool { self.host.printer_available() }
+    fn print_document(&mut self, data: &[u8]) -> Result<u32,u32> { self.host.print_document(data) }
+
+    fn desktop_dialog(&mut self, request: &[u8]) -> Result<Vec<u8>, u32> { self.host.desktop_dialog(request) }
+
     fn memory_status(&mut self) -> Result<nt61::MemoryStatus, u32> {
         self.host.memory_status()
     }

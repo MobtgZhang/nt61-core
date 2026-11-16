@@ -150,6 +150,14 @@ pub struct MemoryStatus {
     pub paging_available: u64,
 }
 pub trait GuestServices {
+    fn printer_available(&mut self) -> bool { false }
+    fn print_document(&mut self, _data: &[u8]) -> Result<u32,u32> { Err(STATUS_NOT_IMPLEMENTED) }
+
+    /// Copied private desktop protocol. Never accepts a guest process pointer.
+    fn desktop_dialog(&mut self, _request: &[u8]) -> Result<alloc::vec::Vec<u8>, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+
     fn memory_status(&mut self) -> Result<MemoryStatus, u32> {
         Err(STATUS_NOT_IMPLEMENTED)
     }

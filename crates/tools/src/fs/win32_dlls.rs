@@ -38,6 +38,8 @@ pub const OLE32_BASE: u64 = 0x0000_1000_7000_0000;
 pub const OLEAUT32_BASE: u64 = 0x0000_1000_8000_0000;
 /// `comctl32.dll`.
 pub const COMCTL32_BASE: u64 = 0x0000_1000_9000_0000;
+/// `comdlg32.dll`.
+pub const COMDLG32_BASE: u64 = 0x0000_1000_c000_0000;
 
 /// `IMAGE_FILE_MACHINE_AMD64`.
 pub const MACHINE_AMD64: u16 = 0x8664;
@@ -295,6 +297,25 @@ pub const OLEAUT32_EXPORTS: &[(&str, u32)] = &[
     ("VariantInit", 5),
 ];
 
+/// The Windows 7 common-dialog export surface.
+pub const COMDLG32_EXPORTS: &[(&str, u32)] = &[
+    ("CommDlgExtendedError", 0),
+    ("GetOpenFileNameA", 1),
+    ("GetOpenFileNameW", 2),
+    ("GetSaveFileNameA", 3),
+    ("GetSaveFileNameW", 4),
+    ("ChooseFontA", 5),
+    ("ChooseFontW", 6),
+    ("ChooseColorA", 7),
+    ("ChooseColorW", 8),
+    ("PrintDlgA", 9),
+    ("PrintDlgW", 10),
+    ("PageSetupDlgA", 11),
+    ("PageSetupDlgW", 12),
+    ("GetFileTitleA", 13),
+    ("GetFileTitleW", 14),
+];
+
 /// The `comctl32.dll` (v6) surface.
 pub const COMCTL32_EXPORTS: &[(&str, u32)] = &[
     ("CreatePropertySheetPageW", 0),
@@ -310,6 +331,13 @@ pub const COMCTL32_EXPORTS: &[(&str, u32)] = &[
     ("InitCommonControlsEx", 10),
     ("InitMUILanguage", 11),
     ("PropertySheetW", 12),
+    ("InitCommonControls", 13),
+    ("GetMUILanguage", 14),
+    ("DllGetVersion", 15),
+    ("ImageList_GetImageCount", 16),
+    ("ImageList_GetIconSize", 17),
+    ("ImageList_SetImageCount", 18),
+    ("ImageList_Remove", 19),
 ];
 
 /// The `user32.dll` imports.
@@ -502,6 +530,12 @@ pub const ALL_DLLS: &[DllSpec] = &[
         imports: OLEAUT32_IMPORTS,
     },
     DllSpec {
+        file_name: "comdlg32.dll",
+        image_base: COMDLG32_BASE,
+        exports: COMDLG32_EXPORTS,
+        imports: &[],
+    },
+    DllSpec {
         file_name: "comctl32.dll",
         image_base: COMCTL32_BASE,
         exports: COMCTL32_EXPORTS,
@@ -567,7 +601,7 @@ fn build_dll_image_native(spec: &DllSpec, machine: u16, return_code: &[u8]) -> V
 
 /// DLLs backed by the isolated x86/x64 runtime gateway. Keeping this set
 /// explicit avoids confusing native architecture placeholders with guest code.
-pub const RUNTIME_DLLS: &[&str] = &["kernel32.dll", "ntdll.dll", "crypt32.dll", "advapi32.dll"];
+pub const RUNTIME_DLLS: &[&str] = &["kernel32.dll", "ntdll.dll", "crypt32.dll", "advapi32.dll", "comdlg32.dll", "comctl32.dll", "gdi32.dll", "user32.dll"];
 
 /// Exact API-set contracts imported by the supplied Firefox UCRT/VCRuntime
 /// packages (both bitnesses). This is a bounded compatibility map, not a prefix
@@ -878,7 +912,7 @@ pub fn build_runtime_dll(file_name: &str, x64: bool) -> Option<Vec<u8>> {
     };
     // Preserve native System32's address plan. crypt32 has its own slot after
     // comctl32, avoiding collisions with user32/gdi32.
-    let slot = [1u64, 0, 10, 11][index];
+    let slot = [1u64, 0, 10, 11, 12, 9, 3, 2][index];
     let base = if x64 {
         0x0000_1000_0000_0000 + slot * 0x1000_0000
     } else {

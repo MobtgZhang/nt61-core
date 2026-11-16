@@ -218,6 +218,7 @@ impl GuestImage {
                     if number & 0xffff_0000 == win32::catalog::GATEWAY_BASE {
                         match win32::dispatch(self, number, services) {
                             Ok(win32::Outcome::Return(value)) => self.thread.context.set_reg(X86Reg::Rax, if abi == GuestAbi::X86_32 { value as u32 as u64 } else { value }),
+                            Ok(win32::Outcome::Continue) => {},
                             Ok(win32::Outcome::Exit(code)) => {
                                 let result = ImageRunResult::Exited(code);
                                 self.terminal = Some(result);

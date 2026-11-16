@@ -14,6 +14,54 @@ pub struct Api {
     pub cdecl: bool,
 }
 pub const APIS: &[Api] = &[
+    Api { id:3700, dll:"user32.dll", name:"CreateWindowExW", arguments:12, x86_arguments:12, cdecl:false },
+    Api { id:3701, dll:"user32.dll", name:"CreateWindowExA", arguments:12, x86_arguments:12, cdecl:false },
+    Api { id:3702, dll:"user32.dll", name:"RegisterClassExW", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3703, dll:"user32.dll", name:"RegisterClassExA", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3704, dll:"user32.dll", name:"SendMessageW", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3705, dll:"user32.dll", name:"SendMessageA", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3706, dll:"user32.dll", name:"DestroyWindow", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3707, dll:"user32.dll", name:"ShowWindow", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3708, dll:"user32.dll", name:"GetClientRect", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3709, dll:"user32.dll", name:"SetWindowTextW", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3710, dll:"user32.dll", name:"SetWindowTextA", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3711, dll:"user32.dll", name:"GetWindowTextW", arguments:3, x86_arguments:3, cdecl:false },
+    Api { id:3712, dll:"user32.dll", name:"GetWindowTextA", arguments:3, x86_arguments:3, cdecl:false },
+    Api { id:3713, dll:"user32.dll", name:"GetMessageW", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3714, dll:"user32.dll", name:"GetMessageA", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3715, dll:"user32.dll", name:"PeekMessageW", arguments:5, x86_arguments:5, cdecl:false },
+    Api { id:3716, dll:"user32.dll", name:"PeekMessageA", arguments:5, x86_arguments:5, cdecl:false },
+    Api { id:3717, dll:"user32.dll", name:"DispatchMessageW", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3718, dll:"user32.dll", name:"DispatchMessageA", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3719, dll:"user32.dll", name:"DefWindowProcW", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3720, dll:"user32.dll", name:"DefWindowProcA", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3721, dll:"user32.dll", name:"TranslateMessage", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3722, dll:"user32.dll", name:"PostMessageW", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3723, dll:"user32.dll", name:"PostMessageA", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3724, dll:"user32.dll", name:"PostQuitMessage", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3725, dll:"user32.dll", name:"GetDlgItem", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3726, dll:"user32.dll", name:"SetWindowPos", arguments:7, x86_arguments:7, cdecl:false },
+    Api { id:3727, dll:"user32.dll", name:"GetParent", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3728, dll:"user32.dll", name:"IsWindow", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3729, dll:"user32.dll", name:"UpdateWindow", arguments:1, x86_arguments:1, cdecl:false },
+
+    Api { id:3600, dll:"gdi32.dll", name:"CreateDCW", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3601, dll:"gdi32.dll", name:"CreateDCA", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3602, dll:"gdi32.dll", name:"DeleteDC", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3603, dll:"gdi32.dll", name:"StartDocW", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3604, dll:"gdi32.dll", name:"StartDocA", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3605, dll:"gdi32.dll", name:"StartPage", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3606, dll:"gdi32.dll", name:"EndPage", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3607, dll:"gdi32.dll", name:"EndDoc", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3608, dll:"gdi32.dll", name:"AbortDoc", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3609, dll:"gdi32.dll", name:"TextOutW", arguments:5, x86_arguments:5, cdecl:false },
+    Api { id:3610, dll:"gdi32.dll", name:"TextOutA", arguments:5, x86_arguments:5, cdecl:false },
+    Api { id:3611, dll:"gdi32.dll", name:"SetTextColor", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3612, dll:"gdi32.dll", name:"GetDeviceCaps", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3613, dll:"gdi32.dll", name:"MoveToEx", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3614, dll:"gdi32.dll", name:"LineTo", arguments:3, x86_arguments:3, cdecl:false },
+    Api { id:3615, dll:"gdi32.dll", name:"Rectangle", arguments:5, x86_arguments:5, cdecl:false },
+
     Api {
         id: 1,
         dll: "kernel32.dll",
@@ -4168,6 +4216,41 @@ pub const APIS: &[Api] = &[
         x86_arguments: 2,
         cdecl: false,
     },
+    Api { id: 3400, dll: "comdlg32.dll", name: "CommDlgExtendedError", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 3401, dll: "comdlg32.dll", name: "GetOpenFileNameA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3402, dll: "comdlg32.dll", name: "GetOpenFileNameW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3403, dll: "comdlg32.dll", name: "GetSaveFileNameA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3404, dll: "comdlg32.dll", name: "GetSaveFileNameW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3405, dll: "comdlg32.dll", name: "ChooseFontA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3406, dll: "comdlg32.dll", name: "ChooseFontW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3407, dll: "comdlg32.dll", name: "ChooseColorA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3408, dll: "comdlg32.dll", name: "ChooseColorW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3409, dll: "comdlg32.dll", name: "PrintDlgA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3410, dll: "comdlg32.dll", name: "PrintDlgW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3411, dll: "comdlg32.dll", name: "PageSetupDlgA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3412, dll: "comdlg32.dll", name: "PageSetupDlgW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3413, dll: "comdlg32.dll", name: "GetFileTitleA", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3414, dll: "comdlg32.dll", name: "GetFileTitleW", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3450, dll: "comctl32.dll", name: "CreatePropertySheetPageW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3451, dll: "comctl32.dll", name: "CreateStatusWindowW", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 3452, dll: "comctl32.dll", name: "CreateToolbarEx", arguments: 13, x86_arguments: 13, cdecl: false },
+    Api { id: 3453, dll: "comctl32.dll", name: "DestroyPropertySheetPage", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3454, dll: "comctl32.dll", name: "ImageList_Add", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3455, dll: "comctl32.dll", name: "ImageList_AddIcon", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3456, dll: "comctl32.dll", name: "ImageList_Create", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 3457, dll: "comctl32.dll", name: "ImageList_Destroy", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3458, dll: "comctl32.dll", name: "ImageList_GetIcon", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3459, dll: "comctl32.dll", name: "ImageList_SetIconSize", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3460, dll: "comctl32.dll", name: "InitCommonControlsEx", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3461, dll: "comctl32.dll", name: "InitMUILanguage", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3462, dll: "comctl32.dll", name: "PropertySheetW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3463, dll: "comctl32.dll", name: "InitCommonControls", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 3464, dll: "comctl32.dll", name: "GetMUILanguage", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 3465, dll: "comctl32.dll", name: "DllGetVersion", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3466, dll: "comctl32.dll", name: "ImageList_GetImageCount", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3467, dll: "comctl32.dll", name: "ImageList_GetIconSize", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3468, dll: "comctl32.dll", name: "ImageList_SetImageCount", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3469, dll: "comctl32.dll", name: "ImageList_Remove", arguments: 2, x86_arguments: 2, cdecl: false },
 ];
 
 pub fn resolve(id: u32) -> Option<&'static Api> {
@@ -4229,6 +4312,21 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "CryptStringToBinaryA" | "CryptStringToBinaryW" => (L, "Base64 and raw hex decoding only; bounded buffers; no certificate validation"),
             _ => (U, "Certificate and other cryptographic operations have no handler; dispatch stops with UnsupportedApi"),
         }
+    } else if dll.eq_ignore_ascii_case("comdlg32.dll") {
+        match name {
+            "CommDlgExtendedError" | "GetFileTitleA" | "GetFileTitleW" => (L, "Per-guest common-dialog error and checked basename extraction; ANSI ASCII only"),
+            _ => (H, "Checked x86/x64 A/W modal dialogs through copied desktop service; hooks, templates and file multiselect rejected; ANSI ASCII only"),
+        }
+    } else if dll.eq_ignore_ascii_case("comctl32.dll") {
+        match name {
+            "DllGetVersion" | "InitMUILanguage" | "GetMUILanguage" | "ImageList_Create" | "ImageList_Destroy" | "ImageList_GetImageCount" | "ImageList_GetIconSize" | "ImageList_SetIconSize" | "ImageList_SetImageCount" | "ImageList_Remove" => (L, "Checked metadata and bounded process-private image-list storage; no GDI bitmap ingestion or icon rendering"),
+            "InitCommonControls" | "InitCommonControlsEx" => (L, "Registers process-private list, tree and toolbar classes for the desktop HWND transport"),
+            _ => (U, "No runtime handler; dispatch stops with UnsupportedApi"),
+        }
+    } else if dll.eq_ignore_ascii_case("user32.dll") {
+        if (3700..=3729).contains(&find(dll,name).unwrap().id) {(H,"Process-owned HWNDs, direct child controls and copied desktop messages; bounded queues and x86/x64 guest window procedures; unsupported messages fail explicitly")}else{(U,"No runtime handler")}
+    } else if dll.eq_ignore_ascii_case("gdi32.dll") {
+        if (3600..=3615).contains(&find(dll,name).unwrap().id) {(H,"PostScript printer DC, document/page lifecycle and basic text/vector drawing; no display DC, bitmap driver or physical printer")}else{(U,"No runtime handler")}
     } else if dll.eq_ignore_ascii_case("advapi32.dll") {
         match name {
             "RegCopyTreeA" | "RegCopyTreeW" | "RegDeleteKeyValueA" | "RegDeleteKeyValueW" | "RegSetKeyValueA" | "RegSetKeyValueW" | "RegEnumKeyA" | "RegEnumKeyW" | "RegQueryValueA" | "RegQueryValueW" | "RegSetValueA" | "RegSetValueW" | "RegQueryMultipleValuesA" | "RegQueryMultipleValuesW" | "RegCloseKey" | "RegCreateKeyA" | "RegCreateKeyExA" | "RegCreateKeyExW" | "RegCreateKeyW" | "RegDeleteKeyA" | "RegDeleteKeyExA" | "RegDeleteKeyExW" | "RegDeleteKeyW" | "RegDeleteTreeA" | "RegDeleteTreeW" | "RegDeleteValueA" | "RegDeleteValueW" | "RegEnumKeyExA" | "RegEnumKeyExW" | "RegEnumValueA" | "RegEnumValueW" | "RegFlushKey" | "RegGetValueA" | "RegGetValueW" | "RegOpenKeyA" | "RegOpenKeyExA" | "RegOpenKeyExW" | "RegOpenKeyW" | "RegQueryInfoKeyA" | "RegQueryInfoKeyW" | "RegQueryValueExA" | "RegQueryValueExW" | "RegSetValueExA" | "RegSetValueExW" => (L, "Checked process-private registry keys, values, access masks and WOW64 views; no persistent hives, notifications, ACL enforcement, merged HKCR or environment expansion; RegFlushKey returns CALL_NOT_IMPLEMENTED; ANSI ASCII only"),
@@ -4264,6 +4362,7 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "GetModuleHandleA" | "GetModuleHandleW" => (L, "Current executable or already mapped guest module identity only"),
             "GetProcAddress" => (L, "Checked readable guest PE code/data exports by name or ordinal; forward targets loaded through GuestServices with bounded depth"),
             "VirtualAlloc" | "VirtualFree" | "VirtualProtect" => (L, "Bounded guest private mappings, reserve/commit/decommit/release and page permissions; zero allocation sizes and mapped-view copy-on-write protections rejected; restricted flags and no host virtual-memory allocation"),
+            "GlobalAlloc" | "GlobalFree" | "GlobalLock" | "GlobalUnlock" => (L,"Process-private stable heap-backed global handles with checked ownership"),
             "LocalAlloc" | "LocalFree" | "LocalSize" => (L, "Fixed private-heap local memory and size queries only; movable handles and LocalLock are unsupported"),
             "HeapAlloc" | "HeapReAlloc" | "HeapFree" | "HeapSize" => (L, "Private guest heap allocations with checked ownership and restricted flags"),
             "TlsAlloc" | "TlsFree" | "TlsSetValue" | "TlsGetValue" => (L, "Up to 1088 slots on the one current guest thread"),

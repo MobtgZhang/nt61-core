@@ -11,9 +11,25 @@ use alloc::{format, string::String, vec::Vec};
 
 struct VolumeIo {
     output: fn(&[u8]),
+    desktop_client: u32,
+    desktop_windows:bool,
     application_directory: String,
 }
+impl Drop for VolumeIo {
+    fn drop(&mut self){if self.desktop_windows{let mut packet=nt61_abi::dialog_bridge::EMPTY;packet.values[0]=nt61_abi::dialog_bridge::WINDOW;packet.values[4]=8;packet.values[63]=self.desktop_client;let _=crate::arch::common::dialog_broker::request(packet);}}
+}
 impl IoHost for VolumeIo {
+    fn printer_available(&mut self) -> bool { true }
+    fn print_document(&mut self, data: &[u8]) -> Result<u32,u32> { crate::arch::common::dialog_broker::spool(data) }
+
+    fn desktop_dialog(&mut self, request: &[u8]) -> Result<Vec<u8>, u32> {
+        let mut packet = crate::arch::common::dialog_broker::decode(request)?;
+        if packet.values[0]==nt61_abi::dialog_bridge::WINDOW{self.desktop_windows=true;}
+        packet.values[63] = self.desktop_client;
+        let response = crate::arch::common::dialog_broker::request(packet)?;
+        Ok(crate::arch::common::dialog_broker::bytes(&response).to_vec())
+    }
+
     fn memory_status(&mut self) -> Result<crate::arch::common::btl::nt61::MemoryStatus, u32> {
         Ok(crate::arch::common::btl::nt61::MemoryStatus {
             physical_total: crate::mm::get_total_physical(),
@@ -131,7 +147,10 @@ pub fn try_execute(
                     return Some(status);
                 }
             };
+        static NEXT_DESKTOP_CLIENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
         let mut services = IoServices::new(VolumeIo {
+            desktop_client: NEXT_DESKTOP_CLIENT.fetch_add(1,core::sync::atomic::Ordering::Relaxed),
+            desktop_windows:false,
             output,
             application_directory: candidate
                 .rsplit_once('\\')

@@ -527,3 +527,20 @@ fn ntdll_exports_all_native_services_and_zw_aliases_with_audited_abi() {
         assert_eq!(ordinals.len(), 802);
     }
 }
+
+#[test]
+fn common_dialog_and_control_runtime_dlls_export_both_guest_abis() {
+    for x64 in [false, true] {
+        let dialog = pe_read::parse(&win32_dlls::build_runtime_dll("comdlg32.dll", x64).unwrap()).unwrap();
+        for name in ["CommDlgExtendedError", "GetOpenFileNameA", "GetOpenFileNameW", "GetSaveFileNameA", "GetSaveFileNameW", "ChooseFontA", "ChooseFontW", "ChooseColorA", "ChooseColorW", "PrintDlgA", "PrintDlgW", "PageSetupDlgA", "PageSetupDlgW", "GetFileTitleA", "GetFileTitleW"] {
+            assert!(dialog.exports_by_name.contains_key(name), "missing {name}");
+        }
+        let controls = pe_read::parse(&win32_dlls::build_runtime_dll("comctl32.dll", x64).unwrap()).unwrap();
+        assert_eq!(dialog.machine, controls.machine);
+        assert_ne!(dialog.image_base, controls.image_base);
+        for (name, _) in win32_dlls::COMCTL32_EXPORTS {
+            assert!(controls.exports_by_name.contains_key(*name), "missing {name}");
+        }
+        assert_eq!(dialog.machine, if x64 { 0x8664 } else { 0x14c });
+    }
+}
