@@ -7,3 +7,4 @@ publish = false
 
 [dependencies]
 fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
+ttf-parser = { version = "0.25", default-features = false, features = ["no-std-float"] }

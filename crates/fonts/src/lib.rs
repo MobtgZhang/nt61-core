@@ -6,6 +6,9 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+mod sfnt;
+pub use sfnt::{FontDescription, OutlineBounds, OutlineBuilder, OutlineMetrics, SfntFont};
+
 /// License-safe sans-serif face used by graphical boot UI.
 pub const UI_FONT: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
 
@@ -103,6 +106,25 @@ impl FontFace {
             return None;
         }
         let (metrics, coverage) = self.font.rasterize(ch, pixel_size as f32);
+        Some(RasterizedGlyph {
+            metrics: GlyphMetrics {
+                width: metrics.width,
+                height: metrics.height,
+                xmin: metrics.xmin,
+                ymin: metrics.ymin,
+                advance_width: metrics.advance_width,
+            },
+            coverage,
+        })
+    }
+
+    /// Rasterize an already mapped glyph. Glyph zero is a valid missing-glyph
+    /// image, so this entry point does not perform a Unicode cmap lookup.
+    pub fn rasterize_indexed(&self, glyph: u16, pixel_size: f32) -> Option<RasterizedGlyph> {
+        if glyph >= self.font.glyph_count() || !pixel_size.is_finite() || pixel_size <= 0.0 {
+            return None;
+        }
+        let (metrics, coverage) = self.font.rasterize_indexed(glyph, pixel_size);
         Some(RasterizedGlyph {
             metrics: GlyphMetrics {
                 width: metrics.width,
