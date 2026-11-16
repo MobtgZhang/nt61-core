@@ -1,7 +1,7 @@
 //! Vista/Windows 7 common item dialog using the same shell artwork as Explorer.
-use super::{layout::Layout, FileDialog, Focus, Mode};
+use super::{encoding_label, layout::Layout, FileDialog, Focus, Mode};
 use crate::{
-    applications::{document::Encoding, explorer::theme},
+    applications::explorer::theme,
     compositor::aero,
     graphics::{Rect, Surface},
 };
@@ -162,7 +162,17 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
         l.header.height,
         0xFFF7F9FC,
     );
-    label(text, frame, "Name", l.header, 0xFF45617D);
+    label(
+        text,
+        frame,
+        if d.sort_descending {
+            "Name ▾"
+        } else {
+            "Name ▴"
+        },
+        l.header,
+        0xFF45617D,
+    );
     if l.header.width >= 340 {
         label(
             text,
@@ -180,7 +190,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
     for (i, entry) in d
         .entries
         .iter()
-        .skip(d.offset)
+        .skip(d.offset())
         .take((l.list.height / 24) as usize)
         .enumerate()
     {
@@ -190,7 +200,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
             l.list.width.saturating_sub(6),
             24,
         );
-        if d.selected == Some(i + d.offset) {
+        if d.selected() == Some(i + d.offset()) {
             aero::selection(frame, row, true, false);
         }
         theme::icon(
@@ -237,7 +247,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
         l.scroll,
         d.entries.len(),
         (l.list.height / 24).max(1) as usize,
-        d.offset,
+        d.offset(),
     ) {
         bar.draw(frame, false, d.captures_pointer());
     }
@@ -256,7 +266,12 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
             d.name.as_str(),
             d.focus == Focus::Name,
         ),
-        ("File type:", l.filter, d.filter.label(), false),
+        (
+            "File type:",
+            l.filter,
+            d.filter_label(),
+            d.focus == Focus::Filter,
+        ),
     ] {
         label(
             text,
@@ -283,15 +298,17 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
         );
     }
     if d.text_encoding && d.overwrite.is_none() {
-        let encoding = match d.encoding {
-            None => "Auto-detect",
-            Some(Encoding::Ansi) => "ANSI",
-            Some(Encoding::Utf16Le) => "Unicode",
-            Some(Encoding::Utf16Be) => "Unicode big endian",
-            Some(Encoding::Utf8Bom) => "UTF-8",
-            Some(Encoding::Utf8) => "UTF-8 (no BOM)",
-        };
-        border(frame, l.encoding, 0xFFFFFFFF, 0xFFABADB3);
+        let encoding = encoding_label(d.encoding);
+        border(
+            frame,
+            l.encoding,
+            0xFFFFFFFF,
+            if d.focus == Focus::Encoding {
+                0xFF3C7FB1
+            } else {
+                0xFFABADB3
+            },
+        );
         label(
             text,
             frame,
@@ -353,4 +370,5 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
             0xFF172635,
         );
     }
+    d.popup.draw(frame, text);
 }

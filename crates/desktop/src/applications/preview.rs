@@ -54,6 +54,9 @@ fn main() {
         std::fs::write(&args[3], bytes).unwrap();
         return;
     }
+    let width = args.get(5).and_then(|v| v.parse().ok()).unwrap_or(640);
+    let height = args.get(6).and_then(|v| v.parse().ok()).unwrap_or(460);
+    let body = Rect::new(0, 0, width, height);
     let id = AppId::from_raw(args[1].parse().unwrap()).unwrap();
     let mut app = ApplicationSession::new(1, id, 7919);
     if args.get(4).is_none_or(|s| s != "import") {
@@ -81,8 +84,10 @@ fn main() {
                 "font-16" => app.notepad.font.points = 16,
                 "font-bold-dialog" => {
                     notepad::execute(&mut app, Command::Font);
-                    if let Some(notepad::Dialog::Font(draft)) = &mut app.notepad.dialog {
-                        draft.style = 1;
+                    if let Some(nt61_desktop::applications::common_dialogs::Dialog::Font(draft)) =
+                        &mut app.common_dialog
+                    {
+                        draft.font.style = 1;
                     }
                 }
                 "cursor-start" | "cursor-one" => {
@@ -199,6 +204,73 @@ fn main() {
             }
         }
     }
+    if let Some(scenario) = args.get(4) {
+        use nt61_desktop::applications::common_dialogs::{self, ColorTarget};
+        match scenario.as_str() {
+            "save" => {
+                use nt61_desktop::{
+                    applications::file_dialog::{FileDialog, Filter, Mode},
+                    file::FileSystem,
+                };
+                app.dialog = Some(FileDialog::new(
+                    &mut FileSystem::new(), Mode::SaveAs, None, "", Filter::All,
+                ));
+            }
+            "common-color" => common_dialogs::open_color(
+                &mut app,
+                if id == AppId::Paint {
+                    ColorTarget::Paint
+                } else {
+                    ColorTarget::Text
+                },
+            ),
+            "common-font" => common_dialogs::open_font(&mut app),
+            "common-print" => common_dialogs::open_print(&mut app),
+            "common-page" | "common-page-popup" | "common-page-paper" | "common-page-footer" => {
+                common_dialogs::open_page(&mut app);
+                if matches!(scenario.as_str(), "common-page-popup" | "common-page-paper") {
+                    let r = common_dialogs::bounds(app.common_dialog.as_ref().unwrap(), body);
+                    common_dialogs::pointer(&mut app, body, r.x + 30, r.y + 70);
+                    if scenario == "common-page-paper" {
+                        common_dialogs::key_at(&mut app, 27, body);
+                    }
+                } else if scenario == "common-page-footer" {
+                    for _ in 0..5 {
+                        common_dialogs::key_at(&mut app, 9, body);
+                    }
+                }
+            }
+            "open-types" | "save-encoding" => {
+                use nt61_desktop::{
+                    applications::{
+                        document::Encoding,
+                        file_dialog::{FileDialog, Filter, Focus, Mode},
+                    },
+                    file::FileSystem,
+                };
+                let mut files = FileSystem::new();
+                files.touch(1, "Example.txt", b"sample");
+                let save = scenario == "save-encoding";
+                let mut dialog = FileDialog::new(
+                    &mut files,
+                    if save { Mode::SaveAs } else { Mode::Open },
+                    None,
+                    "Example.txt",
+                    if id == AppId::WordPad {
+                        Filter::Documents
+                    } else {
+                        Filter::Text
+                    },
+                );
+                dialog.text_encoding = id == AppId::Notepad;
+                dialog.encoding = Some(Encoding::Ansi);
+                dialog.focus = if save { Focus::Encoding } else { Focus::Filter };
+                dialog.key_at(&mut files, b' ', body);
+                app.dialog = Some(dialog);
+            }
+            _ => {}
+        }
+    }
     if let Some(directory) = std::env::var_os("NT61_PREVIEW_EXPORT") {
         let directory = std::path::PathBuf::from(directory);
         std::fs::create_dir_all(&directory).unwrap();
@@ -231,8 +303,6 @@ fn main() {
         processes: None,
         tasks: vec![],
     };
-    let width = args.get(5).and_then(|v| v.parse().ok()).unwrap_or(640);
-    let height = args.get(6).and_then(|v| v.parse().ok()).unwrap_or(460);
     let mut frame = Surface::new(width, height);
     let font = FontLib::ui().unwrap();
     let size = nt61_desktop::shell::layout::UI_FONT_SIZE;

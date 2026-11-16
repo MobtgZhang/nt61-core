@@ -48,9 +48,14 @@ pub fn icon(frame: &mut Surface, name: &str, at: Rect) {
         "Search" => asset!("search"),
         "Refresh" => asset!("refresh"),
         "Document" => asset!("document-16"),
+        "Printer" => asset!("printer-16"),
         _ => asset!("folder-16"),
     };
     draw(frame, pixels, (16, 16), at);
+}
+
+pub fn printer(frame: &mut Surface, at: Rect) {
+    draw(frame, asset!("printer-32"), (32, 32), at);
 }
 
 pub fn large_icon(frame: &mut Surface, name: &str, at: Rect) {
