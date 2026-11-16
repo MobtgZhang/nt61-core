@@ -171,6 +171,32 @@ pub unsafe extern "C" fn nt_open_transaction_manager(
     .unwrap_or_else(|status| status)
 }
 
+/// Set TransactionManagerRecoveryInformation on an existing manager.
+/// Win7 accepts only class 3 with no payload; volatile managers cannot recover
+/// a durable log. Every manager published by this backend is volatile.
+pub extern "C" fn nt_set_information_transaction_manager(
+    handle: HANDLE,
+    class: u32,
+    _information: PVOID,
+    length: u32,
+) -> NTSTATUS {
+    if class != 3 {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if length != 0 {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    (|| {
+        let object = pin(handle, HandleKind::TransactionManager, 2)?;
+        let status = match &STORE.lock().get(object.0)?.payload {
+            Payload::Manager { .. } => Ok(store::TM_VOLATILE),
+            _ => Err(STATUS_OBJECT_TYPE_MISMATCH),
+        };
+        status
+    })()
+    .unwrap_or_else(|status| status)
+}
+
 /// # Safety
 /// Pointers designate caller memory and are captured before the new handle.
 pub unsafe extern "C" fn nt_create_transaction(

@@ -26,6 +26,65 @@ fn basic(handle: HANDLE) -> [u8; 24] {
 fn close(handle: HANDLE) { assert_eq!(unsafe { ntdll::file::nt_close(handle) }, 0); }
 
 #[test]
+fn manager_recovery_validates_class_and_length_before_handle_or_pointer() {
+    let _guard = state_guard();
+    let invalid_information = 1usize as PVOID;
+    for class in [0, 1, 2, 4, 5, u32::MAX] {
+        assert_eq!(nt_set_information_transaction_manager(null_mut(), class,
+            invalid_information, u32::MAX), STATUS_INVALID_INFO_CLASS);
+    }
+    for length in [1, 4, u32::MAX] {
+        assert_eq!(nt_set_information_transaction_manager(null_mut(), 3,
+            invalid_information, length), STATUS_INFO_LENGTH_MISMATCH);
+    }
+    assert_eq!(nt_set_information_transaction_manager(null_mut(), 3,
+        invalid_information, 0), STATUS_INVALID_HANDLE);
+}
+
+#[test]
+fn manager_recovery_requires_set_information_right_and_manager_type() {
+    let _guard = state_guard();
+    let tm = manager();
+    let query_only = ntdll::object::duplicate_object_kernel((-1isize) as HANDLE, tm,
+        (-1isize) as HANDLE, 1, 0, 0).unwrap();
+    assert_eq!(nt_set_information_transaction_manager(query_only, 3, null_mut(), 0),
+        STATUS_ACCESS_DENIED);
+    let tx = transaction(tm, None);
+    assert_eq!(nt_set_information_transaction_manager(tx, 3, null_mut(), 0),
+        STATUS_OBJECT_TYPE_MISMATCH);
+    close(query_only); close(tx); close(tm);
+    assert_eq!(nt_set_information_transaction_manager(tm, 3, null_mut(), 0),
+        STATUS_INVALID_HANDLE);
+}
+
+#[test]
+fn volatile_manager_recovery_never_reads_information_or_changes_manager_state() {
+    let _guard = state_guard();
+    let tm = manager();
+    let mut before = [0u8; 24];
+    assert_eq!(unsafe { nt_query_information_transaction_manager(tm, 0,
+        before.as_mut_ptr().cast(), 24, null_mut()) }, STATUS_SUCCESS);
+    let set_only = ntdll::object::duplicate_object_kernel((-1isize) as HANDLE, tm,
+        (-1isize) as HANDLE, 2, 0, 0).unwrap();
+    close(tm);
+    for information in [null_mut(), 1usize as PVOID, usize::MAX as PVOID] {
+        assert_eq!(nt_set_information_transaction_manager(set_only, 3, information, 0),
+            0xc019003bu32 as i32);
+    }
+    let identity = before[..16].try_into().unwrap();
+    let mut reopened = null_mut();
+    assert_eq!(unsafe { nt_open_transaction_manager(&mut reopened, 1, null_mut(),
+        null(), &identity, 0) }, STATUS_SUCCESS);
+    let mut after = [0u8; 24];
+    assert_eq!(unsafe { nt_query_information_transaction_manager(reopened, 0,
+        after.as_mut_ptr().cast(), 24, null_mut()) }, STATUS_SUCCESS);
+    assert_eq!(before, after);
+    close(set_only); close(reopened);
+    assert_eq!(unsafe { nt_open_transaction_manager(&mut reopened, 1, null_mut(),
+        null(), &identity, 0) }, 0xc0190051u32 as i32);
+}
+
+#[test]
 fn transaction_commit_and_rollback_are_shared_across_guid_opens() {
     let _guard = state_guard();
     let tm = manager();
@@ -307,7 +366,7 @@ fn superior_controls_each_phase_and_receives_completion_notifications() {
     let superior_rm = resource(tm, 0xc5);
     let tx = transaction(tm, None);
     let en = enlist(rm, tx, 0, 0xf, 88);
-    let sup = enlist(superior_rm, tx, 1, 0x040000f0, 99);
+    let sup = enlist(superior_rm, tx, 1, 0x040000f8, 99);
     assert_eq!(nt_commit_transaction(tx, 0), 0);
     notification(superior_rm, 99, 0x04000000);
     assert_eq!(unsafe { nt_commit_enlistment(sup, null()) }, 0xc0190013u32 as i32);
@@ -326,6 +385,62 @@ fn superior_controls_each_phase_and_receives_completion_notifications() {
     assert_eq!(unsafe { nt_commit_complete(en, null()) }, 0);
     notification(superior_rm, 99, 0x40);
     close(sup); close(en); close(tx); close(superior_rm); close(rm); close(tm);
+}
+
+#[test]
+fn enlistment_creation_rejects_invalid_protocol_masks_without_publishing() {
+    let _guard = state_guard();
+    let tm = manager();
+    let rm = resource(tm, 0xe4);
+    let tx = transaction(tm, None);
+    for (options, mask) in [(0, 0), (0, 1), (0, 4), (0, 6), (0, 8),
+                            (0, 0xa), (0, 0x20c), (0, 0x206),
+                            (0, 0x0200_000e), (0, 0x0400_000e),
+                            (1, 0x0400_00f0), (1, 9), (1, 0xa),
+                            (1, 0xc), (1, 0x208)] {
+        let sentinel = 0xfeedusize as HANDLE;
+        let mut output = sentinel;
+        assert_eq!(unsafe { nt_create_enlistment(&mut output, 0xf001f, rm, tx,
+            null_mut(), options, mask, null_mut()) }, STATUS_INVALID_PARAMETER,
+            "options={options:#x} mask={mask:#x}");
+        assert_eq!(output, sentinel, "invalid mask published an enlistment");
+    }
+    close(tx); close(rm); close(tm);
+}
+
+#[test]
+fn rollback_only_superior_and_preprepare_only_subordinate_are_valid_masks() {
+    let _guard = state_guard();
+    let tm = manager();
+    let rm = resource(tm, 0xe5);
+    let superior_rm = resource(tm, 0xe6);
+    let tx = transaction(tm, None);
+    let ordinary = enlist(rm, tx, 0, 9, 10);
+    let superior = enlist(superior_rm, tx, 1, 8, 20);
+    assert_eq!(unsafe { nt_rollback_enlistment(superior, null()) }, STATUS_SUCCESS);
+    notification(rm, 10, 8);
+    assert_eq!(unsafe { nt_rollback_complete(ordinary, null()) }, STATUS_SUCCESS);
+    close(superior); close(ordinary); close(tx); close(superior_rm); close(rm); close(tm);
+}
+
+#[test]
+fn enlistment_protocol_validator_matches_original_instruction_oracle() {
+    // This data was produced by replaying the original kernel helper, without
+    // an implementation-derived predicate. See win7-enlistment-mask-reference.py.
+    let oracle = include_bytes!("../data/win7-enlistment-mask.bin");
+    let bits = [0, 1, 2, 3, 4, 5, 6, 7, 9, 25, 26];
+    assert_eq!(oracle.len(), 4096);
+    for (case, &expected) in oracle.iter().enumerate() {
+        let superior = case >= 2048;
+        let index = case & 2047;
+        let mask = bits.iter().enumerate().fold(0u32, |mask, (offset, bit)| {
+            mask | if index & (1 << offset) != 0 { 1 << bit } else { 0 }
+        });
+        for extra in [0, 0x8000_1500] {
+            assert_eq!(ntdll::ktm::valid_notification_mask(mask | extra, superior), expected != 0,
+                "mask={:#x} superior={superior}", mask | extra);
+        }
+    }
 }
 
 #[test]
@@ -355,4 +470,10 @@ fn resource_manager_description_update_preserves_guid_and_checks_mutation_rights
     close(alias);
     close(rm);
     close(tm);
+}
+
+#[test]
+fn queued_notifications_keep_their_key_and_later_notifications_capture_the_new_key() {
+    let _guard = state_guard();
+    ntdll::ktm::queued_notification_key_regression();
 }

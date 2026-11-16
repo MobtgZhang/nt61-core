@@ -19,6 +19,7 @@ static NEXT_NOTIFICATION: AtomicU64 = AtomicU64::new(1);
 
 pub(super) struct Notification {
     sequence: u64,
+    key: u64,
     mask: u32,
     clock: i64,
 }
@@ -72,7 +73,7 @@ fn broadcast(store: &mut store::Store, tx: u64, mask: u32, pending: u32, skipped
             if mask == 8 && value.state == ROLLING_BACK { continue; }
             if mask == 8 { value.notifications.clear(); }
             if value.mask & mask != 0 {
-                value.notifications.push(Notification { sequence: NEXT_NOTIFICATION.fetch_add(1, Ordering::Relaxed), mask, clock });
+                value.notifications.push(Notification { sequence: NEXT_NOTIFICATION.fetch_add(1, Ordering::Relaxed), key: value.key, mask, clock });
                 value.state = pending;
             } else { value.state = skipped; }
         }
@@ -102,7 +103,7 @@ fn notify_superior(store: &mut store::Store, tx: u64, mask: u32) -> Result<bool,
     if value.mask & mask != 0 {
         value.notifications.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
         value.notifications.push(Notification {
-            sequence: NEXT_NOTIFICATION.fetch_add(1, Ordering::Relaxed), mask, clock,
+            sequence: NEXT_NOTIFICATION.fetch_add(1, Ordering::Relaxed), key: value.key, mask, clock,
         });
     }
     Ok(true)
@@ -182,7 +183,7 @@ fn start(store: &mut store::Store, tx: u64, commit: bool) -> Result<(), NTSTATUS
         let value = enlistment(store, superior)?;
         if value.mask & 0x0400_0000 == 0 { return Err(INVALID_REQUEST); }
         value.notifications.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
-        value.notifications.push(Notification { sequence: NEXT_NOTIFICATION.fetch_add(1, Ordering::Relaxed), mask: 0x0400_0000, clock: 0 });
+        value.notifications.push(Notification { sequence: NEXT_NOTIFICATION.fetch_add(1, Ordering::Relaxed), key: value.key, mask: 0x0400_0000, clock: 0 });
         transaction(store, tx)?.phase = 5;
     } else if participant_count == 1 && enlistment(store, participant.ok_or(INVALID_REQUEST)?)?.mask & 0x200 != 0 {
         broadcast(store, tx, 0x200, SINGLE_PHASE, COMMITTED)?;
@@ -220,10 +221,10 @@ pub unsafe extern "C" fn nt_create_enlistment(output: *mut HANDLE, access: u32,
     options: u32, mask: u32, key: PVOID) -> NTSTATUS {
     (|| {
         if options & !1 != 0 || mask == 0 || mask & !0x3fff_ffff != 0 { return Err(STATUS_INVALID_PARAMETER); }
-        // This backend supports local volatile two-phase enlistments only.
+        if !valid_notification_mask(mask, options == 1) { return Err(STATUS_INVALID_PARAMETER); }
+        // Recovery/distributed notifications need additional lifetime/state
+        // machinery. Keep that backend limit separate from protocol validity.
         if mask & !0x0400_02ff != 0 { return Err(STATUS_NOT_SUPPORTED); }
-        if (options == 0 && mask & 0x0400_00f0 != 0)
-            || (options == 1 && mask & 0x20f != 0) { return Err(STATUS_INVALID_PARAMETER); }
         let resource = pin(resource_manager, HandleKind::ResourceManager, 8)?;
         let tx = pin(tx, HandleKind::Transaction, 4)?;
         publish(output, access, attributes, HandleKind::Enlistment, || {
@@ -247,6 +248,29 @@ pub unsafe extern "C" fn nt_create_enlistment(output: *mut HANDLE, access: u32,
             }))
         })
     })().unwrap_or_else(|status| status)
+}
+
+/// Win7's protocol validator at original RVA 0x30e2a8, including its cold
+/// PREPREPARE alternative at 0x3aa8eb. The caller validates public option and
+/// reserved mask bits separately. These clauses apply before local-backend
+/// capability filtering, so invalid masks cannot become supported enlistments.
+pub(crate) fn valid_notification_mask(mask: u32, superior: bool) -> bool {
+    if mask & 8 == 0 {
+        return false;
+    }
+    if superior {
+        return mask & 0x207 == 0;
+    }
+    if mask & 0x0600_00f0 != 0 {
+        return false;
+    }
+    if mask & 2 != 0 && mask & 4 == 0 {
+        return false;
+    }
+    if mask & 0x200 != 0 && mask & 2 == 0 {
+        return false;
+    }
+    mask & (1 | 4) != 0
 }
 
 /// # Safety
@@ -478,7 +502,7 @@ pub unsafe extern "C" fn nt_get_notification_resource_manager(handle: HANDLE, ou
                     let value = enlistment(&mut store, id)?;
                     let notification = &value.notifications[0];
                     let mut bytes = [0u8; 32];
-                    bytes[..8].copy_from_slice(&value.key.to_le_bytes());
+                    bytes[..8].copy_from_slice(&notification.key.to_le_bytes());
                     bytes[8..12].copy_from_slice(&notification.mask.to_le_bytes());
                     bytes[16..24].copy_from_slice(&notification.clock.to_le_bytes());
                     copy_to_user(output as u64, &bytes)?;
@@ -493,4 +517,61 @@ pub unsafe extern "C" fn nt_get_notification_resource_manager(handle: HANDLE, ou
             crate::ke::scheduler::yield_();
         }
     })().unwrap_or_else(|status| status)
+}
+
+#[cfg(test)]
+pub(crate) use notification_key_tests::queued_notification_key_regression;
+
+#[cfg(test)]
+mod notification_key_tests {
+    use super::*;
+    use core::ptr::{null, null_mut};
+
+    fn change_key(handle: HANDLE, key: u64) {
+        // No registered service currently changes a key. Exercise the private
+        // mutation boundary without exposing an incomplete recovery service.
+        let object = pin(handle, HandleKind::Enlistment, 0).unwrap();
+        enlistment(&mut STORE.lock(), object.0).unwrap().key = key;
+    }
+
+    fn receive(resource: HANDLE, key: u64, mask: u32) {
+        let mut packet = [0xa5u8; 32];
+        let mut returned = 0;
+        assert_eq!(unsafe { nt_get_notification_resource_manager(resource,
+            packet.as_mut_ptr().cast(), 32, &0, &mut returned, 0, 0) }, STATUS_SUCCESS);
+        assert_eq!(returned, 32);
+        assert_eq!(u64::from_le_bytes(packet[..8].try_into().unwrap()), key);
+        assert_eq!(u32::from_le_bytes(packet[8..12].try_into().unwrap()), mask);
+    }
+
+    pub(crate) fn queued_notification_key_regression() {
+        let mut manager = null_mut();
+        let mut resource = null_mut();
+        let mut transaction = null_mut();
+        let mut participant = null_mut();
+        assert_eq!(unsafe { nt_create_transaction_manager(&mut manager, 0xf003f,
+            null_mut(), null(), 1, 0) }, STATUS_SUCCESS);
+        assert_eq!(unsafe { nt_create_resource_manager(&mut resource, 0x1f007f,
+            manager, &[0xe3; 16], null_mut(), 1, null()) }, STATUS_SUCCESS);
+        assert_eq!(unsafe { nt_create_transaction(&mut transaction, 0x1f003f,
+            null_mut(), null(), manager, 0, 0, 0, null(), null()) }, STATUS_SUCCESS);
+        assert_eq!(unsafe { nt_create_enlistment(&mut participant, 0xf001f,
+            resource, transaction, null_mut(), 0, 0xf, 10usize as PVOID) }, STATUS_SUCCESS);
+
+        assert_eq!(nt_commit_transaction(transaction, 0), STATUS_SUCCESS);
+        change_key(participant, 20);
+        assert_eq!(unsafe { nt_pre_prepare_complete(participant, null()) }, STATUS_SUCCESS);
+        change_key(participant, 30);
+        // Both packets were queued before this dequeue. They must retain the
+        // two distinct keys captured when their protocol phases were emitted.
+        receive(resource, 10, 1);
+        receive(resource, 20, 2);
+        assert_eq!(unsafe { nt_prepare_complete(participant, null()) }, STATUS_SUCCESS);
+        change_key(participant, 40);
+        receive(resource, 30, 4);
+        assert_eq!(unsafe { nt_commit_complete(participant, null()) }, STATUS_SUCCESS);
+        for handle in [participant, transaction, resource, manager] {
+            assert_eq!(unsafe { file::nt_close(handle) }, STATUS_SUCCESS);
+        }
+    }
 }
