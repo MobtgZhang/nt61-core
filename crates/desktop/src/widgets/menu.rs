@@ -59,34 +59,27 @@ impl Menu {
     }
 
     pub fn select_next(&mut self) -> Option<u32> {
-        let selected = self.selected;
         if self.items.is_empty() {
             return None;
         }
-        let enabled_count = self.items.iter().filter(|item| item.enabled).count();
-        if enabled_count == 0 {
-            return None;
-        }
-        let mut start = 0;
-        for (index, item) in self.items.iter().enumerate() {
-            if selected == Some(item.id) {
-                start = index;
-                break;
-            }
-        }
-        for offset in 1..=self.items.len() {
-            let index = (start + offset) % self.items.len();
-            let item = &self.items[index];
+        let start = self
+            .selected
+            .and_then(|id| self.items.iter().position(|item| item.id == id))
+            .map_or(0, |index| (index + 1) % self.items.len());
+        for offset in 0..self.items.len() {
+            let item = &self.items[(start + offset) % self.items.len()];
             if item.enabled {
                 self.selected = Some(item.id);
                 return self.selected;
             }
         }
-        selected
+        self.selected = None;
+        None
     }
 
     pub fn activate(&mut self) -> Option<u32> {
         self.selected
+            .filter(|id| self.items.iter().any(|item| item.id == *id && item.enabled))
     }
 }
 
@@ -105,5 +98,21 @@ mod tests {
         assert!(!menu.select(11));
         assert_eq!(menu.select_next(), Some(12));
         assert_eq!(menu.activate(), Some(12));
+    }
+    #[test]
+    fn unselected_menu_starts_at_first_enabled_item() {
+        let mut menu = Menu::new(1, MenuKind::Context);
+        menu.add_item(10, "Open");
+        menu.add_item(11, "Save");
+        assert_eq!(menu.select_next(), Some(10));
+    }
+
+    #[test]
+    fn disabled_selection_cannot_activate() {
+        let mut menu = Menu::new(1, MenuKind::Context);
+        menu.add_item(10, "Open");
+        menu.select(10);
+        menu.items[0].enabled = false;
+        assert_eq!(menu.activate(), None);
     }
 }

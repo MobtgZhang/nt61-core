@@ -25,6 +25,9 @@ impl ControlTree {
     }
 
     pub fn add(&mut self, id: u32, kind: ControlKind, rect: Rect) {
+        if id == CONTROL_NONE || self.control(id).is_some() {
+            return;
+        }
         self.controls.push(ControlLayout {
             id,
             kind,
@@ -65,6 +68,9 @@ impl ControlTree {
     }
 
     pub fn add_hidden(&mut self, id: u32, kind: ControlKind, rect: Rect) {
+        if id == CONTROL_NONE || self.control(id).is_some() {
+            return;
+        }
         self.add(id, kind, rect);
         if let Some(control) = self.controls.last_mut() {
             control.visible = false;
@@ -75,6 +81,9 @@ impl ControlTree {
     }
 
     pub fn add_disabled(&mut self, id: u32, kind: ControlKind, rect: Rect) {
+        if id == CONTROL_NONE || self.control(id).is_some() {
+            return;
+        }
         self.add(id, kind, rect);
         if let Some(control) = self.controls.last_mut() {
             control.enabled = false;
@@ -99,8 +108,8 @@ impl ControlTree {
             return false;
         };
         control.enabled = enabled;
-        if !enabled && self.focus == id {
-            self.focus = CONTROL_NONE;
+        if !enabled {
+            self.clear_input_target(id);
         }
         true
     }
@@ -110,10 +119,25 @@ impl ControlTree {
             return false;
         };
         control.visible = visible;
-        if !visible && self.focus == id {
-            self.focus = CONTROL_NONE;
+        if !visible {
+            self.clear_input_target(id);
         }
         true
+    }
+
+    fn clear_input_target(&mut self, id: u32) {
+        if self.focus == id {
+            self.focus = CONTROL_NONE;
+        }
+        if self.hot == id {
+            self.hot = CONTROL_NONE;
+        }
+        if self.pressed == id {
+            self.pressed = CONTROL_NONE;
+        }
+        if self.capture == id {
+            self.capture = CONTROL_NONE;
+        }
     }
 
     pub fn visual_state(&self, id: u32) -> ControlVisualState {
@@ -179,6 +203,27 @@ impl ControlTree {
         Some(ControlEvent::FocusChanged(next.id))
     }
 
+    /// Reverse tab traversal uses the same enabled/visible rules as Tab.
+    pub fn focus_previous(&mut self) -> Option<ControlEvent> {
+        let focusable: Vec<_> = self
+            .controls
+            .iter()
+            .filter(|control| control.visible && control.enabled && self.can_focus(control.kind))
+            .map(|control| control.id)
+            .collect();
+        if focusable.is_empty() {
+            return None;
+        }
+        let next = focusable
+            .iter()
+            .position(|id| *id == self.focus)
+            .map_or(focusable.len() - 1, |index| {
+                (index + focusable.len() - 1) % focusable.len()
+            });
+        self.focus = focusable[next];
+        Some(ControlEvent::FocusChanged(self.focus))
+    }
+
     pub fn hit_test(&self, x: i32, y: i32) -> u32 {
         self.controls
             .iter()
@@ -202,7 +247,11 @@ impl ControlTree {
         if action == PointerAction::Move {
             let previous_hot = self.hot;
             self.hot = if self.capture != CONTROL_NONE {
-                self.capture
+                if hit == self.capture {
+                    self.capture
+                } else {
+                    CONTROL_NONE
+                }
             } else {
                 hit
             };
@@ -261,7 +310,7 @@ impl ControlTree {
             return None;
         }
         let kind = self.control(self.focus).map(|control| control.kind)?;
-        if byte == b' ' && kind == ControlKind::Button {
+        if byte == b' ' && matches!(kind, ControlKind::Button | ControlKind::CheckBox) {
             return Some(ControlEvent::Activated(self.focus));
         }
         let editable = byte == 8 || byte == 127 || byte == b' ' || byte.is_ascii_graphic();
@@ -274,7 +323,19 @@ impl ControlTree {
     fn can_focus(&self, kind: ControlKind) -> bool {
         matches!(
             kind,
-            ControlKind::Button | ControlKind::Edit | ControlKind::Image
+            ControlKind::Button
+                | ControlKind::Edit
+                | ControlKind::Image
+                | ControlKind::List
+                | ControlKind::ListView
+                | ControlKind::Tree
+                | ControlKind::Toolbar
+                | ControlKind::CheckBox
+                | ControlKind::ComboBox
+                | ControlKind::RichEdit
+                | ControlKind::Tabs
+                | ControlKind::TrackBar
+                | ControlKind::UpDown
         )
     }
 }
@@ -376,5 +437,31 @@ mod tests {
         assert_eq!(tree.visual_state(4002), ControlVisualState::Normal);
         assert_eq!(tree.set_focus(4002), Some(ControlEvent::FocusChanged(4002)));
         assert_eq!(tree.visual_state(4002), ControlVisualState::Focused);
+    }
+    #[test]
+    fn disabling_or_hiding_during_capture_cancels_pending_activation() {
+        let mut tree = ControlTree::new();
+        tree.add(1, ControlKind::Button, Rect::new(0, 0, 80, 24));
+        tree.route_pointer(PointerAction::Down, 5, 5);
+        tree.set_enabled(1, false);
+        tree.set_enabled(1, true);
+        assert_eq!(tree.route_pointer(PointerAction::Up, 5, 5), None);
+        tree.route_pointer(PointerAction::Down, 5, 5);
+        tree.set_visible(1, false);
+        tree.set_visible(1, true);
+        assert_eq!(tree.route_pointer(PointerAction::Up, 5, 5), None);
+    }
+
+    #[test]
+    fn list_tree_and_toolbar_participate_in_bidirectional_focus_traversal() {
+        let mut tree = ControlTree::new();
+        tree.add(1, ControlKind::ListView, Rect::new(0, 0, 80, 24));
+        tree.add(2, ControlKind::Tree, Rect::new(80, 0, 80, 24));
+        tree.add(3, ControlKind::Toolbar, Rect::new(160, 0, 80, 24));
+        assert_eq!(tree.focus(), 1);
+        assert_eq!(tree.focus_previous(), Some(ControlEvent::FocusChanged(3)));
+        assert_eq!(tree.focus_next(), Some(ControlEvent::FocusChanged(1)));
+        tree.set_enabled(2, false);
+        assert_eq!(tree.focus_next(), Some(ControlEvent::FocusChanged(3)));
     }
 }

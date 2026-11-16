@@ -1,9 +1,11 @@
 pub mod button;
 pub mod check_box;
+pub mod combo_box;
 pub mod dialog;
 pub mod label;
 pub mod list_view;
 pub mod menu;
 pub mod panel;
+pub mod popup_menu;
 pub mod scroll_bar;
 pub mod textbox;
