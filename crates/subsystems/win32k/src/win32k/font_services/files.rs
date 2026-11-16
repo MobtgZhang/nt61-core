@@ -1,7 +1,6 @@
-//! Realized font identities refer to the actual embedded SFNT resources.
-//! Keeping a cache entry alive also keeps its file bytes alive: both built-in
-//! faces have static storage, independently of DC and logical-font handles.
-use super::{with_font, RealizedFont};
+//! Realized font identities retain the selected SFNT resource independently
+//! of its DC, logical-font handle, and memory-font installation handle.
+use super::{with_font, FontSource, RealizedFont};
 use crate::arch::common::syscall_frame::SyscallFrame;
 use crate::ke::sync::Spinlock;
 use crate::mm::user_copy::{copy_to_user, probe_user_write, read_user_object};
@@ -36,25 +35,33 @@ impl RealizationKey {
 }
 
 struct CachedFont {
+    id: u32,
     key: RealizationKey,
-    data: &'static [u8],
+    source: FontSource,
 }
 
-static REALIZATIONS: Spinlock<Vec<CachedFont>> = Spinlock::new(Vec::new());
+struct Cache { entries: Vec<CachedFont>, next_id: u32 }
+static REALIZATIONS: Spinlock<Cache> = Spinlock::new(Cache { entries: Vec::new(), next_id: 1 });
+
+pub(super) fn release_process(process: u64) {
+    REALIZATIONS.lock().entries.retain(|entry| !entry.source.belongs_to(process));
+}
 
 fn instance(font: &RealizedFont) -> Option<u32> {
     let key = RealizationKey::from_font(font);
     let mut cache = REALIZATIONS.lock();
-    if let Some(index) = cache.iter().position(|entry| entry.key == key) {
-        return Some(index as u32 + 1);
+    if let Some(entry) = cache.entries.iter().find(|entry| entry.key == key) {
+        return Some(entry.id);
     }
     // Bound kernel retention. IDs are never reused for another realization.
-    if cache.len() >= 4096 {
+    if cache.entries.len() >= 4096 {
         return None;
     }
-    cache.try_reserve(1).ok()?;
-    cache.push(CachedFont { key, data: font.font.data() });
-    Some(cache.len() as u32)
+    let id = cache.next_id;
+    cache.next_id = id.checked_add(1)?;
+    cache.entries.try_reserve(1).ok()?;
+    cache.entries.push(CachedFont { id, key, source: font.source.clone() });
+    Some(id)
 }
 
 pub extern "C" fn nt_gdi_get_realization_info(frame: &SyscallFrame) -> u64 {
@@ -84,7 +91,9 @@ pub extern "C" fn nt_gdi_get_font_file_data(frame: &SyscallFrame) -> u64 {
             return None;
         }
         // Release the cache lock before any access to caller memory.
-        let data = REALIZATIONS.lock().get((id - 1) as usize)?.data;
+        let source = REALIZATIONS.lock().entries.iter().find(|entry| entry.id == id)?.source.clone();
+        if !source.accessible() { return None; }
+        let data = source.data();
         let offset: u64 = read_user_object(frame.args[2]).ok()?;
         let start = usize::try_from(offset).ok()?;
         let size = usize::try_from(frame.args[4]).ok()?;
@@ -105,7 +114,9 @@ pub extern "C" fn nt_gdi_get_font_file_info(frame: &SyscallFrame) -> u64 {
     let result = (|| {
         let id = frame.args[0] as u32;
         if id == 0 || frame.args[1] as u32 != 0 { return None; }
-        let data = REALIZATIONS.lock().get((id - 1) as usize)?.data;
+        let source = REALIZATIONS.lock().entries.iter().find(|entry| entry.id == id)?.source.clone();
+        if !source.accessible() { return None; }
+        let data = source.data();
         const SIZE: usize = 24;
         if frame.args[4] != 0 {
             probe_user_write(frame.args[4], 8).ok()?;

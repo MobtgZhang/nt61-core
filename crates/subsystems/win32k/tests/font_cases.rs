@@ -301,6 +301,43 @@ fn glyph_bitmaps_are_aligned_top_down_and_use_requested_gray_range() {
 }
 
 #[test]
+fn glyph_outline_bitmap_format_is_independent_of_logfont_quality() {
+    let hdc = dc::gre_create_compatible_dc(0);
+    let matrix = [65536, 0, 0, 65536];
+    let mut results = Vec::new();
+    let mut fonts = Vec::new();
+    for quality in [objects::FontQuality::NonAntialiased, objects::FontQuality::Antialiased] {
+        let mut request = objects::GdiFont::new();
+        request.height = -12;
+        request.quality = quality as u8;
+        let font = objects::gdi_create_logical_font(request);
+        assert_ne!(font, 0);
+        assert_ne!(dc::gre_select_object(hdc, font), u64::MAX);
+        fonts.push(font);
+        let mut bitmaps = Vec::new();
+        for format in [1, 6] {
+            let mut metrics = [0; 20];
+            let size = outline_call(hdc, b'W' as u16, format, &matrix, &mut metrics, None);
+            assert!(size > 0 && size < 65536);
+            let mut bitmap = vec![0; size as usize];
+            assert_eq!(outline_call(hdc, b'W' as u16, format, &matrix,
+                &mut metrics, Some(&mut bitmap)), size);
+            if format == 6 {
+                assert!(bitmap.iter().any(|&coverage| coverage > 0 && coverage < 64),
+                    "GGO_GRAY8_BITMAP must retain grayscale even for a nonantialiased LOGFONT");
+            }
+            bitmaps.push((metrics, bitmap));
+        }
+        results.push(bitmaps);
+    }
+    assert_eq!(results[0], results[1]);
+    assert!(dc::gre_delete_dc(hdc));
+    for font in fonts {
+        assert!(objects::gdi_delete_object(font));
+    }
+}
+
+#[test]
 fn glyph_outline_applies_fractional_mat2_and_glyph_index_flag() {
     let hdc = dc::gre_create_compatible_dc(0);
     let mut normal = [0u8; 20];

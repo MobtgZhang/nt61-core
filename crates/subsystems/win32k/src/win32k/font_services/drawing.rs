@@ -3,8 +3,13 @@
 //! Font shaping, font linking, and text paths still need separate backends;
 //! requests requiring those operations fail rather than silently lose text.
 use super::super::region_geometry::{Region, RegionCombineMode};
-use super::super::{clipping, dc, objects::Rect, path::PathState, polygon, raster, transforms};
-use super::{capture_units, outline, RealizedFont, MAX_CHARACTERS};
+use super::super::{
+    clipping, dc,
+    objects::{FontQuality, Rect},
+    path::PathState,
+    polygon, raster, transforms,
+};
+use super::{capture_units, outline, FontSelection, MAX_CHARACTERS};
 use crate::arch::common::syscall_frame::SyscallFrame;
 use crate::mm::user_copy::{copy_from_user, read_user_object};
 use alloc::vec::Vec;
@@ -120,7 +125,8 @@ fn prepare(dc: &dc::DcObject, run: &TextRun, capture_bytes: &mut usize) -> Optio
     if dc.path.state == PathState::Open || dc.text_align & 0x100 != 0 {
         return None;
     }
-    let font = RealizedFont::from_dc(dc)?;
+    let selection = FontSelection::from_dc(dc)?;
+    let font = selection.realize()?;
     // Decorations require outline-derived thickness and placement; accepting
     // them here would silently omit part of the selected font's appearance.
     if font.requested.underline != 0 || font.requested.strike_out != 0 {
@@ -248,27 +254,55 @@ fn prepare(dc: &dc::DcObject, run: &TextRun, capture_bytes: &mut usize) -> Optio
     }
     let mut images = Vec::new();
     images.try_reserve_exact(run.units.len()).ok()?;
+    // Text quality chooses the drawing bitmap only. GetGlyphOutline keeps its
+    // caller-selected bitmap format, independently of the logical font quality.
+    let bitmap_format = if font.requested.quality == FontQuality::NonAntialiased as u8 { 1 } else { 6 };
     for (unit, offset) in run.units.iter().copied().zip(offsets) {
         let format = if run.flags & ETO_GLYPH_INDEX != 0 {
-            6 | 0x80
+            bitmap_format | 0x80
         } else {
-            6
+            bitmap_format
         };
         let glyph = outline::realize_font(&font, dc, unit, format, [65536, 0, 0, 65536], false)?;
-        let (stride, size) = glyph.bitmap_layout(6)?;
+        let (stride, size) = glyph.bitmap_layout(bitmap_format)?;
         *capture_bytes = capture_bytes.checked_add(size)?;
         if *capture_bytes > MAX_CAPTURE_BYTES {
             return None;
         }
+        let coverage = glyph.bitmap(bitmap_format, stride, size)?;
         let offset = rotate(offset.map(|value| value as f64));
         let origin = device_point(dc, [baseline[0] + offset[0], baseline[1] + offset[1]])?;
         let [left, bottom, right, top] = glyph.bounds;
+        let width = usize::try_from(right.checked_sub(left)?).ok()?;
+        let height = usize::try_from(top.checked_sub(bottom)?).ok()?;
+        let (stride, coverage) = if bitmap_format == 1 {
+            // The monochrome backend emits DWORD-aligned rows, high bit first.
+            // Expand only the glyph width, excluding its packed row padding.
+            let expanded_size = width.checked_mul(height)?;
+            *capture_bytes = capture_bytes.checked_add(expanded_size)?;
+            if *capture_bytes > MAX_CAPTURE_BYTES {
+                return None;
+            }
+            let mut expanded = Vec::new();
+            expanded.try_reserve_exact(expanded_size).ok()?;
+            expanded.resize(expanded_size, 0);
+            for row in 0..height {
+                for column in 0..width {
+                    if coverage[row * stride + column / 8] & (0x80 >> (column % 8)) != 0 {
+                        expanded[row * width + column] = 64;
+                    }
+                }
+            }
+            (width, expanded)
+        } else {
+            (stride, coverage)
+        };
         images.push(Image {
             origin: dc::PointL::new(origin.x.checked_add(left)?, origin.y.checked_sub(top)?),
-            width: usize::try_from(right.checked_sub(left)?).ok()?,
-            height: usize::try_from(top.checked_sub(bottom)?).ok()?,
+            width,
+            height,
             stride,
-            coverage: glyph.bitmap(6, stride, size)?,
+            coverage,
         });
     }
     Some(PreparedRun {

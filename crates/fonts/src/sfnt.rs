@@ -57,6 +57,25 @@ impl<'a> SfntFont<'a> {
         self.data
     }
 
+    /// Family names in Unicode SFNT name records, without a terminating NUL.
+    pub fn family_name(&self) -> Option<alloc::vec::Vec<u16>> {
+        let names = self.face.names();
+        let name = names.into_iter().find(|name| name.name_id == 1
+            && name.is_unicode() && name.language_id == 0x0409)
+            .or_else(|| names.into_iter().find(|name| name.name_id == 1 && name.is_unicode()))?;
+        if name.name.is_empty() || name.name.len() % 2 != 0 { return None; }
+        let mut units = alloc::vec::Vec::new();
+        units.try_reserve_exact(name.name.len() / 2).ok()?;
+        for pair in name.name.chunks_exact(2) {
+            let unit = u16::from_be_bytes([pair[0], pair[1]]);
+            if unit == 0 { return None; }
+            units.push(unit);
+        }
+        // Validate paired surrogates before accepting the name for matching.
+        if char::decode_utf16(units.iter().copied()).any(|unit| unit.is_err()) { return None; }
+        Some(units)
+    }
+
     pub fn glyph_count(&self) -> u16 {
         self.face.number_of_glyphs()
     }

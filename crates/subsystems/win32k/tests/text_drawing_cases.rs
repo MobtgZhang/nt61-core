@@ -34,6 +34,71 @@ fn text_output_draws_real_glyph_coverage_and_obeys_clip() {
 }
 
 #[test]
+fn explicit_nonantialiased_quality_paints_mono_instead_of_gray_glyph_pixels() {
+    for (shear, indexed, opaque) in [(0.0, false, false), (0.25, false, true), (0.25, true, true)] {
+        let mut outputs = Vec::new();
+        for quality in [objects::FontQuality::NonAntialiased, objects::FontQuality::Antialiased] {
+            let fixture = DrawingFixture::new();
+            let mut request = objects::GdiFont::new();
+            request.height = -12;
+            request.quality = quality as u8;
+            let font = objects::gdi_create_logical_font(request);
+            assert_ne!(font, 0);
+            assert_ne!(dc::gre_select_object(fixture.handle, font), u64::MAX);
+            {
+                let mut dc = dc::get_dc(fixture.handle).unwrap();
+                dc.bk_mode = dc::TRANSPARENT;
+                dc.text_color = 0x000000ff; // COLORREF red
+                dc.bg_color = 0x0000ff00;
+                dc.graphics_mode = 2;
+                dc.world_transform = dc::Xform { m21: shear, ..dc::Xform::IDENTITY };
+                dc.world_transform_valid = true;
+            }
+            let application_clip = create([2, 2, 14, 14]);
+            assert_eq!(call(clipping::nt_gdi_ext_select_clip_rgn,
+                &[fixture.handle, application_clip, 5]), 2);
+            assert!(objects::gdi_delete_object(application_clip));
+            let mut unit = b'W' as u16;
+            if indexed {
+                let character = unit;
+                mm::user_copy::allow(&character as *const _ as u64, 2, false);
+                mm::user_copy::allow(&mut unit as *mut _ as u64, 2, true);
+                assert_eq!(call(font_services::nt_gdi_get_glyph_indices_w, &[
+                    fixture.handle, &character as *const _ as u64, 1,
+                    &mut unit as *mut _ as u64, 0,
+                ]), 1);
+                assert_ne!(unit, 0);
+            }
+            let clip = Rect::new(2, 2, 14, 14);
+            mm::user_copy::allow(&clip as *const _ as u64, 16, false);
+            let flags = 4 | if indexed { 0x10 } else { 0 } | if opaque { 2 } else { 0 };
+            assert_eq!(text(fixture.handle, flags, &clip as *const _ as u64, &[unit], 0), 1);
+            let mut pixels = Vec::new();
+            for y in 0..16 {
+                for x in 0..16 {
+                    let pixel = fixture.pixel(x, y);
+                    if !(2..14).contains(&x) || !(2..14).contains(&y) {
+                        assert_eq!(pixel, 0x00123456, "both glyph formats must obey the transformed clip");
+                    }
+                    pixels.push(pixel);
+                }
+            }
+            drop(fixture);
+            assert!(objects::gdi_delete_object(font));
+            outputs.push(pixels);
+        }
+        let mono = &outputs[0];
+        let gray = &outputs[1];
+        assert!(mono.contains(&0x00ff0000), "the monochrome path must draw actual glyph ink");
+        assert!(mono.iter().all(|pixel| [0x00123456, 0x00ff0000, 0x0000ff00].contains(pixel)),
+            "monochrome output must contain only unchanged, foreground or opaque background pixels");
+        assert!(gray.iter().any(|pixel| ![0x00123456, 0x00ff0000, 0x0000ff00].contains(pixel)),
+            "explicit antialiasing must retain intermediate coverage on a real glyph");
+        assert_ne!(mono, gray);
+    }
+}
+
+#[test]
 fn empty_opaque_run_paints_only_the_requested_rectangle() {
     let fixture = DrawingFixture::new();
     dc::get_dc(fixture.handle).unwrap().bg_color = 0x0000ff00;

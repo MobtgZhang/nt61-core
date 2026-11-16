@@ -2,7 +2,7 @@
 //! streams retain curves; quadratic curves can also be exported as cubics.
 //! Raster coverage uses the shared local fontdue engine. TrueType bytecode
 //! hinting and Windows font substitution are not implemented by that engine.
-use super::{dc, RealizedFont, GDI_ERROR};
+use super::{dc, FontSelection, FontSource, RealizedFont, GDI_ERROR};
 use crate::arch::common::syscall_frame::SyscallFrame;
 use crate::ke::sync::Spinlock;
 use crate::mm::user_copy::{copy_to_user, probe_user_write, read_user_object};
@@ -164,15 +164,15 @@ pub(super) struct Glyph {
     pub(super) bounds: [i32; 4], // left, bottom, right, top, in upward device coordinates
     outline: Vec<u8>,
     matrix: Matrix,
-    font_data: &'static [u8],
-    monospace: bool,
+    source: FontSource,
     index: u16,
     em_height: i64,
 }
 
 fn realize(hdc: u64, ch: u16, format: u32, mat: [i32; 4], ignore_rotation: bool) -> Option<Glyph> {
     let dc = dc::get_dc(hdc)?;
-    let font = RealizedFont::from_dc(&dc)?;
+    let selection = FontSelection::from_dc(&dc)?;
+    let font = selection.realize()?;
     realize_font(&font, &dc, ch, format, mat, ignore_rotation)
 }
 
@@ -221,7 +221,7 @@ pub(super) fn realize_font(font: &RealizedFont, dc: &dc::DcObject, ch: u16,
     metrics[16..18].copy_from_slice(&i16::try_from(integer(libm::round(advance[0]))?).ok()?.to_le_bytes());
     metrics[18..20].copy_from_slice(&i16::try_from(integer(libm::round(-advance[1]))?).ok()?.to_le_bytes());
     Some(Glyph { metrics, bounds: [left, bottom, right, top], outline: contours.bytes,
-        matrix, font_data: font.font.data(), monospace: font.monospace, index,
+        matrix, source: font.source.clone(), index,
         em_height: font.em_height })
 }
 
@@ -246,15 +246,19 @@ impl Glyph {
         // is supersampled to preserve detail through rotation and shearing.
         let em_size = self.em_height.checked_mul(4)?.max(64);
         if em_size > 2048 { return None; }
-        let cache = if self.monospace { &MONO_RASTERIZER } else { &UI_RASTERIZER };
+        let cache = match &self.source {
+            FontSource::BuiltIn(true) => &MONO_RASTERIZER,
+            FontSource::BuiltIn(false) => &UI_RASTERIZER,
+            FontSource::Memory(font) => &font.rasterizer,
+        };
         let source = {
             let mut rasterizer = cache.lock();
             if rasterizer.is_none() {
-                *rasterizer = Some(FontFace::from_bytes(self.font_data).ok()?);
+                *rasterizer = Some(FontFace::from_bytes(self.source.data()).ok()?);
             }
             rasterizer.as_ref()?.rasterize_indexed(self.index, em_size as f32)?
         };
-        let units = f64::from(nt61_fonts::SfntFont::parse(self.font_data)?.description()?.units_per_em);
+        let units = f64::from(nt61_fonts::SfntFont::parse(self.source.data())?.description()?.units_per_em);
         let scale = em_size as f64 / units;
         let [left, bottom, right, top] = self.bounds;
         let width = (right - left) as usize;

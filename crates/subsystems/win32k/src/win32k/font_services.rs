@@ -8,6 +8,11 @@ use crate::mm::user_copy::{copy_from_user, copy_to_user, probe_user_write, write
 use alloc::vec::Vec;
 use nt61_fonts::{FontDescription, SfntFont};
 
+#[path = "font_services/resources.rs"]
+pub(crate) mod resources;
+pub use resources::{nt_gdi_add_font_mem_resource_ex, nt_gdi_remove_font_mem_resource_ex};
+use resources::FontSource;
+
 #[path = "font_services/files.rs"]
 mod files;
 pub use files::{nt_gdi_get_font_file_data, nt_gdi_get_font_file_info, nt_gdi_get_realization_info};
@@ -16,6 +21,9 @@ pub use files::{nt_gdi_get_font_file_data, nt_gdi_get_font_file_info, nt_gdi_get
 mod outline;
 pub use outline::nt_gdi_get_glyph_outline;
 
+#[path = "font_services/string_bitmap.rs"]
+mod string_bitmap;
+
 #[path = "font_services/drawing.rs"]
 mod drawing;
 pub use drawing::{nt_gdi_ext_text_out, nt_gdi_poly_text_out, nt_gdi_set_text_justification};
@@ -23,14 +31,72 @@ pub use drawing::{nt_gdi_ext_text_out, nt_gdi_poly_text_out, nt_gdi_set_text_jus
 const GDI_ERROR: u64 = u32::MAX as u64;
 const MAX_CHARACTERS: usize = 65_536;
 
-struct RealizedFont {
-    font: SfntFont<'static>,
+/// Create an ordinary logical font from the native ENUMLOGFONTEXDVW layout.
+/// Win7 accepts captures up to420 bytes, then clears the design-axis count
+/// before hfontCreate stores the resulting356-byte logical description. Short
+/// captures leave unspecified stack bytes in Win7; initialize those bytes here.
+/// Client-side font cache/device-font modes remain unsupported.
+pub extern "C" fn nt_gdi_hfont_create(frame: &SyscallFrame) -> u64 {
+    const ENUMLOGFONTEXDVW_SIZE: usize = 420;
+    let supplied = frame.args[1] as u32 as usize;
+    if !(1..=ENUMLOGFONTEXDVW_SIZE).contains(&supplied)
+        || frame.args[0] == 0 || frame.args[2] as u32 != 0 || frame.args[3] as u32 != 0
+        || frame.args[4] != 0
+    {
+        return 0;
+    }
+    let mut bytes = [0u8; ENUMLOGFONTEXDVW_SIZE];
+    if copy_from_user(&mut bytes[..supplied], frame.args[0]).is_err() {
+        return 0;
+    }
+    // ENUMLOGFONTEXW occupies 348 bytes, followed by DESIGNVECTOR's
+    // reserved DWORD, axis count, and sixteen LONG coordinates.
+    bytes[352..356].fill(0);
+    let integer = |offset| i32::from_le_bytes([
+        bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
+    ]);
+    let mut font = objects::GdiFont::new();
+    font.height = integer(0);
+    font.width = integer(4);
+    font.escapement = integer(8);
+    font.orientation = integer(12);
+    font.weight = integer(16);
+    font.italic = bytes[20];
+    font.underline = bytes[21];
+    font.strike_out = bytes[22];
+    font.charset = bytes[23];
+    font.out_precision = bytes[24];
+    font.clip_precision = bytes[25];
+    font.quality = bytes[26];
+    font.pitch_and_family = bytes[27];
+    for (index, unit) in font.face_name.iter_mut().enumerate() {
+        *unit = u16::from_le_bytes([bytes[28 + index * 2], bytes[29 + index * 2]]);
+    }
+    let mut description = [0; 356];
+    description.copy_from_slice(&bytes[..356]);
+    font.captured_description = Some(description);
+    objects::gdi_create_logical_font(font)
+}
+
+/// Process termination revokes its private font handles and file identities.
+pub fn release_process(process: u64) {
+    resources::release_process(process);
+    files::release_process(process);
+}
+
+struct FontSelection {
+    requested: objects::GdiFont,
+    source: FontSource,
+}
+
+struct RealizedFont<'a> {
+    font: SfntFont<'a>,
+    source: &'a FontSource,
     requested: objects::GdiFont,
     description: FontDescription,
     em_height: i64,
     horizontal_numerator: i64,
     horizontal_denominator: i64,
-    monospace: bool,
 }
 
 fn round_ratio(value: i64, numerator: i64, denominator: i64) -> Option<i32> {
@@ -39,10 +105,21 @@ fn round_ratio(value: i64, numerator: i64, denominator: i64) -> Option<i32> {
     i32::try_from(product.checked_add(adjustment)? / denominator).ok()
 }
 
-impl RealizedFont {
+pub(super) fn bind_logical_font(handle: u64) -> bool {
+    objects::with_handle_table(|table| {
+        let entry = table.get(handle)?;
+        if entry.get_type()? != objects::GdiObjectType::Font || entry.obj_ptr == 0 { return None; }
+        // SAFETY: the object table guard protects the logical font allocation.
+        let requested = unsafe { &*(entry.obj_ptr as *const objects::GdiFont) };
+        resources::select(requested, handle)
+    }).is_some()
+}
+
+impl FontSelection {
     fn from_dc(dc: &dc::DcObject) -> Option<Self> {
-        let requested = if dc.font == 0 {
-            objects::GdiFont::new()
+        if dc.font == 0 {
+            let requested = objects::GdiFont::new();
+            Some(Self { source: resources::select(&requested, 0)?, requested })
         } else {
             objects::with_handle_table(|table| {
                 let entry = table.get(dc.font)?;
@@ -51,19 +128,16 @@ impl RealizedFont {
                 }
                 // SAFETY: selected objects are pinned by the DC and the object
                 // table guard serializes access while we copy the LOGFONT.
-                Some(unsafe { *(entry.obj_ptr as *const objects::GdiFont) })
-            })?
-        };
-        let name: Vec<u16> = requested.face_name.iter().copied().take_while(|&unit| unit != 0).collect();
-        let matches = |expected: &str| {
-            name.len() == expected.len() && name.iter().zip(expected.bytes()).all(|(&left, right)| {
-                left <= 127 && (left as u8).eq_ignore_ascii_case(&right)
+                let requested = unsafe { *(entry.obj_ptr as *const objects::GdiFont) };
+                Some(Self { source: resources::select(&requested, dc.font)?, requested })
             })
-        };
-        let monospace = requested.pitch_and_family & 3 == 1
-            || ["DejaVu Sans Mono", "Courier New", "Consolas", "Fixedsys", "Terminal"]
-                .iter().any(|name| matches(name));
-        let font = SfntFont::parse(if monospace { nt61_fonts::TERMINAL_FONT } else { nt61_fonts::UI_FONT })?;
+        }
+    }
+
+    fn realize(&self) -> Option<RealizedFont<'_>> {
+        if !self.source.accessible() { return None; }
+        let requested = self.requested;
+        let font = SfntFont::parse(self.source.data())?;
         let description = font.description()?;
         let requested_height = i64::from(requested.height).abs();
         if requested_height > 32768 || i64::from(requested.width).abs() > 32768 {
@@ -79,10 +153,12 @@ impl RealizedFont {
         } else {
             (i64::from(requested.width).abs(), i64::from(description.average_width).max(1))
         };
-        Some(Self { font, requested, description, em_height: em_height.max(1),
-            horizontal_numerator, horizontal_denominator, monospace })
+        Some(RealizedFont { font, source: &self.source, requested, description,
+            em_height: em_height.max(1), horizontal_numerator, horizontal_denominator })
     }
+}
 
+impl RealizedFont<'_> {
     fn horizontal(&self, value: i64) -> Option<i32> {
         round_ratio(value, self.horizontal_numerator, self.horizontal_denominator)
     }
@@ -112,7 +188,8 @@ impl RealizedFont {
 
 fn with_font<T>(handle: u64, operation: impl FnOnce(&RealizedFont) -> Option<T>) -> Option<T> {
     let dc = dc::get_dc(handle)?;
-    let font = RealizedFont::from_dc(&dc)?;
+    let selection = FontSelection::from_dc(&dc)?;
+    let font = selection.realize()?;
     drop(dc);
     operation(&font)
 }
@@ -293,8 +370,8 @@ pub extern "C" fn nt_gdi_get_text_face_w(frame: &SyscallFrame) -> u64 {
     let count = frame.args[1] as i32;
     if count < 0 { return 0; }
     with_font(frame.args[0], |font| {
-        let name = if font.monospace { "DejaVu Sans Mono" } else { "DejaVu Sans" };
-        let units: Vec<u16> = name.encode_utf16().chain(core::iter::once(0)).collect();
+        let mut units = font.source.family();
+        units.push(0);
         if frame.args[2] == 0 { return Some(units.len() as u64); }
         if count == 0 { return Some(0); }
         let copied = (count as usize).min(units.len());
