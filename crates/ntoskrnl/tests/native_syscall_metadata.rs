@@ -87,9 +87,11 @@ fn portable_adapters_use_the_shipped_argument_counts() {
         registered.insert(name);
         checked += 1;
     }
-    assert!(checked >= 147);
+    assert!(checked >= 151);
+    assert!(registered.contains("NtRenameKey"));
+    assert!(registered.contains("NtSetInformationKey"));
     assert!(
-        registered.len() >= 201,
+        registered.len() >= 205,
         "at least half of the 401 native services must remain registered"
     );
 }
@@ -139,11 +141,11 @@ fn shadow_registrations_match_win7_identities_and_exact_private_stub_arities() {
         }
     }
     assert!(
-        exact_checked >= 408,
+        exact_checked >= 411,
         "exact binary arity coverage must not regress"
     );
     assert!(
-        seen.len() >= 414,
+        seen.len() >= 417,
         "at least half of the 827 services must remain registered"
     );
 }
