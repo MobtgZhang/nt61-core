@@ -37,6 +37,11 @@ pub mod ke {
     }
 }
 pub mod ps {
+    pub mod job {
+        pub fn close_native_job(_: u64) {
+            panic!("process-only fixture closed a job");
+        }
+    }
     pub mod process {
         use std::sync::atomic::{AtomicPtr, AtomicU32};
         pub const PID_SYSTEM: u64 = 4;

@@ -11,6 +11,21 @@ pub mod timer {
 pub mod section {
     pub fn release_section(_: u64) {}
 }
+// These object kinds cannot be allocated by the process-only fixture. A call
+// here indicates an incorrect handle kind or an unexpected cleanup path.
+pub mod io_completion {
+    pub fn close_port(_: u64) {
+        panic!("process-only fixture closed an I/O completion port");
+    }
+    pub fn close_reserve(_: u64) {
+        panic!("process-only fixture closed an I/O reserve");
+    }
+}
+pub mod ktm {
+    pub fn release_open(_: u64) {
+        panic!("process-only fixture closed a transaction object");
+    }
+}
 pub mod string {
     pub unsafe fn alloc_string(_: u32) -> *mut u8 {
         core::ptr::null_mut()

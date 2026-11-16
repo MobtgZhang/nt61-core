@@ -1,7 +1,7 @@
 use super::*;
 use ntdll::{file, object, timer};
 
-fn named<T>(text: &str, attributes: u32, operation: impl FnOnce(&mut ObjectAttributes) -> T) -> T {
+pub(super) fn named<T>(text: &str, attributes: u32, operation: impl FnOnce(&mut ObjectAttributes) -> T) -> T {
     let mut units: Vec<u16> = text.encode_utf16().collect();
     let mut name = UnicodeString {
         length: (units.len() * 2) as u16,

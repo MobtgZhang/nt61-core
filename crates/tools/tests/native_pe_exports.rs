@@ -286,6 +286,6 @@ fn unicode_descriptor_layout_boundaries_and_failure_behavior() {
 
 // Compile and run the dedicated production string ABI/edge-case harness with
 // the regular PE export tests so native services cannot bypass routine checks.
-#[path = "../../ntoskrnl/tests/native_strings_cases.rs"]
+#[path = "../../ntoskrnl/tests/native_strings/cases.rs"]
 #[allow(dead_code)]
 mod native_strings;

@@ -2,7 +2,7 @@
 #![allow(dead_code, non_camel_case_types)]
 #[path = "native_kernel32_time/kernel32.rs"]
 mod kernel32;
-#[path = "native_clock/ntdll.rs"]
+#[path = "native_kernel32_time/ntdll.rs"]
 pub mod ntdll;
 mod libs {
     pub use crate::ntdll;

@@ -3,5 +3,5 @@
 #![allow(dead_code)]
 #[path = "../src/native_exports.rs"]
 mod api;
-#[path = "native_strings_cases.rs"]
+#[path = "native_strings/cases.rs"]
 mod cases;

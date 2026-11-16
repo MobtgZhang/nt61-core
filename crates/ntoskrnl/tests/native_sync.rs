@@ -2,15 +2,67 @@
 //! a host. Memory probes and the clock are supplied by the host fixture.
 #![allow(dead_code, non_camel_case_types)]
 extern crate alloc;
+#[path = "native_sync/ktm_cases.rs"]
+mod ktm_cases;
+#[path = "native_sync/uuid_cases.rs"]
+mod uuid_cases;
+#[path = "../src/se/acl.rs"]
+pub mod acl;
+#[path = "../src/se/sid.rs"]
+pub mod sid;
+#[path = "../src/se/token.rs"]
+pub mod production_token;
+pub mod se {
+    pub use crate::{acl, sid, production_token as token};
+}
+#[path = "native_sync/token_duplicate_cases.rs"]
+mod token_duplicate_cases;
+#[path = "native_sync/token_privilege_cases.rs"]
+mod token_privilege_cases;
+#[path = "native_sync/token_information_cases.rs"]
+mod token_information_cases;
+#[path = "native_sync/token_group_cases.rs"]
+mod token_group_cases;
+pub mod crypto {
+    pub mod csprng {
+        pub fn fill(bytes: &mut [u8]) -> bool {
+            for (index, byte) in bytes.iter_mut().enumerate() { *byte = index as u8 + 1; }
+            true
+        }
+    }
+}
+#[path = "native_sync/coalescable_timer_cases.rs"]
+mod coalescable_timer_cases;
+#[path = "native_sync/section_cases.rs"]
+mod section_cases;
+#[path = "native_sync/namespace_cases.rs"]
+mod namespace_cases;
 #[path = "native_sync/alert_cases.rs"]
 mod alert_cases;
+#[path = "native_sync/debug_filter_cases.rs"]
+mod debug_filter_cases;
+#[path = "native_sync/timer_resolution_cases.rs"]
+mod timer_resolution_cases;
+#[path = "native_sync/job_cases.rs"]
+mod job_cases;
+#[path = "native_sync/io_completion_cases.rs"]
+mod io_completion_cases;
 #[path = "native_sync/kernel32.rs"]
 mod kernel32;
 #[path = "native_sync/ntdll.rs"]
 pub mod ntdll;
 pub mod libs {
     pub use crate::ntdll;
+    pub mod kernel32 {
+        pub use crate::kernel32::error;
+    }
 }
+#[path = "../../libs/advapi32/src/advapi32/token_calls.rs"]
+mod advapi_token_calls;
+#[path = "native_sync/advapi_token_cases.rs"]
+mod advapi_token_cases;
+#[path = "native_sync/access_check_cases.rs"]
+mod access_check_cases;
 pub mod ke {
     pub mod sync {
         pub struct Spinlock<T>(std::sync::Mutex<T>);
@@ -27,6 +79,7 @@ pub mod ke {
         }
     }
     pub mod time {
+        pub const TICKS_PER_SECOND: u32 = 1000;
         #[derive(Clone, Copy)]
         pub struct TimeSnapshot {
             pub system_time: u64,
@@ -65,7 +118,25 @@ pub mod ke {
         }
     }
 }
+#[path = "../src/ps/job.rs"]
+pub mod production_job;
 pub mod ps {
+    pub use crate::production_job as job;
+    pub mod process {
+        pub fn get_by_pid(pid: u64) -> Option<()> {
+            (pid == 100 || pid == 101 || pid == 102).then_some(())
+        }
+        pub fn terminate_process(pid: u64, _: i32) -> bool {
+            super::job::remove_process_from_all_jobs(pid);
+            true
+        }
+    }
+    pub mod process_mgmt {
+        pub fn terminate_process_by_pid(pid: u64, _: bool) -> Result<(), u32> {
+            super::job::remove_process_from_all_jobs(pid);
+            Ok(())
+        }
+    }
     pub mod thread {
         pub struct Thread {
             pub user_alert: crate::ntdll::alert_state::UserAlertState,
@@ -91,6 +162,11 @@ pub mod ps {
         }
     }
 }
+pub mod hal {
+    pub mod serial {
+        pub fn write_string(_: &str) {}
+    }
+}
 pub mod arch {
     pub mod common {
         pub mod percpu {
@@ -101,10 +177,39 @@ pub mod arch {
     }
 }
 pub mod mm {
+    pub mod pool {
+        pub enum PoolType { NonPaged }
+        std::thread_local! {
+            pub static FAIL_AFTER: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
+        }
+        pub static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        pub fn allocate(_: PoolType, size: usize) -> *mut u8 {
+            let fail = FAIL_AFTER.with(|limit| match limit.get() {
+                Some(0) => true,
+                Some(value) => { limit.set(Some(value - 1)); false }
+                None => false,
+            });
+            if fail { return core::ptr::null_mut(); }
+            let layout = std::alloc::Layout::from_size_align(size + 16, 16).unwrap();
+            let allocation = unsafe { std::alloc::alloc(layout) };
+            if allocation.is_null() { return allocation; }
+            unsafe { allocation.cast::<usize>().write(size + 16); }
+            LIVE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            unsafe { allocation.add(16) }
+        }
+        pub fn free(pointer: *mut u8) {
+            let allocation = unsafe { pointer.sub(16) };
+            let size = unsafe { allocation.cast::<usize>().read() };
+            let layout = std::alloc::Layout::from_size_align(size, 16).unwrap();
+            unsafe { std::alloc::dealloc(allocation, layout); }
+            LIVE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
     pub mod user_copy {
+        pub fn probe_user_read(address: u64, size: usize) -> Result<(), i32> { probe_user_write(address, size) }
         std::thread_local! { pub static FAIL_WRITE: core::cell::Cell<u64> = const { core::cell::Cell::new(0) }; }
-        pub fn probe_user_write(address: u64, _: usize) -> Result<(), i32> {
-            if address < 0x1000 {
+        pub fn probe_user_write(address: u64, size: usize) -> Result<(), i32> {
+            if size != 0 && address < 0x1000 {
                 Err(0xc0000005u32 as i32)
             } else {
                 Ok(())
@@ -124,6 +229,7 @@ pub mod mm {
         }
         pub fn copy_to_user(target: u64, bytes: &[u8]) -> Result<(), i32> {
             probe_user_write(target, bytes.len())?;
+            if FAIL_WRITE.with(|value| value.get() == target) { return Err(0xc0000005u32 as i32); }
             unsafe {
                 core::ptr::copy_nonoverlapping(bytes.as_ptr(), target as *mut u8, bytes.len());
             }
@@ -492,7 +598,7 @@ fn section_basic_information_matches_native_layout_and_close_lifetime() {
         let replacement = file::alloc_handle(file::HandleKind::Event, 0);
         assert_eq!(
             nt_query_section(replacement, 0, bytes.as_mut_ptr().cast(), 24, &mut length),
-            STATUS_INVALID_HANDLE
+            STATUS_OBJECT_TYPE_MISMATCH
         );
         assert!(file::free_handle(replacement));
         for _ in 0..128 {
@@ -1490,3 +1596,12 @@ fn concurrent_close_removes_a_handle_once() {
 
 #[path = "native_sync/named_cases.rs"]
 mod named_cases;
+
+#[path = "native_sync/event_pair_cases.rs"]
+mod event_pair_cases;
+
+#[path = "native_sync/keyed_event_cases.rs"]
+mod keyed_event_cases;
+
+#[path = "native_sync/locale_profile_cases.rs"]
+mod locale_profile_cases;
