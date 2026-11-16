@@ -1,7 +1,6 @@
 //! Ring 3 library: ntdll
 
 #![no_std]
-#![allow(dead_code)]
 
 extern crate alloc;
 extern crate ntoskrnl;
@@ -12,5 +11,7 @@ pub use ntoskrnl::{
     libs, loader, lpc, mm, netstack, ob, ps, registry, rtl, se, servers, userspace,
 };
 
-#[cfg(not(test))]
-pub mod ntdll;
+// The kernel already compiles this implementation. Reexport it so the facade
+// shares native handle tables and ETHREAD alert types with the kernel instead
+// of instantiating a second, incompatible copy of the same source modules.
+pub use ntoskrnl::libs::ntdll;

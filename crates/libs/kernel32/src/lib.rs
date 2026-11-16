@@ -1,7 +1,6 @@
 //! Ring 3 library: kernel32
 
 #![no_std]
-#![allow(dead_code)]
 
 extern crate alloc;
 extern crate ntoskrnl;
@@ -12,4 +11,6 @@ pub use ntoskrnl::{
     loader, lpc, mm, netstack, ob, ps, registry, rtl, se, servers, userspace,
 };
 
-pub mod kernel32;
+// Keep the standalone facade on the same native dispatcher and handle tables
+// as the embedded implementation; private native helpers stay encapsulated.
+pub use ntoskrnl::libs::kernel32;

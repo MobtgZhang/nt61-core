@@ -15,10 +15,34 @@
 extern crate alloc;
 
 pub use super::bitmap::*;
+pub use super::window::native_state::*;
+pub use super::window::coordinates::*;
+pub use super::user_state::menu_services::*;
+pub use super::window::class_services::*;
+pub use super::window::attributes::*;
+pub use super::window::placement::*;
+pub use super::window::attributes::nt_user_window_from_physical_point as nt_user_window_from_point;
+pub use super::clipboard::services::*;
+pub use super::window::input_context::*;
+pub use super::font_services::{
+    nt_gdi_get_glyph_outline,
+    nt_gdi_get_realization_info, nt_gdi_get_font_file_data, nt_gdi_get_font_file_info,
+    nt_gdi_get_font_data, nt_gdi_get_font_unicode_ranges,
+    nt_gdi_get_glyph_indices_w, nt_gdi_get_glyph_indices_w_internal,
+    nt_gdi_get_char_width_w, nt_gdi_get_char_abc_widths_w,
+    nt_gdi_get_text_extent_ex_w, nt_gdi_get_char_width_info, nt_gdi_get_kerning_pairs,
+    nt_gdi_get_rasterizer_caps,
+};
 
 pub use super::clipping::*;
+pub use super::dc::caps::*;
 pub use super::dc::services::*;
+pub use super::objects::nt_gdi_get_stock_object;
+pub use super::objects::nt_gdi_create_hatch_brush_internal;
+pub use super::palette::*;
 pub use super::path::services::*;
+pub use super::path::shapes::*;
+pub use super::dc::bounds::*;
 pub use super::polygon::services::*;
 pub use super::region::services::*;
 pub use super::selection::*;
@@ -240,15 +264,7 @@ pub extern "C" fn nt_gdi_bit_blt(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_GDI_GET_CHAR_SET - Get character set
-pub extern "C" fn nt_gdi_get_char_set(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-
-    // kprintln!("[win32k] NT_GDI_GET_CHAR_SET");
-
-    // Return default charset (DEFAULT_CHARSET = 1)
-    1
-}
+pub use super::font_services::nt_gdi_get_char_set;
 
 /// NT_GDI_SELECT_BITMAP - Select bitmap into DC
 pub extern "C" fn nt_gdi_select_object(frame: &SyscallFrame) -> u64 {
@@ -296,93 +312,10 @@ pub extern "C" fn nt_gdi_delete_object(frame: &SyscallFrame) -> u64 {
 /// source extents are slots eight/nine, ROP is slot ten, and background
 /// color is slot eleven. A six-argument PatBlt interpretation is invalid.
 pub extern "C" fn nt_gdi_stretch_blt(frame: &SyscallFrame) -> u64 {
-    // The existing renderer has no stretch sampling implementation. In
-    // particular, returning success here used to discard the entire draw.
-    // Until scaling/ROP/clipping are implemented together, report FALSE.
-    let _destination = (
-        frame.args[0],
-        frame.args[1],
-        frame.args[2],
-        frame.args[3],
-        frame.args[4],
-    );
-    let _source = (
-        frame.args[5],
-        frame.args[6],
-        frame.args[7],
-        frame.args[8],
-        frame.args[9],
-    );
-    let _rop = frame.args[10] as u32;
-    let _background_color = frame.args[11] as u32;
-    0
+    super::raster::stretch::nt_gdi_stretch_blt(frame)
 }
 
-/// NT_GDI_GET_DCOBJECT - Get DC object handle
-pub extern "C" fn nt_gdi_get_dc_object(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let obj_type = unsafe { get_arg1(frame) };
-    let _ = &obj_type;
-
-    // kprintln!("[win32k] NT_GDI_GET_DCOBJECT");
-
-    // Return a nonzero pseudo-handle for valid object types.
-    // Type 0 = PEN, 1 = BRUSH, 2 = PALETTE, 3 = FONT, 4 = BITMAP.
-    if obj_type <= 4 {
-        hdc | 0x0001_0000 // tag with an object-type bit
-    } else {
-        0
-    }
-}
-
-/// NT_GDI_EXT_TEXT_OUT_W - Extended text output
-pub extern "C" fn nt_gdi_ext_text_out(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let x = unsafe { get_arg1(frame) };
-    let _ = &x;
-    let y = unsafe { get_arg2(frame) };
-    let _ = &y;
-    let options = unsafe { get_arg3(frame) };
-    let _ = &options;
-    let rect = unsafe { get_arg4(frame) };
-    let _ = &rect;
-    let s = unsafe { get_arg5(frame) };
-    let _ = &s;
-    let count = unsafe { get_arg6(frame) };
-    let _ = &count;
-
-    // kprintln!("[win32k] NT_GDI_EXT_TEXT_OUT_W");
-
-    // Render text to the primary surface via the HAL text console.
-    // The x/y coordinates are used as a rough column/row hint.
-    let primary = super::surface::get_primary_surface();
-    if !primary.is_null() && count > 0 {
-        let text_ptr = s as *const u16;
-        if !text_ptr.is_null() {
-            // Probe the user buffer before dereferencing it: the
-            // pointer is Ring-3 controlled and could point into
-            // kernel memory or unmapped pages.
-            let byte_len = (count as usize).saturating_mul(2);
-            if crate::mm::user_copy::probe_user_read(s, byte_len).is_err() {
-                return 0;
-            }
-            for i in 0..count {
-                let ch = unsafe { *text_ptr.add(i as usize) };
-                if ch == 0 {
-                    break;
-                }
-                // Render the character as-is (ASCII subset) to the VGA text.
-                let byte = (ch & 0xFF) as u8;
-                if byte >= 0x20 {
-                    crate::hal::text_console::put_byte_vga_only(byte);
-                }
-            }
-        }
-    }
-    1 // TRUE
-}
+pub use super::font_services::{nt_gdi_ext_text_out, nt_gdi_poly_text_out, nt_gdi_set_text_justification};
 
 /// NT_GDI_RESTORE_DC - Restore device context
 pub extern "C" fn nt_gdi_restore_dc(frame: &SyscallFrame) -> u64 {
@@ -425,25 +358,6 @@ pub extern "C" fn nt_gdi_line_to(frame: &SyscallFrame) -> u64 {
     super::gdi_ops::gre_line_to(&mut dc, frame.args[1] as i32, frame.args[2] as i32) as u64
 }
 
-/// NT_GDI_DO_PALETTE - Perform palette operation
-pub extern "C" fn nt_gdi_do_palette(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let index = unsafe { get_arg1(frame) };
-    let _ = &index;
-    let count = unsafe { get_arg2(frame) };
-    let _ = &count;
-    let ppe = unsafe { get_arg3(frame) };
-    let _ = &ppe;
-    let op = unsafe { get_arg4(frame) };
-    let _ = &op;
-
-    // kprintln!("[win32k] NT_GDI_DO_PALETTE");
-
-    // DoPalette: return 1 for success (palette is a no-op with 32bpp framebuffer).
-    1
-}
-
 /// NT_GDI_CREATE_COMPATIBLE_BITMAP - create compatible bitmap
 pub extern "C" fn nt_gdi_create_compatible_bitmap(frame: &SyscallFrame) -> u64 {
     let hdc = unsafe { get_arg0(frame) };
@@ -464,99 +378,16 @@ pub extern "C" fn nt_gdi_create_compatible_bitmap(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_GDI_GET_TEXT_CHARSET_INFO - Get text charset info
-pub extern "C" fn nt_gdi_get_text_charset_info(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let metrics = unsafe { get_arg1(frame) };
-    let _ = &metrics;
-    let flags = unsafe { get_arg2(frame) };
-    let _ = &flags;
-
-    // kprintln!("[win32k] NT_GDI_GET_TEXT_CHARSET_INFO: hdc=0x{:x}", hdc);
-
-    // Return DEFAULT_CHARSET (1)
-    // A full implementation would read the charset from the DC's selected font
-    1 // DEFAULT_CHARSET
-}
+pub use super::font_services::nt_gdi_get_text_charset_info;
 
 /// NT_GDI_GET_TEXT_METRICS_W - Get text metrics
-pub extern "C" fn nt_gdi_get_text_metrics_w(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let metrics_ptr = unsafe { get_arg1(frame) };
-    let _ = &metrics_ptr;
-
-    // kprintln!("[win32k] NT_GDI_GET_TEXT_METRICS_W: hdc=0x{:x}, metrics=0x{:x}", hdc, metrics_ptr);
-
-    // Return 1 (success) and fill the TEXTMETRICW structure
-    // For now, return default metrics
-    // A full implementation would read from the selected font
-    if metrics_ptr != 0 {
-        // Return TRUE if successful
-        1
-    } else {
-        0
-    }
-}
+pub use super::font_services::nt_gdi_get_text_metrics_w;
 
 /// NT_GDI_GET_TEXT_EXTENT - Get text extent
-pub extern "C" fn nt_gdi_get_text_extent(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let string = unsafe { get_arg1(frame) };
-    let _ = &string;
-    let count = unsafe { get_arg2(frame) };
-    let _ = &count;
-    let dx = unsafe { get_arg3(frame) };
-    let _ = &dx;
-    let flags = unsafe { get_arg4(frame) };
-    let _ = &flags;
-
-    // kprintln!("[win32k] NT_GDI_GET_TEXT_EXTENT: hdc=0x{:x}", hdc);
-
-    // Return the width as a GDI handle (in reality, returns size struct)
-    // For simplicity, return a default width based on character count
-    // A full implementation would calculate based on the selected font
-    let count = unsafe { get_arg2(frame) } as i32;
-    let _ = &count;
-    if count > 0 {
-        // Assume 8 pixels per character (8x8 bitmap font)
-        (count * 8) as u64
-    } else {
-        0
-    }
-}
+pub use super::font_services::nt_gdi_get_text_extent;
 
 /// NT_GDI_GET_TEXT_FACE_W - Get font face name
-pub extern "C" fn nt_gdi_get_text_face_w(frame: &SyscallFrame) -> u64 {
-    let hdc = unsafe { get_arg0(frame) };
-    let _ = &hdc;
-    let count = unsafe { get_arg1(frame) } as i32;
-    let _ = &count;
-    let face_name_ptr = unsafe { get_arg2(frame) };
-    let _ = &face_name_ptr;
-
-    // kprintln!("[win32k] NT_GDI_GET_TEXT_FACE_W: hdc=0x{:x}, count={}, ptr=0x{:x}",
-    //               hdc, count, face_name_ptr);
-
-    if face_name_ptr != 0 && count > 0 {
-        // Return the number of characters copied (including null)
-        let name_utf16: [u16; 7] = [0x0053, 0x0079, 0x0073, 0x0074, 0x0065, 0x006D, 0x0000];
-        let chars = (count as usize).min(name_utf16.len());
-        let mut bytes = [0u8; 14];
-        for (index, unit) in name_utf16[..chars].iter().enumerate() {
-            bytes[index * 2] = (unit & 0xFF) as u8;
-            bytes[index * 2 + 1] = (unit >> 8) as u8;
-        }
-        if crate::mm::user_copy::copy_to_user(face_name_ptr, &bytes[..chars * 2]).is_ok() {
-            chars as u64
-        } else {
-            0
-        }
-    } else {
-        0
-    }
-}
+pub use super::font_services::nt_gdi_get_text_face_w;
 
 /// NT_GDI_EXT_GET_OBJECT_W - Get object information
 pub extern "C" fn nt_gdi_ext_get_object_w(frame: &SyscallFrame) -> u64 {
@@ -613,19 +444,7 @@ pub extern "C" fn nt_gdi_create_pen(frame: &SyscallFrame) -> u64 {
 
 /// NT_GDI_CREATE_BITMAP - create bitmap object
 pub extern "C" fn nt_gdi_create_bitmap(frame: &SyscallFrame) -> u64 {
-    let width = unsafe { get_arg0(frame) } as i32;
-    let _ = &width;
-    let height = unsafe { get_arg1(frame) } as i32;
-    let _ = &height;
-    let planes = unsafe { get_arg2(frame) } as u16; // planes parameter not used
-    let _ = &planes;
-    let bits_per_pixel = unsafe { get_arg3(frame) } as u16;
-    let _ = &bits_per_pixel;
-
-    // kprintln!("[win32k] NT_GDI_CREATE_BITMAP: {}x{}x{}, {}bpp", width, height, planes, bits_per_pixel);
-
-    // Call the GDI objects module to create a bitmap
-    crate::libs::win32k::objects::gdi_create_bitmap(width, height, bits_per_pixel)
+    super::bitmap::storage::nt_gdi_create_bitmap(frame)
 }
 
 /// NT_GDI_PAT_BLT - Pattern blt operation
@@ -687,11 +506,8 @@ pub extern "C" fn nt_gdi_draw_stream(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_GDI_MASK_BLT - Masked block transfer
-pub extern "C" fn nt_gdi_mask_blt(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_MASK_BLT");
-
-    // MaskBlt: return TRUE (mask blit is a no-op without mask surfaces).
-    1
+pub extern "C" fn nt_gdi_mask_blt(frame: &SyscallFrame) -> u64 {
+    super::raster::mask::nt_gdi_mask_blt(frame)
 }
 
 /// NT_GDI_GET_WIDTH_TABLE - Get width table
@@ -703,11 +519,8 @@ pub extern "C" fn nt_gdi_get_width_table(_frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_GDI_POLY_PAT_BLT - Poly pattern blt
-pub extern "C" fn nt_gdi_poly_pat_blt(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_POLY_PAT_BLT");
-
-    // PolyPatBlt: return TRUE (pattern blit is a no-op for now).
-    1
+pub extern "C" fn nt_gdi_poly_pat_blt(frame: &SyscallFrame) -> u64 {
+    super::raster::pattern::nt_gdi_poly_pat_blt(frame)
 }
 
 /// NT_GDI_GET_NEAREST_COLOR - Get nearest color
@@ -734,11 +547,8 @@ pub extern "C" fn nt_gdi_create_dib_brush(_frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_GDI_ALPHA_BLEND - Alpha blend
-pub extern "C" fn nt_gdi_alpha_blend(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_ALPHA_BLEND");
-
-    // AlphaBlend: return TRUE (alpha blend is a no-op without source surfaces).
-    1
+pub extern "C" fn nt_gdi_alpha_blend(frame: &SyscallFrame) -> u64 {
+    super::raster::alpha::nt_gdi_alpha_blend(frame)
 }
 
 /// NT_GDI_DD_BLT - DirectDraw blt
@@ -808,68 +618,21 @@ pub extern "C" fn nt_gdi_open_dc_w(frame: &SyscallFrame) -> u64 {
 
 /// NT_GDI_GET_BITMAP_BITS - Get bitmap bits
 pub extern "C" fn nt_gdi_get_bitmap_bits(frame: &SyscallFrame) -> u64 {
-    let hbitmap = unsafe { get_arg0(frame) };
-    let _ = &hbitmap;
-    let start_scan = unsafe { get_arg1(frame) };
-    let _ = &start_scan;
-    let num_scans = unsafe { get_arg2(frame) };
-    let _ = &num_scans;
-    let bits_ptr = unsafe { get_arg3(frame) };
-    let _ = &bits_ptr;
-
-    // kprintln!("[win32k] NT_GDI_GET_BITMAP_BITS: hbitmap=0x{:x}, start=0x{:x}, num={}, bits=0x{:x}",
-    //               hbitmap, start_scan, num_scans, bits_ptr);
-
-    let object_ptr = match crate::libs::win32k::objects::gdi_get_object_ptr(hbitmap) {
-        Some(object_ptr) => object_ptr,
-        None => return 0,
-    };
-    let bitmap = unsafe { &*(object_ptr as *const crate::libs::win32k::objects::GdiBitmap) };
-    if bitmap.bits.is_null() {
-        return 0;
-    }
-
-    let start_scan = start_scan as i32;
-    if start_scan < 0 || num_scans == 0 {
-        return 0;
-    }
-    let scan_count = num_scans.min(bitmap.height.unsigned_abs().into());
-    if start_scan.saturating_add(scan_count as i32) > bitmap.height.abs() {
-        return 0;
-    }
-
-    let row_bytes = bitmap.width_bytes.max(0) as usize;
-    let offset = start_scan as usize * row_bytes;
-    let byte_count = scan_count as usize * row_bytes;
-    if offset
-        .checked_add(byte_count)
-        .map(|end| end > bitmap.size as usize)
-        .unwrap_or(true)
-    {
-        return 0;
-    }
-
-    let source = unsafe { core::slice::from_raw_parts(bitmap.bits.add(offset), byte_count) };
-    match crate::mm::user_copy::copy_to_user(bits_ptr, source) {
-        Ok(()) => byte_count as u64,
-        Err(_) => 0,
-    }
+    super::bitmap::storage::nt_gdi_get_bitmap_bits(frame)
 }
 
 /// NT_GDI_STRETCH_DIBITS_INTERNAL - Stretch DIB bits (internal)
-pub extern "C" fn nt_gdi_stretch_dibits_internal(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_STRETCH_DIBITS_INTERNAL");
+pub extern "C" fn nt_gdi_stretch_dibits_internal(frame: &SyscallFrame) -> u64 {
+    super::raster::dib::nt_gdi_stretch_dibits_internal(frame)
+}
 
-    // StretchDIBitsInternal: return 0 (no DIBs without object table).
-    0
+pub extern "C" fn nt_gdi_set_dibits_to_device_internal(frame: &SyscallFrame) -> u64 {
+    super::raster::dib::nt_gdi_set_dibits_to_device_internal(frame)
 }
 
 /// NT_GDI_GET_DIBITS_INTERNAL - Get DIB bits (internal)
-pub extern "C" fn nt_gdi_get_dibits_internal(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_GET_DIBITS_INTERNAL");
-
-    // GetDIBitsInternal: return 0 (no DIBs without object table).
-    0
+pub extern "C" fn nt_gdi_get_dibits_internal(frame: &SyscallFrame) -> u64 {
+    super::bitmap::dib::nt_gdi_get_dibits_internal(frame)
 }
 
 /// NT_GDI_DELETE_CLIENT_OBJ - Delete client object
@@ -1018,14 +781,6 @@ pub extern "C" fn nt_gdi_ext_create_pen(_frame: &SyscallFrame) -> u64 {
     0x0007_0001
 }
 
-/// NT_GDI_CREATE_PALETTE_INTERNAL - create palette (internal)
-pub extern "C" fn nt_gdi_create_palette_internal(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_CREATE_PALETTE_INTERNAL");
-
-    // CreatePaletteInternal: return a pseudo-handle for the palette.
-    0x0008_0001
-}
-
 /// NT_GDI_CREATE_PATTERN_BRUSH_INTERNAL - create pattern brush (internal)
 pub extern "C" fn nt_gdi_create_pattern_brush_internal(_frame: &SyscallFrame) -> u64 {
     // kprintln!("[win32k] NT_GDI_CREATE_PATTERN_BRUSH_INTERNAL");
@@ -1043,11 +798,8 @@ pub extern "C" fn nt_gdi_get_outline_text_metrics_internal_w(_frame: &SyscallFra
 }
 
 /// NT_GDI_SET_BITMAP_BITS - Set bitmap bits
-pub extern "C" fn nt_gdi_set_bitmap_bits(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_GDI_SET_BITMAP_BITS");
-
-    // SetBitmapBits: return 0 (no bitmap object table to write to).
-    0
+pub extern "C" fn nt_gdi_set_bitmap_bits(frame: &SyscallFrame) -> u64 {
+    super::bitmap::storage::nt_gdi_set_bitmap_bits(frame)
 }
 
 /// NT_GDI_CREATE_SOLID_BRUSH - create solid brush
@@ -1304,122 +1056,10 @@ pub extern "C" fn nt_user_set_window_pos(frame: &SyscallFrame) -> u64 {
     }
 }
 
-/// NT_USER_GET_MESSAGE - Get message from queue
-pub extern "C" fn nt_user_get_message(frame: &SyscallFrame) -> u64 {
-    let msg_ptr = unsafe { get_arg0(frame) };
-    let _ = &msg_ptr;
-    let hwnd = unsafe { get_arg1(frame) };
-    let _ = &hwnd;
-    let msg_filter_min = unsafe { get_arg2(frame) } as u32;
-    let _ = &msg_filter_min;
-    let msg_filter_max = unsafe { get_arg3(frame) } as u32;
-    let _ = &msg_filter_max;
-
-    // kprintln!("[win32k] NT_USER_GET_MESSAGE: msg_ptr=0x{:x}, hwnd=0x{:x}, filter={:#x}-{:#x}",
-    //         msg_ptr, hwnd, msg_filter_min, msg_filter_max);
-
-    if msg_ptr == 0 {
-        return 0;
-    }
-
-    // Try to get a message (timeout=0: return immediately if no message)
-    match crate::libs::win32k::message::with_current_queue(|queue| {
-        queue.get_message(hwnd, msg_filter_min, msg_filter_max, 0)
-    }) {
-        Some(msg) => {
-            // Copy the message to user memory
-            if crate::mm::user_copy::write_user(msg_ptr, &msg).is_err() {
-                return 0;
-            }
-
-            // Return 1 for success, 0 for WmQuit
-            if msg.message == 0x0012 {
-                // WmQuit
-                // kprintln!("[win32k] NT_USER_GET_MESSAGE: got WmQuit");
-                0
-            } else {
-                1
-            }
-        }
-        None => {
-            // No message available. In real NT6.1, GetMessage blocks until
-            // a message arrives. Since we do not yet have full scheduler
-            // integration, yield and return -1 (error) so the caller does
-            // not treat the empty queue as a successfully retrieved message.
-            // kprintln!("[win32k] NT_USER_GET_MESSAGE: no message available");
-            u64::MAX // -1 (error) as a u64
-        }
-    }
-}
-
-/// NT_USER_PEEK_MESSAGE - Peek at message
-pub extern "C" fn nt_user_peek_message(frame: &SyscallFrame) -> u64 {
-    let msg_ptr = unsafe { get_arg0(frame) };
-    let hwnd = unsafe { get_arg1(frame) };
-    let _ = &hwnd;
-    let msg_filter_min = unsafe { get_arg2(frame) };
-    let _ = &msg_filter_min;
-    let msg_filter_max = unsafe { get_arg3(frame) };
-    let _ = &msg_filter_max;
-    let remove = unsafe { get_arg4(frame) };
-    let _ = &remove;
-
-    // kprintln!("[win32k] NT_USER_PEEK_MESSAGE");
-
-    // PeekMessage: look for a message but do not block.
-    // `remove` (PM_REMOVE = 1) controls whether the message is removed
-    // from the queue. Returns nonzero if a message is available, 0 if none.
-    if msg_ptr == 0 {
-        return 0;
-    }
-
-    match crate::libs::win32k::message::with_current_queue(|queue| {
-        queue.peek_message(
-            hwnd,
-            msg_filter_min as u32,
-            msg_filter_max as u32,
-            remove != 0,
-        )
-    }) {
-        Some(msg) => {
-            if crate::mm::user_copy::write_user(msg_ptr, &msg).is_err() {
-                return 0;
-            }
-            1
-        }
-        None => 0,
-    }
-}
-
-/// NT_USER_POST_MESSAGE - Post message to queue
-pub extern "C" fn nt_user_post_message(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let msg = unsafe { get_arg1(frame) };
-    let _ = &msg;
-    let w_param = unsafe { get_arg2(frame) };
-    let _ = &w_param;
-    let l_param = unsafe { get_arg3(frame) };
-    let _ = &l_param;
-
-    // kprintln!("[win32k] NT_USER_POST_MESSAGE");
-
-    if hwnd == 0 {
-        return 1;
-    }
-    let valid_window = crate::libs::win32k::window::WINDOW_MANAGER
-        .lock()
-        .get_window(hwnd)
-        .is_some();
-    if !valid_window {
-        return 0;
-    }
-    if crate::libs::win32k::message::post_message(hwnd, msg as u32, w_param, l_param as i64) {
-        1
-    } else {
-        0
-    }
-}
+pub use super::message::services::{
+    nt_user_get_message, nt_user_peek_message, nt_user_post_message,
+    nt_user_post_thread_message,
+};
 
 /// NT_USER_SET_FOCUS - Set focus window
 pub extern "C" fn nt_user_set_focus(frame: &SyscallFrame) -> u64 {
@@ -1458,61 +1098,10 @@ pub extern "C" fn nt_user_set_foreground_window(frame: &SyscallFrame) -> u64 {
     result.unwrap_or_default()
 }
 
-/// NT_USER_GET_KEYBOARD_STATE - Get keyboard state
-pub extern "C" fn nt_user_get_keyboard_state(frame: &SyscallFrame) -> u64 {
-    let state_ptr = unsafe { get_arg0(frame) };
-    let _ = &state_ptr;
-
-    // kprintln!("[win32k] NT_USER_GET_KEYBOARD_STATE: state=0x{:x}", state_ptr);
-
-    // Return 1 (success) if state pointer is valid
-    // A full implementation would copy the keyboard state to the buffer
-    if state_ptr != 0 {
-        1 // TRUE
-    } else {
-        0 // FALSE
-    }
-}
-
-/// NT_USER_SET_KEYBOARD_STATE - Set keyboard state
-pub extern "C" fn nt_user_set_keyboard_state(frame: &SyscallFrame) -> u64 {
-    let state_ptr = unsafe { get_arg0(frame) };
-    let _ = &state_ptr;
-
-    // kprintln!("[win32k] NT_USER_SET_KEYBOARD_STATE: state=0x{:x}", state_ptr);
-
-    // Return 1 (success) if state pointer is valid
-    if state_ptr != 0 {
-        1 // TRUE
-    } else {
-        0 // FALSE
-    }
-}
-
-/// NT_USER_GET_KEY_STATE - Get key state
-pub extern "C" fn nt_user_get_key_state(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let vk = unsafe { get_arg1(frame) } as i32;
-    let _ = &vk;
-
-    // kprintln!("[win32k] NT_USER_GET_KEY_STATE: vk=0x{:x}", vk);
-
-    // Return key state: high bit = toggled, second high bit = pressed
-    // For now, return 0 (not pressed, not toggled)
-    0
-}
-
-/// NT_USER_GET_ASYNC_KEY_STATE - Get async key state
-pub extern "C" fn nt_user_get_async_key_state(frame: &SyscallFrame) -> u64 {
-    let vk = unsafe { get_arg0(frame) } as i32;
-    let _ = &vk;
-
-    // kprintln!("[win32k] NT_USER_GET_ASYNC_KEY_STATE: vk=0x{:x}", vk);
-
-    // Return key state: high bit = toggled, second high bit = pressed
-    0
-}
+pub use super::input_services::keyboard::{
+    nt_user_get_async_key_state, nt_user_get_key_state,
+    nt_user_get_keyboard_state, nt_user_set_keyboard_state,
+};
 
 /// NT_USER_SEND_INPUT - Send input events
 pub extern "C" fn nt_user_send_input(frame: &SyscallFrame) -> u64 {
@@ -1532,17 +1121,7 @@ pub extern "C" fn nt_user_send_input(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_TRANSLATE_MESSAGE - Translate virtual key message
-pub extern "C" fn nt_user_translate_message(frame: &SyscallFrame) -> u64 {
-    let msg = unsafe { get_arg0(frame) };
-    let _ = &msg;
-    let flags = unsafe { get_arg1(frame) };
-    let _ = &flags;
-
-    // kprintln!("[win32k] NT_USER_TRANSLATE_MESSAGE");
-
-    // TranslateMessage: return 0 (no WM_CHAR generated for the current key).
-    0
-}
+pub use super::input_services::layout::nt_user_translate_message;
 
 /// NT_USER_DISPATCH_MESSAGE - Dispatch message
 pub extern "C" fn nt_user_dispatch_message(frame: &SyscallFrame) -> u64 {
@@ -1867,17 +1446,17 @@ pub extern "C" fn nt_user_call_one_param(frame: &SyscallFrame) -> u64 {
 
 /// NT_USER_CALL_TWO_PARAM - Call with two parameters
 pub extern "C" fn nt_user_call_two_param(frame: &SyscallFrame) -> u64 {
-    let param1 = unsafe { get_arg0(frame) };
-    let _ = &param1;
-    let param2 = unsafe { get_arg1(frame) };
-    let _ = &param2;
-    let code = unsafe { get_arg2(frame) };
-    let _ = &code;
-
-    // kprintln!("[win32k] NT_USER_CALL_TWO_PARAM");
-
-    // CallTwoParam: return the first parameter as the result.
-    param1
+    match frame.args[2] as u32 {
+        // Verified against the Win7 SP1 user32 SetCaretPos/SetCursorPos wrappers.
+        0x69 => u64::from(super::input_services::get_cursor(frame.args[0])),
+        0x73 => {
+            let (_, thread) = super::window::input_context::caller_identity();
+            u64::from(super::user_state::with_user_state(|state| state.set_caret_position(
+                thread, frame.args[0] as i32, frame.args[1] as i32)))
+        }
+        0x74 => u64::from(super::input_services::set_cursor(frame.args[0] as i32, frame.args[1] as i32)),
+        _ => 0,
+    }
 }
 
 /// NT_USER_CALL_MSG_FILTER - Call message filter
@@ -1972,32 +1551,10 @@ pub extern "C" fn nt_user_get_class_name(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_GET_PROP - Get window property
-pub extern "C" fn nt_user_get_prop(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let s = unsafe { get_arg1(frame) };
-    let _ = &s;
 
-    // kprintln!("[win32k] NT_USER_GET_PROP");
-
-    // GetProp: return 0 (no property stored).
-    0
-}
 
 /// NT_USER_SET_PROP - Set window property
-pub extern "C" fn nt_user_set_prop(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let s = unsafe { get_arg1(frame) };
-    let _ = &s;
-    let data = unsafe { get_arg2(frame) };
-    let _ = &data;
 
-    // kprintln!("[win32k] NT_USER_SET_PROP");
-
-    // SetProp: return TRUE (property stored).
-    1
-}
 
 /// NT_USER_REDRAW_WINDOW - Redraw window
 pub extern "C" fn nt_user_redraw_window(frame: &SyscallFrame) -> u64 {
@@ -2203,33 +1760,6 @@ pub extern "C" fn nt_user_send_message(frame: &SyscallFrame) -> u64 {
     result as u64
 }
 
-/// NT_USER_POST_THREAD_MESSAGE - Post thread message
-pub extern "C" fn nt_user_post_thread_message(frame: &SyscallFrame) -> u64 {
-    let id_thread = unsafe { get_arg0(frame) };
-    let _ = &id_thread;
-    let msg = unsafe { get_arg1(frame) };
-    let _ = &msg;
-    let w_param = unsafe { get_arg2(frame) };
-    let _ = &w_param;
-    let l_param = unsafe { get_arg3(frame) };
-    let _ = &l_param;
-
-    // kprintln!("[win32k] NT_USER_POST_THREAD_MESSAGE");
-
-    if crate::libs::win32k::user_state::post_thread_message(
-        id_thread as u32,
-        crate::libs::win32k::user_state::ThreadMessage {
-            message: msg as u32,
-            wparam: w_param,
-            lparam: l_param as i64,
-        },
-    ) {
-        1
-    } else {
-        0
-    }
-}
-
 /// NT_USER_REPLY_MESSAGE - Reply to GetMessage
 pub extern "C" fn nt_user_reply_message(frame: &SyscallFrame) -> u64 {
     let result = unsafe { get_arg0(frame) };
@@ -2242,17 +1772,7 @@ pub extern "C" fn nt_user_reply_message(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_WINDOW_FROM_POINT - Get window from point
-pub extern "C" fn nt_user_window_from_point(frame: &SyscallFrame) -> u64 {
-    let x = unsafe { get_arg0(frame) };
-    let _ = &x;
-    let y = unsafe { get_arg1(frame) };
-    let _ = &y;
 
-    // kprintln!("[win32k] NT_USER_WINDOW_FROM_POINT");
-
-    // WindowFromPoint: return 0 (no window at the given point).
-    0
-}
 
 /// NT_USER_FIND_WINDOW_EX - Find window (extended)
 pub extern "C" fn nt_user_find_window_ex(frame: &SyscallFrame) -> u64 {
@@ -2287,19 +1807,7 @@ pub extern "C" fn nt_user_find_window(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_SET_PARENT - Set parent window
-pub extern "C" fn nt_user_set_parent(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let hwnd_new_parent = unsafe { get_arg1(frame) };
-    let _ = &hwnd_new_parent;
 
-    // kprintln!("[win32k] NT_USER_SET_PARENT: hwnd=0x{:x}, new_parent=0x{:x}",
-    //         hwnd, hwnd_new_parent);
-
-    // For now, return the old parent (0)
-    // Full implementation would modify window's parent
-    0
-}
 
 /// NT_USER_GET_ACTIVE_WINDOW - Get active window
 pub extern "C" fn nt_user_get_active_window(_frame: &SyscallFrame) -> u64 {
@@ -2337,19 +1845,7 @@ pub extern "C" fn nt_user_release_capture(_frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_SET_WINDOW_LONG - Set window long
-pub extern "C" fn nt_user_set_window_long(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let index = unsafe { get_arg1(frame) };
-    let _ = &index;
-    let new_long = unsafe { get_arg2(frame) };
-    let _ = &new_long;
 
-    // kprintln!("[win32k] NT_USER_SET_WINDOW_LONG");
-
-    // SetWindowLong: return the previous value (0 = none).
-    0
-}
 
 /// NT_USER_GET_CONTROL_BRUSH - Get control brush
 pub extern "C" fn nt_user_get_control_brush(frame: &SyscallFrame) -> u64 {
@@ -2462,15 +1958,7 @@ pub extern "C" fn nt_user_get_title_bar_info(_frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_SET_THREAD_DESKTOP - Set thread desktop
-pub extern "C" fn nt_user_set_thread_desktop(frame: &SyscallFrame) -> u64 {
-    let h_desk = unsafe { get_arg0(frame) };
-    let _ = &h_desk;
 
-    // kprintln!("[win32k] NT_USER_SET_THREAD_DESKTOP");
-
-    // SetThreadDesktop: return TRUE (desktop switch succeeds).
-    1
-}
 
 /// NT_USER_GET_SCROLL_BAR_INFO - Get scroll bar info
 pub extern "C" fn nt_user_get_scroll_bar_info(_frame: &SyscallFrame) -> u64 {
@@ -2523,15 +2011,7 @@ pub extern "C" fn nt_user_open_window_station(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_CLOSE_DESKTOP - close desktop
-pub extern "C" fn nt_user_close_desktop(frame: &SyscallFrame) -> u64 {
-    let h_desk = unsafe { get_arg0(frame) };
-    let _ = &h_desk;
 
-    // kprintln!("[win32k] NT_USER_CLOSE_DESKTOP");
-
-    // CloseDesktop: return TRUE.
-    1
-}
 
 /// NT_USER_OPEN_DESKTOP - Open desktop
 pub extern "C" fn nt_user_open_desktop(frame: &SyscallFrame) -> u64 {
@@ -2574,23 +2054,10 @@ pub extern "C" fn nt_user_set_cursor_icon_data(_frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_REGISTER_CLASS_EX_WOW - Register class (extended WOW)
-pub extern "C" fn nt_user_register_class_ex_wow(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_REGISTER_CLASS_EX_WOW");
-    0
-}
+
 
 /// NT_USER_GET_ANCESTOR - Get ancestor window
-pub extern "C" fn nt_user_get_ancestor(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let ga_flags = unsafe { get_arg1(frame) };
-    let _ = &ga_flags;
 
-    // kprintln!("[win32k] NT_USER_GET_ANCESTOR");
-
-    // GetAncestor: return 0 (no ancestor without a window tree).
-    0
-}
 
 /// NT_USER_CLOSE_WINDOW_STATION - close window station
 pub extern "C" fn nt_user_close_window_station(frame: &SyscallFrame) -> u64 {
@@ -2645,21 +2112,7 @@ pub extern "C" fn nt_user_scroll_window_ex(_frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_SET_CLASS_LONG - Set class long
-pub extern "C" fn nt_user_set_class_long(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let index = unsafe { get_arg1(frame) };
-    let _ = &index;
-    let new_long = unsafe { get_arg2(frame) };
-    let _ = &new_long;
-    let dw_extra = unsafe { get_arg3(frame) };
-    let _ = &dw_extra;
 
-    // kprintln!("[win32k] NT_USER_SET_CLASS_LONG");
-
-    // SetClassLong: return the previous value (0 = none).
-    0
-}
 
 /// NT_USER_GET_MENU_BAR_INFO - Get menu bar info
 pub extern "C" fn nt_user_get_menu_bar_info(_frame: &SyscallFrame) -> u64 {
@@ -2677,31 +2130,13 @@ pub extern "C" fn nt_user_get_clipboard_sequence_number(_frame: &SyscallFrame) -
 }
 
 /// NT_USER_GET_KEYBOARD_LAYOUT_LIST - Get keyboard layout list
-pub extern "C" fn nt_user_get_keyboard_layout_list(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_GET_KEYBOARD_LAYOUT_LIST");
-    0
-}
+pub use super::input_services::layout::nt_user_get_keyboard_layout_list;
 
 /// NT_USER_MAP_VIRTUAL_KEY_EX - Map virtual key (extended)
-pub extern "C" fn nt_user_map_virtual_key_ex(frame: &SyscallFrame) -> u64 {
-    let code = unsafe { get_arg0(frame) };
-    let _ = &code;
-    let map_type = unsafe { get_arg1(frame) };
-    let _ = &map_type;
-    let hkl = unsafe { get_arg2(frame) };
-    let _ = &hkl;
-
-    // kprintln!("[win32k] NT_USER_MAP_VIRTUAL_KEY_EX");
-
-    // MapVirtualKeyEx: return the virtual key code as-is.
-    code
-}
+pub use super::input_services::layout::nt_user_map_virtual_key_ex;
 
 /// NT_USER_TO_UNICODE_EX - Convert to unicode (extended)
-pub extern "C" fn nt_user_to_unicode_ex(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_TO_UNICODE_EX");
-    0
-}
+pub use super::input_services::layout::nt_user_to_unicode_ex;
 
 /// NT_USER_DEF_SET_TEXT - Default set text
 pub extern "C" fn nt_user_def_set_text(_frame: &SyscallFrame) -> u64 {
@@ -2710,17 +2145,7 @@ pub extern "C" fn nt_user_def_set_text(_frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_GET_THREAD_DESKTOP - Get thread desktop
-pub extern "C" fn nt_user_get_thread_desktop(frame: &SyscallFrame) -> u64 {
-    let thread_id = unsafe { get_arg0(frame) };
-    let _ = &thread_id;
-    let flags = unsafe { get_arg1(frame) };
-    let _ = &flags;
 
-    // kprintln!("[win32k] NT_USER_GET_THREAD_DESKTOP");
-
-    // GetThreadDesktop: return a pseudo-handle for the default desktop.
-    0x0010_0001
-}
 
 /// NT_USER_GET_ICON_SIZE - Get icon size
 pub extern "C" fn nt_user_get_icon_size(frame: &SyscallFrame) -> u64 {
@@ -2821,23 +2246,10 @@ pub extern "C" fn nt_user_destroy_cursor(frame: &SyscallFrame) -> u64 {
 
 /// NT_USER_MESSAGE_CALL - Message call
 pub extern "C" fn nt_user_message_call(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let msg = unsafe { get_arg1(frame) };
-    let _ = &msg;
-    let w_param = unsafe { get_arg2(frame) };
-    let _ = &w_param;
-    let l_param = unsafe { get_arg3(frame) };
-    let _ = &l_param;
-    let msg_fu_flags = unsafe { get_arg4(frame) };
-    let _ = &msg_fu_flags;
-    let info = unsafe { get_arg5(frame) };
-    let _ = &info;
+    if frame.args[5] as u32 != 0x029e { return 0; }
+    super::message::default_wndproc(frame.args[0], frame.args[1] as u32,
+        frame.args[2], frame.args[3] as i64) as u64
 
-    // kprintln!("[win32k] NT_USER_MESSAGE_CALL");
-
-    // MessageCall: return 0 (no message dispatched).
-    0
 }
 
 /// NT_USER_END_MENU - End menu
@@ -2939,10 +2351,7 @@ pub extern "C" fn nt_user_call_hwnd_param_lock(_frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_VK_KEY_SCAN_EX - Virtual key scan (extended)
-pub extern "C" fn nt_user_vk_key_scan_ex(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_VK_KEY_SCAN_EX");
-    0
-}
+pub use super::input_services::layout::nt_user_vk_key_scan_ex;
 
 /// NT_USER_COPY_ACCELERATOR_TABLE - Copy accelerator table
 pub extern "C" fn nt_user_copy_accelerator_table(_frame: &SyscallFrame) -> u64 {
@@ -2963,8 +2372,7 @@ pub extern "C" fn nt_user_is_clipboard_format_available(frame: &SyscallFrame) ->
 
     // kprintln!("[win32k] NT_USER_IS_CLIPBOARD_FORMAT_AVAILABLE");
 
-    // IsClipboardFormatAvailable: return 1 (text format available).
-    1
+    super::clipboard::formats().contains(&(format as u32)) as u64
 }
 
 /// NT_USER_SET_SCROLL_INFO - Set scroll info
@@ -2973,17 +2381,8 @@ pub extern "C" fn nt_user_set_scroll_info(_frame: &SyscallFrame) -> u64 {
     0
 }
 
-/// NT_USER_SELECT_PALETTE - Select palette
-pub extern "C" fn nt_user_select_palette(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_SELECT_PALETTE");
-    0
-}
-
 /// NT_USER_REMOVE_PROP - Remove property
-pub extern "C" fn nt_user_remove_prop(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_REMOVE_PROP");
-    0
-}
+
 
 /// NT_USER_REGISTER_HOT_KEY - Register hot key
 pub extern "C" fn nt_user_register_hot_key(frame: &SyscallFrame) -> u64 {
@@ -3092,22 +2491,11 @@ pub extern "C" fn nt_user_invalidate_rgn(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_GET_CLIPBOARD_OWNER - Get clipboard owner window
-pub extern "C" fn nt_user_get_clipboard_owner(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_GET_CLIPBOARD_OWNER");
-    0 // NULL
-}
+
 
 /// NT_USER_SET_WINDOW_RGN - Set window region
 pub extern "C" fn nt_user_set_window_rgn(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let hrgn = unsafe { get_arg1(frame) };
-    let _ = &hrgn;
-    let redraw = unsafe { get_arg2(frame) };
-    let _ = &redraw;
-
-    // kprintln!("[win32k] NT_USER_SET_WINDOW_RGN");
-    1 // TRUE
+    super::window::native_state::nt_user_set_window_rgn_ex(frame)
 }
 
 /// NT_USER_OPEN_CLIPBOARD - Open clipboard
@@ -3187,21 +2575,10 @@ pub extern "C" fn nt_user_alter_window_style(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_GET_WINDOW_PLACEMENT - Get window placement
-pub extern "C" fn nt_user_get_window_placement(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let placement = unsafe { get_arg1(frame) };
-    let _ = &placement;
 
-    // kprintln!("[win32k] NT_USER_GET_WINDOW_PLACEMENT");
-    1 // TRUE
-}
 
 /// NT_USER_GET_OPEN_CLIPBOARD_WINDOW - Get open clipboard window
-pub extern "C" fn nt_user_get_open_clipboard_window(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_GET_OPEN_CLIPBOARD_WINDOW");
-    0 // NULL
-}
+
 
 /// NT_USER_SET_THREAD_STATE - Set thread state
 pub extern "C" fn nt_user_set_thread_state(frame: &SyscallFrame) -> u64 {
@@ -3259,15 +2636,7 @@ pub extern "C" fn nt_user_set_information_thread(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_SET_WINDOW_PLACEMENT - Set window placement
-pub extern "C" fn nt_user_set_window_placement(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let placement = unsafe { get_arg1(frame) };
-    let _ = &placement;
 
-    // kprintln!("[win32k] NT_USER_SET_WINDOW_PLACEMENT");
-    1 // TRUE
-}
 
 /// NT_USER_GET_CONTROL_COLOR - Get control color
 pub extern "C" fn nt_user_get_control_color(frame: &SyscallFrame) -> u64 {
@@ -3283,17 +2652,7 @@ pub extern "C" fn nt_user_get_control_color(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_SET_WINDOW_WORD - Set window word
-pub extern "C" fn nt_user_set_window_word(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
-    let index = unsafe { get_arg1(frame) };
-    let _ = &index;
-    let value = unsafe { get_arg2(frame) };
-    let _ = &value;
 
-    // kprintln!("[win32k] NT_USER_SET_WINDOW_WORD");
-    0
-}
 
 /// NT_USER_GET_CLIPBOARD_FORMAT_NAME - Get clipboard format name
 pub extern "C" fn nt_user_get_clipboard_format_name(frame: &SyscallFrame) -> u64 {
@@ -3407,15 +2766,11 @@ pub extern "C" fn nt_user_get_caret_blink_time(_frame: &SyscallFrame) -> u64 {
 
 /// NT_USER_PROCESS_CONNECT - Process connect
 pub extern "C" fn nt_user_process_connect(frame: &SyscallFrame) -> u64 {
-    let process = unsafe { get_arg0(frame) };
-    let _ = &process;
-    let conn_info = unsafe { get_arg1(frame) };
-    let _ = &conn_info;
-    let size = unsafe { get_arg2(frame) };
-    let _ = &size;
+    let _ = (frame.args[0], frame.args[1]);
+    // USER shared-info mapping is not implemented. This native call returns
+    // NTSTATUS; returning TRUE used to conceal an uninitialized connect block.
+    0xc00000bb
 
-    // kprintln!("[win32k] NT_USER_PROCESS_CONNECT");
-    1 // TRUE
 }
 
 /// NT_USER_ENUM_DISPLAY_DEVICES - Enum display devices
@@ -3598,8 +2953,7 @@ pub extern "C" fn nt_user_modify_user_startup_info_flags(frame: &SyscallFrame) -
 
 /// NT_USER_COUNT_CLIPBOARD_FORMATS - count clipboard formats
 pub extern "C" fn nt_user_count_clipboard_formats(_frame: &SyscallFrame) -> u64 {
-    // kprintln!("[win32k] NT_USER_COUNT_CLIPBOARD_FORMATS");
-    0
+    super::clipboard::formats().len() as u64
 }
 
 /// NT_USER_ENUM_DISPLAY_SETTINGS - Enum display settings
@@ -3627,24 +2981,10 @@ pub extern "C" fn nt_user_paint_desktop(frame: &SyscallFrame) -> u64 {
 }
 
 /// NT_USER_CHANGE_CLIPBOARD_CHAIN - Change clipboard chain
-pub extern "C" fn nt_user_change_clipboard_chain(frame: &SyscallFrame) -> u64 {
-    let remove = unsafe { get_arg0(frame) };
-    let _ = &remove;
-    let next = unsafe { get_arg1(frame) };
-    let _ = &next;
 
-    // kprintln!("[win32k] NT_USER_CHANGE_CLIPBOARD_CHAIN");
-    1 // TRUE
-}
 
 /// NT_USER_SET_CLIPBOARD_VIEWER - Set clipboard viewer
-pub extern "C" fn nt_user_set_clipboard_viewer(frame: &SyscallFrame) -> u64 {
-    let hwnd = unsafe { get_arg0(frame) };
-    let _ = &hwnd;
 
-    // kprintln!("[win32k] NT_USER_SET_CLIPBOARD_VIEWER");
-    0 // Previous viewer
-}
 
 /// NT_USER_SHOW_WINDOW_ASYNC - Show window async
 pub extern "C" fn nt_user_show_window_async(frame: &SyscallFrame) -> u64 {
@@ -3994,4 +3334,41 @@ pub extern "C" fn nt_user_unhook_win_event(frame: &SyscallFrame) -> u64 {
     crate::libs::win32k::user_state::remove_event_hook(h_win_event_hook) as u64
 }
 
-pub use super::raster::{nt_gdi_fill_rgn, nt_gdi_get_pixel, nt_gdi_invert_rgn, nt_gdi_set_pixel};
+pub use super::raster::{nt_gdi_fill_rgn, nt_gdi_frame_rgn, nt_gdi_get_pixel, nt_gdi_invert_rgn, nt_gdi_set_pixel};
+pub use super::raster::extended::{nt_gdi_ext_flood_fill, nt_gdi_gradient_fill, nt_gdi_transparent_blt};
+pub use super::raster::parallelogram::nt_gdi_plg_blt;
+
+// Shared USER state services; each export retains the window lifetime guard.
+pub use super::window::services::*;
+
+/// Drawing is immediate in this GDI backend; there is no deferred batch to
+/// drain. The full fence publishes completed CPU surface writes.
+pub extern "C" fn nt_gdi_flush(_frame: &SyscallFrame) -> u64 {
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    1
+}
+
+pub use super::objects::attributes::*;
+pub use super::dc::pixel_format::*;
+pub use super::font_services::linking::*;
+
+pub use super::input_services::{
+    nt_user_block_input, nt_user_clip_cursor, nt_user_get_caret_pos,
+    nt_user_get_clip_cursor, nt_user_get_key_name_text, nt_user_get_keyboard_layout_name,
+    nt_user_get_thread_state, nt_user_unload_keyboard_layout,
+};
+pub use super::input_services::history::nt_user_get_mouse_move_points_ex;
+
+pub use super::raw_input::{
+    nt_user_get_raw_input_buffer, nt_user_get_raw_input_data, nt_user_get_raw_input_device_info,
+    nt_user_get_raw_input_device_list, nt_user_get_registered_raw_input_devices,
+    nt_user_register_raw_input_devices,
+};
+
+pub use super::display_config::*;
+
+pub use super::color_space::*;
+
+pub use super::window::session_services::*;
+
+pub use super::resources::nt_user_get_gui_resources;

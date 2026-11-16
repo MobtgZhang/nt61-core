@@ -34,13 +34,25 @@
 //!   * ReactOS 0.3.x ntdll headers
 //!   * Wine 1.7.x ntdll.spec
 
+pub mod ktm;
+pub mod atom;
 pub mod clock;
 pub mod debug;
+pub mod debug_filter;
+pub mod timer_resolution;
+pub(crate) mod privilege;
+pub mod event_pair;
+pub mod keyed_event;
+pub mod job;
 pub mod file;
 pub mod heap;
 pub mod info;
 pub mod ioctl;
+pub mod io_completion;
 pub mod ldr;
+pub mod luid;
+pub mod uuid;
+pub mod wall_clock;
 pub mod ob_integration;
 pub mod object;
 pub mod peb_teb;
@@ -54,6 +66,7 @@ pub mod smoke;
 pub mod status;
 pub mod string;
 pub mod sync;
+pub mod system_services;
 pub mod thread;
 pub mod types;
 pub mod virtual_mem;
@@ -102,6 +115,17 @@ pub mod rtl_critical;
 pub mod rtl_memory;
 pub mod rtl_string_ext;
 pub mod security;
+pub(crate) mod token_duplicate;
+pub(crate) mod token_privileges;
+pub(crate) mod token_groups;
+pub(crate) mod token_information;
 pub mod timer;
 pub mod tls;
 pub mod wait;
+
+pub mod namespace;
+
+pub mod locale;
+pub mod profile_interval;
+
+pub(crate) mod access_check;

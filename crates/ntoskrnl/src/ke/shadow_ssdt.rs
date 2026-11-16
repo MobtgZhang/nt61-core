@@ -74,8 +74,8 @@ pub unsafe fn init_shadow_services() {
     // Argument sizes are 64-bit slots on every supported 64-bit ISA.
     // Counts above four were checked against W32pArgumentTable in the
     // supplied SP1 win32k.sys (encoded as four bytes per stack argument).
-    // Smaller counts use ReactOS w32ksvc64.h signatures; its syscall order
-    // is Windows 2003 and must never be used for Windows 7 numbering.
+    // Exact arities are also checked against the original WOW64 user32/gdi32
+    // stubs. WOW64 uses AMD64 indices; native x86 uses its separate CSV table.
     macro_rules! register {
         ($name:literal, $handler:ident, $arguments:literal) => {
             if let Some(number) = nt61_abi::syscalls::win32k_number($name) {
@@ -85,6 +85,9 @@ pub unsafe fn init_shadow_services() {
                     nt61_abi::syscall_metadata::WIN32K_STACK_ARGUMENTS[index],
                     "win32k argument count differs from the original W32pArgumentTable"
                 );
+                let exact = nt61_abi::syscall_metadata::WIN32K_ARGUMENTS[index];
+                assert!(exact == 255 || exact == $arguments,
+                    "win32k argument count differs from the original WOW64 stub");
                 register_shadow_service(
                     index as u32,
                     syscall::$handler as *const (),
@@ -94,6 +97,120 @@ pub unsafe fn init_shadow_services() {
         };
     }
 
+    register!("NtUserSetLayeredWindowAttributes", nt_user_set_layered_window_attributes, 4);
+    register!("NtUserGetLayeredWindowAttributes", nt_user_get_layered_window_attributes, 4);
+    register!("NtUserGetWindowDisplayAffinity", nt_user_get_window_display_affinity, 2);
+    register!("NtUserSetWindowDisplayAffinity", nt_user_set_window_display_affinity, 2);
+    register!("NtUserGetTopLevelWindow", nt_user_get_top_level_window, 1);
+    register!("NtUserIsTopLevelWindow", nt_user_is_top_level_window, 1);
+    register!("NtUserGetWindowMinimizeRect", nt_user_get_window_minimize_rect, 2);
+    register!("NtUserInternalGetWindowIcon", nt_user_internal_get_window_icon, 2);
+    register!("NtUserSetChildWindowNoActivate", nt_user_set_child_window_no_activate, 1);
+    register!("NtUserSetProcessDPIAware", nt_user_set_process_dpi_aware, 0);
+    register!("NtUserSetShellWindowEx", nt_user_set_shell_window_ex, 2);
+    register!("NtUserNotifyIMEStatus", nt_user_notify_ime_status, 3);
+    register!("NtUserGetWindowRgnEx", nt_user_get_window_rgn_ex, 3);
+    register!("NtUserSetWindowRgnEx", nt_user_set_window_rgn_ex, 3);
+    register!("NtUserIsTouchWindow", nt_user_is_touch_window, 2);
+    register!("NtUserModifyWindowTouchCapability", nt_user_modify_window_touch_capability, 3);
+    register!("NtUserSetGestureConfig", nt_user_set_gesture_config, 5);
+    register!("NtUserGetGestureConfig", nt_user_get_gesture_config, 6);
+    register!("NtGdiSetBitmapAttributes", nt_gdi_set_bitmap_attributes, 2);
+    register!("NtGdiClearBitmapAttributes", nt_gdi_clear_bitmap_attributes, 2);
+    register!("NtGdiSetBrushAttributes", nt_gdi_set_brush_attributes, 2);
+    register!("NtGdiClearBrushAttributes", nt_gdi_clear_brush_attributes, 2);
+    register!("NtGdiGetObjectBitmapHandle", nt_gdi_get_object_bitmap_handle, 2);
+    register!("NtGdiDescribePixelFormat", nt_gdi_describe_pixel_format, 4);
+    register!("NtGdiSetPixelFormat", nt_gdi_set_pixel_format, 2);
+    register!("NtGdiSwapBuffers", nt_gdi_swap_buffers, 1);
+    register!("NtGdiUpdateColors", nt_gdi_update_colors, 1);
+    register!("NtGdiAnyLinkedFonts", nt_gdi_any_linked_fonts, 0);
+    register!("NtGdiFontIsLinked", nt_gdi_font_is_linked, 1);
+    register!("NtGdiQueryFontAssocInfo", nt_gdi_query_font_assoc_info, 1);
+    register!("NtUserClipCursor", nt_user_clip_cursor, 1);
+    register!("NtUserGetClipCursor", nt_user_get_clip_cursor, 1);
+    register!("NtUserGetMouseMovePointsEx", nt_user_get_mouse_move_points_ex, 5);
+    register!("NtUserBlockInput", nt_user_block_input, 1);
+    register!("NtUserGetKeyboardLayoutName", nt_user_get_keyboard_layout_name, 1);
+    register!("NtUserUnloadKeyboardLayout", nt_user_unload_keyboard_layout, 1);
+    register!("NtUserGetKeyNameText", nt_user_get_key_name_text, 3);
+    register!("NtUserGetThreadState", nt_user_get_thread_state, 1);
+    register!("NtUserGetCaretPos", nt_user_get_caret_pos, 1);
+    register!("NtUserRegisterRawInputDevices", nt_user_register_raw_input_devices, 3);
+    register!("NtUserGetRegisteredRawInputDevices", nt_user_get_registered_raw_input_devices, 3);
+    register!("NtUserGetRawInputDeviceList", nt_user_get_raw_input_device_list, 3);
+    register!("NtUserGetRawInputDeviceInfo", nt_user_get_raw_input_device_info, 4);
+    register!("NtUserGetRawInputData", nt_user_get_raw_input_data, 5);
+    register!("NtUserGetRawInputBuffer", nt_user_get_raw_input_buffer, 3);
+    register!("NtUserGetDisplayConfigBufferSizes", nt_user_get_display_config_buffer_sizes, 3);
+    register!("NtUserQueryDisplayConfig", nt_user_query_display_config, 6);
+    register!("NtUserDisplayConfigGetDeviceInfo", nt_user_display_config_get_device_info, 1);
+    register!("NtGdiCreateColorSpace", nt_gdi_create_color_space, 1);
+    register!("NtGdiDeleteColorSpace", nt_gdi_delete_color_space, 1);
+    register!("NtGdiSetColorSpace", nt_gdi_set_color_space, 2);
+    register!("NtGdiSetIcmMode", nt_gdi_set_icm_mode, 3);
+    register!("NtUserCheckDesktopByThreadId", nt_user_check_desktop_by_thread_id, 1);
+    register!("NtUserCheckWindowThreadDesktop", nt_user_check_window_thread_desktop, 2);
+    register!("NtUserOpenInputDesktop", nt_user_open_input_desktop, 3);
+    register!("NtUserSwitchDesktop", nt_user_switch_desktop, 2);
+    register!("NtUserGetWindowCompositionAttribute", nt_user_get_window_composition_attribute, 2);
+    register!("NtUserSetWindowCompositionAttribute", nt_user_set_window_composition_attribute, 2);
+    register!("NtUserCalculatePopupWindowPosition", nt_user_calculate_popup_window_position, 5);
+    register!("NtUserGetGuiResources", nt_user_get_gui_resources, 2);
+    register!("NtUserSetMenuFlagRtoL", nt_user_set_menu_flag_rto_l, 1);
+    register!("NtUserLogicalToPhysicalPoint", nt_user_logical_to_physical_point, 2);
+    register!("NtUserPhysicalToLogicalPoint", nt_user_physical_to_logical_point, 2);
+    register!("NtUserGetMenuIndex", nt_user_get_menu_index, 2);
+    register!("NtUserSetMenuContextHelpId", nt_user_set_menu_context_help_id, 2);
+    register!("NtUserHiliteMenuItem", nt_user_hilite_menu_item, 4);
+    register!("NtGdiFlush", nt_gdi_flush, 0);
+    register!("NtUserAddClipboardFormatListener", nt_user_add_clipboard_format_listener, 1);
+    register!("NtUserRemoveClipboardFormatListener", nt_user_remove_clipboard_format_listener, 1);
+    register!("NtUserGetClipboardViewer", nt_user_get_clipboard_viewer, 0);
+    register!("NtUserSetClassLongPtr", nt_user_set_class_long_ptr, 4);
+    register!("NtUserSetClassWord", nt_user_set_class_word, 3);
+    register!("NtUserCreateInputContext", nt_user_create_input_context, 1);
+    register!("NtUserDestroyInputContext", nt_user_destroy_input_context, 1);
+    register!("NtUserQueryInputContext", nt_user_query_input_context, 2);
+    register!("NtUserUpdateInputContext", nt_user_update_input_context, 3);
+    register!("NtUserBuildHimcList", nt_user_build_himc_list, 4);
+    register!("NtUserAssociateInputContext", nt_user_associate_input_context, 3);
+    register!("NtUserGetAppImeLevel", nt_user_get_app_ime_level, 1);
+    register!("NtUserSetAppImeLevel", nt_user_set_app_ime_level, 2);
+    register!("NtUserDisableThreadIme", nt_user_disable_thread_ime, 1);
+    register!("NtUserBuildPropList", nt_user_build_prop_list, 4);
+    register!("NtUserSetWindowLongPtr", nt_user_set_window_long_ptr, 4);
+    register!("NtUserGetInternalWindowPos", nt_user_get_internal_window_pos, 3);
+    register!("NtUserSetInternalWindowPos", nt_user_set_internal_window_pos, 4);
+    register!("NtUserWindowFromPhysicalPoint", nt_user_window_from_physical_point, 2);
+    register!("NtGdiGetStockObject", nt_gdi_get_stock_object, 1);
+    register!("NtGdiMonoBitmap", nt_gdi_mono_bitmap, 1);
+    register!("NtGdiGetRealizationInfo", nt_gdi_get_realization_info, 2);
+    register!("NtGdiGetFontFileData", nt_gdi_get_font_file_data, 5);
+    register!("NtGdiGetFontFileInfo", nt_gdi_get_font_file_info, 5);
+    register!("NtGdiPolyTextOutW", nt_gdi_poly_text_out, 4);
+    register!("NtGdiGetGlyphOutline", nt_gdi_get_glyph_outline, 8);
+    register!("NtGdiSetTextJustification", nt_gdi_set_text_justification, 3);
+    register!("NtGdiGetFontData", nt_gdi_get_font_data, 5);
+    register!("NtGdiGetCharWidthInfo", nt_gdi_get_char_width_info, 2);
+    register!("NtGdiGetKerningPairs", nt_gdi_get_kerning_pairs, 3);
+    register!("NtGdiGetRasterizerCaps", nt_gdi_get_rasterizer_caps, 2);
+    register!("NtGdiGetFontUnicodeRanges", nt_gdi_get_font_unicode_ranges, 2);
+    register!("NtGdiGetGlyphIndicesW", nt_gdi_get_glyph_indices_w, 5);
+    register!("NtGdiGetGlyphIndicesWInternal", nt_gdi_get_glyph_indices_w_internal, 6);
+    register!("NtGdiGetCharWidthW", nt_gdi_get_char_width_w, 6);
+    register!("NtGdiGetCharABCWidthsW", nt_gdi_get_char_abc_widths_w, 6);
+    register!("NtGdiGetTextExtentExW", nt_gdi_get_text_extent_ex_w, 8);
+    register!("NtGdiGetDeviceCaps", nt_gdi_get_device_caps, 2);
+    register!("NtGdiGetDeviceCapsAll", nt_gdi_get_device_caps_all, 2);
+    register!("NtGdiGetNearestPaletteIndex", nt_gdi_get_nearest_palette_index, 2);
+    register!("NtGdiResizePalette", nt_gdi_resize_palette, 2);
+    register!("NtGdiGetSystemPaletteUse", nt_gdi_get_system_palette_use, 1);
+    register!("NtGdiSetSystemPaletteUse", nt_gdi_set_system_palette_use, 2);
+    register!("NtGdiCreateHalftonePalette", nt_gdi_create_halftone_palette, 1);
+    register!("NtGdiSetVirtualResolution", nt_gdi_set_virtual_resolution, 5);
+    register!("NtGdiCreateEllipticRgn", nt_gdi_create_elliptic_rgn, 4);
+    register!("NtGdiCreateRoundRectRgn", nt_gdi_create_round_rect_rgn, 6);
     register!("NtGdiIntersectClipRect", nt_gdi_intersect_clip_rect, 5);
     register!("NtGdiExtSelectClipRgn", nt_gdi_ext_select_clip_rgn, 3);
     register!("NtGdiOffsetClipRgn", nt_gdi_offset_clip_rgn, 3);
@@ -314,9 +431,17 @@ pub unsafe fn init_shadow_services() {
         nt_gdi_stretch_dibits_internal,
         16
     );
+    register!(
+        "NtGdiSetDIBitsToDeviceInternal",
+        nt_gdi_set_dibits_to_device_internal,
+        16
+    );
     register!("NtUserSendInput", nt_user_send_input, 3);
-    register!("NtUserGetThreadDesktop", nt_user_get_thread_desktop, 2);
+    register!("NtUserGetThreadDesktop", nt_user_get_thread_desktop, 1);
     register!("NtGdiCreateRectRgn", nt_gdi_create_rect_rgn, 4);
+    register!("NtGdiCreateHatchBrushInternal", nt_gdi_create_hatch_brush_internal, 3);
+    register!("NtGdiGetColorAdjustment", nt_gdi_get_color_adjustment, 2);
+    register!("NtGdiSetColorAdjustment", nt_gdi_set_color_adjustment, 2);
     register!("NtGdiGetDIBitsInternal", nt_gdi_get_dibits_internal, 9);
     register!("NtUserGetUpdateRgn", nt_user_get_update_rgn, 3);
     register!("NtGdiDeleteClientObj", nt_gdi_delete_client_obj, 1);
@@ -337,6 +462,12 @@ pub unsafe fn init_shadow_services() {
     register!("NtGdiUnrealizeObject", nt_gdi_unrealize_object, 1);
     register!("NtUserGetTitleBarInfo", nt_user_get_title_bar_info, 2);
     register!("NtGdiRectangle", nt_gdi_rectangle, 5);
+    register!("NtGdiEllipse", nt_gdi_ellipse, 5);
+    register!("NtGdiGetBoundsRect", nt_gdi_get_bounds_rect, 3);
+    register!("NtGdiSetBoundsRect", nt_gdi_set_bounds_rect, 3);
+    register!("NtGdiRoundRect", nt_gdi_round_rect, 7);
+    register!("NtGdiArcInternal", nt_gdi_arc_internal, 10);
+    register!("NtGdiAngleArc", nt_gdi_angle_arc, 6);
     register!("NtUserSetThreadDesktop", nt_user_set_thread_desktop, 1);
     register!("NtUserGetDCEx", nt_user_get_dcex, 3);
     register!("NtUserGetScrollBarInfo", nt_user_get_scroll_bar_info, 3);
@@ -395,6 +526,8 @@ pub unsafe fn init_shadow_services() {
         3
     );
     register!("NtUserGetAncestor", nt_user_get_ancestor, 2);
+    register!("NtUserChildWindowFromPointEx", nt_user_child_window_from_point_ex, 4);
+    register!("NtUserRealChildWindowFromPoint", nt_user_real_child_window_from_point, 3);
     register!(
         "NtGdiGetOutlineTextMetricsInternalW",
         nt_gdi_get_outline_text_metrics_internal_w,
@@ -425,6 +558,11 @@ pub unsafe fn init_shadow_services() {
     register!("NtUserEnableMenuItem", nt_user_enable_menu_item, 3);
     register!("NtUserAlterWindowStyle", nt_user_alter_window_style, 3);
     register!("NtGdiFillRgn", nt_gdi_fill_rgn, 3);
+    register!("NtGdiFrameRgn", nt_gdi_frame_rgn, 5);
+    register!("NtGdiTransparentBlt", nt_gdi_transparent_blt, 11);
+    register!("NtGdiPlgBlt", nt_gdi_plg_blt, 11);
+    register!("NtGdiGradientFill", nt_gdi_gradient_fill, 6);
+    register!("NtGdiExtFloodFill", nt_gdi_ext_flood_fill, 5);
     register!("NtUserGetWindowPlacement", nt_user_get_window_placement, 2);
     register!(
         "NtGdiModifyWorldTransform",
@@ -479,8 +617,10 @@ pub unsafe fn init_shadow_services() {
     register!("NtUserGetCursorFrameInfo", nt_user_get_cursor_frame_info, 4);
     register!("NtUserGetAltTabInfo", nt_user_get_alt_tab_info, 6);
     register!("NtUserGetCaretBlinkTime", nt_user_get_caret_blink_time, 0);
-    register!("NtUserProcessConnect", nt_user_process_connect, 3);
+    register!("NtUserProcessConnect", nt_user_process_connect, 2);
     register!("NtUserEnumDisplayDevices", nt_user_enum_display_devices, 4);
+    register!("NtUserGetPriorityClipboardFormat", nt_user_get_priority_clipboard_format, 2);
+    register!("NtUserGetUpdatedClipboardFormats", nt_user_get_updated_clipboard_formats, 3);
     register!("NtUserEmptyClipboard", nt_user_empty_clipboard, 0);
     register!("NtUserGetClipboardData", nt_user_get_clipboard_data, 2);
     register!("NtUserRemoveMenu", nt_user_remove_menu, 3);

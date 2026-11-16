@@ -58,9 +58,11 @@ pub mod clipboard;
 pub mod clipping;
 pub mod dc;
 pub mod gdi_ops;
+pub mod font_services;
 pub mod message;
 pub mod objects;
 pub mod paint;
+pub mod palette;
 pub mod path;
 pub mod polygon;
 pub mod raster;
@@ -203,7 +205,7 @@ impl DCState {
             background_color: 0x00FFFFFF, // White
             text_color: 0x00000000,       // Black
             rop_mode: 0xCC,               // SRCCOPY
-            stretch_mode: 0,              // BLACKONWHITE
+            stretch_mode: 1,              // BLACKONWHITE
         }
     }
 }
@@ -2545,3 +2547,13 @@ pub fn timer_dpc_callback(context: *mut u8) {
         }
     }
 }
+
+pub mod input_services;
+
+pub mod raw_input;
+
+pub mod display_config;
+
+pub mod color_space;
+
+pub mod resources;

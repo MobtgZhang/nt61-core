@@ -2012,6 +2012,9 @@ pub fn process_exit(exit_code: u32) -> ! {
         }
     }
     if exit_pid != 0 {
+        crate::libs::ntdll::timer_resolution::process_exit(exit_pid);
+        crate::libs::win32k::raw_input::release_process(exit_pid);
+        crate::libs::win32k::window::session_services::release_process(exit_pid);
         crate::ps::job::remove_process_from_all_jobs(exit_pid);
         // Tear down the address space and resources.
         let process = get_by_pid(exit_pid);
@@ -2164,6 +2167,9 @@ pub fn terminate_process(pid: u64, exit_code: i32) -> bool {
         return false;
     };
     crate::ps::job::remove_process_from_all_jobs(pid);
+    crate::libs::ntdll::timer_resolution::process_exit(pid);
+    crate::libs::win32k::raw_input::release_process(pid);
+    crate::libs::win32k::window::session_services::release_process(pid);
     unsafe {
         process.exit_status = exit_code;
         process.exit_time = crate::hal::common::pit::get_system_time_ms();
@@ -2734,4 +2740,22 @@ pub unsafe fn build_process_security_descriptor(
     process: *mut Eprocess,
 ) -> *const crate::se::seaccess::SecurityDescriptor {
     unsafe { crate::se::seaccess::build_process_security_descriptor(process) }
+}
+
+/// Resolve the process queried by NtUserGetGuiResources. Preserve the process
+/// handle's access check under the native object-table lock.
+pub fn gui_resource_process(handle: u64) -> Option<u64> {
+    if handle == u64::MAX {
+        let thread = super::thread::get_current_ethread();
+        if thread.is_null() { return None; }
+        // SAFETY: the running thread remains alive for this syscall.
+        return Some(unsafe { (*thread).client_id.unique_process });
+    }
+    crate::libs::ntdll::file::with_sync_access(handle as *mut core::ffi::c_void, 0x400, |entries| {
+        let entry = &entries[0];
+        if entry.kind != crate::libs::ntdll::file::HandleKind::Process {
+            return Err(0xc0000024u32 as i32);
+        }
+        Ok(entry.target)
+    }).ok()
 }

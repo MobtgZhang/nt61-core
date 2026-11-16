@@ -1529,6 +1529,10 @@ pub unsafe fn terminate(thread: *mut Ethread, _exit_code: u32) {
         (*thread).exit_time = crate::ke::time::get_system_time() as i64;
         crate::libs::ntdll::file::terminate_user_alert(&(*thread).user_alert);
         crate::libs::ntdll::file::abandon_mutants((*thread).client_id.unique_thread);
+        crate::libs::win32k::input_services::release_thread((*thread).client_id.unique_thread);
+        crate::libs::win32k::window::session_services::release_thread((*thread).client_id.unique_thread);
+        crate::libs::win32k::message::release_thread((*thread).client_id.unique_thread);
+        crate::libs::win32k::raw_input::release_thread((*thread).client_id.unique_thread);
         (*thread).kthread.state = KThreadState::Terminated;
         (*thread).kthread.header.signal_state = 1;
 
@@ -1742,6 +1746,10 @@ pub unsafe fn ps_terminate_system_thread(ethread: *mut Ethread, _exit_code: u32)
         (*ethread).exit_time = crate::ke::time::get_system_time() as i64;
         crate::libs::ntdll::file::terminate_user_alert(&(*ethread).user_alert);
         crate::libs::ntdll::file::abandon_mutants((*ethread).client_id.unique_thread);
+        crate::libs::win32k::input_services::release_thread((*ethread).client_id.unique_thread);
+        crate::libs::win32k::window::session_services::release_thread((*ethread).client_id.unique_thread);
+        crate::libs::win32k::message::release_thread((*ethread).client_id.unique_thread);
+        crate::libs::win32k::raw_input::release_thread((*ethread).client_id.unique_thread);
         (*ethread).kthread.state = KThreadState::Terminated;
         (*ethread).kthread.header.signal_state = 1;
         crate::ke::scheduler::remove_ready(ethread);
