@@ -314,12 +314,17 @@ fn check_access_with_granted(
             break;
         }
 
-        let ace_mask = u32::from_le_bytes([
+        let mut ace_mask = u32::from_le_bytes([
             acl.data[offset + 4],
             acl.data[offset + 5],
             acl.data[offset + 6],
             acl.data[offset + 7],
         ]);
+        // Default descriptors retain generic ACE masks. Resolve them with
+        // the same object mapping used for the requested rights.
+        if let Some(mapping) = generic_mapping {
+            mapping.map_generic(&mut ace_mask);
+        }
         let sid_offset = offset + 8;
         if ace_size < 16 {
             return (AccessCheckResult::Denied, 0);
@@ -413,10 +418,10 @@ pub static FILE_GENERIC_MAPPING: GenericMapping = GenericMapping::new(
 
 /// Generic registry mapping.
 pub static REGISTRY_GENERIC_MAPPING: GenericMapping = GenericMapping::new(
-    0x00020000 | 0x0001 | 0x0002 | 0x0004 | 0x0008 | 0x0010, // KEY_READ etc.
-    0x00020000 | 0x0002 | 0x0004 | 0x0010 | 0x0020,          // KEY_WRITE etc.
-    0x00020000 | 0x0004 | 0x0008,                            // KEY_EXECUTE
-    0xF003F,                                                 // KEY_ALL_ACCESS
+    0x0002_0019, // KEY_READ: query values, enumerate subkeys, notify
+    0x0002_0006, // KEY_WRITE: set values and create subkeys
+    0x0002_0019, // KEY_EXECUTE equals KEY_READ (without SYNCHRONIZE)
+    0x000f_003f, // KEY_ALL_ACCESS
 );
 
 /// Generic process mapping.
@@ -1027,5 +1032,68 @@ mod tests {
         assert_eq!(result, AccessCheckResult::Allowed);
         assert_eq!(granted & ACCESS_MAXIMUM_ALLOWED, 0);
         assert_ne!(granted, 0);
+    }
+    #[test]
+    fn generic_ace_masks_apply_to_allow_deny_and_maximum_allowed() {
+        use super::{
+            check_access_with_granted, ACCESS_GENERIC_ALL, ACCESS_GENERIC_READ,
+            REGISTRY_GENERIC_MAPPING,
+        };
+        use crate::se::acl::AceFlags;
+        let token = Token::new_primary(sid::well_known(WellKnownSid::Users));
+        let mut acl = Acl::new();
+        assert!(acl.add_access_allowed(&token.user, ACCESS_GENERIC_READ, AceFlags::NONE));
+        assert_eq!(
+            check_access(
+                1,
+                &token,
+                &token.user,
+                &acl,
+                Some(&REGISTRY_GENERIC_MAPPING)
+            ),
+            AccessCheckResult::Allowed
+        );
+        assert_eq!(
+            check_access(
+                2,
+                &token,
+                &token.user,
+                &acl,
+                Some(&REGISTRY_GENERIC_MAPPING)
+            ),
+            AccessCheckResult::Denied
+        );
+        let (result, granted) = check_access_with_granted(
+            ACCESS_MAXIMUM_ALLOWED,
+            &token,
+            &token.user,
+            &acl,
+            Some(&REGISTRY_GENERIC_MAPPING),
+        );
+        assert_eq!(result, AccessCheckResult::Allowed);
+        assert_eq!(granted, REGISTRY_GENERIC_MAPPING.generic_read);
+        let mut denied = Acl::new();
+        assert!(denied.add_access_denied(&token.user, ACCESS_GENERIC_READ, AceFlags::NONE));
+        assert!(denied.add_access_allowed(&token.user, ACCESS_GENERIC_ALL, AceFlags::NONE));
+        assert_eq!(
+            check_access(
+                1,
+                &token,
+                &token.user,
+                &denied,
+                Some(&REGISTRY_GENERIC_MAPPING)
+            ),
+            AccessCheckResult::Denied
+        );
+        assert_eq!(
+            check_access(
+                2,
+                &token,
+                &token.user,
+                &denied,
+                Some(&REGISTRY_GENERIC_MAPPING)
+            ),
+            AccessCheckResult::Allowed
+        );
     }
 }

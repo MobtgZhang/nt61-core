@@ -201,6 +201,7 @@ pub unsafe fn se_token_is_restricted(token: *const Token) -> bool {
 
 pub use self::adjust::{se_adjust_groups_token, se_adjust_privileges_token};
 
+#[path = "tokenmgmt/adjust.rs"]
 mod adjust;
 
 /// # Safety
