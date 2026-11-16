@@ -37,8 +37,8 @@ impl DisplayMetrics {
     }
 }
 
-fn logical_extent(micrometers: i32, mode: i32) -> i32 {
-    let value = i64::from(micrometers);
+fn logical_extent(micrometers: i64, mode: i32) -> i32 {
+    let value = micrometers;
     let (numerator, denominator) = match mode {
         MM_LOMETRIC | MM_ISOTROPIC => (1, 100),
         MM_HIMETRIC => (1, 10),
@@ -47,7 +47,7 @@ fn logical_extent(micrometers: i32, mode: i32) -> i32 {
         MM_TWIPS => (144, 2540),
         _ => return 1,
     };
-    ((value * numerator + denominator / 2) / denominator).max(1) as i32
+    ((value * numerator + denominator / 2) / denominator).clamp(1, i64::from(i32::MAX)) as i32
 }
 
 pub(super) fn set_map_mode(dc: &mut DcObject, mode: i32) -> i32 {
@@ -66,10 +66,17 @@ pub(super) fn set_map_mode(dc: &mut DcObject, mode: i32) -> i32 {
         MM_ANISOTROPIC => {}
         _ => {
             let metrics = DisplayMetrics::current();
-            dc.viewport_ext = SizeL::new(metrics.pixels.cx, -metrics.pixels.cy);
+            let virtual_values = dc.attributes.virtual_resolution;
+            let (pixels, micrometers) = if virtual_values == [0; 4] {
+                (metrics.pixels, [i64::from(metrics.micrometers.cx), i64::from(metrics.micrometers.cy)])
+            } else {
+                (SizeL::new(virtual_values[0] as i32, virtual_values[1] as i32),
+                    [i64::from(virtual_values[2]) * 1000, i64::from(virtual_values[3]) * 1000])
+            };
+            dc.viewport_ext = SizeL::new(pixels.cx, pixels.cy.wrapping_neg());
             dc.window_ext = SizeL::new(
-                logical_extent(metrics.micrometers.cx, mode),
-                logical_extent(metrics.micrometers.cy, mode),
+                logical_extent(micrometers[0], mode),
+                logical_extent(micrometers[1], mode),
             );
         }
     }

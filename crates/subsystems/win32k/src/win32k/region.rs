@@ -7,6 +7,8 @@ pub use super::region_geometry::{RegionCombineMode, RegionType};
 
 #[path = "region/services.rs"]
 pub mod services;
+#[path = "region/curves.rs"]
+mod curves;
 
 pub(super) fn replace_geometry(handle: u64, geometry: Region) -> bool {
     objects::with_handle_table(|table| {
@@ -37,10 +39,7 @@ pub fn gre_create_rect_rgn_indirect(rect: &Rect) -> u64 {
 }
 
 pub fn gre_delete_region(handle: u64) -> bool {
-    if objects::gdi_get_object_type(handle) != Some(GdiObjectType::Region) {
-        return false;
-    }
-    objects::gdi_delete_object(handle)
+    objects::delete_object_checked(handle, Some(GdiObjectType::Region))
 }
 
 pub fn rect_contains(outer: &Rect, inner: &Rect) -> bool {

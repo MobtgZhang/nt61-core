@@ -7,6 +7,81 @@ use super::{get_dc, DC_TYPE_MEMORY};
 use crate::arch::common::syscall_frame::SyscallFrame;
 use crate::mm::user_copy;
 
+/// The public COLORADJUSTMENT ABI is twelve two-byte fields on every ISA.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColorAdjustment {
+    pub size: u16,
+    pub flags: u16,
+    pub illuminant: u16,
+    pub red_gamma: u16,
+    pub green_gamma: u16,
+    pub blue_gamma: u16,
+    pub reference_black: u16,
+    pub reference_white: u16,
+    pub contrast: i16,
+    pub brightness: i16,
+    pub colorfulness: i16,
+    pub red_green_tint: i16,
+}
+
+impl Default for ColorAdjustment {
+    fn default() -> Self {
+        Self {
+            size: 24,
+            flags: 0,
+            illuminant: 0,
+            red_gamma: 10_000,
+            green_gamma: 10_000,
+            blue_gamma: 10_000,
+            reference_black: 0,
+            reference_white: 10_000,
+            contrast: 0,
+            brightness: 0,
+            colorfulness: 0,
+            red_green_tint: 0,
+        }
+    }
+}
+
+impl ColorAdjustment {
+    fn valid(self) -> bool {
+        self.size == 24 && self.flags & !3 == 0 && self.illuminant <= 8
+            && [self.red_gamma, self.green_gamma, self.blue_gamma]
+                .iter().all(|value| (2500..=65_000).contains(value))
+            && self.reference_black <= 4000
+            && (6000..=10_000).contains(&self.reference_white)
+            && [self.contrast, self.brightness, self.colorfulness, self.red_green_tint]
+                .iter().all(|value| (-100..=100).contains(value))
+    }
+}
+
+pub extern "C" fn nt_gdi_get_color_adjustment(frame: &SyscallFrame) -> u64 {
+    let Some(dc) = get_dc(frame.args[0]) else { return 0 };
+    user_copy::write_user_object(frame.args[1], &dc.attributes.color_adjustment).is_ok() as u64
+}
+
+pub extern "C" fn nt_gdi_set_color_adjustment(frame: &SyscallFrame) -> u64 {
+    let Ok(value) = user_copy::read_user_object::<ColorAdjustment>(frame.args[1]) else {
+        return 0;
+    };
+    if !value.valid() { return 0; }
+    let Some(mut dc) = get_dc(frame.args[0]) else { return 0 };
+    dc.attributes.color_adjustment = value;
+    1
+}
+
+/// Override the physical metrics used when establishing a mapping mode.
+pub extern "C" fn nt_gdi_set_virtual_resolution(frame: &SyscallFrame) -> u64 {
+    let values: [u32; 4] = core::array::from_fn(|index| frame.args[index + 1] as u32);
+    if values.contains(&0) && values != [0; 4] {
+        return 0;
+    }
+    let Some(mut dc) = get_dc(frame.args[0]) else { return 0 };
+    dc.attributes.virtual_resolution = values;
+    1
+}
+
 /// Brush origins use device coordinates and belong to the saved drawing state.
 pub extern "C" fn nt_gdi_set_brush_org(frame: &SyscallFrame) -> u64 {
     let Some(mut dc) = get_dc(frame.args[0]) else {

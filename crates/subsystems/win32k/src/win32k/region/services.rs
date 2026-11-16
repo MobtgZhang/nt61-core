@@ -25,6 +25,21 @@ pub extern "C" fn nt_gdi_create_rect_rgn(frame: &SyscallFrame) -> u64 {
     super::gre_create_rect_rgn_indirect(&rect)
 }
 
+pub extern "C" fn nt_gdi_create_round_rect_rgn(frame: &SyscallFrame) -> u64 {
+    let bounds = rectangle_arguments(frame, 0);
+    let diameter = [i64::from(frame.args[4] as i32), i64::from(frame.args[5] as i32)];
+    super::curves::rounded(bounds, diameter).map(objects::gdi_create_region).unwrap_or(0)
+}
+
+pub extern "C" fn nt_gdi_create_elliptic_rgn(frame: &SyscallFrame) -> u64 {
+    let bounds = rectangle_arguments(frame, 0);
+    let diameter = [
+        (i64::from(bounds.right) - i64::from(bounds.left)).abs(),
+        (i64::from(bounds.bottom) - i64::from(bounds.top)).abs(),
+    ];
+    super::curves::rounded(bounds, diameter).map(objects::gdi_create_region).unwrap_or(0)
+}
+
 pub extern "C" fn nt_gdi_combine_rgn(frame: &SyscallFrame) -> u64 {
     let Some(mode) = RegionCombineMode::from_raw(frame.args[3] as i32) else {
         return 0;

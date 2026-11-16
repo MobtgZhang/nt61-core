@@ -107,16 +107,24 @@ impl Region {
         Self::sweep(rects, &[], RegionCombineMode::Copy)
     }
 
-    /// Scan converters produce sorted, disjoint spans, one row at a time.
+    /// Scan converters produce sorted, disjoint spans with one-pixel height.
     /// Canonicalize those directly instead of running a quadratic Boolean sweep.
     pub(super) fn from_scanlines(rows: &[Rect]) -> Result<Self, RegionError> {
+        if rows.iter().any(|row| row.top.checked_add(1) != Some(row.bottom)) {
+            return Err(RegionError::InvalidData);
+        }
+        Self::from_bands(rows)
+    }
+
+    /// Canonicalize ordered, nonoverlapping horizontal bands.
+    pub(super) fn from_bands(rows: &[Rect]) -> Result<Self, RegionError> {
         let mut result = Self::default();
         let mut previous_start = 0;
         let mut previous_count = 0;
         let mut index = 0;
         while index < rows.len() {
             let first = rows[index];
-            if !valid_rect(&first) || first.is_empty() || first.bottom != first.top + 1 {
+            if !valid_rect(&first) || first.is_empty() {
                 return Err(RegionError::InvalidData);
             }
             if index > 0 && rows[index - 1].bottom > first.top {
@@ -167,6 +175,40 @@ impl Region {
 
     pub fn rectangles(&self) -> &[Rect] {
         &self.rects
+    }
+
+    /// Subtract the interior remaining after a rectangular erosion. Diagonal
+    /// translations preserve the corner behavior of the NT region frame.
+    pub(super) fn frame(&self, width: i32, height: i32) -> Result<Self, RegionError> {
+        let width = i64::from(width).abs();
+        let height = i64::from(height).abs();
+        if width > i64::from(MAX_COORD) || height > i64::from(MAX_COORD) {
+            return Err(RegionError::InvalidCoordinate);
+        }
+        if self.rects.is_empty() {
+            return Err(RegionError::InvalidData);
+        }
+        let (width, height) = (width as i32, height as i32);
+        if self.rects.len() == 1 {
+            let bounds = self.bounds();
+            if i64::from(bounds.width()) <= 2 * i64::from(width)
+                || i64::from(bounds.height()) <= 2 * i64::from(height)
+            {
+                return self.try_clone();
+            }
+            let inner = Self::rectangle(Rect::new(
+                bounds.left + width, bounds.top + height,
+                bounds.right - width, bounds.bottom - height,
+            ))?;
+            return self.combine(&inner, RegionCombineMode::Difference);
+        }
+        let mut inner = self.try_clone()?;
+        for (dx, dy) in [(width, height), (-width, height), (-width, -height), (width, -height)] {
+            let mut shifted = self.try_clone()?;
+            shifted.offset(dx, dy)?;
+            inner = inner.combine(&shifted, RegionCombineMode::Intersection)?;
+        }
+        self.combine(&inner, RegionCombineMode::Difference)
     }
 
     pub fn complexity(&self) -> i32 {

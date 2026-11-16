@@ -27,16 +27,6 @@
 //! | `HANDLE_INDEX_MASK` | 0xFFFF | Mask to extract index from handle |
 //! | `HANDLE_TYPE_MASK` | 0xFFFF0000 | Mask to extract type from handle |
 //
-//! | Stock Object | handle | Description |
-//! |--------------|--------|-------------|
-//! | `STOCK_OBJECT_BLACK_BRUSH` | 0x40000004 | Black brush |
-//! | `STOCK_OBJECT_WHITE_BRUSH` | 0x40000005 | White brush |
-//! | `STOCK_OBJECT_HOLLOW_BRUSH` | 0x40000006 | Hollow brush (NULL_BRUSH) |
-//! | `STOCK_OBJECT_BLACK_PEN` | 0x40000007 | Black pen |
-//! | `STOCK_OBJECT_WHITE_PEN` | 0x40000008 | White pen |
-//! | `STOCK_OBJECT_NULL_PEN` | 0x40000009 | Null pen |
-//! | `STOCK_OBJECT_SYSTEM_FONT` | 0x4000000A | System font |
-//
 //! Reference: ReactOS win32ss/gdi/gdiobj, Geoff Chappell
 
 extern crate alloc;
@@ -59,6 +49,7 @@ pub enum GdiObjectType {
     Metafile = 9,
     MemDC = 10,
     EnhancedMetafileDC = 11,
+    ColorSpace = 12,
 }
 
 impl GdiObjectType {
@@ -75,6 +66,7 @@ impl GdiObjectType {
             9 => Some(GdiObjectType::Metafile),
             10 => Some(GdiObjectType::MemDC),
             11 => Some(GdiObjectType::EnhancedMetafileDC),
+            12 => Some(GdiObjectType::ColorSpace),
             _ => None,
         }
     }
@@ -144,6 +136,7 @@ fn get_handle_prefix(obj_type: GdiObjectType) -> u32 {
         GdiObjectType::Metafile => HANDLE_TYPE_METAFILE,
         GdiObjectType::MemDC => HANDLE_TYPE_MEMDC,
         GdiObjectType::EnhancedMetafileDC => HANDLE_TYPE_ENHANCED_DC,
+        GdiObjectType::ColorSpace => 0x400c,
     }
 }
 
@@ -173,6 +166,14 @@ impl GdiHandleTable {
         ((get_handle_prefix(obj_type) as u64) << 16) | index as u64
     }
 
+    pub fn count_for_process(&self, process: u32) -> usize {
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|entry| entry.process_id == process && entry.flags & HANDLE_FLAG_STOCK == 0)
+            .count()
+    }
+
     /// Get a handle entry - validates both index and type prefix
     pub fn get(&self, handle: u64) -> Option<&GdiHandleEntry> {
         if handle > u32::MAX as u64 {
@@ -188,7 +189,14 @@ impl GdiHandleTable {
             let _ = &expected_prefix;
             let actual_prefix = (handle >> 16) as u32;
             let _ = &actual_prefix;
-            if actual_prefix == expected_prefix {
+            if actual_prefix
+                == (expected_prefix
+                    | if entry.flags & attributes::CONVERTED_STOCK != 0 {
+                        (attributes::STOCK_HANDLE_BIT >> 16) as u32
+                    } else {
+                        0
+                    })
+            {
                 Some(entry)
             } else {
                 // kprintln!("[win32k] handle type mismatch: expected=0x{:04x}, got=0x{:04x}",
@@ -215,7 +223,14 @@ impl GdiHandleTable {
             let _ = &expected_prefix;
             let actual_prefix = (handle >> 16) as u32;
             let _ = &actual_prefix;
-            if actual_prefix == expected_prefix {
+            if actual_prefix
+                == (expected_prefix
+                    | if entry.flags & attributes::CONVERTED_STOCK != 0 {
+                        (attributes::STOCK_HANDLE_BIT >> 16) as u32
+                    } else {
+                        0
+                    })
+            {
                 self.entries[index].as_mut()
             } else {
                 // kprintln!("[win32k] handle type mismatch: expected=0x{:04x}, got=0x{:04x}",
@@ -508,7 +523,6 @@ impl Default for GdiFont {
 
 /// Bitmap object
 #[repr(C)]
-#[derive(Clone)]
 pub struct GdiBitmap {
     pub type_: u8,
     pub uses: u8,
@@ -528,23 +542,32 @@ pub struct GdiBitmap {
 
 impl GdiBitmap {
     pub fn new(width: i32, height: i32, bit_count: u16) -> Option<Self> {
-        let width_bytes = ((width * (bit_count as i32) + 31) / 32) * 4;
-        let _ = &width_bytes;
-        let size = (width_bytes * height.abs()) as u64;
-        let _ = &size;
-
-        let bits = if size > 0 {
-            crate::mm::pool::allocate(crate::mm::pool::PoolType::NonPaged, size as usize)
-        } else {
-            core::ptr::null_mut()
-        };
+        if width <= 0 || height == 0 || !matches!(bit_count, 1 | 4 | 8 | 16 | 24 | 32) {
+            return None;
+        }
+        let rows = height.checked_abs()? as usize;
+        let row_bits = (width as usize).checked_mul(usize::from(bit_count))?;
+        let pitch = row_bits.checked_add(31)?.checked_div(32)?.checked_mul(4)?;
+        let width_bytes = i32::try_from(pitch).ok()?;
+        let allocation_size = pitch.checked_mul(rows)?;
+        // Pointer offsets must fit isize even when the dimensions fit LONG.
+        isize::try_from(allocation_size).ok()?;
+        let bits = crate::mm::pool::allocate(
+            crate::mm::pool::PoolType::NonPaged, allocation_size,
+        );
+        if bits.is_null() {
+            return None;
+        }
+        // SAFETY: the fresh, exclusively owned allocation has allocation_size
+        // bytes. Initialize padding too, before any bitmap reader can see it.
+        unsafe { bits.write_bytes(0, allocation_size); }
 
         Some(Self {
             type_: GdiObjectType::Bitmap as u8,
             uses: 0,
             flags: 0,
             palette: 0,
-            size,
+            size: allocation_size as u64,
             width,
             height,
             width_bytes,
@@ -559,6 +582,7 @@ impl GdiBitmap {
 
 impl Drop for GdiBitmap {
     fn drop(&mut self) {
+        // SAFETY: GdiBitmap exclusively owns this allocation and is not Clone.
         unsafe {
             if !self.bits.is_null() {
                 let _ = crate::mm::pool::free(self.bits);
@@ -579,7 +603,6 @@ pub struct PaletteEntry {
 
 /// Palette object
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub struct GdiPalette {
     pub type_: u8,
     pub uses: u8,
@@ -587,48 +610,45 @@ pub struct GdiPalette {
     pub palette_flags: u8,
     pub version: u16,
     pub num_entries: u32,
-    pub entries: [PaletteEntry; 256],
+    pub entries: Vec<PaletteEntry>,
 }
 
 impl GdiPalette {
-    pub fn new() -> Self {
-        let mut entries = [PaletteEntry {
-            red: 0,
-            green: 0,
-            blue: 0,
-            flags: 0,
-        }; 256];
-
-        // Initialize with standard system palette colors
-        for i in 0..16 {
-            let (r, g, b) = match i {
-                0 => (0, 0, 0),        // Black
-                1 => (128, 0, 0),      // Dark Red
-                2 => (0, 128, 0),      // Dark Green
-                3 => (128, 128, 0),    // Dark Yellow
-                4 => (0, 0, 128),      // Dark Blue
-                5 => (128, 0, 128),    // Dark Magenta
-                6 => (0, 128, 128),    // Dark Cyan
-                7 => (192, 192, 192),  // Light Gray
-                8 => (128, 128, 128),  // Dark Gray
-                9 => (255, 0, 0),      // Red
-                10 => (0, 255, 0),     // Green
-                11 => (255, 255, 0),   // Yellow
-                12 => (0, 0, 255),     // Blue
-                13 => (255, 0, 255),   // Magenta
-                14 => (0, 255, 255),   // Cyan
-                15 => (255, 255, 255), // White
-                _ => (0, 0, 0),
-            };
-            entries[i] = PaletteEntry {
-                red: r,
-                green: g,
-                blue: b,
+    pub fn try_new() -> Option<Self> {
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(20).ok()?;
+        let colors = [
+            (0, 0, 0),
+            (128, 0, 0),
+            (0, 128, 0),
+            (128, 128, 0),
+            (0, 0, 128),
+            (128, 0, 128),
+            (0, 128, 128),
+            (192, 192, 192),
+            (192, 220, 192),
+            (166, 202, 240),
+            (255, 251, 240),
+            (160, 160, 164),
+            (128, 128, 128),
+            (255, 0, 0),
+            (0, 255, 0),
+            (255, 255, 0),
+            (0, 0, 255),
+            (255, 0, 255),
+            (0, 255, 255),
+            (255, 255, 255),
+        ];
+        for (red, green, blue) in colors {
+            entries.push(PaletteEntry {
+                red,
+                green,
+                blue,
                 flags: 0,
-            };
+            });
         }
 
-        Self {
+        Some(Self {
             type_: GdiObjectType::Palette as u8,
             uses: 0,
             flags: 0,
@@ -636,13 +656,7 @@ impl GdiPalette {
             version: 0x0300,
             num_entries: 20,
             entries,
-        }
-    }
-}
-
-impl Default for GdiPalette {
-    fn default() -> Self {
-        Self::new()
+        })
     }
 }
 
@@ -792,7 +806,17 @@ pub fn gdi_create_pen(style: PenStyle, width: i32, color: u32) -> u64 {
 
     let mut handle_table = get_handle_table();
     let _ = &handle_table;
-    let handle = handle_table.allocate(GdiObjectType::Pen, pen as u64, 0);
+    let handle = handle_table.allocate(
+        GdiObjectType::Pen,
+        pen as u64,
+        super::window::input_context::caller_identity().0 as u32,
+    );
+    if handle == 0 {
+        // SAFETY: the fresh allocation was never published as a GDI object.
+        unsafe {
+            let _ = crate::mm::pool::free(pen);
+        }
+    }
     let _ = &handle;
 
     // kprintln!("[win32k] gdi_create_pen: style=0x{:x}, width={}, color=0x{:08x} -> handle=0x{:016x}",
@@ -819,7 +843,11 @@ pub fn gdi_create_solid_brush(color: u32) -> u64 {
 
     let mut handle_table = get_handle_table();
     let _ = &handle_table;
-    let handle = handle_table.allocate(GdiObjectType::Brush, brush as u64, 0);
+    let handle = handle_table.allocate(
+        GdiObjectType::Brush,
+        brush as u64,
+        super::window::input_context::caller_identity().0 as u32,
+    );
     let _ = &handle;
 
     // kprintln!("[win32k] gdi_create_solid_brush: color=0x{:08x} -> handle=0x{:016x}", color, handle);
@@ -845,20 +873,46 @@ pub fn gdi_create_hatch_brush(style: HatchStyle, color: u32) -> u64 {
     }
 
     unsafe {
-        let b = &mut *(brush as *mut GdiBrush);
-        let _ = &b;
-        *b = GdiBrush::new_hatched(style, color);
+        // SAFETY: this fresh pool allocation is aligned and not yet published.
+        brush
+            .cast::<GdiBrush>()
+            .write(GdiBrush::new_hatched(style, color));
     }
 
     let mut handle_table = get_handle_table();
     let _ = &handle_table;
-    let handle = handle_table.allocate(GdiObjectType::Brush, brush as u64, 0);
+    let handle = handle_table.allocate(
+        GdiObjectType::Brush,
+        brush as u64,
+        super::window::input_context::caller_identity().0 as u32,
+    );
+    if handle == 0 {
+        // SAFETY: the fresh allocation was never published as a GDI object.
+        unsafe {
+            let _ = crate::mm::pool::free(brush);
+        }
+    }
     let _ = &handle;
 
     // kprintln!("[win32k] gdi_create_hatch_brush: style={:?}, color=0x{:08x} -> handle=0x{:016x}",
     //               style, color, handle);
 
     handle
+}
+
+pub extern "C" fn nt_gdi_create_hatch_brush_internal(
+    frame: &crate::arch::common::syscall_frame::SyscallFrame,
+) -> u64 {
+    let style = match frame.args[0] as i32 {
+        0 => HatchStyle::Horizontal,
+        1 => HatchStyle::Vertical,
+        2 => HatchStyle::FDiagonal,
+        3 => HatchStyle::BDiagonal,
+        4 => HatchStyle::Cross,
+        5 => HatchStyle::DiagonalCross,
+        _ => return 0,
+    };
+    gdi_create_hatch_brush(style, frame.args[1] as u32)
 }
 
 /// create a font
@@ -892,7 +946,17 @@ pub fn gdi_create_font(
 
     let mut handle_table = get_handle_table();
     let _ = &handle_table;
-    let handle = handle_table.allocate(GdiObjectType::Font, font as u64, 0);
+    let handle = handle_table.allocate(
+        GdiObjectType::Font,
+        font as u64,
+        super::window::input_context::caller_identity().0 as u32,
+    );
+    if handle == 0 {
+        // SAFETY: the fresh allocation was never published as a GDI object.
+        unsafe {
+            let _ = crate::mm::pool::free(font);
+        }
+    }
     let _ = &handle;
 
     // kprintln!("[win32k] gdi_create_font: height={}, weight={} -> handle=0x{:016x}",
@@ -921,16 +985,25 @@ pub fn gdi_create_bitmap(width: i32, height: i32, bit_count: u16) -> u64 {
         return 0;
     }
 
-    unsafe {
-        let b = &mut *(bitmap_mem as *mut GdiBitmap);
-        let _ = &b;
-        *b = bitmap;
-    }
+    // SAFETY: initialize the fresh allocation without dropping uninitialized
+    // memory. Ownership of the pixels moves into the published bitmap.
+    unsafe { bitmap_mem.cast::<GdiBitmap>().write(bitmap); }
 
     let mut handle_table = get_handle_table();
     let _ = &handle_table;
-    let handle = handle_table.allocate(GdiObjectType::Bitmap, bitmap_mem as u64, 0);
-    let _ = &handle;
+    let handle = handle_table.allocate(
+        GdiObjectType::Bitmap,
+        bitmap_mem as u64,
+        super::window::input_context::caller_identity().0 as u32,
+    );
+    drop(handle_table);
+    if handle == 0 {
+        // SAFETY: the failed registration never published the allocation.
+        unsafe {
+            core::ptr::drop_in_place(bitmap_mem.cast::<GdiBitmap>());
+            let _ = crate::mm::pool::free(bitmap_mem);
+        }
+    }
 
     // kprintln!("[win32k] gdi_create_bitmap: {}x{}x{} -> handle=0x{:016x}",
     //               width, height, bit_count, handle);
@@ -960,8 +1033,13 @@ pub(super) fn gdi_create_region(geometry: Region) -> u64 {
             .cast::<GdiRegion>()
             .write(GdiRegion::new(geometry));
     }
-    let handle =
-        with_handle_table(|table| table.allocate(GdiObjectType::Region, allocation as u64, 0));
+    let handle = with_handle_table(|table| {
+        table.allocate(
+            GdiObjectType::Region,
+            allocation as u64,
+            super::window::input_context::caller_identity().0 as u32,
+        )
+    });
     if handle == 0 {
         unsafe {
             core::ptr::drop_in_place(allocation.cast::<GdiRegion>());
@@ -973,6 +1051,9 @@ pub(super) fn gdi_create_region(geometry: Region) -> u64 {
 
 /// create a palette
 pub fn gdi_create_palette() -> u64 {
+    let Some(object) = GdiPalette::try_new() else {
+        return 0;
+    };
     let palette = crate::mm::pool::allocate(
         crate::mm::pool::PoolType::NonPaged,
         core::mem::size_of::<GdiPalette>(),
@@ -984,14 +1065,24 @@ pub fn gdi_create_palette() -> u64 {
     }
 
     unsafe {
-        let p = &mut *(palette as *mut GdiPalette);
-        let _ = &p;
-        *p = GdiPalette::new();
+        // SAFETY: initialize fresh pool storage without dropping an uninitialized Vec.
+        palette.cast::<GdiPalette>().write(object);
     }
 
     let mut handle_table = get_handle_table();
     let _ = &handle_table;
-    let handle = handle_table.allocate(GdiObjectType::Palette, palette as u64, 0);
+    let handle = handle_table.allocate(
+        GdiObjectType::Palette,
+        palette as u64,
+        super::window::input_context::caller_identity().0 as u32,
+    );
+    if handle == 0 {
+        // SAFETY: the fresh allocation was never published as a GDI object.
+        unsafe {
+            core::ptr::drop_in_place(palette.cast::<GdiPalette>());
+            let _ = crate::mm::pool::free(palette);
+        }
+    }
     let _ = &handle;
 
     // kprintln!("[win32k] gdi_create_palette: -> handle=0x{:016x}", handle);
@@ -1005,6 +1096,12 @@ pub fn gdi_create_palette() -> u64 {
 
 /// Delete a GDI object
 pub fn gdi_delete_object(handle: u64) -> bool {
+    delete_object_checked(handle, None)
+}
+
+/// Validate the expected type and ownership while holding the deletion lock.
+/// Keeping these checks together prevents handle reuse between validation and free.
+pub(super) fn delete_object_checked(handle: u64, expected: Option<GdiObjectType>) -> bool {
     unsafe {
         if handle == 0 {
             return false;
@@ -1020,6 +1117,15 @@ pub fn gdi_delete_object(handle: u64) -> bool {
             }
         };
 
+        if expected.is_some_and(|kind| entry.get_type() != Some(kind))
+            || entry.process_id != 0
+                && entry.process_id != super::window::input_context::caller_identity().0 as u32
+        {
+            return false;
+        }
+        if entry.flags & HANDLE_FLAG_STOCK != 0 {
+            return true;
+        }
         if entry.uses != 0 {
             return false;
         }
@@ -1031,7 +1137,7 @@ pub fn gdi_delete_object(handle: u64) -> bool {
         // Free the object memory
         if obj_ptr != 0 {
             match obj_type {
-                Some(GdiObjectType::Pen) => {
+                Some(GdiObjectType::ColorSpace) | Some(GdiObjectType::Pen) => {
                     let _ = crate::mm::pool::free(obj_ptr as *mut u8);
                 }
                 Some(GdiObjectType::Brush) => {
@@ -1041,12 +1147,9 @@ pub fn gdi_delete_object(handle: u64) -> bool {
                     let _ = crate::mm::pool::free(obj_ptr as *mut u8);
                 }
                 Some(GdiObjectType::Bitmap) => {
-                    // Bitmap's Drop will free the bits
-                    let bitmap = { &mut *(obj_ptr as *mut GdiBitmap) };
-                    let _ = &bitmap;
-                    if !bitmap.bits.is_null() {
-                        let _ = crate::mm::pool::free(bitmap.bits);
-                    }
+                    // The table guard and zero selection count give exclusive
+                    // ownership; Drop releases the bitmap's pixel allocation.
+                    core::ptr::drop_in_place(obj_ptr as *mut GdiBitmap);
                     let _ = crate::mm::pool::free(obj_ptr as *mut u8);
                 }
                 Some(GdiObjectType::Region) => {
@@ -1054,6 +1157,7 @@ pub fn gdi_delete_object(handle: u64) -> bool {
                     let _ = crate::mm::pool::free(obj_ptr as *mut u8);
                 }
                 Some(GdiObjectType::Palette) => {
+                    core::ptr::drop_in_place(obj_ptr as *mut GdiPalette);
                     let _ = crate::mm::pool::free(obj_ptr as *mut u8);
                 }
                 _ => {
@@ -1192,35 +1296,10 @@ pub fn gdi_get_brush_color(handle: u64) -> u32 {
 // Stock Objects (Predefined GDI Objects)
 // =============================================================================
 
-/// Stock object handles (Windows system objects)
-pub const STOCK_OBJECT_BLACK_BRUSH: u64 = 0x40000004;
-pub const STOCK_OBJECT_WHITE_BRUSH: u64 = 0x40000005;
-pub const STOCK_OBJECT_HOLLOW_BRUSH: u64 = 0x40000006;
-pub const STOCK_OBJECT_BLACK_PEN: u64 = 0x40000007;
-pub const STOCK_OBJECT_WHITE_PEN: u64 = 0x40000008;
-pub const STOCK_OBJECT_NULL_PEN: u64 = 0x40000009;
-pub const STOCK_OBJECT_SYSTEM_FONT: u64 = 0x4000000A;
-
-/// Initialize stock objects
-pub fn init_stock_objects() {
-    // kprintln!("[win32k] Initializing stock GDI objects...");
-
-    // Pre-allocate common stock objects
-    // These are created once and never deleted
-    // The actual handles will be set after handle table is initialized
-}
-
-/// Get a stock object
-pub fn gdi_get_stock_object(object_type: i32) -> u64 {
-    match object_type {
-        0 => STOCK_OBJECT_BLACK_BRUSH, // BLACK_BRUSH
-        1 => STOCK_OBJECT_WHITE_BRUSH, // WHITE_BRUSH
-        4 => STOCK_OBJECT_BLACK_PEN,   // BLACK_PEN
-        5 => STOCK_OBJECT_WHITE_PEN,   // WHITE_PEN
-        6 => STOCK_OBJECT_NULL_PEN,    // NULL_PEN
-        _ => 0,
-    }
-}
+#[path = "objects/stock.rs"]
+mod stock;
+pub use stock::{gdi_get_stock_object, init_stock_objects, nt_gdi_get_stock_object};
+pub(crate) const HANDLE_FLAG_STOCK: u8 = stock::STOCK_FLAG;
 
 // =============================================================================
 // GDI Object Reference Counting
@@ -1243,7 +1322,13 @@ pub struct ObjectReference {
 impl ObjectReference {
     pub fn acquire(handle: u64) -> Option<Self> {
         with_handle_table(|table| {
-            let object_type = table.get(handle)?.get_type()?;
+            let entry = table.get(handle)?;
+            if entry.process_id != 0
+                && entry.process_id != super::window::input_context::caller_identity().0 as u32
+            {
+                return None;
+            }
+            let object_type = entry.get_type()?;
             if !table.add_ref(handle) {
                 return None;
             }
@@ -1287,3 +1372,6 @@ pub fn dump_handle_stats() {
 
     // kprintln!("[win32k] handle table: {}/{} slots used", used, total);
 }
+
+#[path = "objects/attributes.rs"]
+pub mod attributes;

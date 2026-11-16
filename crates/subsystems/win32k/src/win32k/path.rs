@@ -9,6 +9,8 @@ use alloc::vec::Vec;
 
 #[path = "path/services.rs"]
 pub mod services;
+#[path = "path/shapes.rs"]
+pub mod shapes;
 
 pub const PT_CLOSEFIGURE: u8 = 1;
 pub const PT_LINETO: u8 = 2;

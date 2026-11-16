@@ -44,6 +44,10 @@ pub(crate) mod mapping;
 
 #[path = "dc/services.rs"]
 pub mod services;
+#[path = "dc/caps.rs"]
+pub mod caps;
+#[path = "dc/bounds.rs"]
+pub mod bounds;
 
 /// DC type flags
 const DC_TYPE_WINDOW: u32 = 0x00000001;
@@ -149,19 +153,29 @@ impl SizeL {
 /// saved drawing state, unlike the device's EPS and print-copy settings.
 #[derive(Clone, Copy)]
 pub struct DcAttributes {
+    pub color_space: u64,
     pub brush_origin: PointL,
     pub relative_mode: u32,
     pub mapper_flags: u32,
     pub arc_direction: u32,
+    pub color_adjustment: services::ColorAdjustment,
+    pub virtual_resolution: [u32; 4],
+    pub text_justification_extra: i32,
+    pub text_justification_breaks: i32,
 }
 
 impl Default for DcAttributes {
     fn default() -> Self {
         Self {
+            color_space: 0,
             brush_origin: PointL::default(),
             relative_mode: 1,
             mapper_flags: 0,
             arc_direction: 1,
+            color_adjustment: services::ColorAdjustment::default(),
+            virtual_resolution: [0; 4],
+            text_justification_extra: 0,
+            text_justification_breaks: 0,
         }
     }
 }
@@ -170,7 +184,7 @@ impl Default for DcAttributes {
 #[repr(C)]
 pub struct SavedDcState {
     pub attributes: DcAttributes,
-    selected_references: [Option<super::objects::ObjectReference>; 6],
+    selected_references: [Option<super::objects::ObjectReference>; 7],
     pub path: super::path::GdiPath,
     pub poly_fill_mode: i32,
     pub graphics_mode: i32,
@@ -222,7 +236,7 @@ impl Default for SavedDcState {
             text_align: TA_LEFT | TA_TOP | TA_NOUPDATECP,
             bk_mode: OPAQUE,
             rop_mode: R2_COPYPEN,
-            stretch_mode: 0,
+            stretch_mode: super::raster::stretch::BLACKONWHITE,
             map_mode: MM_TEXT,
             viewport_ext: SizeL::new(1, 1),
             window_ext: SizeL::new(1, 1),
@@ -237,10 +251,14 @@ impl Default for SavedDcState {
 /// DC object
 #[repr(C)]
 pub struct DcObject {
+    pub process_id: u64,
+    /// A pixel format can be assigned only once during a DC lifetime.
+    pub pixel_format: u32,
+    pub drawing_bounds: bounds::DrawingBounds,
     pub attributes: DcAttributes,
     pub eps_printing: bool,
     pub print_copies: u32,
-    selected_references: [Option<super::objects::ObjectReference>; 6],
+    selected_references: [Option<super::objects::ObjectReference>; 7],
     pub path: super::path::GdiPath,
     pub poly_fill_mode: i32,
     pub graphics_mode: i32,
@@ -307,6 +325,9 @@ pub struct DcObject {
 impl DcObject {
     pub fn new() -> Self {
         Self {
+            process_id: super::window::input_context::caller_identity().0,
+            pixel_format: 0,
+            drawing_bounds: bounds::DrawingBounds::default(),
             attributes: DcAttributes::default(),
             eps_printing: false,
             print_copies: 1,
@@ -338,7 +359,7 @@ impl DcObject {
             cur_y: 0,
             bk_mode: OPAQUE,
             rop_mode: R2_COPYPEN,
-            stretch_mode: 0,
+            stretch_mode: super::raster::stretch::BLACKONWHITE,
             map_mode: MM_TEXT,
             viewport_ext: SizeL::new(1, 1),
             window_ext: SizeL::new(1, 1),
@@ -379,6 +400,7 @@ impl DcObject {
             self.palette_handle,
             self.region,
             self.bitmap,
+            self.attributes.color_space,
         ]
         .into_iter()
         .enumerate()
@@ -507,6 +529,23 @@ impl DcHandleTable {
         let mut object = DcObject::new();
         object.dc_type = dc_type;
         object.surface = surface;
+        for (slot, index) in [(0, 7), (1, 0), (2, 13), (3, 15)] {
+            let handle = super::objects::gdi_get_stock_object(index);
+            let Some(reference) = super::objects::ObjectReference::acquire(handle) else {
+                // SAFETY: no DcObject has been written to this allocation yet.
+                unsafe {
+                    let _ = crate::mm::pool::free(dc);
+                }
+                return 0;
+            };
+            match slot {
+                0 => object.pen = handle,
+                1 => object.brush = handle,
+                2 => object.font = handle,
+                _ => object.palette_handle = handle,
+            }
+            object.selected_references[slot] = Some(reference);
+        }
         // SAFETY: initialize a fresh allocation without dropping uninitialized Vecs.
         unsafe {
             dc.cast::<DcObject>().write(object);
@@ -523,6 +562,13 @@ impl DcHandleTable {
         //                   dc_type, surface, handle);
 
         handle
+    }
+
+    pub fn count_for_process(&self, process: u64) -> usize {
+        self.entries.iter().flatten().filter(|&&pointer| {
+            // SAFETY: this table guard prevents concurrent destruction.
+            unsafe { (*pointer).process_id == process }
+        }).count()
     }
 
     /// Get a DC by handle
@@ -1081,5 +1127,18 @@ pub fn dump_dc_info(dc_handle: u64) {
         //                   dc.viewport_org.x, dc.viewport_org.y,
         //                   dc.window_org.x, dc.window_org.y);
         // kprintln!("  saved_states: {}", dc.saved_states.len());
+    }
+}
+
+#[path = "dc/pixel_format.rs"]
+pub mod pixel_format;
+
+impl DcObject {
+    pub(super) fn set_color_space(&mut self, handle: u64) -> bool {
+        let Some(reference) = super::objects::ObjectReference::acquire(handle) else { return false; };
+        if reference.object_type() != super::objects::GdiObjectType::ColorSpace { return false; }
+        self.selected_references[6] = Some(reference);
+        self.attributes.color_space = handle;
+        true
     }
 }

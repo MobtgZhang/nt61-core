@@ -8,7 +8,7 @@
 extern crate alloc;
 
 use crate::libs::win32k::dc::DcObject;
-use crate::libs::win32k::surface::{GdiSurface, PIXEL_FORMAT_32BPP, PIXEL_FORMAT_32BPP_ARGB};
+use crate::libs::win32k::surface::GdiSurface;
 use alloc::vec::Vec;
 
 /// Raster operation codes
@@ -115,133 +115,6 @@ pub fn gre_pat_blt(
         return false; // PatBlt cannot sample a source.
     }
     super::raster::bit_blt(dc, left, top, width, height, None, 0, 0, rop)
-}
-
-// =============================================================================
-// Rectangle Operations
-// =============================================================================
-
-/// Fill rectangle with solid color
-fn fill_rect_solid(
-    surface: *mut GdiSurface,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-    color: u32,
-) -> bool {
-    if surface.is_null() {
-        return false;
-    }
-
-    let surf = unsafe { &mut *surface };
-
-    let _ = &surf;
-    let _ = &surf;
-    if surf.bits.is_null() {
-        return false;
-    }
-
-    // Clip to surface bounds
-    let left = x.max(0);
-    let _ = &left;
-    let _ = &left;
-    let top = y.max(0);
-    let _ = &top;
-    let _ = &top;
-    let right = (x + width).min(surf.width);
-    let _ = &right;
-    let _ = &right;
-    let bottom = (y + height).min(surf.height);
-    let _ = &bottom;
-    let _ = &bottom;
-
-    if left >= right || top >= bottom {
-        return true;
-    }
-
-    let actual_width = right - left;
-
-    let _ = &actual_width;
-    let _ = &actual_width;
-    let actual_height = bottom - top;
-    let _ = &actual_height;
-    let _ = &actual_height;
-
-    // Check for 32bpp surface
-    if surf.format != PIXEL_FORMAT_32BPP && surf.format != PIXEL_FORMAT_32BPP_ARGB {
-        // For other formats, we'd need conversion - for now, skip
-        return true;
-    }
-
-    unsafe {
-        for row in top..bottom {
-            let line_ptr = surf.bits.add((row * surf.pitch) as usize);
-            let _ = &line_ptr;
-            let _ = &line_ptr;
-            for col in left..right {
-                core::ptr::write_unaligned(line_ptr.add((col * 4) as usize) as *mut u32, color);
-            }
-        }
-    }
-
-    // kprintln!("[win32k] fill_rect_solid: {}x{} at ({},{}) color=0x{:08x}",
-    //               actual_width, actual_height, left, top, color);
-
-    true
-}
-
-/// Invert rectangle
-fn invert_rect(surface: *mut GdiSurface, x: i32, y: i32, width: i32, height: i32) -> bool {
-    if surface.is_null() {
-        return false;
-    }
-
-    let surf = unsafe { &mut *surface };
-
-    let _ = &surf;
-    let _ = &surf;
-    if surf.bits.is_null() {
-        return false;
-    }
-
-    // Clip
-    let left = x.max(0);
-    let _ = &left;
-    let _ = &left;
-    let top = y.max(0);
-    let _ = &top;
-    let _ = &top;
-    let right = (x + width).min(surf.width);
-    let _ = &right;
-    let _ = &right;
-    let bottom = (y + height).min(surf.height);
-    let _ = &bottom;
-    let _ = &bottom;
-
-    if left >= right || top >= bottom {
-        return true;
-    }
-
-    if surf.format != PIXEL_FORMAT_32BPP && surf.format != PIXEL_FORMAT_32BPP_ARGB {
-        return true;
-    }
-
-    unsafe {
-        for row in top..bottom {
-            let line_ptr = surf.bits.add((row * surf.pitch) as usize);
-            let _ = &line_ptr;
-            let _ = &line_ptr;
-            for col in left..right {
-                let pixel =
-                    core::ptr::read_unaligned(line_ptr.add((col * 4) as usize) as *const u32);
-                let _ = &pixel;
-                core::ptr::write_unaligned(line_ptr.add((col * 4) as usize) as *mut u32, !pixel);
-            }
-        }
-    }
-
-    true
 }
 
 /// gre_rectangle - Draw rectangle outline

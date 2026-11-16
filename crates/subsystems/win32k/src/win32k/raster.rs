@@ -15,6 +15,21 @@ use alloc::vec::Vec;
 
 const MAX_CAPTURE_PIXELS: usize = 16 * 1024 * 1024;
 
+#[path = "raster/extended.rs"]
+pub mod extended;
+#[path = "raster/stretch.rs"]
+pub mod stretch;
+#[path = "raster/alpha.rs"]
+pub mod alpha;
+#[path = "raster/mask.rs"]
+pub mod mask;
+#[path = "raster/parallelogram.rs"]
+pub mod parallelogram;
+#[path = "raster/dib.rs"]
+pub mod dib;
+#[path = "raster/pattern.rs"]
+pub mod pattern;
+
 fn bound_surface(dc: &DcObject) -> Option<&GdiSurface> {
     let pointer = if dc.surface == 0 {
         surface::get_primary_surface()
@@ -50,17 +65,129 @@ fn read_pixel(surface: &GdiSurface, x: i32, y: i32) -> Option<u32> {
     Some(unsafe { pixel_pointer(surface, x, y)?.read_unaligned() })
 }
 
-fn write_pixel(surface: &GdiSurface, x: i32, y: i32, color: u32) {
+fn write_pixel(dc: &DcObject, surface: &GdiSurface, x: i32, y: i32, color: u32) {
     if let Some(pointer) = pixel_pointer(surface, x, y) {
         unsafe {
             pointer.write_unaligned(color);
         }
+        dc.drawing_bounds.record_pixel(x, y);
     }
 }
 
 // COLORREF stores red in its low byte; framebuffer RGB stores blue there.
 fn swap_red_blue(color: u32) -> u32 {
     ((color & 0xff) << 16) | (color & 0xff00) | ((color >> 16) & 0xff)
+}
+
+/// Prepared text draws retain one validated surface binding and reuse their
+/// captured clip. Glyph coverage is 0..64, as returned by GGO_GRAY8_BITMAP.
+pub(crate) struct CoveragePainter<'a> {
+    dc: &'a DcObject,
+    surface: &'a GdiSurface,
+}
+
+impl<'a> CoveragePainter<'a> {
+    pub(crate) fn new(dc: &'a DcObject) -> Option<Self> {
+        Some(Self { dc, surface: bound_surface(dc)? })
+    }
+
+    pub(crate) fn fill(&mut self, region: &Region, color: u32) {
+        let color = swap_red_blue(color);
+        for rect in region.rectangles() {
+            for y in rect.top..rect.bottom {
+                for x in rect.left..rect.right {
+                    write_pixel(self.dc, self.surface, x, y, color);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn paint(&mut self, clip: &Region, origin: PointL,
+        width: usize, height: usize, stride: usize, coverage: &[u8], color: u32)
+    {
+        let color = swap_red_blue(color);
+        for rect in clip.rectangles() {
+            let left = i64::from(rect.left).max(i64::from(origin.x));
+            let top = i64::from(rect.top).max(i64::from(origin.y));
+            let right = i64::from(rect.right).min(i64::from(origin.x) + width as i64);
+            let bottom = i64::from(rect.bottom).min(i64::from(origin.y) + height as i64);
+            for y in top..bottom {
+                for x in left..right {
+                    let row = (y - i64::from(origin.y)) as usize;
+                    let column = (x - i64::from(origin.x)) as usize;
+                    let Some(&alpha) = coverage.get(row * stride + column) else { continue };
+                    let alpha = u32::from(alpha).min(64);
+                    if alpha == 0 { continue; }
+                    let Some(destination) = read_pixel(self.surface, x as i32, y as i32) else { continue };
+                    let mut output = destination & 0xff00_0000;
+                    for shift in [0, 8, 16] {
+                        let foreground = (color >> shift) & 255;
+                        let background = (destination >> shift) & 255;
+                        output |= ((foreground * alpha + background * (64 - alpha) + 32) / 64) << shift;
+                    }
+                    write_pixel(self.dc, self.surface, x as i32, y as i32, output);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BrushSample {
+    foreground: u32,
+    background: Option<u32>,
+    hatch: Option<i32>,
+    origin: PointL,
+}
+
+impl BrushSample {
+    fn solid(color: u32) -> Self {
+        Self { foreground: color, background: None, hatch: None, origin: PointL::default() }
+    }
+
+    fn at(self, x: i32, y: i32) -> Option<u32> {
+        let Some(style) = self.hatch else { return Some(self.foreground) };
+        let x = (i64::from(x) - i64::from(self.origin.x)).rem_euclid(8);
+        let y = (i64::from(y) - i64::from(self.origin.y)).rem_euclid(8);
+        let foreground = match style {
+            0 => y == 3,
+            1 => x == 4,
+            2 => x == y,
+            3 => (x + y) % 8 == 7,
+            4 => x == 4 || y == 3,
+            5 => x == y || (x + y) % 8 == 7,
+            _ => return None,
+        };
+        if foreground { Some(self.foreground) } else { self.background }
+    }
+}
+
+fn brush_sample(dc: &DcObject, handle: u64) -> Option<Option<BrushSample>> {
+    if handle == 0 { return Some(Some(BrushSample::solid(0xffffff))); }
+    objects::with_handle_table(|table| {
+        let entry = table.get(handle)?;
+        if entry.get_type()? != GdiObjectType::Brush || entry.obj_ptr == 0 { return None; }
+        // SAFETY: the object table guard pins and serializes the brush.
+        let brush = unsafe { &*(entry.obj_ptr as *const GdiBrush) };
+        sample_brush(dc, brush)
+    })
+}
+
+fn sample_brush(dc: &DcObject, brush: &GdiBrush) -> Option<Option<BrushSample>> {
+    let foreground = swap_red_blue(brush.color);
+    match brush.style {
+        value if value == objects::BrushStyle::Null as u32 => Some(None),
+        value if value == objects::BrushStyle::Solid as u32 => Some(Some(BrushSample::solid(foreground))),
+        value if value == objects::BrushStyle::Hatched as u32 && (0..=5).contains(&brush.hatch) => {
+            Some(Some(BrushSample {
+                foreground,
+                background: (dc.bk_mode == super::dc::OPAQUE).then(|| swap_red_blue(dc.bg_color)),
+                hatch: Some(brush.hatch),
+                origin: dc.attributes.brush_origin,
+            }))
+        }
+        _ => None,
+    }
 }
 
 pub fn solid_brush_color(handle: u64) -> Option<u32> {
@@ -162,13 +289,13 @@ pub fn bit_blt(
     let Some(destination_surface) = bound_surface(destination) else {
         return false;
     };
-    let pattern = if uses_pattern(operation) && destination.brush != 0 {
-        let Some(color) = solid_brush_color(destination.brush) else {
+    let pattern = if uses_pattern(operation) {
+        let Some(brush) = brush_sample(destination, destination.brush) else {
             return false;
         };
-        color
+        brush
     } else {
-        0
+        Some(BrushSample::solid(0))
     };
     let source_data = if uses_source(operation) {
         let Some(source) = source else { return false };
@@ -226,9 +353,11 @@ pub fn bit_blt(
                     Some(0)
                 };
                 index += 1;
-                if let (Some(source), Some(dest)) = (sample, read_pixel(destination_surface, x, y))
+                if let (Some(source), Some(dest), Some(pattern)) = (
+                    sample, read_pixel(destination_surface, x, y), pattern.and_then(|brush| brush.at(x, y)))
                 {
                     write_pixel(
+                        destination,
                         destination_surface,
                         x,
                         y,
@@ -242,6 +371,10 @@ pub fn bit_blt(
 }
 
 pub fn paint_region(dc: &DcObject, geometry: &Region, color: u32, operation: u32) -> bool {
+    paint_sampled_region(dc, geometry, BrushSample::solid(color), operation)
+}
+
+fn paint_sampled_region(dc: &DcObject, geometry: &Region, brush: BrushSample, operation: u32) -> bool {
     let Ok(clip) = clipping::effective_region(dc) else {
         return false;
     };
@@ -254,8 +387,8 @@ pub fn paint_region(dc: &DcObject, geometry: &Region, color: u32, operation: u32
     for rect in draw.rectangles() {
         for y in rect.top..rect.bottom {
             for x in rect.left..rect.right {
-                if let Some(dest) = read_pixel(surface, x, y) {
-                    write_pixel(surface, x, y, rop3(dest, 0, color, operation));
+                if let (Some(dest), Some(color)) = (read_pixel(surface, x, y), brush.at(x, y)) {
+                    write_pixel(dc, surface, x, y, rop3(dest, 0, color, operation));
                 }
             }
         }
@@ -286,7 +419,7 @@ pub fn set_pixel(dc: &DcObject, x: i32, y: i32, color: u32) -> bool {
     let Some(surface) = bound_surface(dc) else {
         return false;
     };
-    write_pixel(surface, point.x, point.y, swap_red_blue(color));
+    write_pixel(dc, surface, point.x, point.y, swap_red_blue(color));
     true
 }
 
@@ -307,16 +440,14 @@ pub extern "C" fn nt_gdi_fill_rgn(frame: &SyscallFrame) -> u64 {
     let Some(region) = super::region::snapshot(frame.args[1]) else {
         return 0;
     };
-    let Some(color) = solid_brush_color(frame.args[2]) else {
-        return 0;
-    };
     let Some(dc) = super::dc::get_dc(frame.args[0]) else {
         return 0;
     };
+    let Some(brush) = brush_sample(&dc, frame.args[2]) else { return 0 };
     let Some(region) = logical_region(&dc, &region) else {
         return 0;
     };
-    paint_region(&dc, &region, color, super::gdi_ops::PATCOPY) as u64
+    brush.map_or(true, |brush| paint_sampled_region(&dc, &region, brush, super::gdi_ops::PATCOPY)) as u64
 }
 
 pub extern "C" fn nt_gdi_invert_rgn(frame: &SyscallFrame) -> u64 {
@@ -330,6 +461,27 @@ pub extern "C" fn nt_gdi_invert_rgn(frame: &SyscallFrame) -> u64 {
         return 0;
     };
     paint_region(&dc, &region, 0, super::gdi_ops::DSTINVERT) as u64
+}
+
+pub extern "C" fn nt_gdi_frame_rgn(frame: &SyscallFrame) -> u64 {
+    let Some(region) = super::region::snapshot(frame.args[1]) else {
+        return 0;
+    };
+    let Ok(frame_region) = region.frame(frame.args[3] as i32, frame.args[4] as i32) else {
+        return 0;
+    };
+    let Some(dc) = super::dc::get_dc(frame.args[0]) else {
+        return 0;
+    };
+    let Some(brush) = brush_sample(&dc, frame.args[2]) else {
+        return 0;
+    };
+    let Some(frame_region) = logical_region(&dc, &frame_region) else {
+        return 0;
+    };
+    brush.map_or(true, |brush| {
+        paint_sampled_region(&dc, &frame_region, brush, super::gdi_ops::PATCOPY)
+    }) as u64
 }
 
 pub extern "C" fn nt_gdi_set_pixel(frame: &SyscallFrame) -> u64 {
@@ -368,28 +520,6 @@ pub(super) fn pen_color(handle: u64) -> Option<Option<u32>> {
             return None;
         }
         Some(Some(swap_red_blue(pen.color)))
-    })
-}
-
-pub(super) fn brush_color(handle: u64) -> Option<Option<u32>> {
-    if handle == 0 {
-        // A new DC selects WHITE_BRUSH; zero is the current internal default
-        // binding, and must not silently behave as a NULL_BRUSH.
-        return Some(Some(0x00ffffff));
-    }
-    objects::with_handle_table(|table| {
-        let entry = table.get(handle)?;
-        if entry.get_type()? != GdiObjectType::Brush || entry.obj_ptr == 0 {
-            return None;
-        }
-        let brush = unsafe { &*(entry.obj_ptr as *const GdiBrush) };
-        match brush.style {
-            value if value == objects::BrushStyle::Null as u32 => Some(None),
-            value if value == objects::BrushStyle::Solid as u32 => {
-                Some(Some(swap_red_blue(brush.color)))
-            }
-            _ => None,
-        }
     })
 }
 
@@ -435,7 +565,7 @@ pub fn line_to(dc: &mut DcObject, x: i32, y: i32) -> bool {
         while px != end.x || py != end.y {
             if clip.contains_point(px, py) {
                 if let Some(old) = read_pixel(surface, px, py) {
-                    write_pixel(surface, px, py, rop3(old, 0, color, operation));
+                    write_pixel(dc, surface, px, py, rop3(old, 0, color, operation));
                 }
             }
             let twice = 2 * error;
@@ -461,7 +591,7 @@ pub fn rectangle(dc: &DcObject, rect: Rect) -> bool {
     let Some(pen) = pen_color(dc.pen) else {
         return false;
     };
-    let Some(brush) = brush_color(dc.brush) else {
+    let Some(brush) = brush_sample(dc, dc.brush) else {
         return false;
     };
     let Some(operation) = rop2_operation(dc.rop_mode) else {
@@ -488,9 +618,9 @@ pub fn rectangle(dc: &DcObject, rect: Rect) -> bool {
     if bound_surface(dc).is_none() || clipping::effective_region(dc).is_err() {
         return false;
     }
-    if let Some(color) = brush {
+    if let Some(brush) = brush {
         let fill = if pen.is_some() { &inner } else { &outer };
-        if !paint_region(dc, fill, color, operation) {
+        if !paint_sampled_region(dc, fill, brush, operation) {
             return false;
         }
     }
@@ -579,7 +709,7 @@ pub(super) fn paint_path(
         return false;
     };
     let Some(brush) = (if fill {
-        brush_color(dc.brush)
+        brush_sample(dc, dc.brush)
     } else {
         Some(None)
     }) else {
@@ -625,13 +755,13 @@ pub(super) fn paint_path(
     let Some(surface) = bound_surface(dc) else {
         return false;
     };
-    for (region, color) in [(&fill_region, brush), (&outline, pen)] {
-        if let Some(color) = color {
+    for (region, brush) in [(&fill_region, brush), (&outline, pen.map(BrushSample::solid))] {
+        if let Some(brush) = brush {
             for rect in region.rectangles() {
                 for y in rect.top..rect.bottom {
                     for x in rect.left..rect.right {
-                        if let Some(old) = read_pixel(surface, x, y) {
-                            write_pixel(surface, x, y, rop3(old, 0, color, operation));
+                        if let (Some(old), Some(color)) = (read_pixel(surface, x, y), brush.at(x, y)) {
+                            write_pixel(dc, surface, x, y, rop3(old, 0, color, operation));
                         }
                     }
                 }
