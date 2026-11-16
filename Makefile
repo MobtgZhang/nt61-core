@@ -621,6 +621,13 @@ run-loongarch64: SERIAL_LOG=$(IMAGES_DIR)/serial_$(ARCH)_$(FORMAT).log
 run-loongarch64:
 	$(MAKE) run-loongarch64-$(FORMAT)
 
+# Prepare the same architecture firmware used by interactive run targets.
+# Headless verification needs this step even when it does not run `make run`.
+.PHONY: prepare-firmware
+prepare-firmware:
+	@mkdir -p $(IMAGES_DIR)
+	$(call _setup_firmware_$(ARCH))
+
 # ============================================================
 # All 16 arch x format combinations (serial log)
 # ============================================================
