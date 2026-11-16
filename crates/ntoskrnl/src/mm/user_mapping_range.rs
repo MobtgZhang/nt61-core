@@ -7,6 +7,21 @@ pub fn page_extent(base: u64, size: u64) -> Option<(u64, u64)> {
     Some((base & !0xfff, end))
 }
 
+/// Visit each touched page only after validating the complete byte extent.
+/// Empty ranges require no page-table access; malformed ranges fail closed.
+pub fn all_pages(base: u64, size: u64, mut mapped: impl FnMut(u64) -> bool) -> bool {
+    let Some((mut page, end)) = page_extent(base, size) else {
+        return false;
+    };
+    while page < end {
+        if !mapped(page) {
+            return false;
+        }
+        page += 0x1000;
+    }
+    true
+}
+
 /// Missing reservations have size zero. Malformed nonempty reservations fail
 /// closed, including arithmetic overflow. Adjacent half-open ranges are safe.
 pub fn available(base: u64, size: u64, reserved: &[(u64, u64)]) -> bool {

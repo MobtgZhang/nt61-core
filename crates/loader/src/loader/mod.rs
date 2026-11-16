@@ -2662,13 +2662,6 @@ fn determine_section_protection(characteristics: u32) -> u64 {
         flags |= PTE_NX; // NX for read-only data
     }
 
-    // handle code sections specifically
-    if characteristics & section::CNT_CODE != 0 {
-        // .text section: readable and executable, not writable
-        // R+X (remove any NX and RW bits)
-        flags = PTE_US; // R+X means no RW, no NX
-    }
-
     flags
 }
 
@@ -2678,6 +2671,18 @@ pub mod pe32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section_memory_attributes_control_permissions() {
+        use ntoskrnl::mm::vas::{PTE_NX, PTE_RW, PTE_US};
+        // CNT_CODE describes content; it must not override explicit memory
+        // permissions on writable code or force execution without MEM_EXECUTE.
+        assert_eq!(determine_section_protection(0xe0000020), PTE_US | PTE_RW);
+        assert_eq!(determine_section_protection(0x60000020), PTE_US);
+        assert_eq!(determine_section_protection(0xc0000020), PTE_US | PTE_RW | PTE_NX);
+        assert_eq!(determine_section_protection(0x40000020), PTE_US | PTE_NX);
+        assert_eq!(determine_section_protection(0xc0000040), PTE_US | PTE_RW | PTE_NX);
+    }
 
     #[test]
     fn optional_header_sizes_match_pe_spec() {

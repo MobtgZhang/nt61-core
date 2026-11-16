@@ -39,6 +39,13 @@ pub use crate::mm::constants::*;
 
 #[path = "user_mapping_range.rs"]
 mod user_mapping_range;
+#[path = "user_page_protection.rs"]
+mod user_page_protection;
+#[path = "native_user_protection.rs"]
+mod native_user_protection;
+#[cfg(target_arch = "x86_64")]
+#[path = "x64_mapping_presence.rs"]
+mod x64_mapping_presence;
 static BOOT_STACK_BASE: AtomicU64 = AtomicU64::new(0);
 static BOOT_STACK_SIZE: AtomicU64 = AtomicU64::new(0);
 
@@ -1313,129 +1320,21 @@ pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatu
 /// `true`. Returns `false` on the first page that is missing or that
 /// cannot be reached because an intermediate table is absent.
 pub fn is_user_range_mapped(pml4_phys: u64, va: u64, size: u64) -> bool {
-    if size == 0 {
-        return true;
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let root_pfn = pml4_phys >> 12;
-        let mut cur = va & !0xFFFu64;
-        let end = (va + size + 0xFFF) & !0xFFFu64;
-        while cur < end {
-            if !crate::arch::page_is_mapped_in_root(root_pfn, cur) {
-                return false;
-            }
-            cur += 0x1000;
+    user_mapping_range::all_pages(va, size, |page| {
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            crate::arch::page_is_mapped_in_root(pml4_phys >> 12, page)
         }
-        return true;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let mut cur = va & !0xFFFu64;
-        let end = (va + size + 0xFFF) & !0xFFFu64;
-        while cur < end {
-            let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
-            let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
-            let pd_idx = ((cur >> 21) & 0x1FF) as usize;
-            let pt_idx = ((cur >> 12) & 0x1FF) as usize;
-            unsafe {
-                let pml4e_val = pml4e(pml4_phys, pml4_idx);
-                if pml4e_val & PTE_P == 0 {
-                    return false;
-                }
-                let pdpt_phys = pml4e_val & 0x000F_FFFF_FFFF_F000;
-                let pdpte_val = pte_read(pdpt_phys, pdpt_idx);
-                if pdpte_val & PTE_P == 0 {
-                    return false;
-                }
-                let pd_phys = pdpte_val & 0x000F_FFFF_FFFF_F000;
-                let pde_val = pte_read(pd_phys, pd_idx);
-                if pde_val & PTE_P == 0 {
-                    return false;
-                }
-                let pt_phys = pde_val & 0x000F_FFFF_FFFF_F000;
-                let pte_val = pte_read(pt_phys, pt_idx);
-                if pte_val & PTE_P == 0 {
-                    return false;
-                }
-            }
-            cur += 0x1000;
+        #[cfg(target_arch = "x86_64")]
+        {
+            x64_mapping_presence::page_is_mapped(pml4_phys, page, |table, index| unsafe {
+                pte_read(table, index)
+            })
         }
-        true
-    }
+    })
 }
 
-/// Update the protection bits on an existing user range without
-/// remapping the underlying pages. Each leaf PTE in `[va, va+size)` is
-/// re-programmed so that bits other than `P`, `A`, `D`, and the
-/// physical-address bits are taken from `new_protect` (a Win32
-/// PAGE_* value).
-///
-/// The page must already be mapped; this routine will not allocate
-/// new tables. Returns `InvalidAddress` if any page in the range is
-/// not currently present.
-pub fn protect_user_range(pml4_phys: u64, va: u64, size: u64, new_protect: u32) -> MmStatus {
-    if size == 0 {
-        return MmStatus::Ok;
-    }
-    let mut cur = va & !0xFFFu64;
-    let end = (va + size + 0xFFF) & !0xFFFu64;
-    while cur < end {
-        let pml4_idx = ((cur >> 39) & 0x1FF) as usize;
-        let pdpt_idx = ((cur >> 30) & 0x1FF) as usize;
-        let pd_idx = ((cur >> 21) & 0x1FF) as usize;
-        let pt_idx = ((cur >> 12) & 0x1FF) as usize;
-        unsafe {
-            let pml4e_val = pml4e(pml4_phys, pml4_idx);
-            if pml4e_val & PTE_P == 0 {
-                return MmStatus::InvalidAddress;
-            }
-            let pdpt_phys = pml4e_val & 0x000F_FFFF_FFFF_F000;
-            let pdpte_val = pte_read(pdpt_phys, pdpt_idx);
-            if pdpte_val & PTE_P == 0 {
-                return MmStatus::InvalidAddress;
-            }
-            let pd_phys = pdpte_val & 0x000F_FFFF_FFFF_F000;
-            let pde_val = pte_read(pd_phys, pd_idx);
-            if pde_val & PTE_P == 0 {
-                return MmStatus::InvalidAddress;
-            }
-            let pt_phys = pde_val & 0x000F_FFFF_FFFF_F000;
-            let pte_val = pte_read(pt_phys, pt_idx);
-            if pte_val & PTE_P == 0 {
-                return MmStatus::InvalidAddress;
-            }
-            // Preserve the physical-address bits and P/A/D; replace
-            // protection, NX, user/kernel, etc. from new_protect.
-            let pa_bits = pte_val & 0x000F_FFFF_FFFF_F000u64;
-            // new_protect is a u32 PAGE_* value; combine with the
-            // standard hardware PTE bits expected for user mappings.
-            let mut new_pte = pa_bits | PTE_P | PTE_A | PTE_D | PTE_US;
-            if new_protect & 0x04 != 0 {
-                new_pte |= PTE_RW;
-            } // PAGE_READWRITE
-            if new_protect & 0x40 != 0 {
-                new_pte |= PTE_RW;
-            } // PAGE_EXECUTE_READWRITE
-            if new_protect & 0xF0 == 0 {
-                new_pte |= PTE_NX;
-            } // non-executable by default
-            pte_write(pt_phys, pt_idx, new_pte);
-            // Protection changed on a mapping other CPUs may have in
-            // their TLB. A downgrade (clearing the write bit) is only
-            // safe once every core dropped the stale writable entry,
-            // so this invalidation is cross-core.
-            crate::ke::tlb_shootdown::invalidate_va_all_cpus(cur);
-        }
-        cur += 0x1000;
-    }
-    // NT 6.1: after clearing PTEs, the TLB must be flushed. Without
-    // this, stale TLB entries keep freed pages readable/writable
-    // until an unrelated CR3 reload evicts them — a freed-then-
-    // remapped page can be observed by the previous owner.
-    crate::arch::flush_tlb();
-    MmStatus::Ok
-}
+pub use native_user_protection::protect_user_range;
 
 /// Map a contiguous range `[va, va+size)` of 4-KiB user pages,
 /// allocating one physical frame per 4-KiB page and mapping it with

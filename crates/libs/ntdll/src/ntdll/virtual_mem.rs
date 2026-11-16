@@ -249,7 +249,7 @@ pub unsafe extern "C" fn nt_free_virtual_memory(
     use crate::mm::user_copy::{probe_user_write, read_user_object, write_user_object};
 
     // Parameter validation
-    if base_address.is_null() || (*base_address).is_null() {
+    if base_address.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     if probe_user_write(base_address as u64, core::mem::size_of::<PVOID>()).is_err() {
@@ -345,7 +345,7 @@ pub unsafe extern "C" fn nt_protect_virtual_memory(
     use crate::mm::user_copy::{probe_user_write, read_user_object, write_user_object};
 
     // Parameter validation
-    if base_address.is_null() || (*base_address).is_null() {
+    if base_address.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     if probe_user_write(base_address as u64, core::mem::size_of::<PVOID>()).is_err()
@@ -733,7 +733,6 @@ pub unsafe fn nt_query_virtual_memory_kernel(
     memory_information_length: SizeT,
     return_length: &mut SizeT,
 ) -> NTSTATUS {
-    let result = MemoryBasicInformation::default();
     let mut result_length = *return_length;
     let status = nt_query_virtual_memory(
         process_handle,
@@ -744,7 +743,6 @@ pub unsafe fn nt_query_virtual_memory_kernel(
         &mut result_length,
     );
     if status == STATUS_SUCCESS {
-        *memory_information = result;
         *return_length = result_length;
     }
     status

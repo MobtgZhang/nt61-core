@@ -2,6 +2,23 @@
 mod policy;
 
 #[test]
+fn presence_checks_reject_overflow_before_touching_page_tables() {
+    assert!(!policy::all_pages(u64::MAX - 0xfff, 0x2000, |_| panic!("wrapped walk")));
+    assert!(!policy::all_pages(u64::MAX - 1, 1, |_| panic!("rounded walk")));
+    assert!(policy::all_pages(u64::MAX, 0, |_| panic!("empty walk")));
+}
+
+#[test]
+fn presence_checks_visit_both_sides_of_an_unaligned_boundary_and_stop_at_a_hole() {
+    let mut visited = Vec::new();
+    assert!(!policy::all_pages(0x1fff, 0x2002, |page| {
+        visited.push(page);
+        page != 0x3000
+    }));
+    assert_eq!(visited, [0x1000, 0x2000, 0x3000]);
+}
+
+#[test]
 fn explorer_cannot_replace_the_running_loongarch_stack() {
     assert!(!policy::available(0x1f0000, 0x42bf000, &[(0x433f000, 0x100000)]));
     assert!(policy::available(0x1f0000, 0x42bf000, &[(0x239000000, 0x100000)]));
