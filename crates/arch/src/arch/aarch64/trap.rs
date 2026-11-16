@@ -187,8 +187,8 @@ fn handle_lower_sync(tf: &mut TrapFrame) {
                 unsafe { crate::arch::aarch64::syscall::syscall_dispatch_with_tf(syscall_num, tf) };
 
             tf.x0 = result;
-            // Advance the PC past the SVC instruction (SVC #imm is 4 bytes).
-            tf.elr_el1 = tf.elr_el1.wrapping_add(4);
+            // SVC saves the address of the following instruction in ELR_EL1.
+            // Advancing it again would skip the caller's stack restoration.
         }
         ec::DATA_ABORT_LOWER_EL | ec::INSTRUCTION_ABORT_LOWER_EL => {
             // Page fault from user mode. We dispatch to the
