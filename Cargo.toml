@@ -53,6 +53,14 @@ codegen-units = 1
 strip = "none"
 panic = "abort"
 
+# Software composition and glyph rasterization are throughput-sensitive. Size
+# optimization disables LLVM's loop vectorization in these hot paths.
+[profile.release.package.nt61-desktop]
+opt-level = 3
+
+[profile.release.package.nt61-fonts]
+opt-level = 3
+
 [profile.dev]
 opt-level = 0
 debug = false
