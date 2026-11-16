@@ -96,11 +96,13 @@ fn bootmgr_panic(info: &core::panic::PanicInfo) -> ! {
 #[macro_export]
 macro_rules! debug_println {
     ($fmt:expr $(, $arg:expr)*) => {{
-        use ::alloc::format;
-        #[cfg(feature = "log_level_debug")]
-        $crate::arch::current::write_com1_marker(
-            format!("{}\r\n", format!($fmt, $($arg),*)).as_bytes(),
-        );
+        // Keep diagnostic arguments type checked in every build. The constant
+        // branch avoids evaluating them or allocating when debug logging is off.
+        if cfg!(feature = "log_level_debug") {
+            $crate::arch::current::write_com1_marker(
+                ::alloc::format!("{}\r\n", core::format_args!($fmt, $($arg),*)).as_bytes(),
+            );
+        }
     }};
 }
 
@@ -828,7 +830,7 @@ fn draw_gop_advanced_screen(
         // Draw the lines
         let mut y_pos = desc_text_y as i32;
         let line_spacing = font.line_height() as i32 + 2;
-        let max_y = (status_bottom as i32 - status_height as i32 - 16);
+        let max_y = status_bottom as i32 - status_height as i32 - 16;
         for line in lines {
             if y_pos + font.line_height() as i32 > max_y {
                 // Add ellipsis if no more room

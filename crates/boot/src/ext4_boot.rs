@@ -253,7 +253,7 @@ fn read_extents(
 
         let ee_start_hi = (start_word >> 16) & 0xFFFF;
         let ee_start_lo = start_word;
-        let physical = ((ee_start_hi << 16) | ee_start_lo);
+        let physical = (ee_start_hi << 16) | ee_start_lo;
         let sectors = ((block_count as usize).div_ceil(ext4.block_size as usize)
             * (ext4.block_size / 512) as usize) as u32;
         let lba = partition_start_lba + (physical as u64) * (ext4.block_size / 512) as u64;
@@ -289,7 +289,7 @@ fn read_extents(
             let _ei_block = w0 & 0xFFFF;
             let ei_leaf_lo = w1;
             let ei_leaf_hi = (w2 >> 16) & 0xFFFF;
-            let leaf_block = ((ei_leaf_hi << 16) | ei_leaf_lo);
+            let leaf_block = (ei_leaf_hi << 16) | ei_leaf_lo;
             let leaf_lba =
                 partition_start_lba + (leaf_block as u64) * (ext4.block_size / 512) as u64;
             let sectors_per_block = ext4.block_size / 512;

@@ -110,6 +110,7 @@ mod pe;
 mod boot_image;
 mod image_integrity;
 mod refs_boot;
+mod refs_discovery;
 mod verify;
 
 static EXIT_BOOT_SERVICES_DONE: AtomicBool = AtomicBool::new(false);
@@ -354,7 +355,7 @@ fn open_system_file_data(path: &str) -> Option<Vec<u8>> {
         if fs_kind == SYSTEM_FS_UNKNOWN || fs_kind == SYSTEM_FS_REFS {
             // ReFS System partition: resolve via the self-describing
             // directory index produced by the in-tree builder.
-            if let Some(data) = crate::refs_boot::read_refs_system_file(path) {
+            if let Some(data) = crate::refs_discovery::read_refs_system_file(path) {
                 unsafe {
                     core::ptr::addr_of_mut!(SYSTEM_FS_KIND).write_volatile(SYSTEM_FS_REFS);
                 }
