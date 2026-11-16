@@ -41,21 +41,26 @@ pub enum KeyType {
     SymbolicLink = 2,
 }
 
-/// Registry value types
+/// Registry type tags are opaque DWORD values. The named REG_* constants do
+/// not limit which values NtSetValueKey may preserve and return to callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValueType {
-    None = 0,
-    String = 1,
-    ExpandString = 2,
-    Binary = 3,
-    DWord = 4,
-    DWordBigEndian = 5,
-    Link = 6,
-    MultiString = 7,
-    ResourceList = 9,
-    FullResourceDescriptor = 10,
-    ResourceRequirementsList = 11,
-    QWord = 12,
+#[repr(transparent)]
+pub struct ValueType(pub u32);
+
+#[allow(non_upper_case_globals)]
+impl ValueType {
+    pub const None: Self = Self(0);
+    pub const String: Self = Self(1);
+    pub const ExpandString: Self = Self(2);
+    pub const Binary: Self = Self(3);
+    pub const DWord: Self = Self(4);
+    pub const DWordBigEndian: Self = Self(5);
+    pub const Link: Self = Self(6);
+    pub const MultiString: Self = Self(7);
+    pub const ResourceList: Self = Self(8);
+    pub const FullResourceDescriptor: Self = Self(9);
+    pub const ResourceRequirementsList: Self = Self(10);
+    pub const QWord: Self = Self(11);
 }
 
 /// Registry value with fixed-size buffers.
@@ -132,6 +137,7 @@ pub struct RegistryKey {
     pub name: [u16; 256],
     pub name_len: u16,
     pub key_type: KeyType,
+    pub last_write_time: i64,
     pub values: [Option<RegValue>; 64],
     pub value_count: usize,
     pub children: [Option<*mut RegistryKey>; 32],
@@ -146,6 +152,7 @@ impl RegistryKey {
             name: [0; 256],
             name_len: 0,
             key_type: KeyType::Directory,
+            last_write_time: 0,
             values: [const { None }; 64],
             value_count: 0,
             children: [const { None }; 32],
@@ -161,6 +168,10 @@ impl RegistryKey {
         result
     }
 }
+
+// Serialize native tree access before taking root, handle or notification locks.
+// This keeps rename/delete and readers from retaining freed key pointers.
+static REGISTRY_OPERATIONS: spin::Spinlock<()> = spin::Spinlock::new(());
 
 /// Global registry state
 static REGISTRY_ROOT: spin::Spinlock<Option<*mut RegistryKey>> = spin::Spinlock::new(None);
@@ -375,6 +386,16 @@ pub fn init() {
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// create a subkey under the given parent.
 pub unsafe fn create_subkey(parent: *mut RegistryKey, name: &[u16]) -> Option<*mut RegistryKey> {
+    // Check the insertion slot before allocation. Returning an unlinked key
+    // would expose a successful create that could never be opened by name.
+    // SAFETY: the caller pins the parent and serializes changes to its children.
+    if name.is_empty()
+        || name.len() > 255
+        || name.iter().any(|unit| *unit == 0 || *unit == BACKSLASH_U16)
+        || (!parent.is_null() && unsafe { (*parent).child_count >= (*parent).children.len() })
+    {
+        return None;
+    }
     let key_ptr = crate::mm::pool::allocate(
         crate::mm::pool::PoolType::NonPaged,
         core::mem::size_of::<RegistryKey>(),
@@ -387,10 +408,11 @@ pub unsafe fn create_subkey(parent: *mut RegistryKey, name: &[u16]) -> Option<*m
                 (*key_ptr).name[i] = 0;
             }
             // Copy name one element at a time (avoid copy_from_slice)
-            let len = name.len().min(255);
+            let len = name.len();
             (&mut (*key_ptr).name)[..len].copy_from_slice(&name[..len]);
             (*key_ptr).name_len = len as u16;
             (*key_ptr).key_type = KeyType::Directory;
+            (*key_ptr).last_write_time = crate::ke::time::get_system_time() as i64;
             (*key_ptr).parent = parent;
             (*key_ptr).value_count = 0;
             (*key_ptr).child_count = 0;
@@ -580,7 +602,7 @@ pub unsafe fn set_value(
                 if value_name_len == name.len() {
                     let mut match_found = true;
                     for j in 0..value_name_len {
-                        if value.name[j] != name[j] {
+                        if !same_value_unit(value.name[j], name[j]) {
                             match_found = false;
                             break;
                         }
@@ -631,7 +653,7 @@ pub unsafe fn get_value(key: *mut RegistryKey, name: &[u16]) -> Option<(ValueTyp
                 if value_name_len == name.len() {
                     let mut match_found = true;
                     for j in 0..value_name_len {
-                        if value.name[j] != name[j] {
+                        if !same_value_unit(value.name[j], name[j]) {
                             match_found = false;
                             break;
                         }
@@ -665,14 +687,29 @@ pub unsafe extern "C" fn nt_create_key(
     create_options: u32,
     disposition: *mut u32,
 ) -> NTSTATUS {
+    let _operation = REGISTRY_OPERATIONS.lock();
+    let desired_access = match key_access_mask(desired_access) {
+        Ok(access) => access,
+        Err(status) => return status,
+    };
+    if let Err(status) = probe_user_write(key_handle as u64, core::mem::size_of::<HANDLE>()) {
+        return status;
+    }
+
     let _ = title_index;
-    let _ = create_options;
+    // This tree is volatile. Hive links and backup/restore opens need separate
+    // implementations and may not be silently converted to normal creates.
+    if create_options & !1 != 0 || !_class.is_null() {
+        return crate::libs::ntdll::status::STATUS_NOT_SUPPORTED;
+    }
+    if !disposition.is_null() {
+        if let Err(status) = probe_user_write(disposition as u64, 4) {
+            return status;
+        }
+    }
 
     if key_handle.is_null() {
         return STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-    if desired_access & KEY_CREATE_SUB_KEY == 0 {
-        return STATUS_ACCESS_DENIED;
     }
 
     let attributes: ObjectAttributes = if !object_attributes.is_null() {
@@ -699,10 +736,11 @@ pub unsafe extern "C" fn nt_create_key(
     );
 
     let root = REGISTRY_ROOT.lock();
-    let mut current = match *root {
-        Some(r) => r,
-        None => return STATUS_OBJECT_NAME_NOT_FOUND,
+    let mut current = match registry_start(&attributes, *root) {
+        Ok(key) => key,
+        Err(status) => return status,
     };
+    let mut created = false;
 
     // Skip leading backslashes.
     let mut start = 0;
@@ -723,12 +761,19 @@ pub unsafe extern "C" fn nt_create_key(
             if let Some(found_key) = found {
                 current = found_key;
             } else {
-                // create missing subkey.
+                if !registry_access_allowed(current, KEY_CREATE_SUB_KEY)
+                    || !registry_access_allowed(current, desired_access)
+                {
+                    return STATUS_ACCESS_DENIED;
+                }
+                // Create only after checking the parent DACL. Children inherit
+                // the same descriptor in this volatile implementation.
                 let new_key = match create_subkey(current, component) {
                     Some(k) => k,
-                    None => return STATUS_OBJECT_NAME_NOT_FOUND,
+                    None => return crate::libs::ntdll::status::STATUS_INSUFFICIENT_RESOURCES,
                 };
                 current = new_key;
+                created = true;
             }
         }
         start = end + 1;
@@ -753,18 +798,22 @@ pub unsafe extern "C" fn nt_create_key(
     };
 
     let handle = (slot_idx as u32 + 1) as HANDLE;
-    if write_user_object(key_handle as u64, &handle).is_err() {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+    if let Err(status) = write_user_object(key_handle as u64, &handle) {
+        KEY_HANDLE_TABLE.lock()[slot_idx] = None;
+        return status;
     }
-
-    if !disposition.is_null() && write_user_object(disposition as u64, &1u32).is_err() {
-        return STATUS_INVALID_PARAMETER;
+    let action = if created { 1u32 } else { 2u32 };
+    if !disposition.is_null() {
+        if let Err(status) = write_user_object(disposition as u64, &action) {
+            KEY_HANDLE_TABLE.lock()[slot_idx] = None;
+            return status;
+        }
     }
 
     kprintln!(
         subsystem: "REG",
         "    [REG] NtCreateKey: handle=0x{:x} (slot={})",
-        *key_handle as u32,
+        handle as usize as u32,
         slot_idx
     );
 
@@ -780,6 +829,15 @@ pub unsafe extern "C" fn nt_open_key(
     desired_access: u32,
     object_attributes: *mut ObjectAttributes,
 ) -> NTSTATUS {
+    let _operation = REGISTRY_OPERATIONS.lock();
+    let desired_access = match key_access_mask(desired_access) {
+        Ok(access) => access,
+        Err(status) => return status,
+    };
+    if let Err(status) = probe_user_write(key_handle as u64, core::mem::size_of::<HANDLE>()) {
+        return status;
+    }
+
     if key_handle.is_null() {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
@@ -804,9 +862,9 @@ pub unsafe extern "C" fn nt_open_key(
     kprintln!(subsystem: "REG", "    [REG] NtOpenKey: path_len={}", path.len());
 
     let root = REGISTRY_ROOT.lock();
-    let mut current = match *root {
-        Some(r) => r,
-        None => return STATUS_OBJECT_NAME_NOT_FOUND,
+    let mut current = match registry_start(&attributes, *root) {
+        Ok(key) => key,
+        Err(status) => return status,
     };
 
     let mut start = 0;
@@ -873,10 +931,13 @@ pub unsafe extern "C" fn nt_set_value_key(
     data: PVOID,
     data_size: u32,
 ) -> NTSTATUS {
+    let _operation = REGISTRY_OPERATIONS.lock();
     let _ = title_index;
 
     // handle = slot_index + 1. Validate range first.
-    let handle_idx = (key_handle as usize).saturating_sub(1);
+    let Some(handle_idx) = (key_handle as usize).checked_sub(1) else {
+        return STATUS_INVALID_HANDLE;
+    };
     if handle_idx >= MAX_KEY_HANDLES {
         return STATUS_INVALID_PARAMETER;
     }
@@ -891,16 +952,12 @@ pub unsafe extern "C" fn nt_set_value_key(
         return STATUS_ACCESS_DENIED;
     }
 
-    if entry.desired_access & KEY_QUERY_VALUE == 0 {
-        return STATUS_ACCESS_DENIED;
-    }
-
     let key = entry.key_ptr;
     drop(handle_table);
 
     // Extract value name.
     let name = if !value_name.is_null() {
-        match read_user_unicode_string(value_name as u64, MAX_VALUE_NAME_LEN * 2) {
+        match capture_value_name(value_name as u64) {
             Ok(value) => value,
             Err(_) => return STATUS_INVALID_PARAMETER,
         }
@@ -928,18 +985,15 @@ pub unsafe extern "C" fn nt_set_value_key(
         return STATUS_INVALID_PARAMETER;
     }
 
-    let vtype = match value_type {
-        1 => ValueType::String,
-        3 => ValueType::Binary,
-        4 => ValueType::DWord,
-        7 => ValueType::MultiString,
-        _ => ValueType::Binary,
-    };
+    let vtype = ValueType(value_type);
 
+    if data.is_null() && data_size != 0 {
+        return STATUS_ACCESS_VIOLATION;
+    }
     let mut data_bytes = alloc::vec![0u8; data_size as usize];
     let data_slice = if !data.is_null() && data_size > 0 {
-        if copy_from_user(&mut data_bytes, data as u64).is_err() {
-            return STATUS_INVALID_PARAMETER;
+        if let Err(status) = copy_from_user(&mut data_bytes, data as u64) {
+            return status;
         }
         data_bytes.as_slice()
     } else {
@@ -954,6 +1008,7 @@ pub unsafe extern "C" fn nt_set_value_key(
     );
 
     if set_value(key, &name, vtype, data_slice) {
+        (*key).last_write_time = crate::ke::time::get_system_time() as i64;
         notify_registry_change(key);
         STATUS_SUCCESS
     } else {
@@ -973,7 +1028,10 @@ pub unsafe extern "C" fn nt_query_value_key(
     length: u32,
     result_length: *mut u32,
 ) -> NTSTATUS {
-    let handle_idx = (key_handle as usize).saturating_sub(1);
+    let _operation = REGISTRY_OPERATIONS.lock();
+    let Some(handle_idx) = (key_handle as usize).checked_sub(1) else {
+        return STATUS_INVALID_HANDLE;
+    };
     if handle_idx >= MAX_KEY_HANDLES {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
@@ -984,11 +1042,14 @@ pub unsafe extern "C" fn nt_query_value_key(
         None => return STATUS_OBJECT_NAME_NOT_FOUND,
     };
 
+    if entry.desired_access & KEY_QUERY_VALUE == 0 {
+        return STATUS_ACCESS_DENIED;
+    }
     let key = entry.key_ptr;
     drop(handle_table);
 
     let name = if !value_name.is_null() {
-        match read_user_unicode_string(value_name as u64, MAX_VALUE_NAME_LEN * 2) {
+        match capture_value_name(value_name as u64) {
             Ok(value) => value,
             Err(_) => return STATUS_OBJECT_NAME_NOT_FOUND,
         }
@@ -998,114 +1059,22 @@ pub unsafe extern "C" fn nt_query_value_key(
 
     // Find the value and its data directly from the key.
     let found = find_value(key, &name);
-    let Some((vtype, data_slice)) = found else {
+    let Some(value) = found else {
         return STATUS_OBJECT_NAME_NOT_FOUND;
     };
-    let data_size = data_slice.len();
-
-    // Per-class fixed header sizes, indexed by information class. Adding a
-    // new class means adding a row here plus its payload writer below; the
-    // validation path (required-size report, buffer-size check and user
-    // probe) is shared so it cannot be forgotten per branch.
-    const HEADER_SIZES: [usize; 3] = [
-        KEY_VALUE_BASIC_INFORMATION_SIZE, // 0: KeyValueBasicInformation
-        KEY_VALUE_FULL_INFORMATION_SIZE,  // 1: KeyValueFullInformation
-        0x18,                             // 2: KeyValuePartialInformation
-    ];
-
-    let class = key_value_information_class as usize;
-    let header_size = match HEADER_SIZES.get(class) {
-        Some(h) => *h,
-        None => return STATUS_INVALID_PARAMETER,
-    };
-
-    let name_bytes = name.len() * 2;
-    let required = match class {
-        0 => header_size + name_bytes,
-        1 => header_size + name_bytes + data_size,
-        _ => header_size + data_size,
-    };
-
-    // Unified validation entry: report the required size, then make sure
-    // the caller's buffer is large enough and actually writable.
-    let info_ptr = {
-        if !write_result_length(result_length, required) {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        if (length as usize) < required || key_value_information.is_null() {
-            return STATUS_BUFFER_TOO_SMALL;
-        }
-        if probe_user_write(key_value_information as u64, required).is_err() {
-            return STATUS_ACCESS_VIOLATION;
-        }
-        key_value_information as *mut u8
-    };
-
-    unsafe {
-        // TitleIndex (4 bytes) + Type (4 bytes): common to every class.
-        let title_index = 0u32.to_le_bytes();
-        core::ptr::copy_nonoverlapping(title_index.as_ptr(), info_ptr, 4);
-        let vtype_bytes = (vtype as u32).to_le_bytes();
-        core::ptr::copy_nonoverlapping(vtype_bytes.as_ptr(), info_ptr.add(4), 4);
-
-        match class {
-            0 => {
-                // KeyValueBasicInformation: fixed 12-byte header followed by
-                // the value name. Windows always returns the name here, so
-                // callers that read NameLength and then the name bytes see
-                // consistent data instead of stale user-buffer contents.
-                let name_len_bytes = (name_bytes as u32).to_le_bytes();
-                core::ptr::copy_nonoverlapping(name_len_bytes.as_ptr(), info_ptr.add(8), 4);
-                copy_utf16_name(info_ptr.add(header_size), &name);
-            }
-            1 => {
-                // KeyValueFullInformation: 20-byte header, then the value
-                // name, then the value data. DataOffset points at the data
-                // (immediately after the name), matching Windows NT 6.1.
-                let data_offset = header_size + name_bytes;
-                let data_offset_bytes = (data_offset as u32).to_le_bytes();
-                core::ptr::copy_nonoverlapping(data_offset_bytes.as_ptr(), info_ptr.add(8), 4);
-                let data_size_bytes = (data_size as u32).to_le_bytes();
-                core::ptr::copy_nonoverlapping(data_size_bytes.as_ptr(), info_ptr.add(12), 4);
-                let name_len_bytes = (name_bytes as u32).to_le_bytes();
-                core::ptr::copy_nonoverlapping(name_len_bytes.as_ptr(), info_ptr.add(16), 4);
-                copy_utf16_name(info_ptr.add(header_size), &name);
-                core::ptr::copy_nonoverlapping(
-                    data_slice.as_ptr(),
-                    info_ptr.add(data_offset),
-                    data_size,
-                );
-            }
-            _ => {
-                // KeyValuePartialInformation: TitleIndex (4 bytes) +
-                // Type (4 bytes) + DataLength (4 bytes), then the data.
-                let len_bytes = (data_size as u32).to_le_bytes();
-                core::ptr::copy_nonoverlapping(len_bytes.as_ptr(), info_ptr.add(8), 4);
-                core::ptr::copy_nonoverlapping(
-                    data_slice.as_ptr(),
-                    info_ptr.add(header_size),
-                    data_size,
-                );
-            }
-        }
-    }
-
-    STATUS_SUCCESS
+    registry_information::value_information(
+        &value.name[..value.name_len as usize],
+        value.value_type,
+        &value.data[..value.data_size as usize],
+        key_value_information_class,
+        key_value_information,
+        length,
+        result_length,
+    )
 }
 
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Copies a UTF-16LE value name into a user buffer at `dst`.
-unsafe fn copy_utf16_name(dst: *mut u8, name: &[u16]) {
-    for (index, unit) in name.iter().enumerate() {
-        let bytes = unit.to_le_bytes();
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(index * 2), 2);
-    }
-}
-
-/// Finds a value by name and returns (type, data-slice).
-fn find_value(key: *mut RegistryKey, name: &[u16]) -> Option<(ValueType, &[u8])> {
+/// Finds the stored value, retaining its original name spelling.
+unsafe fn find_value<'a>(key: *mut RegistryKey, name: &[u16]) -> Option<&'a RegValue> {
     if key.is_null() {
         return None;
     }
@@ -1116,14 +1085,13 @@ fn find_value(key: *mut RegistryKey, name: &[u16]) -> Option<(ValueType, &[u8])>
                 if value_name_len == name.len() {
                     let mut match_found = true;
                     for j in 0..value_name_len {
-                        if value.name[j] != name[j] {
+                        if !same_value_unit(value.name[j], name[j]) {
                             match_found = false;
                             break;
                         }
                     }
                     if match_found {
-                        let data_size = value.data_size as usize;
-                        return Some((value.value_type, &value.data[..data_size]));
+                        return Some(value);
                     }
                 }
             }
@@ -1143,9 +1111,12 @@ fn find_value(key: *mut RegistryKey, name: &[u16]) -> Option<(ValueType, &[u8])>
 /// invalidated so no caller keeps using freed memory. Root keys cannot
 /// be deleted.
 pub unsafe extern "C" fn nt_delete_key(key_handle: HANDLE) -> NTSTATUS {
+    let _operation = REGISTRY_OPERATIONS.lock();
     const STATUS_CANNOT_DELETE: NTSTATUS = -1073741791;
 
-    let handle_idx = (key_handle as usize).saturating_sub(1);
+    let Some(handle_idx) = (key_handle as usize).checked_sub(1) else {
+        return STATUS_INVALID_HANDLE;
+    };
     if handle_idx >= MAX_KEY_HANDLES {
         kprintln!(
             subsystem: "REG",
@@ -1251,12 +1222,15 @@ pub unsafe extern "C" fn nt_delete_value_key(
     key_handle: HANDLE,
     value_name: *mut UnicodeString,
 ) -> NTSTATUS {
+    let _operation = REGISTRY_OPERATIONS.lock();
     if value_name.is_null() {
         kprintln!(subsystem: "REG", "    [REG] NtDeleteValueKey: value_name is null");
         return STATUS_INVALID_PARAMETER;
     }
 
-    let handle_idx = (key_handle as usize).saturating_sub(1);
+    let Some(handle_idx) = (key_handle as usize).checked_sub(1) else {
+        return STATUS_INVALID_HANDLE;
+    };
     if handle_idx >= MAX_KEY_HANDLES {
         kprintln!(
             subsystem: "REG",
@@ -1270,7 +1244,7 @@ pub unsafe extern "C" fn nt_delete_value_key(
         let handle_table = KEY_HANDLE_TABLE.lock();
         match &handle_table[handle_idx] {
             Some(entry) => {
-                if entry.desired_access & (KEY_SET_VALUE | DELETE_RIGHT) == 0 {
+                if entry.desired_access & KEY_SET_VALUE == 0 {
                     return STATUS_ACCESS_DENIED;
                 }
                 entry.key_ptr
@@ -1296,7 +1270,7 @@ pub unsafe extern "C" fn nt_delete_value_key(
     }
 
     // Extract ValueName UTF-16 string.
-    let name_slice = match read_user_unicode_string(value_name as u64, MAX_VALUE_NAME_LEN * 2) {
+    let name_slice = match capture_value_name(value_name as u64) {
         Ok(value) => value,
         Err(_) => return STATUS_OBJECT_NAME_NOT_FOUND,
     };
@@ -1311,7 +1285,7 @@ pub unsafe extern "C" fn nt_delete_value_key(
                 if v_len == name_len_u16 {
                     let mut eq = true;
                     for j in 0..v_len {
-                        if v.name[j] != name_slice[j] {
+                        if !same_value_unit(v.name[j], name_slice[j]) {
                             eq = false;
                             break;
                         }
@@ -1342,6 +1316,7 @@ pub unsafe extern "C" fn nt_delete_value_key(
                     key_ref.values[idx] = None;
                 }
                 key_ref.value_count -= 1;
+                key_ref.last_write_time = crate::ke::time::get_system_time() as i64;
                 notify_registry_change(key);
                 kprintln!(
                     subsystem: "REG",
@@ -1370,26 +1345,24 @@ pub struct KeyBasicInformation {
 }
 
 /// KEY_NODE_INFORMATION — detailed key information.
-/// Total: 0x1C bytes fixed header + name (FAM).
+/// Total: 0x18 bytes fixed header + name (FAM).
 #[repr(C)]
 pub struct KeyNodeInformation {
-    pub class_name_offset: u32,
-    pub reserved: u32,
     pub last_write_time: i64,
     pub title_index: u32,
+    pub class_name_offset: u32,
     pub class_name_length: u32,
     pub name_length: u32,
     pub name: [u16; 1], // Flexible array member
 }
 
 /// KEY_VALUE_BASIC_INFORMATION — basic value information.
-/// Total: 0x08 bytes fixed header + name (FAM).
+/// Total: 0x0C bytes fixed header + name (FAM).
 #[repr(C)]
 pub struct KeyValueBasicInformation {
     pub title_index: u32,
     pub value_type: u32,
     pub name_length: u32,
-    pub data_size: u32,
     pub name: [u16; 1], // Flexible array member
 }
 
@@ -1402,14 +1375,12 @@ pub struct KeyValueFullInformation {
     pub data_offset: u32,
     pub data_size: u32,
     pub name_length: u32,
-    pub class_name_offset: u32,
-    pub class_name_length: u32,
     pub name: [u16; 1], // Flexible array member
 }
 
 /// Fixed header sizes
 const KEY_BASIC_INFORMATION_SIZE: usize = 16;
-const KEY_NODE_INFORMATION_SIZE: usize = 28;
+const KEY_NODE_INFORMATION_SIZE: usize = 24;
 const KEY_VALUE_BASIC_INFORMATION_SIZE: usize = 12;
 const KEY_VALUE_FULL_INFORMATION_SIZE: usize = 20;
 
@@ -1417,13 +1388,7 @@ fn write_result_length(result_length: *mut u32, required: usize) -> bool {
     if result_length.is_null() {
         return true;
     }
-    if probe_user_write(result_length as u64, core::mem::size_of::<u32>()).is_err() {
-        return false;
-    }
-    unsafe {
-        *result_length = required as u32;
-    }
-    true
+    write_user_object(result_length as u64, &(required as u32)).is_ok()
 }
 
 /// # Safety
@@ -1437,11 +1402,12 @@ pub unsafe extern "C" fn nt_query_key(
     length: u32,
     result_length: *mut u32,
 ) -> NTSTATUS {
-    use crate::libs::ntdll::status::STATUS_BUFFER_OVERFLOW;
-    use crate::libs::ntdll::status::STATUS_BUFFER_TOO_SMALL;
+    let _operation = REGISTRY_OPERATIONS.lock();
     use crate::libs::ntdll::status::STATUS_INVALID_HANDLE;
 
-    let handle_idx = (key_handle as usize).saturating_sub(1);
+    let Some(handle_idx) = (key_handle as usize).checked_sub(1) else {
+        return STATUS_INVALID_HANDLE;
+    };
     if handle_idx >= MAX_KEY_HANDLES {
         return STATUS_INVALID_HANDLE;
     }
@@ -1452,90 +1418,29 @@ pub unsafe extern "C" fn nt_query_key(
         None => return STATUS_INVALID_HANDLE,
     };
 
-    let key = entry.key_ptr;
-    let requested_access = entry.desired_access | KEY_QUERY_VALUE;
-    drop(handle_table);
-
-    if !registry_access_allowed(key, requested_access) {
+    if key_information_class != 3 && entry.desired_access & KEY_QUERY_VALUE == 0 {
         return STATUS_ACCESS_DENIED;
     }
+    let key = entry.key_ptr;
+    drop(handle_table);
 
-    let key_name_len = unsafe { (*key).name_len as usize };
-    let key_name_bytes = key_name_len * 2;
-
-    match key_information_class {
-        0 => {
-            // KeyBasicInformation
-            let required = KEY_BASIC_INFORMATION_SIZE + key_name_bytes;
-            if !write_result_length(result_length, required) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            if (length as usize) < required {
-                return STATUS_BUFFER_OVERFLOW;
-            }
-            if key_information.is_null() {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            if probe_user_write(key_information as u64, required).is_err() {
-                return STATUS_ACCESS_VIOLATION;
-            }
-
-            let info = &mut *(key_information as *mut KeyBasicInformation);
-            info.last_write_time = 0; // No timestamp tracking
-            info.title_index = 0;
-            info.name_length = key_name_bytes as u32;
-
-            // Copy key name
-            let name_ptr = &mut info.name as *mut u16 as *mut u8;
-            core::ptr::copy_nonoverlapping(
-                (*key).name.as_ptr() as *const u8,
-                name_ptr,
-                key_name_bytes,
-            );
-
-            kprintln!(subsystem: "REG", "    [REG] NtQueryKey: KeyBasicInformation (name_len={})", key_name_bytes);
-            STATUS_SUCCESS
-        }
-        1 => {
-            // KeyNodeInformation
-            let required = KEY_NODE_INFORMATION_SIZE + key_name_bytes;
-            if !write_result_length(result_length, required) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            if (length as usize) < required {
-                return STATUS_BUFFER_OVERFLOW;
-            }
-            if key_information.is_null() {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            if probe_user_write(key_information as u64, required).is_err() {
-                return STATUS_ACCESS_VIOLATION;
-            }
-
-            let info = &mut *(key_information as *mut KeyNodeInformation);
-            info.class_name_offset = 0;
-            info.reserved = 0;
-            info.last_write_time = 0;
-            info.title_index = 0;
-            info.class_name_length = 0;
-            info.name_length = key_name_bytes as u32;
-
-            // Copy key name
-            let name_ptr = &mut info.name as *mut u16 as *mut u8;
-            core::ptr::copy_nonoverlapping(
-                (*key).name.as_ptr() as *const u8,
-                name_ptr,
-                key_name_bytes,
-            );
-
-            kprintln!(subsystem: "REG", "    [REG] NtQueryKey: KeyNodeInformation (name_len={})", key_name_bytes);
-            STATUS_SUCCESS
-        }
-        // Unsupported information classes must not fake success: the
-        // caller would read a half-initialised buffer. Windows returns
-        // STATUS_INVALID_PARAMETER for an unknown class.
-        _ => crate::libs::ntdll::status::STATUS_INVALID_PARAMETER,
+    // SAFETY: the operation lock excludes tree mutation and deletion.
+    if key_information_class == 3 {
+        return registry_information::key_name_information(
+            &*key,
+            key_information,
+            length,
+            result_length,
+        );
     }
+    registry_information::key_information(
+        &*key,
+        key_information_class,
+        key_information,
+        length,
+        result_length,
+        true,
+    )
 }
 
 /// # Safety
@@ -1550,12 +1455,13 @@ pub unsafe extern "C" fn nt_enumerate_key(
     length: u32,
     result_length: *mut u32,
 ) -> NTSTATUS {
-    use crate::libs::ntdll::status::STATUS_BUFFER_OVERFLOW;
-    use crate::libs::ntdll::status::STATUS_BUFFER_TOO_SMALL;
+    let _operation = REGISTRY_OPERATIONS.lock();
     use crate::libs::ntdll::status::STATUS_INVALID_HANDLE;
     use crate::libs::ntdll::status::STATUS_NO_MORE_ENTRIES;
 
-    let handle_idx = (key_handle as usize).saturating_sub(1);
+    let Some(handle_idx) = (key_handle as usize).checked_sub(1) else {
+        return STATUS_INVALID_HANDLE;
+    };
     if handle_idx >= MAX_KEY_HANDLES {
         return STATUS_INVALID_HANDLE;
     }
@@ -1566,13 +1472,11 @@ pub unsafe extern "C" fn nt_enumerate_key(
         None => return STATUS_INVALID_HANDLE,
     };
 
-    let key = entry.key_ptr;
-    let requested_access = entry.desired_access | KEY_ENUMERATE_SUB_KEYS;
-    drop(handle_table);
-
-    if !registry_access_allowed(key, requested_access) {
+    if entry.desired_access & KEY_ENUMERATE_SUB_KEYS == 0 {
         return STATUS_ACCESS_DENIED;
     }
+    let key = entry.key_ptr;
+    drop(handle_table);
 
     let child_count = unsafe { (*key).child_count };
 
@@ -1589,82 +1493,15 @@ pub unsafe extern "C" fn nt_enumerate_key(
         }
     };
 
-    let child_name_len = unsafe { (*child).name_len as usize };
-    let child_name_bytes = child_name_len * 2;
-
-    match key_information_class {
-        0 => {
-            // KeyBasicInformation
-            let required = KEY_BASIC_INFORMATION_SIZE + child_name_bytes;
-            if !write_result_length(result_length, required) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            if (length as usize) < required {
-                return STATUS_BUFFER_OVERFLOW;
-            }
-            if key_information.is_null() {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            if probe_user_write(key_information as u64, required).is_err() {
-                return STATUS_ACCESS_VIOLATION;
-            }
-
-            let info = &mut *(key_information as *mut KeyBasicInformation);
-            info.last_write_time = 0;
-            info.title_index = 0;
-            info.name_length = child_name_bytes as u32;
-
-            // Copy child key name
-            let name_ptr = &mut info.name as *mut u16 as *mut u8;
-            core::ptr::copy_nonoverlapping(
-                (*child).name.as_ptr() as *const u8,
-                name_ptr,
-                child_name_bytes,
-            );
-
-            kprintln!(subsystem: "REG", "    [REG] NtEnumerateKey: index={}, KeyBasicInformation", index);
-            STATUS_SUCCESS
-        }
-        1 => {
-            // KeyNodeInformation
-            let required = KEY_NODE_INFORMATION_SIZE + child_name_bytes;
-            if !write_result_length(result_length, required) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            if (length as usize) < required {
-                return STATUS_BUFFER_OVERFLOW;
-            }
-            if key_information.is_null() {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            if probe_user_write(key_information as u64, required).is_err() {
-                return STATUS_ACCESS_VIOLATION;
-            }
-
-            let info = &mut *(key_information as *mut KeyNodeInformation);
-            info.class_name_offset = 0;
-            info.reserved = 0;
-            info.last_write_time = 0;
-            info.title_index = 0;
-            info.class_name_length = 0;
-            info.name_length = child_name_bytes as u32;
-
-            // Copy child key name
-            let name_ptr = &mut info.name as *mut u16 as *mut u8;
-            core::ptr::copy_nonoverlapping(
-                (*child).name.as_ptr() as *const u8,
-                name_ptr,
-                child_name_bytes,
-            );
-
-            kprintln!(subsystem: "REG", "    [REG] NtEnumerateKey: index={}, KeyNodeInformation", index);
-            STATUS_SUCCESS
-        }
-        // Unsupported information classes must not fake success: the
-        // caller would read a half-initialised buffer. Windows returns
-        // STATUS_INVALID_PARAMETER for an unknown class.
-        _ => crate::libs::ntdll::status::STATUS_INVALID_PARAMETER,
-    }
+    // SAFETY: the operation lock pins the enumerated child and its subtree.
+    registry_information::key_information(
+        &*child,
+        key_information_class,
+        key_information,
+        length,
+        result_length,
+        false,
+    )
 }
 
 /// # Safety
@@ -1679,12 +1516,13 @@ pub unsafe extern "C" fn nt_enumerate_value_key(
     length: u32,
     result_length: *mut u32,
 ) -> NTSTATUS {
-    use crate::libs::ntdll::status::STATUS_BUFFER_OVERFLOW;
-    use crate::libs::ntdll::status::STATUS_BUFFER_TOO_SMALL;
+    let _operation = REGISTRY_OPERATIONS.lock();
     use crate::libs::ntdll::status::STATUS_INVALID_HANDLE;
     use crate::libs::ntdll::status::STATUS_NO_MORE_ENTRIES;
 
-    let handle_idx = (key_handle as usize).saturating_sub(1);
+    let Some(handle_idx) = (key_handle as usize).checked_sub(1) else {
+        return STATUS_INVALID_HANDLE;
+    };
     if handle_idx >= MAX_KEY_HANDLES {
         return STATUS_INVALID_HANDLE;
     }
@@ -1695,13 +1533,11 @@ pub unsafe extern "C" fn nt_enumerate_value_key(
         None => return STATUS_INVALID_HANDLE,
     };
 
-    let key = entry.key_ptr;
-    let requested_access = entry.desired_access | KEY_QUERY_VALUE;
-    drop(handle_table);
-
-    if !registry_access_allowed(key, requested_access) {
+    if entry.desired_access & KEY_QUERY_VALUE == 0 {
         return STATUS_ACCESS_DENIED;
     }
+    let key = entry.key_ptr;
+    drop(handle_table);
 
     let value_count = unsafe { (*key).value_count };
 
@@ -1717,120 +1553,15 @@ pub unsafe extern "C" fn nt_enumerate_value_key(
         }
     };
 
-    let value_name_len = value.name_len as usize;
-    let value_name_bytes = value_name_len * 2;
-
-    match key_value_information_class {
-        0 => {
-            // KeyValueBasicInformation
-            let required = KEY_VALUE_BASIC_INFORMATION_SIZE + value_name_bytes;
-            if !write_result_length(result_length, required) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            if (length as usize) < required {
-                return STATUS_BUFFER_OVERFLOW;
-            }
-            if key_value_information.is_null() {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            if probe_user_write(key_value_information as u64, required).is_err() {
-                return STATUS_ACCESS_VIOLATION;
-            }
-
-            let info = &mut *(key_value_information as *mut KeyValueBasicInformation);
-            info.title_index = 0;
-            info.value_type = value.value_type as u32;
-            info.name_length = value_name_bytes as u32;
-            info.data_size = value.data_size;
-
-            // Copy value name
-            let name_ptr = &mut info.name as *mut u16 as *mut u8;
-            core::ptr::copy_nonoverlapping(
-                value.name.as_ptr() as *const u8,
-                name_ptr,
-                value_name_bytes,
-            );
-
-            kprintln!(subsystem: "REG", "    [REG] NtEnumerateValueKey: index={}, KeyValueBasicInformation", index);
-            STATUS_SUCCESS
-        }
-        1 => {
-            // KeyValueFullInformation
-            let data_size = value.data_size as usize;
-            let required = KEY_VALUE_FULL_INFORMATION_SIZE + value_name_bytes + data_size;
-            if !write_result_length(result_length, required) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            if (length as usize) < required {
-                return STATUS_BUFFER_OVERFLOW;
-            }
-            if key_value_information.is_null() {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            if probe_user_write(key_value_information as u64, required).is_err() {
-                return STATUS_ACCESS_VIOLATION;
-            }
-
-            let info = &mut *(key_value_information as *mut KeyValueFullInformation);
-            info.title_index = 0;
-            info.value_type = value.value_type as u32;
-            info.data_offset = (KEY_VALUE_FULL_INFORMATION_SIZE + value_name_bytes) as u32;
-            info.data_size = value.data_size;
-            info.name_length = value_name_bytes as u32;
-            info.class_name_offset = 0;
-            info.class_name_length = 0;
-
-            // Copy value name
-            let name_ptr = (&mut info.name as *mut u16 as *mut u8).add(0);
-            core::ptr::copy_nonoverlapping(
-                value.name.as_ptr() as *const u8,
-                name_ptr,
-                value_name_bytes,
-            );
-
-            // Copy value data
-            let data_ptr = (key_value_information as *mut u8).add(info.data_offset as usize);
-            core::ptr::copy_nonoverlapping(value.data.as_ptr(), data_ptr, data_size);
-
-            kprintln!(subsystem: "REG", "    [REG] NtEnumerateValueKey: index={}, KeyValueFullInformation", index);
-            STATUS_SUCCESS
-        }
-        2 => {
-            // KeyValuePartialInformation
-            let data_size = value.data_size as usize;
-            // KeyValuePartialInformation: 0x18 bytes fixed + data
-            let required = 0x18 + data_size;
-            if !write_result_length(result_length, required) {
-                return STATUS_ACCESS_VIOLATION;
-            }
-            if (length as usize) < required {
-                return STATUS_BUFFER_OVERFLOW;
-            }
-            if key_value_information.is_null() {
-                return STATUS_BUFFER_TOO_SMALL;
-            }
-            if probe_user_write(key_value_information as u64, required).is_err() {
-                return STATUS_ACCESS_VIOLATION;
-            }
-
-            // write KeyValuePartialInformation structure
-            let info_ptr = key_value_information as *mut u8;
-            core::ptr::write_unaligned(info_ptr as *mut u32, 0); // TitleIndex
-            core::ptr::write_unaligned((info_ptr as *mut u32).add(1), value.value_type as u32); // r#type
-            core::ptr::write_unaligned((info_ptr as *mut u32).add(2), value.data_size); // DataSize
-            core::ptr::write_unaligned((info_ptr as *mut u64).add(1), 0); // Data (aligned)
-
-            // Copy value data
-            core::ptr::copy_nonoverlapping(value.data.as_ptr(), info_ptr.add(0x18), data_size);
-
-            kprintln!(subsystem: "REG", "    [REG] NtEnumerateValueKey: index={}, KeyValuePartialInformation", index);
-            STATUS_SUCCESS
-        }
-        // Unsupported information classes must not fake success: the
-        // caller would read a half-initialised buffer. Windows returns
-        // STATUS_INVALID_PARAMETER for an unknown class.
-        _ => crate::libs::ntdll::status::STATUS_INVALID_PARAMETER,
-    }
+    registry_information::value_information(
+        &value.name[..value.name_len as usize],
+        value.value_type,
+        &value.data[..value.data_size as usize],
+        key_value_information_class,
+        key_value_information,
+        length,
+        result_length,
+    )
 }
 
 /// # Safety
@@ -1838,9 +1569,12 @@ pub unsafe extern "C" fn nt_enumerate_value_key(
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// nt_reg_close_key — close a registry key handle.
 pub unsafe extern "C" fn nt_reg_close_key(key_handle: HANDLE) -> NTSTATUS {
+    let _operation = REGISTRY_OPERATIONS.lock();
     use crate::libs::ntdll::status::STATUS_INVALID_HANDLE;
 
-    let handle_idx = (key_handle as usize).saturating_sub(1);
+    let Some(handle_idx) = (key_handle as usize).checked_sub(1) else {
+        return STATUS_INVALID_HANDLE;
+    };
     if handle_idx >= MAX_KEY_HANDLES {
         return STATUS_INVALID_HANDLE;
     }
@@ -1870,7 +1604,10 @@ pub unsafe extern "C" fn nt_reg_close_key(key_handle: HANDLE) -> NTSTATUS {
 /// to flush. The handle is still validated to match the real API's
 /// error behaviour.
 pub unsafe extern "C" fn nt_flush_key(key_handle: HANDLE) -> NTSTATUS {
-    let handle_idx = (key_handle as usize).saturating_sub(1);
+    let _operation = REGISTRY_OPERATIONS.lock();
+    let Some(handle_idx) = (key_handle as usize).checked_sub(1) else {
+        return STATUS_INVALID_HANDLE;
+    };
     if handle_idx >= MAX_KEY_HANDLES || KEY_HANDLE_TABLE.lock()[handle_idx].is_none() {
         return STATUS_INVALID_HANDLE;
     }
@@ -1896,7 +1633,10 @@ pub unsafe extern "C" fn nt_notify_change_key(
     _buffer_size: u32,
     asynchronous: u32,
 ) -> NTSTATUS {
-    let handle_idx = (key_handle as usize).saturating_sub(1);
+    let _operation = REGISTRY_OPERATIONS.lock();
+    let Some(handle_idx) = (key_handle as usize).checked_sub(1) else {
+        return STATUS_INVALID_HANDLE;
+    };
     if handle_idx >= MAX_KEY_HANDLES || KEY_HANDLE_TABLE.lock()[handle_idx].is_none() {
         return STATUS_INVALID_HANDLE;
     }
@@ -1984,6 +1724,9 @@ pub fn init_default_keys() {
 }
 
 #[cfg(test)]
+pub(crate) static REGISTRY_TEST_LOCK: spin::Spinlock<()> = spin::Spinlock::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1995,7 +1738,6 @@ mod tests {
     // (REGISTRY_ROOT, root child arrays, KEY_HANDLE_TABLE) through unsynchronized
     // read-modify-write sequences. Running them in parallel loses updates and
     // corrupts key structures, so serialize them explicitly.
-    static REGISTRY_TEST_LOCK: spin::Spinlock<()> = spin::Spinlock::new(());
 
     // Under libtest the kernel heap is never initialised; configure a test
     // region so pool allocations for registry keys work.
@@ -2104,3 +1846,67 @@ mod tests {
 pub mod queries;
 
 pub use queries::{nt_open_key_ex, nt_query_multiple_value_key, nt_query_open_sub_keys};
+
+#[path = "registry_mutation.rs"]
+pub mod mutation;
+pub use mutation::{nt_rename_key, nt_set_information_key};
+
+#[path = "registry_information.rs"]
+mod registry_information;
+
+// Registry values use a counted name; zero length identifies the default value.
+fn capture_value_name(address: u64) -> Result<alloc::vec::Vec<u16>, NTSTATUS> {
+    let header = read_user_object::<UnicodeString>(address)?;
+    if header.length % 2 != 0
+        || header.length > header.maximum_length
+        || header.length as usize > MAX_VALUE_NAME_LEN * 2
+    {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if header.length == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
+    read_user_unicode_string(address, MAX_VALUE_NAME_LEN * 2)
+}
+fn same_value_unit(left: u16, right: u16) -> bool {
+    // Full Win7 NLS upcase data remains a separate compatibility requirement.
+    let lower = |unit| {
+        if (65..=90).contains(&unit) {
+            unit + 32
+        } else {
+            unit
+        }
+    };
+    lower(left) == lower(right)
+}
+
+fn key_access_mask(mut access: u32) -> Result<u32, NTSTATUS> {
+    // WOW64 view selectors choose a namespace; this single view has no
+    // redirection yet, so reject them explicitly.
+    if access & 0x300 != 0 {
+        return Err(crate::libs::ntdll::status::STATUS_NOT_SUPPORTED);
+    }
+    crate::se::seaccess::REGISTRY_GENERIC_MAPPING.map_generic(&mut access);
+    if access & !0x000f_003f != 0 {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    Ok(access)
+}
+fn registry_start(
+    attributes: &ObjectAttributes,
+    root: Option<*mut RegistryKey>,
+) -> Result<*mut RegistryKey, NTSTATUS> {
+    if attributes.length as usize != core::mem::size_of::<ObjectAttributes>() {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    if attributes.root_directory.is_null() {
+        return root.ok_or(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+    let table = KEY_HANDLE_TABLE.lock();
+    (attributes.root_directory as usize)
+        .checked_sub(1)
+        .and_then(|slot| table.get(slot))
+        .and_then(Option::as_ref)
+        .map(|entry| entry.key_ptr)
+        .ok_or(STATUS_INVALID_HANDLE)
+}

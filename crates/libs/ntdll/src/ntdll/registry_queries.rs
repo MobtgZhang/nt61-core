@@ -40,6 +40,7 @@ pub unsafe extern "C" fn nt_query_multiple_value_key(
     buffer_length: *mut u32,
     required_length: *mut u32,
 ) -> NTSTATUS {
+    let _operation = REGISTRY_OPERATIONS.lock();
     use super::super::status::*;
     (|| {
         if count > 65536 {
@@ -63,10 +64,7 @@ pub unsafe extern "C" fn nt_query_multiple_value_key(
                 .checked_add(index * 24)
                 .ok_or(STATUS_ACCESS_VIOLATION)?;
             let entry = read_user_object::<ValueEntry>(address)?;
-            names.push(read_user_unicode_string(
-                entry.name,
-                MAX_VALUE_NAME_LEN * 2,
-            )?);
+            names.push(capture_value_name(entry.name)?);
             captured.push(entry);
         }
         let mut bytes = Vec::new();
@@ -109,7 +107,7 @@ pub unsafe extern "C" fn nt_query_multiple_value_key(
                 bytes.extend_from_slice(&value.data[..value.data_size as usize]);
                 entry.offset = aligned as u32;
                 entry.length = value.data_size as u32;
-                entry.kind = value.value_type as u32;
+                entry.kind = value.value_type.0;
                 entry.padding = 0;
             }
         }
@@ -138,6 +136,7 @@ pub unsafe extern "C" fn nt_query_open_sub_keys(
     attributes: *mut ObjectAttributes,
     output: *mut u32,
 ) -> NTSTATUS {
+    let _operation = REGISTRY_OPERATIONS.lock();
     use super::super::status::*;
     (|| {
         probe_user_write(output as u64, 4)?;

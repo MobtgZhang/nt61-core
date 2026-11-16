@@ -43,6 +43,8 @@ macro_rules! portable_services {
 }
 
 portable_services! {
+    ("NtRenameKey", portable_nt_rename_key, registry::nt_rename_key, [0, 1]);
+    ("NtSetInformationKey", portable_nt_set_information_key, registry::nt_set_information_key, [0, 1, 2, 3]);
     ("NtDuplicateToken", portable_nt_duplicate_token, security::nt_duplicate_token, [0, 1, 2, 3, 4, 5]);
     ("NtQueryDefaultLocale", portable_nt_query_default_locale, locale::nt_query_default_locale, [0, 1]);
     ("NtSetDefaultLocale", portable_nt_set_default_locale, locale::nt_set_default_locale, [0, 1]);
