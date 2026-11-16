@@ -1048,23 +1048,14 @@ impl Eprocess {
         self.token.get_object() as *mut crate::se::token::Token
     }
 
-    /// Get thread count from process
+    /// Count process membership under the same lock used by publication and
+    /// termination. Ready-queue transitions do not change this count.
     pub fn thread_count(&mut self) -> u32 {
-        let mut count = 0u32;
-        let head = self.kprocess_thread_list_head.flink;
-        if head.is_null() {
-            return 0;
-        }
-        let mut entry = head;
-        let head_addr = core::ptr::addr_of_mut!(self.kprocess_thread_list_head);
-        while !entry.is_null() && entry != head_addr {
-            count += 1;
-            unsafe {
-                entry = (*entry).flink;
-            }
-        }
-        count
+        // SAFETY: the method's caller retains this process and its listed
+        // threads; thread-list mutation is serialized in the helper.
+        unsafe { super::thread_list::count(self) }
     }
+
 }
 
 impl Default for Eprocess {
@@ -1820,6 +1811,10 @@ pub fn create_user_process(
         {
             core::ptr::write_bytes(process as *mut u8, 0, 4096);
             core::ptr::write_bytes(thread_ptr as *mut u8, 0, 4096);
+            core::ptr::addr_of_mut!((*thread_ptr).execution_request)
+                .write(super::execution_request::ThreadExecutionRequest::new());
+            core::ptr::addr_of_mut!((*thread_ptr).impersonation)
+                .write(super::impersonation::ThreadImpersonation::new());
 
             core::ptr::write_bytes(ht_ptr as *mut u8, 0, 4096);
             (*ht_ptr).next_slot = 1;
@@ -1877,11 +1872,14 @@ pub fn create_user_process(
             (*thread).kthread.state = KThreadState::Initialized;
             (*thread).kthread.base_priority = 8;
             (*thread).kthread.priority = 8;
+            crate::ke::scheduler::init_thread_quantum(
+                thread,
+                crate::ke::scheduler::Quantum::Standard,
+            );
             (*thread).kthread.global_thread_list_entry.init();
 
-            (*process)
-                .kprocess_thread_list_head
-                .insert_tail(&mut (*thread).kthread.global_thread_list_entry as *mut ListEntry);
+            (*thread).thread_list_entry = ListEntry::new();
+            super::thread_list::attach(process, thread);
 
             // Publish the new thread as the process's main thread so
             // `setup_bsp` can install it into the per-CPU current_thread
@@ -2169,11 +2167,14 @@ pub fn terminate_process(pid: u64, exit_code: i32) -> bool {
     crate::ps::job::remove_process_from_all_jobs(pid);
     crate::libs::ntdll::timer_resolution::process_exit(pid);
     crate::libs::win32k::raw_input::release_process(pid);
+    crate::libs::win32k::font_services::release_process(pid);
     crate::libs::win32k::window::session_services::release_process(pid);
     unsafe {
         process.exit_status = exit_code;
         process.exit_time = crate::hal::common::pit::get_system_time_ms();
         if !process.main_thread.is_null() {
+            (*process.main_thread).execution_request.terminate();
+            (*process.main_thread).impersonation.terminate();
             (*process.main_thread).kthread.state = crate::ps::thread::KThreadState::Terminated;
         }
 
@@ -2303,51 +2304,18 @@ where
     true
 }
 
+/// Find a process member through its independent ETHREAD list node.
+///
 /// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Find a thread within a specific process by its TID.
-///
-/// Scans the process's thread list to find a thread with the given TID.
-/// The thread list is accessed through `kprocess_thread_list_head` which links
-/// `global_thread_list_entry` fields of each thread's KTHREAD (offset 0x0C8).
-///
-/// Returns the ETHREAD pointer if found.
+/// The caller must retain the process and listed threads, normally by holding
+/// PROCESS_LIST. The returned raw pointer is borrowed, not a lifetime reference.
+/// No membership lock is retained after this function returns.
 pub unsafe fn find_thread_in_process(
     process: *mut Eprocess,
     tid: u64,
 ) -> Option<*mut crate::ps::thread::Ethread> {
-    if process.is_null() {
-        return None;
-    }
-
-    unsafe {
-        let head = (*process).kprocess_thread_list_head.flink;
-        if head.is_null() {
-            return None;
-        }
-
-        let head_addr = core::ptr::addr_of_mut!((*process).kprocess_thread_list_head);
-        let mut entry = head;
-
-        while !entry.is_null() && entry != head_addr {
-            // Calculate ETHREAD pointer from ListEntry.
-            // ETHREAD = ListEntry - offset_of(Kthread, global_thread_list_entry)
-            // (Kthread is at ETHREAD offset 0, so no additional Kthread offset needed.)
-            const GLOBAL_THREAD_ENTRY_OFFSET: usize =
-                core::mem::offset_of!(crate::ps::thread::Kthread, global_thread_list_entry);
-            debug_assert!(GLOBAL_THREAD_ENTRY_OFFSET == 0x0C8); // Win7 documented offset
-            let ethread = (entry as *mut u8).offset(-(GLOBAL_THREAD_ENTRY_OFFSET as isize))
-                as *mut crate::ps::thread::Ethread;
-
-            if !ethread.is_null() && (*ethread).client_id.unique_thread == tid {
-                return Some(ethread);
-            }
-
-            entry = (*entry).flink;
-        }
-    }
-    None
+    // SAFETY: the caller retains allocations; the helper locks membership.
+    unsafe { super::thread_list::find(process, tid) }
 }
 
 /// Initialize process subsystem
@@ -2577,16 +2545,16 @@ pub unsafe fn ps_open_process(
     };
 
     // 2. Get the caller's token
+    let current_token = crate::ps::process::get_current_thread_token();
     let caller_token = if !token_ptr.is_null() {
         unsafe { &*token_ptr }
     } else {
         // Use current thread's token
-        let current_token = get_current_thread_token();
         if current_token.is_null() {
             // // kprintln!("[PS] ps_open_process: no token available");
             return Err(STATUS_ACCESS_DENIED);
         }
-        unsafe { &*current_token }
+        current_token.as_ref().expect("checked effective token")
     };
 
     // 3. Get the target's security descriptor
@@ -2694,40 +2662,9 @@ pub unsafe fn ps_set_primary_token(
     }
 }
 
-/// Get the current thread's primary token.
-///
-/// Walks the per-CPU area to find the running ETHREAD, then reads
-/// `Ethread::primary_token`. Returns null if no thread is installed
-/// (early boot) or the thread has not yet been assigned a token.
-pub fn get_current_thread_token() -> *const crate::se::token::Token {
-    let thread = crate::ps::thread::get_current_ethread();
-    if thread.is_null() {
-        // No current thread installed in per-CPU area yet (early boot).
-        // Return null rather than panic — callers must treat null as
-        // "no token available".
-        return core::ptr::null();
-    }
-    let token = unsafe { (*thread).primary_token };
-    if token != 0 {
-        return token as *const crate::se::token::Token;
-    }
-
-    // Thread-level token is null: fall back to the process primary token
-    // (Windows NT semantics: if ETHREAD->Token is NULL, the effective token
-    // is the EPROCESS->Token).
-    let process = unsafe { (*thread).threads_process };
-    if process.is_null() {
-        return core::ptr::null();
-    }
-    // EPROCESS.Token is an EX_FAST_REF: low 3 bits are refcount,
-    // upper bits are the Token* pointer.
-    let proc_token = unsafe { (*process).token.get_object() };
-    if proc_token == 0 {
-        core::ptr::null()
-    } else {
-        proc_token as *const crate::se::token::Token
-    }
-}
+/// Retain the current thread's impersonation token while reading its identity.
+/// Without impersonation, use the owning process's primary token.
+pub use super::effective_token::get_current_thread_token;
 
 /// # Safety
 ///
@@ -2758,4 +2695,11 @@ pub fn gui_resource_process(handle: u64) -> Option<u64> {
         }
         Ok(entry.target)
     }).ok()
+}
+
+/// # Safety
+/// Caller must hold the process registry lock and retain all member threads.
+/// Only records requests; the scheduler owns state changes and stack lifetime.
+pub unsafe fn request_process_members_termination(process:*mut Eprocess){
+    unsafe{super::thread_list::request_termination(process);}
 }

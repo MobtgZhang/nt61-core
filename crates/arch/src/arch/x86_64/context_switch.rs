@@ -48,6 +48,30 @@ global_asm!(
     // The return address is on the new stack right after the
     // last popped register; the caller's `ret` will land there.
     "    ret",
+    // Save on the outgoing address space before changing CR3. Neither
+    // stack need be mapped in the other process. IRQs must stay masked
+    // across the two register writes, with no intervening memory access.
+    ".global swap_context_address_space",
+    "swap_context_address_space:",
+    "    push rbx",
+    "    push rbp",
+    "    push r12",
+    "    push r13",
+    "    push r14",
+    "    push r15",
+    "    mov [rdi], rsp",
+    "    test rdx, rdx",
+    "    jz 2f",
+    "    mov cr3, rdx",
+    "2:",
+    "    mov rsp, rsi",
+    "    pop r15",
+    "    pop r14",
+    "    pop r13",
+    "    pop r12",
+    "    pop rbp",
+    "    pop rbx",
+    "    ret",
     // ---- FPU state save via XSAVE ----
     // void fpu_save(void *state_buffer)
     // rdi = buffer pointer
@@ -102,6 +126,7 @@ global_asm!(
 
 extern "C" {
     pub fn swap_context(out_rsp: *mut u64, new_rsp: u64);
+    pub fn swap_context_address_space(out_rsp: *mut u64, new_rsp: u64, root: u64);
     pub fn fpu_save(state_buffer: *mut u8);
     pub fn fpu_restore(state_buffer: *mut u8);
     pub fn fpu_init(state_buffer: *mut u8);

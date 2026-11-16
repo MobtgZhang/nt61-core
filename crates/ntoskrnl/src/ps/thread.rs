@@ -93,6 +93,7 @@ pub struct Kthread {
     _pad_priority: u16,    // 0x0C6
 
     // === 0x0C8: Thread List Entry ===
+    /// Scheduler ready-queue link. Never used for process membership.
     pub global_thread_list_entry: ListEntry, // 0x0C8
 
     // === 0x0D8: Process Link ===
@@ -447,6 +448,12 @@ pub struct Ethread {
 
     /// Project extension: user alerts serialized with native dispatcher waits.
     pub user_alert: crate::libs::ntdll::alert_state::UserAlertState,
+
+    /// Project extension: exclusive ownership of continuous power requests.
+    pub(crate) execution_request: super::execution_request::ThreadExecutionRequest,
+
+    /// Project extension: owned impersonation snapshots and pinned readers.
+    pub(crate) impersonation: super::impersonation::ThreadImpersonation,
 }
 
 // Compile-time size validation for Windows 7 x64 compatibility.
@@ -1071,6 +1078,8 @@ impl Ethread {
             wow64_start_address: 0,
             wow64_stack_top: 0,
             user_alert: crate::libs::ntdll::alert_state::UserAlertState::new(),
+            execution_request: super::execution_request::ThreadExecutionRequest::new(),
+            impersonation: super::impersonation::ThreadImpersonation::new(),
         }
     }
 
@@ -1349,6 +1358,10 @@ pub unsafe fn create_thread(
 
     if !thread.is_null() {
         unsafe {
+            core::ptr::addr_of_mut!((*thread).execution_request)
+                .write(super::execution_request::ThreadExecutionRequest::new());
+            core::ptr::addr_of_mut!((*thread).impersonation)
+                .write(super::impersonation::ThreadImpersonation::new());
             // // crate::kprintln!("[THREAD] create_thread: init kthread in place");
             (*thread).kthread.header = DispatcherHeader::new(6);
             (*thread).kthread.global_thread_list_entry.flink = core::ptr::null_mut();
@@ -1407,11 +1420,9 @@ pub unsafe fn create_thread(
             (*thread).kthread.stack_limit = stack_base;
             (*thread).kthread.kernel_stack = stack_base + stack_size as u64;
 
-            // Initialize thread list entry and add to process list
-            (*thread).kthread.global_thread_list_entry.init();
-            (*process)
-                .kprocess_thread_list_head
-                .insert_tail(&mut (*thread).kthread.global_thread_list_entry as *mut ListEntry);
+            // The process and scheduler own separate intrusive nodes.
+            (*thread).thread_list_entry = ListEntry::new();
+            super::thread_list::attach(process, thread);
         }
 
         THREAD_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -1480,6 +1491,11 @@ pub fn create_idle_thread(cpu_id: u32) -> Option<&'static mut Ethread> {
 
     unsafe {
         // // kprintln!("[THREAD] create_idle_thread: initializing kthread fields");
+        core::ptr::addr_of_mut!((*thread).execution_request)
+            .write(super::execution_request::ThreadExecutionRequest::new());
+        core::ptr::addr_of_mut!((*thread).impersonation)
+            .write(super::impersonation::ThreadImpersonation::new());
+        (*thread).thread_list_entry = ListEntry::new();
         let kt = Kthread::new();
         // // kprintln!("[THREAD] create_idle_thread: Kthread::new() succeeded");
         (*thread).kthread.header = kt.header;
@@ -1526,6 +1542,8 @@ pub fn create_idle_thread(cpu_id: u32) -> Option<&'static mut Ethread> {
 /// Terminate thread
 pub unsafe fn terminate(thread: *mut Ethread, _exit_code: u32) {
     unsafe {
+        (*thread).execution_request.terminate();
+        (*thread).impersonation.terminate();
         (*thread).exit_time = crate::ke::time::get_system_time() as i64;
         crate::libs::ntdll::file::terminate_user_alert(&(*thread).user_alert);
         crate::libs::ntdll::file::abandon_mutants((*thread).client_id.unique_thread);
@@ -1541,16 +1559,9 @@ pub unsafe fn terminate(thread: *mut Ethread, _exit_code: u32) {
         // the thread even though its stack is gone.
         crate::ke::scheduler::remove_ready(thread);
 
-        // Remove from the process thread list so the scheduler and
-        // `find_thread_in_process` no longer see the terminated thread.
-        let entry = core::ptr::addr_of_mut!((*thread).kthread.global_thread_list_entry);
-        if !(*entry).flink.is_null() && !(*entry).blink.is_null() {
-            let flink = (*entry).flink;
-            let blink = (*entry).blink;
-            (*blink).flink = flink;
-            (*flink).blink = blink;
-        }
-        (*entry).init();
+        // Membership has its own node and lock; removing a ready node must
+        // never destroy the process chain used by native thread lookup.
+        super::thread_list::detach(thread);
 
         // Free the kernel stack.
         let stack_base = (*thread).kthread.stack_limit;
@@ -1634,6 +1645,10 @@ pub fn ps_create_system_thread_affinity(
 
     unsafe {
         core::ptr::write_bytes(ethread as *mut u8, 0, ethread_layout);
+        core::ptr::addr_of_mut!((*ethread).execution_request)
+            .write(super::execution_request::ThreadExecutionRequest::new());
+        core::ptr::addr_of_mut!((*ethread).impersonation)
+            .write(super::impersonation::ThreadImpersonation::new());
 
         let tid = NEXT_TID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         (*ethread)
@@ -1652,6 +1667,10 @@ pub fn ps_create_system_thread_affinity(
         (*ethread).kthread.state = KThreadState::Initialized;
         (*ethread).kthread.base_priority = 8;
         (*ethread).kthread.priority = 8;
+        crate::ke::scheduler::init_thread_quantum(
+            ethread,
+            crate::ke::scheduler::Quantum::Standard,
+        );
         (*ethread).kthread.ideal_processor = 0;
         // Initialize affinity: default to all CPUs, home CPU = 0
         (*ethread).kthread.affinity_mask = !0u64;
@@ -1702,11 +1721,8 @@ pub fn ps_create_system_thread_affinity(
 
         (*ethread).kthread.teb = core::ptr::null_mut();
 
-        (*system_process)
-            .kprocess_thread_list_head
-            .insert_tail(core::ptr::addr_of_mut!(
-                (*ethread).kthread.global_thread_list_entry
-            ));
+        (*ethread).thread_list_entry = ListEntry::new();
+        super::thread_list::attach(system_process, ethread);
 
         (*ethread).kthread.state = KThreadState::Ready;
         if affinity_mask != 0 {
@@ -1743,6 +1759,8 @@ pub unsafe fn ps_terminate_system_thread(ethread: *mut Ethread, _exit_code: u32)
         return;
     }
     unsafe {
+        (*ethread).execution_request.terminate();
+        (*ethread).impersonation.terminate();
         (*ethread).exit_time = crate::ke::time::get_system_time() as i64;
         crate::libs::ntdll::file::terminate_user_alert(&(*ethread).user_alert);
         crate::libs::ntdll::file::abandon_mutants((*ethread).client_id.unique_thread);
@@ -1754,22 +1772,18 @@ pub unsafe fn ps_terminate_system_thread(ethread: *mut Ethread, _exit_code: u32)
         (*ethread).kthread.header.signal_state = 1;
         crate::ke::scheduler::remove_ready(ethread);
 
-        // Remove from the process thread list (like NT's RemoveEntryList).
-        let entry = core::ptr::addr_of_mut!((*ethread).kthread.global_thread_list_entry);
-        if !(*entry).flink.is_null() && !(*entry).blink.is_null() {
-            // Standard doubly-linked-list removal: Flink->Blink = Blink,
-            // Blink->Flink = Flink.
-            let flink = (*entry).flink;
-            let blink = (*entry).blink;
-            (*blink).flink = flink;
-            (*flink).blink = blink;
-        }
-        (*entry).init();
+        super::thread_list::detach(ethread);
 
-        // Free the kernel stack allocated by ps_create_system_thread.
+        // A terminating system thread still executes on this stack until
+        // schedule() swaps it out. Reclaim it on a later dispatch on this CPU.
         let stack_base = (*ethread).kthread.stack_limit;
         if stack_base != 0 {
-            let _ = crate::mm::pool::free(stack_base as *mut u8);
+            if ethread == get_current_ethread() {
+                super::stack_reaper::retire(crate::ke::scheduler::get_current_cpu(), stack_base);
+            } else {
+                crate::mm::pool::free_aligned(stack_base as *mut u8);
+                (*ethread).kthread.stack_limit = 0;
+            }
         }
         THREAD_COUNT.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     }
@@ -1782,6 +1796,9 @@ pub unsafe fn ps_terminate_system_thread(ethread: *mut Ethread, _exit_code: u32)
 
 /// Exit the current system thread (never returns)
 pub fn ps_exit_system_thread(exit_code: u32) -> ! {
+    // Do not allow preemption between marking this thread terminated and
+    // handing its still-active stack to the per-CPU reaper.
+    crate::arch::disable_interrupts();
     unsafe {
         let ethread = KeGetCurrentEthread();
         ps_terminate_system_thread(ethread, exit_code);
@@ -2036,14 +2053,14 @@ pub unsafe fn ps_open_thread(
     };
 
     // 2. Get the caller's token
+    let current_token = crate::ps::process::get_current_thread_token();
     let caller_token = if !token_ptr.is_null() {
         unsafe { &*token_ptr }
     } else {
-        let current_token = crate::ps::process::get_current_thread_token();
         if current_token.is_null() {
             return Err(crate::ps::process::STATUS_ACCESS_DENIED);
         }
-        unsafe { &*current_token }
+        current_token.as_ref().expect("checked effective token")
     };
 
     // 3. Get the thread's security descriptor

@@ -6,6 +6,9 @@ pub mod cmdline;
 pub mod process;
 pub mod smoke;
 pub mod thread;
+pub(crate) mod thread_list;
+pub(crate) mod stack_reaper;
+pub(crate) mod execution_request;
 pub mod wow64_process;
 pub mod wow64_thread;
 
@@ -37,3 +40,7 @@ pub mod job;
 pub mod job_extended;
 pub mod process_mgmt;
 pub mod tests;
+
+pub mod impersonation;
+
+pub mod effective_token;

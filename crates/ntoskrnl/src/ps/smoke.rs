@@ -244,7 +244,7 @@ fn step4_create_user_process() -> bool {
     }
 
     // The thread list head is NOT empty - create_user_process adds an initial thread.
-    if process.kprocess_thread_list_head.is_empty() {
+    if process.thread_count() == 0 {
         return false;
     }
 

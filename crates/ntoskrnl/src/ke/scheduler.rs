@@ -20,7 +20,7 @@ use crate::ke::sync::Spinlock;
 use crate::ps::thread::{create_idle_thread as create_thread_idle, Ethread, KThreadState};
 use core::ptr::null_mut;
 use core::ptr::null_mut as atomic_null_mut;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicU64, Ordering};
 
 static SCHED_SWITCH_DIAG: AtomicU8 = AtomicU8::new(0);
 
@@ -1136,6 +1136,11 @@ pub unsafe fn setup_bsp(thread: *mut Ethread) -> bool {
             prcb.idle_thread = idle_ptr;
         }
         prcb.current_thread = thread;
+        if !thread.is_null() {
+            // Direct Ring-3 entry must satisfy the same running-state
+            // contract as schedule(), or the first preemption loses it.
+            unsafe { (*thread).kthread.state = KThreadState::Running; }
+        }
     }
     if sched.num_cpus == 0 {
         sched.num_cpus = 1;
@@ -1468,6 +1473,13 @@ pub fn schedule() -> bool {
         return false;
     }
 
+    let active = crate::ps::thread::get_current_ethread();
+    let active_stack = if active.is_null() { 0 } else {
+        // SAFETY: this CPU owns its executing ETHREAD while interrupts are masked.
+        unsafe { (*active).kthread.stack_limit }
+    };
+    crate::ps::stack_reaper::reap(cpu, active_stack);
+
     // Acquire per-CPU dispatcher lock first
     if !lock_prcb(cpu) {
         // Reentrant acquisition or out-of-range CPU: the dispatcher lock
@@ -1576,6 +1588,11 @@ pub fn schedule() -> bool {
         }
     };
 
+    // A foreign process termination only records a request; the dispatcher
+    // owns state transitions and leaves active allocations pinned.
+    let next=next.filter(|thread|unsafe{
+        if (**thread).execution_request.is_terminating(){(**thread).kthread.state=KThreadState::Terminated;false}else{true}
+    });
     // Update current_thread in PRCB
     if let Some(next_thread) = next {
         if Some(next_thread) != current {
@@ -1600,6 +1617,7 @@ pub fn schedule() -> bool {
                     // semantics) so it is not lost when we switch away.
                     // Blocked/terminated threads have already left the
                     // Running state and must not be re-queued.
+                    if (*cur).execution_request.is_terminating() {(*cur).kthread.state=KThreadState::Terminated;}
                     if (*cur).kthread.state == KThreadState::Running {
                         let prio = ((*cur).kthread.priority as i32).clamp(0, 31) as usize;
                         if let Some(ref mut prcb) = scheduler.prcb_mut(cpu) {
@@ -1639,17 +1657,22 @@ pub fn schedule() -> bool {
             unsafe {
                 (*next_thread).kthread.state = KThreadState::Running;
                 if new_rsp != 0 {
-                    publish_switch_context(current, next_thread);
+                    let incoming_root = publish_switch_context(current, next_thread);
                     match current {
                         Some(cur) => {
-                            crate::arch::swap_context(
+                            crate::arch::swap_context_address_space(
                                 &mut (*cur).kthread.context.kernel_rsp,
                                 new_rsp,
+                                incoming_root,
                             );
                         }
                         None => {
                             let mut out_rsp: u64 = 0;
-                            crate::arch::swap_context(&mut out_rsp, new_rsp);
+                            crate::arch::swap_context_address_space(
+                                &mut out_rsp,
+                                new_rsp,
+                                incoming_root,
+                            );
                         }
                     }
                 }
@@ -1685,7 +1708,7 @@ impl Drop for DispatchInterrupts {
 /// # Safety
 /// Both ETHREADs and the incoming kernel stack must remain live. Local
 /// interrupts are disabled and no scheduler lock is held.
-unsafe fn publish_switch_context(current: Option<*mut Ethread>, next: *mut Ethread) {
+unsafe fn publish_switch_context(current: Option<*mut Ethread>, next: *mut Ethread) -> u64 {
     use crate::arch::common::percpu;
     let root = crate::arch::read_current_page_root();
     if let Some(area) = percpu::try_get_current() {
@@ -1721,16 +1744,24 @@ unsafe fn publish_switch_context(current: Option<*mut Ethread>, next: *mut Ethre
     percpu::set_address_space_roots(incoming.system_root, incoming.user_root);
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::tss::set_rsp0(incoming.kernel_stack);
-    if incoming.active_root != 0 && incoming.active_root != root {
-        crate::arch::load_page_root(incoming.active_root >> 12);
-    }
     irql::lower_irql(Irql::from(incoming.irql));
+    // The outgoing stack may be private to its process. Leave CR3 alone
+    // until the assembly trampoline has saved that stack and can switch
+    // roots without touching it again.
+    if incoming.active_root != root {
+        incoming.active_root
+    } else {
+        0
+    }
 }
 
 /// Phase 0: tick handler called by the timer ISR. Decrements
 /// the current thread's quantum and, when it reaches zero,
 /// triggers a reschedule.
 /// Also implements priority decay mechanism (P2 Enhancement).
+static ACTIVITY_TOTAL: AtomicU64 = AtomicU64::new(0);
+static ACTIVITY_IDLE: AtomicU64 = AtomicU64::new(0);
+pub fn activity_ticks()->(u64,u64){(ACTIVITY_TOTAL.load(Ordering::Relaxed),ACTIVITY_IDLE.load(Ordering::Relaxed))}
 pub fn tick() {
     unsafe {
         // The clock ISR runs at CLOCK_LEVEL (28). A context switch is only
@@ -1755,6 +1786,12 @@ pub fn tick() {
                 drop(scheduler);
                 poll_services();
                 return;
+            }
+            ACTIVITY_TOTAL.fetch_add(1,Ordering::Relaxed);
+            if current==prcb.idle_thread {ACTIVITY_IDLE.fetch_add(1,Ordering::Relaxed);}
+            if (*current).execution_request.is_terminating() {
+                (*current).kthread.state=KThreadState::Terminated;
+                drop(scheduler);request_reschedule(cpu);irql::lower_irql(previous_irql);return;
             }
             let remaining = (*current).kthread.quantum_remaining;
             if remaining == 0 {
