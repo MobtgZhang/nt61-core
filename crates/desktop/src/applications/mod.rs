@@ -6,6 +6,10 @@ pub mod associations;
 pub mod calculator;
 pub mod catalog;
 pub mod command_prompt;
+pub mod common_dialogs;
+pub mod guest_dialog;
+pub mod guest_window;
+pub mod printing;
 pub mod document;
 pub use wordpad::formats as rich_text;
 pub mod editor_view;
@@ -95,6 +99,11 @@ pub struct ApplicationSession {
     pub status: String,
     pub hot: Option<crate::graphics::Rect>,
     pub dialog: Option<file_dialog::FileDialog>,
+    pub common_dialog: Option<common_dialogs::Dialog>,
+    pub common_scroll: (u32, u32),
+    pub guest_dialog: Option<guest_dialog::Request>,
+    pub guest_window: Option<guest_window::Scene>,
+    pub custom_colors: [u32; 16],
     pub pending: Option<Pending>,
     pub confirm: bool,
     pub menu: bool,
@@ -179,6 +188,11 @@ impl ApplicationSession {
             status: String::new(),
             hot: None,
             dialog: None,
+            common_dialog: None,
+            common_scroll: (0, 0),
+            guest_dialog: None,
+            guest_window: None,
+            custom_colors: [0xffffffff; 16],
             pending: None,
             confirm: false,
             menu: false,
@@ -191,6 +205,12 @@ impl ApplicationSession {
         }
     }
     pub fn key(&mut self, key: u8) -> AppAction {
+        if let Some(scene)=&mut self.guest_window {scene.key(key);return AppAction::None;}
+        if self.common_dialog.is_some() { return common_dialogs::key(self, key); }
+        if key == 16 && matches!(self.state, AppState::Document(_) | AppState::Paint(_)) {
+            common_dialogs::open_print(self);
+            return AppAction::None;
+        }
         if self.id == AppId::Notepad {
             return notepad::key(self, key);
         }

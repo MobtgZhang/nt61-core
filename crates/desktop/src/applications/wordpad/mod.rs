@@ -26,6 +26,9 @@ pub enum Command {
     Strike,
     Family,
     FontMenu,
+    FontDialog,
+    MoreColors(bool),
+    PageSetup,
     SizeMenu,
     ColorMenu,
     HighlightMenu,
@@ -260,6 +263,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
     if let Some(dialog) = &app.dialog {
         super::file_dialog::draw(dialog, frame, b, text);
     }
+    super::common_dialogs::draw(app, frame, b, text);
     if app.confirm {
         frame.fill_rect(
             b.x + 8,

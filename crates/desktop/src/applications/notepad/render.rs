@@ -210,6 +210,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
     if let Some(dialog) = &app.dialog {
         crate::applications::file_dialog::draw(dialog, frame, b, f);
     }
+    super::super::common_dialogs::draw(app, frame, b, f);
     if app.confirm {
         let r = dialog_rect(b, 480, 170);
         dialog_frame(frame, f, r, "Notepad");

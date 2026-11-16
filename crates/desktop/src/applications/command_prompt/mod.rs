@@ -20,6 +20,7 @@ pub struct CommandPrompt {
     pub disk_focus: Option<[u32; 3]>,
     pub diskpart_only: bool,
     pub bcdedit_only: bool,
+    pending_command: Option<u64>,
 }
 impl CommandPrompt {
     pub fn new() -> Self {
@@ -39,6 +40,7 @@ impl CommandPrompt {
             disk_focus: None,
             diskpart_only: false,
             bcdedit_only: false,
+            pending_command: None,
         }
     }
     pub fn bcdedit() -> Self {
@@ -81,6 +83,7 @@ impl CommandPrompt {
     }
     /// Console navigation arrives as ANSI sequences from all four input backends.
     pub fn key(&mut self, files: &mut FileSystem, byte: u8) -> AppAction {
+        if self.pending_command.is_some(){return AppAction::None;}
         let Some(key) = self.decoder.feed(byte, 0) else {
             return AppAction::None;
         };
@@ -134,6 +137,13 @@ impl CommandPrompt {
     pub fn display_input(&self) -> String {
         let cursor = self.valid_cursor();
         format!("{}|{}", &self.input[..cursor], &self.input[cursor..])
+    }
+    pub fn display_line(&self) -> String {
+        if self.pending_command.is_some() {
+            "|".into()
+        } else {
+            format!("{}>{}", self.display_prompt(), self.display_input())
+        }
     }
     fn valid_cursor(&self) -> usize {
         let mut cursor = self.cursor.min(self.input.len());
@@ -360,25 +370,24 @@ impl CommandPrompt {
                 }
             }
         }
-        match crate::platform::services::command(line, &self.cwd) {
-            Ok(result) => {
-                self.cwd = result.directory;
-                self.lines.extend(
-                    String::from_utf8_lossy(&result.bytes)
-                        .replace('\r', "")
-                        .lines()
-                        .map(String::from),
-                );
-                if result.exit {
-                    return AppAction::Close;
-                }
-            }
-            Err(status) => self
-                .lines
-                .push(format!("Command service failed (0x{status:08X})")),
+        match crate::platform::services::command_start(line, &self.cwd) {
+            Ok(id)=>self.pending_command=Some(id),
+            Err(status)=>self.lines.push(format!("Command service failed (0x{status:08X})")),
         }
         self.trim_output();
         AppAction::None
+    }
+    pub fn poll_command(&mut self)->(bool,bool){
+        let Some(id)=self.pending_command else{return (false,false);};
+        match crate::platform::services::command_poll(id){
+            Ok(None)=>(false,false),
+            Ok(Some(result))=>{
+                self.pending_command=None;self.cwd=result.directory;
+                self.lines.extend(String::from_utf8_lossy(&result.bytes).replace('\r', "").lines().map(String::from));
+                self.trim_output();(true,result.exit)
+            },
+            Err(status)=>{self.pending_command=None;self.lines.push(format!("Command service failed (0x{status:08X})"));(true,false)}
+        }
     }
     fn trim_output(&mut self) {
         if self.lines.len() > 1024 {
@@ -456,6 +465,15 @@ mod editing_tests {
 #[cfg(test)]
 mod unicode_cursor_tests {
     use super::*;
+    #[test]
+    fn running_command_does_not_display_an_available_prompt() {
+        let mut c = CommandPrompt::new();
+        assert_eq!(c.display_line(), "C:\\>|");
+        c.pending_command = Some(1);
+        assert_eq!(c.display_line(), "|");
+        c.pending_command = None;
+        assert_eq!(c.display_line(), "C:\\>|");
+    }
     #[test]
     fn externally_set_cursor_is_normalized_to_a_utf8_boundary() {
         let mut c = CommandPrompt::new();

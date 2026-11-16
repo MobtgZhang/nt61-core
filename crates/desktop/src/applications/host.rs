@@ -80,6 +80,7 @@ impl ShellModel {
         })
     }
     pub fn application_key(&mut self, id: u32, key: u8) -> bool {
+        if let Some(modal) = self.guest_modal_for(id) { self.select_window(modal); return true; }
         if let Some(explorer) = self.explorers.iter_mut().find(|e| e.window_id == id) {
             let changed = explorer.stream_key(&mut self.files, key);
             let open = explorer.pending_open.take();
@@ -144,11 +145,20 @@ impl ShellModel {
                 dialog.visible_rows =
                     (super::file_dialog::list_bounds(body).height / 24).max(1) as usize;
             }
-            let result = dialog.key(&mut self.files, key);
+            let result = if let Some(body) = self.application_body(id) {
+                dialog.key_at(&mut self.files, key, body)
+            } else {
+                dialog.key(&mut self.files, key)
+            };
             self.finish_file_dialog(id, dialog, result);
             return;
         }
         if let Some(b) = self.application_body(id) {
+            if self.applications[index].common_dialog.is_some() {
+                let action = super::common_dialogs::key_at(&mut self.applications[index], key, b);
+                self.apply_application_action(id, action);
+                return;
+            }
             if let AppState::Document(d) = &self.applications[index].state {
                 let r = super::notepad::editor_bounds(b, d, &self.applications[index].notepad);
                 self.applications[index].notepad.editor_size = (r.width, r.height);
@@ -166,7 +176,16 @@ impl ShellModel {
                 expired.push((app.window_id, key));
             }
         }
-        let changed = !expired.is_empty();
+        let mut changed = !expired.is_empty();
+        let mut closed=alloc::vec::Vec::new();
+        for app in &mut self.applications {
+            if let AppState::CommandPrompt(console)=&mut app.state {
+                let (updated,exit)=console.poll_command();changed|=updated;
+                if exit {closed.push(app.window_id);}
+            }
+        }
+        for id in closed {self.close_window(id);}
+
         for (id, key) in expired {
             self.application_decoded_key(id, key);
         }
@@ -182,7 +201,7 @@ impl ShellModel {
             }
             return;
         };
-        if app.dialog.is_some() || app.confirm {
+        if app.dialog.is_some() || app.common_dialog.is_some() || app.confirm {
             return;
         }
         app.menu = false;
@@ -282,6 +301,7 @@ impl ShellModel {
         result: super::file_dialog::Result,
     ) {
         use super::file_dialog::Result as R;
+        if self.finish_guest_file(id, &dialog, &result) { return; }
         let outcome: Result<(), String> = match result {
             R::None => {
                 if let Some(app) = self.applications.iter_mut().find(|a| a.window_id == id) {
@@ -465,10 +485,11 @@ impl ShellModel {
     /// A dragged thumb keeps receiving motion outside its window until release.
     pub fn captured_pointer_window(&self) -> Option<u32> {
         self.explorers.iter().find(|e| e.captures_pointer()).map(|e| e.window_id)
-            .or_else(|| self.applications.iter().find(|app| app.dialog.as_ref().is_some_and(|d| d.captures_pointer())).map(|app| app.window_id))
+            .or_else(|| self.applications.iter().find(|app| app.dialog.as_ref().is_some_and(|d| d.captures_pointer()) || super::common_dialogs::captures_pointer(app) || app.guest_window.as_ref().is_some_and(|s|s.captures_pointer())).map(|app| app.window_id))
     }
 
     pub fn application_wheel(&mut self, id: u32, x: i32, y: i32, delta: i32) -> bool {
+        if let Some(modal) = self.guest_modal_for(id) { self.select_window(modal); return true; }
         let Some(body) = self.application_body(id) else { return false; };
         if !body.contains(x, y) { return false; }
         if let Some(explorer) = self.explorers.iter_mut().find(|e| e.window_id == id) {
@@ -476,6 +497,7 @@ impl ShellModel {
         }
         if let Some(app) = self.applications.iter_mut().find(|a| a.window_id == id) {
             if let Some(dialog) = &mut app.dialog { return dialog.wheel(body, delta); }
+            if app.common_dialog.is_some() { return super::common_dialogs::wheel(app, body, delta); }
         }
         false
     }
@@ -489,6 +511,7 @@ impl ShellModel {
         held: bool,
         right: bool,
     ) -> bool {
+        if let Some(modal) = self.guest_modal_for(id) { self.select_window(modal); return true; }
         let Some(body) = self.application_body(id) else {
             return false;
         };
@@ -500,8 +523,11 @@ impl ShellModel {
             }
             return changed;
         }
+        if let Some(scene)=self.applications.iter_mut().find(|a|a.window_id==id).and_then(|a|a.guest_window.as_mut()) {
+            scene.pointer(body,x,y,down,held);return true;
+        }
         let dialog_capture = self.applications.iter().find(|app| app.window_id == id)
-            .is_some_and(|app| app.dialog.as_ref().is_some_and(|d| d.captures_pointer()));
+            .is_some_and(|app| app.dialog.as_ref().is_some_and(|d| d.captures_pointer()) || super::common_dialogs::captures_pointer(app) || app.guest_window.as_ref().is_some_and(|s|s.captures_pointer()));
         if !body.contains(x, y) && !dialog_capture {
             if !held {
                 if let Some(app) = self.applications.iter_mut().find(|a| a.window_id == id) {
@@ -546,9 +572,13 @@ impl ShellModel {
             return down;
         }
         if let Some(mut dialog) = app.dialog.take() {
+            dialog.input_time = app.input_time;
             let (changed, result) = dialog.pointer(&mut self.files, body, x, y, down, held);
             self.finish_file_dialog(id, dialog, result);
             return changed;
+        }
+        if app.common_dialog.is_some() {
+            return !right && super::common_dialogs::pointer_event(app, body, x, y, down, held);
         }
         if app.id == AppId::Notepad {
             let (changed, action) = super::notepad::pointer(app, body, x, y, down, held, right);
@@ -822,6 +852,39 @@ impl ShellModel {
 mod tests {
     use super::*;
     use crate::theme::Theme;
+    #[test]
+    fn shared_modals_capture_shell_input_and_prevent_owner_close_until_dismissed() {
+        use super::super::common_dialogs::{self, ColorTarget, Dialog};
+        let mut shell = ShellModel::new(Theme::aero());
+        let id = shell.launch_application(AppId::Paint);
+        let app = shell.applications.iter_mut().find(|app| app.window_id == id).unwrap();
+        common_dialogs::open_color(app, ColorTarget::Paint);
+        let original = app.state.clone();
+        let body = shell.application_body(id).unwrap();
+        let r = common_dialogs::bounds(shell.application(id).unwrap().common_dialog.as_ref().unwrap(), body);
+        shell.application_pointer(id, r.x + 286, r.y + 58, true, true, false);
+        assert_eq!(shell.captured_pointer_window(), Some(id));
+        shell.application_pointer(id, r.x + 360, r.y + 58, false, true, false);
+        shell.application_pointer(id, r.x + 360, r.y + 58, false, false, false);
+        assert_eq!(shell.captured_pointer_window(), None);
+        shell.request_application_close(id);
+        assert!(shell.application(id).is_some());
+        assert_eq!(shell.application(id).unwrap().state, original);
+        shell.application_decoded_key(id, 27);
+        assert!(shell.application(id).unwrap().common_dialog.is_none());
+        let editor = shell.launch_application(AppId::Notepad);
+        shell.application_key(editor, b'a');
+        let app = shell.applications.iter_mut().find(|app| app.window_id == editor).unwrap();
+        common_dialogs::open_font(app);
+        shell.application_key(editor, b'z');
+        let AppState::Document(doc) = &shell.application(editor).unwrap().state else { panic!("doc"); };
+        assert_eq!(doc.editor.text, "a");
+        assert!(matches!(shell.application(editor).unwrap().common_dialog, Some(Dialog::Font(_))));
+        shell.application_decoded_key(editor, 27);
+        shell.application_key(editor, b'b');
+        let AppState::Document(doc) = &shell.application(editor).unwrap().state else { panic!("doc"); };
+        assert_eq!(doc.editor.text, "ab");
+    }
     #[test]
     fn run_launch_save_and_task_manager_end_task_are_real_actions() {
         let mut shell = ShellModel::new(Theme::aero());
@@ -1172,8 +1235,8 @@ mod notepad_workflow_tests {
             shell.application_key(id, *b);
         }
         assert!(matches!(
-            shell.application(id).unwrap().notepad.dialog,
-            Some(notepad::Dialog::Font(_))
+            shell.application(id).unwrap().common_dialog,
+            Some(super::super::common_dialogs::Dialog::Font(_))
         ));
     }
 }

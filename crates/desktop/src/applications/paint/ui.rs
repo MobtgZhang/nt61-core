@@ -117,6 +117,7 @@ pub fn buttons(app: &ApplicationSession, b: Rect) -> Vec<Button> {
             );
         }
         button(&mut out, b, 8, 112, 80, 25, "Clear", Command::New);
+        button(&mut out, b, 365, 99, 112, 27, "Edit colors", Command::EditColors);
         button(
             &mut out,
             b,

@@ -34,9 +34,12 @@ pub fn execute(app: &mut ApplicationSession, c: Command) -> AppAction {
             app.status =
                 "WordPad — NT61 6.1. RTF / DOCX rich text; Word 97-2003 DOC text import.".into()
         }
-        Command::Print => {
-            app.status = "No printer service is available. Save the document as RTF or DOCX.".into()
-        }
+        Command::Print => super::super::common_dialogs::open_print(app),
+        Command::FontDialog => super::super::common_dialogs::open_font(app),
+        Command::PageSetup => super::super::common_dialogs::open_page(app),
+        Command::MoreColors(highlight) => super::super::common_dialogs::open_color(app,
+            if highlight { super::super::common_dialogs::ColorTarget::Highlight }
+            else { super::super::common_dialogs::ColorTarget::Text }),
         _ => {
             if let AppState::Document(d) = &mut app.state {
                 let s = d.current_style();

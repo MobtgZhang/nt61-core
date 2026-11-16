@@ -259,8 +259,8 @@ mod tests {
             draw(&app, &mut frame, bounds, &|_, _, _, _| {});
         }
         assert!(Rc::ptr_eq(&before, &app.notepad.renderer().unwrap()));
-        if let Some(Dialog::Font(draft)) = &mut app.notepad.dialog {
-            draft.points = 20;
+        if let Some(crate::applications::common_dialogs::Dialog::Font(draft)) = &mut app.common_dialog {
+            draft.points = "20".into();
         }
         draw(&app, &mut frame, bounds, &|_, _, _, _| {});
         key(&mut app, 13);

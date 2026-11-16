@@ -1,6 +1,11 @@
 //! Notepad commands behavior.
 use super::*;
 pub fn execute(app: &mut ApplicationSession, c: Command) -> AppAction {
+    match c {
+        Command::Font => { super::super::common_dialogs::open_font(app); return AppAction::None; }
+        Command::Page => { super::super::common_dialogs::open_page(app); return AppAction::None; }
+        _ => {}
+    }
     let AppState::Document(d) = &mut app.state else {
         return AppAction::None;
     };
@@ -68,7 +73,7 @@ pub fn execute(app: &mut ApplicationSession, c: Command) -> AppAction {
                 error: String::new(),
             })
         }
-        Print => n.dialog = Some(Dialog::Print),
+        Print => super::super::common_dialogs::open_print(app),
         About => n.dialog = Some(Dialog::About),
         Help => n.dialog = Some(Dialog::Help),
         Time => return AppAction::InsertTime,
@@ -128,6 +133,7 @@ pub(super) fn edit(field: &mut String, select: &mut bool, key: u8, numeric: bool
     }
 }
 pub fn key(app: &mut ApplicationSession, key: u8) -> AppAction {
+    if app.common_dialog.is_some() { return super::super::common_dialogs::key(app, key); }
     let n = &mut app.notepad;
     if let Some(mut dialog) = n.dialog.take() {
         if key == 27 {
@@ -414,20 +420,7 @@ pub(super) fn find_document(state: &mut AppState, s: &mut Search, do_replace: bo
     }
 }
 pub(super) fn valid_page(p: &Page) -> bool {
-    let values: Option<Vec<f32>> = p
-        .margins
-        .iter()
-        .map(|s| s.parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0))
-        .collect();
-    values.is_some_and(|v| {
-        let (w, h) = if p.letter {
-            (215.9, 279.4)
-        } else {
-            (210.0, 297.0)
-        };
-        let (w, h) = if p.landscape { (h, w) } else { (w, h) };
-        v[0] + v[1] < w && v[2] + v[3] < h
-    })
+    super::super::common_dialogs::valid_page(p)
 }
 
 // Layout uses exactly the same glyph advances for drawing, wrapping and hit tests.

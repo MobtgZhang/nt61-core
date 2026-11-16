@@ -263,6 +263,8 @@ pub fn buttons(app: &ApplicationSession, b: Rect) -> Vec<Button> {
                     }),
                 );
             }
+            push(&mut out, b, 276, 174, 220, 26, "More colors...",
+                Ui::WordPad(Command::MoreColors(highlight)));
             if highlight {
                 push(
                     &mut out,
@@ -285,6 +287,8 @@ pub fn buttons(app: &ApplicationSession, b: Rect) -> Vec<Button> {
             ("Save                Ctrl+S", Ui::Save),
             ("Save as...", Ui::SaveAs),
             ("Print...", Ui::WordPad(Command::Print)),
+            ("Page setup...", Ui::WordPad(Command::PageSetup)),
+            ("Font...", Ui::WordPad(Command::FontDialog)),
             ("About WordPad", Ui::WordPad(Command::About)),
             ("Exit", Ui::Exit),
         ]
@@ -433,7 +437,8 @@ pub(super) fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
                 Command::SetFamily(_)
                 | Command::SetSize(_)
                 | Command::SetColor(_)
-                | Command::SetHighlight(_),
+                | Command::SetHighlight(_)
+                | Command::MoreColors(_),
             ) => true,
             _ => false,
         };

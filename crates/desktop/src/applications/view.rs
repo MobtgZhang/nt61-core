@@ -42,6 +42,9 @@ pub enum Command {
     Copy,
     Paste,
     Color(usize),
+    EditColors,
+    Print,
+    PageSetup,
     Tool(Tool),
     Character(u32),
     Page(i32),
@@ -503,6 +506,8 @@ pub fn buttons(app: &ApplicationSession, b: Rect, env: &Environment) -> Vec<Butt
                 ("Open...    Ctrl+O", Command::Open),
                 ("Save    Ctrl+S", Command::Save),
                 ("Save As...", Command::SaveAs),
+                ("Print...    Ctrl+P", Command::Print),
+                ("Page setup...", Command::PageSetup),
                 ("Exit", Command::Exit)
             ],
         };
@@ -530,6 +535,10 @@ pub fn click(
     y: i32,
     right: bool,
 ) -> AppAction {
+    if app.common_dialog.is_some() {
+        if !right { super::common_dialogs::pointer(app, body, x, y); }
+        return AppAction::None;
+    }
     let Some(button) = buttons(app, body, env)
         .into_iter()
         .rev()
@@ -683,6 +692,9 @@ pub fn click(
                 d.dirty = true;
             }
         }
+        Command::EditColors => super::common_dialogs::open_color(app, super::common_dialogs::ColorTarget::Paint),
+        Command::Print => super::common_dialogs::open_print(app),
+        Command::PageSetup => super::common_dialogs::open_page(app),
         Command::Color(i) => {
             if let AppState::Paint(p) = &mut app.state {
                 p.color = COLORS[i];
@@ -799,6 +811,13 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
     env: &Environment,
     text: F,
 ) {
+    if let Some(scene)=&app.guest_window {scene.draw(frame,b,&text);return;}
+    if app.guest_dialog.is_some() {
+        frame.fill_rect(b.x,b.y,b.width,b.height,0xfff0f0f0);
+        if let Some(dialog)=&app.dialog {super::file_dialog::draw(dialog,frame,b,&text);}
+        super::common_dialogs::draw(app,frame,b,&text);
+        return;
+    }
     if app.id == AppId::WordPad {
         super::wordpad::draw(app, frame, b, &text);
         return;
@@ -834,7 +853,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
             let row = c.lines.len().min(count.saturating_sub(1));
             text(
                 frame,
-                &format!("{}>{}", c.display_prompt(), c.display_input()),
+                &c.display_line(),
                 Rect::new(
                     b.x + 10,
                     b.y + 10 + row as i32 * 21,
@@ -1318,6 +1337,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
             );
         }
     }
+    super::common_dialogs::draw(app, frame, b, &text);
 }
 
 fn architecture() -> &'static str {
