@@ -118,6 +118,69 @@ pub unsafe extern "C" fn nt_open_timer(
 
 pub type TimerApcRoutine = unsafe extern "C" fn(PVOID, u32, i32);
 
+/// Win7 TIMER_SET_COALESCABLE_TIMER_INFO, shared by all supported 64-bit ABIs.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimerSetCoalescableTimerInfo {
+    pub due_time: i64,
+    pub apc_routine: PVOID,
+    pub context: PVOID,
+    pub wake_context: PVOID,
+    pub period: u32,
+    pub tolerable_delay: u32,
+    pub previous_state: *mut u8,
+}
+
+const _: () = assert!(core::mem::size_of::<TimerSetCoalescableTimerInfo>() == 48);
+
+/// Arm a coalescable timer. Delivering at the requested deadline is permitted
+/// for any tolerance; the fixed-tick backend need not postpone an expiration.
+/// APC delivery and wake requests have the same explicit limitations as
+/// NtSetTimer and fail before changing the timer.
+///
+/// # Safety
+/// The information buffer and nested output address are user addresses.
+pub unsafe extern "C" fn nt_set_timer_ex(
+    timer_handle: HANDLE,
+    class: u32,
+    information: PVOID,
+    length: u32,
+) -> NTSTATUS {
+    if class != 0 {
+        return STATUS_INVALID_INFO_CLASS;
+    }
+    if length as usize != core::mem::size_of::<TimerSetCoalescableTimerInfo>() {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    let info = match read_user_object::<TimerSetCoalescableTimerInfo>(information as u64) {
+        Ok(info) => info,
+        Err(status) => return status,
+    };
+    if info.period > i32::MAX as u32 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if !info.previous_state.is_null() {
+        if let Err(status) = probe_user_write(info.previous_state as u64, 1) {
+            return status;
+        }
+    }
+    change_timer(
+        timer_handle,
+        info.due_time,
+        info.apc_routine,
+        info.context,
+        u8::from(!info.wake_context.is_null()),
+        info.period as i32,
+        |signaled| {
+            if info.previous_state.is_null() {
+                Ok(())
+            } else {
+                write_user_object(info.previous_state as u64, &u8::from(signaled))
+            }
+        },
+    )
+}
+
 /// Arm/rearm a timer, clearing its old signal state. The previous-state output
 /// is the BOOLEAN signal state before resetting, not whether it was armed.
 ///

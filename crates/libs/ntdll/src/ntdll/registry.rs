@@ -831,8 +831,6 @@ pub unsafe extern "C" fn nt_open_key(
         start = end + 1;
     }
 
-    drop(root);
-
     if !registry_access_allowed(current, desired_access) {
         return STATUS_ACCESS_DENIED;
     }
@@ -846,13 +844,15 @@ pub unsafe extern "C" fn nt_open_key(
     };
 
     let handle = (slot_idx as u32 + 1) as HANDLE;
-    if write_user_object(key_handle as u64, &handle).is_err() {
-        return STATUS_OBJECT_NAME_NOT_FOUND;
+    drop(root);
+    if let Err(status) = write_user_object(key_handle as u64, &handle) {
+        KEY_HANDLE_TABLE.lock()[slot_idx] = None;
+        return status;
     }
     kprintln!(
         subsystem: "REG",
         "    [REG] NtOpenKey: handle=0x{:x} (slot={})",
-        *key_handle as u32,
+        handle as usize as u32,
         slot_idx
     );
 
@@ -2099,3 +2099,8 @@ mod tests {
         }
     }
 }
+
+#[path = "registry_queries.rs"]
+pub mod queries;
+
+pub use queries::{nt_open_key_ex, nt_query_multiple_value_key, nt_query_open_sub_keys};

@@ -97,6 +97,7 @@ pub unsafe extern "C" fn nt_set_information_object(
 #[path = "object_sync.rs"]
 mod sync_objects;
 pub(crate) use sync_objects::{
+    capture_attributes,
     create_native_sync, equal_sync_name, map_sync_access, open_native_sync, open_sync_win32,
     win32_sync_attributes, SyncAttributes,
 };

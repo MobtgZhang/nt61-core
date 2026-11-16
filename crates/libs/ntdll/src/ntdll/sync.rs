@@ -661,6 +661,40 @@ pub unsafe extern "C" fn nt_wait_for_multiple_objects(
     )
 }
 
+/// Capture an array of WOW64 LONG handles before using the shared dispatcher.
+///
+/// # Safety
+/// Both pointers designate user memory and are captured through user_copy.
+pub unsafe extern "C" fn nt_wait_for_multiple_objects32(
+    count: u32,
+    handles: *const u32,
+    wait_type: u32,
+    alertable: u8,
+    timeout: *const i64,
+) -> NTSTATUS {
+    if count == 0 || count > 64 || wait_type > 1 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let mut captured = [0u8; 64 * 4];
+    if let Err(status) = copy_from_user(&mut captured[..count as usize * 4], handles as u64) {
+        return status;
+    }
+    let mut expanded = [HANDLE::default(); 64];
+    for (slot, bytes) in expanded.iter_mut().zip(captured.chunks_exact(4)).take(count as usize) {
+        let value = i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        *slot = value as HANDLE;
+    }
+    let timeout = if timeout.is_null() {
+        None
+    } else {
+        match read_user_object::<i64>(timeout as u64) {
+            Ok(value) => Some(value),
+            Err(status) => return status,
+        }
+    };
+    nt_wait_for_multiple_objects_kernel(count, &expanded[..count as usize], wait_type, alertable, timeout)
+}
+
 /// Trusted-kernel entry point for `nt_wait_for_multiple_objects`.
 pub fn nt_wait_for_multiple_objects_kernel(
     count: u32,
@@ -695,7 +729,7 @@ pub fn nt_wait_for_multiple_objects_kernel(
     complete_wait(start)
 }
 
-fn complete_wait(start: Result<super::file::WaitStart, NTSTATUS>) -> NTSTATUS {
+pub(crate) fn complete_wait(start: Result<super::file::WaitStart, NTSTATUS>) -> NTSTATUS {
     match start {
         Ok(super::file::WaitStart::Complete(status)) => status,
         Ok(super::file::WaitStart::Pending(wait)) => loop {

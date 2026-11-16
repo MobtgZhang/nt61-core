@@ -8,6 +8,10 @@ use crate::ke::sync::Spinlock;
 use alloc::vec::Vec;
 use core::ptr;
 
+#[path = "namespace.rs"]
+pub(crate) mod namespace;
+pub(crate) use namespace::directory_root;
+
 const MAX_HANDLES: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -54,6 +58,17 @@ pub(crate) enum HandleKind {
     Mutant,
     Semaphore,
     Timer,
+    EventPair,
+    KeyedEvent,
+    Job,
+    IoCompletion,
+    IoReserve,
+    TransactionManager,
+    Transaction,
+    ResourceManager,
+    Enlistment,
+    Directory,
+    SymbolicLink,
     /// Pipe slot index and direction bit (bit 32).
     Pipe,
     /// AFD endpoint handle identifier.
@@ -72,6 +87,10 @@ struct HandleObject {
     entry: HandleEntry,
     handles: usize,
     waits: usize,
+    permanent: bool,
+    parent: Option<u64>,
+    /// Optional owner for payloads whose lifetime ends with this object.
+    release: Option<unsafe fn(u64)>,
 }
 
 static HANDLE_TABLE: Spinlock<HandleTable> = Spinlock::new(HandleTable::new());
@@ -81,10 +100,13 @@ struct HandleTable {
     objects: [Option<HandleObject>; MAX_HANDLES],
     next_identity: u64,
     names: Vec<(usize, Vec<u16>)>,
+    links: Vec<(u64, Vec<u16>)>,
     waits: [Option<WaitRequest>; 256],
     next_wait_identity: u64,
     pending_waits: [u64; 4],
     timers: [u64; MAX_HANDLES / 64],
+    default_keyed_object: Option<usize>,
+    namespace_initialized: bool,
 }
 
 impl HandleTable {
@@ -94,16 +116,60 @@ impl HandleTable {
             objects: [None; MAX_HANDLES],
             next_identity: 1,
             names: Vec::new(),
+            links: Vec::new(),
             waits: [None; 256],
             next_wait_identity: 1,
             pending_waits: [0; 4],
             timers: [0; MAX_HANDLES / 64],
+            default_keyed_object: None,
+            namespace_initialized: false,
         }
     }
 }
 
 pub(crate) fn alloc_handle(kind: HandleKind, target: u64) -> HANDLE {
     alloc_dispatcher_handle(kind, target, DispatcherState::None)
+}
+
+/// Publish a handle with an explicit granted access mask and inherit flag.
+pub(crate) fn alloc_access_handle(kind: HandleKind, target: u64, access: u32, inherit: bool) -> Result<HANDLE, NTSTATUS> {
+    HANDLE_TABLE.lock().allocate(kind, target, DispatcherState::None, access, u8::from(inherit))
+}
+
+/// Clone a payload while its source handle is pinned. The initializer must not
+/// reenter the handle table. Its release function owns only the returned payload
+/// and must not reenter the table either. Failure to publish also releases it.
+pub(crate) fn clone_owned_handle(
+    source: HANDLE,
+    kind: HandleKind,
+    required: u32,
+    desired: Option<u32>,
+    inherit: bool,
+    initialize: impl FnOnce(u64) -> Result<(u64, unsafe fn(u64)), NTSTATUS>,
+) -> Result<HANDLE, NTSTATUS> {
+    use super::super::status::*;
+    let mut table = HANDLE_TABLE.lock();
+    let slot = table.slots.get(decode_handle(source))
+        .and_then(|slot| *slot).ok_or(STATUS_INVALID_HANDLE)?;
+    let entry = table.objects[slot.object].ok_or(STATUS_INVALID_HANDLE)?.entry;
+    if entry.kind != kind { return Err(STATUS_OBJECT_TYPE_MISMATCH); }
+    if slot.access & required != required { return Err(STATUS_ACCESS_DENIED); }
+    let access = desired.unwrap_or(slot.access);
+    // Independent object security descriptors are not implemented yet. Until
+    // they are, do not expand rights based on a token's default-object DACL.
+    if access & !slot.access != 0 { return Err(STATUS_ACCESS_DENIED); }
+    let (target, release) = initialize(entry.target)?;
+    let handle = match table.allocate(kind, target, DispatcherState::None, access, u8::from(inherit)) {
+        Ok(handle) => handle,
+        Err(status) => {
+            // SAFETY: the initializer transferred ownership of this payload.
+            unsafe { release(target); }
+            return Err(status);
+        }
+    };
+    let object = table.slots[decode_handle(handle)].expect("allocated slot").object;
+    table.objects[object].as_mut().expect("allocated object").release = Some(release);
+    Ok(handle)
 }
 
 pub(crate) fn alloc_dispatcher_handle(
@@ -115,6 +181,8 @@ pub(crate) fn alloc_dispatcher_handle(
     let access = match kind {
         HandleKind::Event | HandleKind::Semaphore | HandleKind::Timer => 0x001f0003,
         HandleKind::Mutant => 0x001f0001,
+        HandleKind::EventPair => 0x001f0000,
+        HandleKind::KeyedEvent => 0x000f0003,
         _ => u32::MAX,
     };
     table
@@ -153,6 +221,9 @@ impl HandleTable {
             },
             handles: 1,
             waits: 0,
+            permanent: false,
+            parent: None,
+            release: None,
         });
         self.slots[slot] = Some(HandleSlot {
             object,
@@ -194,13 +265,43 @@ pub(crate) fn create_sync_handle(
     attributes: super::super::object::SyncAttributes,
     create: bool,
 ) -> Result<(HANDLE, NTSTATUS), NTSTATUS> {
+    create_object_handle(kind, dispatcher, access, attributes, create, || Ok(target))
+}
+
+/// Initialize external object state only after a named open has been ruled out.
+/// The callback runs under the handle lock and must not reenter that lock.
+pub(crate) fn create_object_handle(
+    kind: HandleKind,
+    dispatcher: DispatcherState,
+    access: u32,
+    attributes: super::super::object::SyncAttributes,
+    create: bool,
+    initialize: impl FnOnce() -> Result<u64, NTSTATUS>,
+) -> Result<(HANDLE, NTSTATUS), NTSTATUS> {
+    create_named_handle(kind, dispatcher, access, attributes, create, initialize, None)
+}
+
+pub(crate) fn create_named_handle(
+    kind: HandleKind,
+    dispatcher: DispatcherState,
+    access: u32,
+    mut attributes: super::super::object::SyncAttributes,
+    create: bool,
+    initialize: impl FnOnce() -> Result<u64, NTSTATUS>,
+    link_target: Option<Vec<u16>>,
+) -> Result<(HANDLE, NTSTATUS), NTSTATUS> {
     use super::super::status::*;
     let mut table = HANDLE_TABLE.lock();
+    table.ensure_namespace()?;
+    if let Some(identity) = attributes.root_identity {
+        if !table.objects.iter().flatten().any(|object| object.entry.identity == identity) {
+            return Err(STATUS_INVALID_HANDLE);
+        }
+    }
+    let mut parent = None;
     if let Some(name) = &attributes.name {
-        if let Some((object, _)) = table.names.iter().find(|(_, existing)| {
-            super::super::object::equal_sync_name(existing, name, attributes.case_insensitive)
-        }) {
-            let object = *object;
+        let (canonical, parent_identity, existing) = table.resolve_for_create(name, attributes.case_insensitive, kind != HandleKind::SymbolicLink)?;
+        if let Some(object) = existing {
             if table.objects[object]
                 .ok_or(STATUS_INVALID_HANDLE)?
                 .entry
@@ -226,15 +327,36 @@ pub(crate) fn create_sync_handle(
             return Err(STATUS_OBJECT_NAME_NOT_FOUND);
         }
         table.names.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
-    } else if !create {
+        parent = Some(parent_identity);
+        attributes.name = Some(canonical);
+    }
+    if link_target.is_some() {
+        table.links.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
+    }
+    if attributes.name.is_none() && !create {
         return Err(STATUS_OBJECT_NAME_INVALID);
     }
+    // Reserve a slot before initializing an external payload. This prevents a
+    // full handle table from leaking an otherwise unreachable kernel object.
+    if !table.slots.iter().any(Option::is_none) || !table.objects.iter().any(Option::is_none)
+        || table.next_identity == u64::MAX
+    {
+        return Err(STATUS_NO_MEMORY);
+    }
+    let target = initialize()?;
     let handle = table.allocate(kind, target, dispatcher, access, attributes.flags)?;
+    let object = table.slots[decode_handle(handle)]
+        .ok_or(STATUS_INVALID_HANDLE)?
+        .object;
     if let Some(name) = attributes.name {
-        let object = table.slots[decode_handle(handle)]
-            .ok_or(STATUS_INVALID_HANDLE)?
-            .object;
+        if let Some(value) = &mut table.objects[object] {
+            value.parent = parent;
+        }
         table.names.push((object, name));
+    }
+    if let Some(target) = link_target {
+        let identity = table.objects[object].ok_or(STATUS_INVALID_HANDLE)?.entry.identity;
+        table.links.push((identity, target));
     }
     Ok((handle, STATUS_SUCCESS))
 }
@@ -270,7 +392,8 @@ pub(crate) fn close_sync_handle(handle: HANDLE) -> Result<(), NTSTATUS> {
         .entry;
     if !matches!(
         entry.kind,
-        HandleKind::Event | HandleKind::Semaphore | HandleKind::Mutant | HandleKind::Timer
+        HandleKind::Event | HandleKind::Semaphore | HandleKind::Mutant | HandleKind::Timer | HandleKind::EventPair | HandleKind::KeyedEvent | HandleKind::Job | HandleKind::IoCompletion | HandleKind::IoReserve | HandleKind::Directory | HandleKind::SymbolicLink | HandleKind::Section
+            | HandleKind::TransactionManager | HandleKind::Transaction | HandleKind::ResourceManager | HandleKind::Enlistment | HandleKind::Token
     ) {
         return Err(super::super::status::STATUS_NOT_SUPPORTED);
     }
@@ -287,10 +410,27 @@ impl HandleTable {
         if let Some(value) = &mut self.objects[object] {
             value.handles -= 1;
         }
-        if self.objects[object].is_some_and(|value| value.handles == 0) {
+        if self.objects[object].is_some_and(|value| value.handles == 0 && !value.permanent) {
             self.names.retain(|(index, _)| *index != object);
             if self.objects[object].is_some_and(|value| value.waits == 0) {
-                self.objects[object] = None;
+                if let Some(value) = self.objects[object].take() {
+                    if let Some(release) = value.release {
+                        // SAFETY: the final object reference owns its payload.
+                        unsafe { release(value.entry.target); }
+                    }
+                    self.links.retain(|(identity, _)| *identity != value.entry.identity);
+                    if value.entry.kind == HandleKind::Job {
+                        crate::ps::job::close_native_job(value.entry.target);
+                    } else if value.entry.kind == HandleKind::IoCompletion {
+                        super::super::io_completion::close_port(value.entry.target);
+                    } else if value.entry.kind == HandleKind::IoReserve {
+                        super::super::io_completion::close_reserve(value.entry.target);
+                    } else if value.entry.kind == HandleKind::Section {
+                        super::super::section::release_section(value.entry.target);
+                    } else if matches!(value.entry.kind, HandleKind::TransactionManager | HandleKind::Transaction | HandleKind::ResourceManager | HandleKind::Enlistment) {
+                        super::super::ktm::release_open(value.entry.target);
+                    }
+                }
                 self.timers[object / 64] &= !(1 << (object % 64));
             }
         }
@@ -321,7 +461,8 @@ pub(crate) fn duplicate_sync_handle_with_access(
         .entry;
     if !matches!(
         entry.kind,
-        HandleKind::Event | HandleKind::Semaphore | HandleKind::Mutant | HandleKind::Timer
+        HandleKind::Event | HandleKind::Semaphore | HandleKind::Mutant | HandleKind::Timer | HandleKind::EventPair | HandleKind::KeyedEvent | HandleKind::Job | HandleKind::IoCompletion | HandleKind::IoReserve | HandleKind::Directory | HandleKind::SymbolicLink | HandleKind::Section
+            | HandleKind::TransactionManager | HandleKind::Transaction | HandleKind::ResourceManager | HandleKind::Enlistment | HandleKind::Token
     ) {
         return Err(STATUS_NOT_SUPPORTED);
     }
@@ -345,8 +486,8 @@ pub(crate) fn duplicate_sync_handle_with_access(
         table.alias(source.object, access, attributes)
     })();
     // CLOSE_SOURCE applies even when access validation or target allocation
-    // fails. Only dispatcher objects reach this path, so final close has no
-    // external file/section resource teardown to run after unlocking.
+    // fails. retire_sync_slot also releases section and completion payloads
+    // using the same lock order as their creation and query paths.
     if options & 1 != 0 {
         table.retire_sync_slot(source_index, source.object);
     }
@@ -446,7 +587,8 @@ pub(crate) fn sync_object_name(handle: HANDLE) -> Result<Option<Vec<u16>>, NTSTA
         .entry;
     if !matches!(
         entry.kind,
-        HandleKind::Event | HandleKind::Semaphore | HandleKind::Mutant | HandleKind::Timer
+        HandleKind::Event | HandleKind::Semaphore | HandleKind::Mutant | HandleKind::Timer | HandleKind::EventPair | HandleKind::KeyedEvent | HandleKind::Job | HandleKind::IoCompletion | HandleKind::IoReserve | HandleKind::Directory | HandleKind::SymbolicLink | HandleKind::Section
+            | HandleKind::TransactionManager | HandleKind::Transaction | HandleKind::ResourceManager | HandleKind::Enlistment | HandleKind::Token
     ) {
         return Err(STATUS_NOT_IMPLEMENTED);
     }
@@ -497,18 +639,36 @@ fn remove_handle(handle: HANDLE, protect: bool) -> Result<(HandleEntry, bool), N
     let object = table.objects[slot.object]
         .as_ref()
         .ok_or(STATUS_INVALID_HANDLE)?;
-    let last_handle = object.handles == 0;
+    let last_handle = object.handles == 0 && !object.permanent;
     let retire = last_handle && object.waits == 0;
     if last_handle {
+        table.links.retain(|(identity, _)| *identity != entry.identity);
         table.names.retain(|(index, _)| *index != slot.object);
     }
+    let mut release = None;
     let retired = if retire {
         table.timers[slot.object / 64] &= !(1 << (slot.object % 64));
-        table.objects[slot.object].take().map(|object| object.entry)
+        table.objects[slot.object].take().map(|object| {
+            release = object.release;
+            object.entry
+        })
     } else {
         None
     };
     drop(table);
+    if let (Some(release), Some(entry)) = (release, retired) {
+        // SAFETY: the final object reference has been atomically removed.
+        unsafe { release(entry.target); }
+    }
+    if let Some(HandleEntry { kind: HandleKind::IoCompletion, target, .. }) = retired {
+        super::super::io_completion::close_port(target);
+    }
+    if let Some(HandleEntry { kind: HandleKind::IoReserve, target, .. }) = retired {
+        super::super::io_completion::close_reserve(target);
+    }
+    if let Some(HandleEntry { kind: HandleKind::Job, target, .. }) = retired {
+        crate::ps::job::close_native_job(target);
+    }
     if let Some(HandleEntry {
         kind: HandleKind::Section,
         target,
@@ -516,6 +676,11 @@ fn remove_handle(handle: HANDLE, protect: bool) -> Result<(HandleEntry, bool), N
     }) = retired
     {
         super::super::section::release_section(target);
+    }
+    if let Some(value) = retired {
+        if matches!(value.kind, HandleKind::TransactionManager | HandleKind::Transaction | HandleKind::ResourceManager | HandleKind::Enlistment) {
+            super::super::ktm::release_open(value.target);
+        }
     }
     Ok((entry, retired.is_some()))
 }
@@ -539,7 +704,7 @@ pub(crate) fn with_sync_handles<T>(
     with_sync_handles_access(handles, 0, operation)
 }
 
-fn with_sync_handles_access<T>(
+pub(crate) fn with_sync_handles_access<T>(
     handles: &[HANDLE],
     access: u32,
     operation: impl FnOnce(&mut [HandleEntry]) -> Result<T, NTSTATUS>,
@@ -642,6 +807,10 @@ struct WaitRequest {
     objects: [usize; 64],
     count: usize,
     all: bool,
+    /// Event pairs expose two auto-reset events through dedicated syscalls,
+    /// rather than through NtWaitForSingleObject.
+    pair_bit: u64,
+    keyed: Option<(u64, bool)>, // key and release-side rendezvous
     pid: u64,
     tid: u64,
     alertable: bool,
@@ -692,6 +861,79 @@ pub(crate) fn begin_wait(
 ) -> Result<WaitStart, NTSTATUS> {
     let mut table = HANDLE_TABLE.lock();
     let wait = table.prepare_wait(handles, all, pid, tid, timeout)?;
+    table.start_wait(wait, alert)
+}
+
+/// Resolve an event pair once, then publish its signal and pin its opposite
+/// event in the same transaction. Signals coalesce, as for synchronization
+/// events. Neither close/reuse nor a competing waiter can redirect the request.
+pub(crate) fn operate_event_pair(
+    handle: HANDLE,
+    signal_bit: u64,
+    wait_bit: u64,
+    pid: u64,
+    tid: u64,
+) -> Result<WaitStart, NTSTATUS> {
+    use super::super::status::*;
+    let mut table = HANDLE_TABLE.lock();
+    let slot = table.slots
+        .get(decode_handle(handle))
+        .and_then(|slot| *slot)
+        .ok_or(STATUS_INVALID_HANDLE)?;
+    let entry = table.objects[slot.object].ok_or(STATUS_INVALID_HANDLE)?.entry;
+    if entry.kind != HandleKind::EventPair {
+        return Err(STATUS_OBJECT_TYPE_MISMATCH);
+    }
+    if slot.access & 0x0010_0000 == 0 {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    let wait = if wait_bit != 0 {
+        if table.waits.iter().all(Option::is_some) {
+            return Err(STATUS_NO_MEMORY);
+        }
+        Some(table.prepare_wait_mode(&[handle], false, pid, tid, None, wait_bit, None)?)
+    } else {
+        None
+    };
+    if signal_bit != 0 {
+        table.objects[slot.object].as_mut().ok_or(STATUS_INVALID_HANDLE)?
+            .entry.target |= signal_bit;
+        table.satisfy_waiters();
+    }
+    match wait {
+        Some(wait) => table.start_wait(wait, None),
+        None => Ok(WaitStart::Complete(STATUS_SUCCESS)),
+    }
+}
+
+/// Keyed events rendezvous one waiter with one releaser in the same process.
+/// Releasing an unmatched key is itself a wait; no signal is accumulated.
+pub(crate) fn begin_keyed_wait(
+    handle: HANDLE,
+    key: u64,
+    release: bool,
+    pid: u64,
+    tid: u64,
+    timeout: Option<i64>,
+    alert: Option<&UserAlertState>,
+) -> Result<WaitStart, NTSTATUS> {
+    use super::super::status::*;
+    if key & 1 != 0 { return Err(0xc000_00ef_u32 as i32); }
+    let mut table = HANDLE_TABLE.lock();
+    let wait = table.prepare_wait_mode(&[handle], false, pid, tid, timeout, 0, Some((key, release)))?;
+    table.satisfy_waiters();
+    let counterpart = table.waits.iter().enumerate().filter_map(|(slot, candidate)| {
+        let candidate = candidate.as_ref()?;
+        (candidate.result.is_none() && candidate.pid == pid
+            && candidate.objects[0] == wait.objects[0]
+            && candidate.keyed == Some((key, !release)))
+            .then_some((slot, candidate.identity))
+    }).min_by_key(|&(_, identity)| identity).map(|(slot, _)| slot);
+    if let Some(slot) = counterpart {
+        table.waits[slot].as_mut().ok_or(STATUS_INVALID_HANDLE)?.result = Some(STATUS_SUCCESS);
+        table.pending_waits[slot / 64] &= !(1 << (slot % 64));
+        return Ok(WaitStart::Complete(STATUS_SUCCESS));
+    }
     table.start_wait(wait, alert)
 }
 
@@ -756,12 +998,25 @@ pub(crate) fn signal_and_begin_wait(
 
 impl HandleTable {
     fn prepare_wait(
-        &self,
+        &mut self,
         handles: &[HANDLE],
         all: bool,
         pid: u64,
         tid: u64,
         timeout: Option<i64>,
+    ) -> Result<WaitRequest, NTSTATUS> {
+        self.prepare_wait_mode(handles, all, pid, tid, timeout, 0, None)
+    }
+
+    fn prepare_wait_mode(
+        &mut self,
+        handles: &[HANDLE],
+        all: bool,
+        pid: u64,
+        tid: u64,
+        timeout: Option<i64>,
+        pair_bit: u64,
+        keyed: Option<(u64, bool)>,
     ) -> Result<WaitRequest, NTSTATUS> {
         use super::super::status::*;
         if handles.is_empty() || handles.len() > 64 {
@@ -780,6 +1035,8 @@ impl HandleTable {
             objects: [0; 64],
             count: handles.len(),
             all,
+            pair_bit,
+            keyed,
             pid,
             tid,
             alertable: false,
@@ -787,24 +1044,45 @@ impl HandleTable {
             result: None,
         };
         for (index, &handle) in handles.iter().enumerate() {
+            let object = if keyed.is_some() && handle.is_null() {
+                if let Some(object) = self.default_keyed_object {
+                    object
+                } else {
+                    // Keep one private root reference without exposing a handle
+                    // slot. Keys are further isolated by the waiting process ID.
+                    let temporary = self.allocate(HandleKind::KeyedEvent, 0, DispatcherState::None, 3, 0)?;
+                    let slot = self.slots[decode_handle(temporary)].take().ok_or(STATUS_INVALID_HANDLE)?;
+                    self.default_keyed_object = Some(slot.object);
+                    slot.object
+                }
+            } else {
             let slot = self
                 .slots
                 .get(decode_handle(handle))
                 .and_then(|slot| *slot)
                 .ok_or(STATUS_INVALID_HANDLE)?;
-            if slot.access & 0x0010_0000 == 0 {
+            let required = keyed.map_or(0x0010_0000, |(_, release)| if release { 2 } else { 1 });
+            if pair_bit == 0 && slot.access & required == 0 {
                 return Err(STATUS_ACCESS_DENIED);
             }
-            let object = slot.object;
+            slot.object
+            };
             if all && wait.objects[..index].contains(&object) {
                 return Err(STATUS_INVALID_PARAMETER);
             }
             wait.objects[index] = object;
             let entry = self.objects[object].ok_or(STATUS_INVALID_HANDLE)?.entry;
-            if !matches!(
+            let compatible_type = if keyed.is_some() {
+                entry.kind == HandleKind::KeyedEvent
+            } else if pair_bit != 0 {
+                entry.kind == HandleKind::EventPair
+            } else {
+                matches!(
                 entry.kind,
                 HandleKind::Event | HandleKind::Semaphore | HandleKind::Mutant | HandleKind::Timer
-            ) {
+                )
+            };
+            if !compatible_type {
                 return Err(
                     if matches!(entry.kind, HandleKind::Process | HandleKind::Thread) {
                         STATUS_NOT_SUPPORTED
@@ -877,11 +1155,17 @@ impl HandleTable {
         check_timeout: bool,
     ) -> Option<NTSTATUS> {
         use super::super::status::*;
+        if wait.keyed.is_some() {
+            return if check_timeout && wait.deadline.is_some_and(|(absolute, deadline)| {
+                deadline <= if absolute { wall } else { uptime }
+            }) { Some(STATUS_TIMEOUT) } else { None };
+        }
         let mut selected = None;
         let mut all_ready = true;
         for (index, &object) in wait.objects[..wait.count].iter().enumerate() {
             let entry = &mut self.objects[object].as_mut()?.entry;
             let ready = match entry.kind {
+                HandleKind::EventPair if wait.pair_bit != 0 => entry.target & wait.pair_bit != 0,
                 HandleKind::Event => entry.target & 1 != 0,
                 HandleKind::Semaphore => entry.target as u32 != 0,
                 HandleKind::Mutant => match entry.dispatcher {
@@ -935,6 +1219,7 @@ impl HandleTable {
             if wait.all || Some(index) == selected {
                 let entry = &mut self.objects[object].as_mut()?.entry;
                 match entry.kind {
+                    HandleKind::EventPair => entry.target &= !wait.pair_bit,
                     HandleKind::Event if entry.target & 0x100 == 0 => entry.target &= !1,
                     HandleKind::Semaphore => entry.target -= 1,
                     HandleKind::Mutant => {

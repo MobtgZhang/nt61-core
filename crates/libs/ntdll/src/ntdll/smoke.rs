@@ -407,11 +407,10 @@ pub fn test_nt_query_section() -> bool {
             return report("NtQuerySection maximum size write", false);
         }
 
-        let mut object_attributes = ObjectAttributes::new();
         if section::nt_create_section(
             output_handle,
             crate::libs::ntdll::types::section_access::SECTION_QUERY,
-            &mut object_attributes,
+            ptr::null_mut(),
             maximum_size_pointer,
             0x04,
             0x0800_0000,

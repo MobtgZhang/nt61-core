@@ -14,15 +14,17 @@ pub(crate) struct SyncAttributes {
     pub flags: u8,
     pub case_insensitive: bool,
     pub open_if: bool,
+    pub root_identity: Option<u64>,
 }
 
 impl SyncAttributes {
-    fn unnamed() -> Self {
+    pub(crate) fn unnamed() -> Self {
         Self {
             name: None,
             flags: 0,
             case_insensitive: false,
             open_if: false,
+            root_identity: None,
         }
     }
 }
@@ -30,21 +32,121 @@ impl SyncAttributes {
 /// Generic mappings from the NT dispatcher object types. Security descriptor
 /// evaluation is separate from the granted mask retained in each handle slot.
 pub(crate) fn map_sync_access(kind: HandleKind, access: u32) -> Result<u32, NTSTATUS> {
+    if matches!(kind, HandleKind::TransactionManager | HandleKind::Transaction | HandleKind::ResourceManager | HandleKind::Enlistment) {
+        let (read, write, execute, all) = match kind {
+            HandleKind::TransactionManager => (0x20001, 0x2001e, 0x20000, 0xf003f),
+            HandleKind::Transaction => (0x120001, 0x12003e, 0x120018, 0x1f003f),
+            HandleKind::ResourceManager => (0x120001, 0x12007e, 0x12005c, 0x1f007f),
+            _ => (0x20001, 0x2001e, 0x2001c, 0xf001f),
+        };
+        let mut mapped = access & 0x0fff_ffff;
+        for (generic, rights) in [(0x8000_0000, read), (0x4000_0000, write),
+            (0x2000_0000, execute), (0x1000_0000, all)]
+        {
+            if access & generic != 0 { mapped |= rights; }
+        }
+        if mapped & 0x0100_0000 != 0 { return Err(STATUS_PRIVILEGE_NOT_HELD); }
+        if mapped & 0x0200_0000 != 0 { return Err(STATUS_NOT_SUPPORTED); }
+        return if mapped & !all == 0 { Ok(mapped) } else { Err(STATUS_ACCESS_DENIED) };
+    }
+    if kind == HandleKind::Token {
+        let mut mapped = access & 0x0fff_ffff;
+        for (generic, rights) in [
+            (0x8000_0000, 0x0002_0008),
+            (0x4000_0000, 0x0002_00e0),
+            (0x2000_0000, 0x0002_0004),
+            (0x1000_0000, 0x000f_01ff),
+        ] {
+            if access & generic != 0 {
+                mapped |= rights;
+            }
+        }
+        if mapped & 0x0100_0000 != 0 {
+            return Err(STATUS_PRIVILEGE_NOT_HELD);
+        }
+        if mapped & 0x0200_0000 != 0 {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        if mapped & !0x000f_01ff != 0 {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+        return Ok(mapped);
+    }
+    if kind == HandleKind::IoReserve {
+        let mut mapped = access & 0x0fff_ffff;
+        for (generic, rights) in [(0x80000000, 0x20001), (0x40000000, 0x20002),
+            (0x20000000, 0x20000), (0x10000000, 0xf0003)] {
+            if access & generic != 0 { mapped |= rights; }
+        }
+        return if mapped & !0xf0003 == 0 { Ok(mapped) } else { Err(STATUS_ACCESS_DENIED) };
+    }
+    if kind == HandleKind::Section {
+        let mut mapped = access & 0x0fff_ffff;
+        for (generic, rights) in [
+            (0x8000_0000, 0x0002_0005),
+            (0x4000_0000, 0x0002_0012),
+            (0x2000_0000, 0x0002_0008),
+            (0x1000_0000, 0x000f_001f),
+        ] {
+            if access & generic != 0 {
+                mapped |= rights;
+            }
+        }
+        if mapped & 0x0100_0000 != 0 {
+            return Err(STATUS_PRIVILEGE_NOT_HELD);
+        }
+        if mapped & 0x0200_0000 != 0 {
+            return Err(STATUS_NOT_SUPPORTED);
+        }
+        return if mapped & !0x000f_001f == 0 {
+            Ok(mapped)
+        } else {
+            Err(STATUS_ACCESS_DENIED)
+        };
+    }
+    if matches!(kind, HandleKind::Directory | HandleKind::SymbolicLink) {
+        let directory = kind == HandleKind::Directory;
+        let all = if directory { 0x000f_000f } else { 0x000f_0001 };
+        let mut mapped = access & 0x0fff_ffff;
+        for (generic, rights) in [(0x8000_0000, 0x0002_0001),
+            (0x4000_0000, if directory { 0x0002_000c } else { 0x0002_0000 }),
+            (0x2000_0000, if directory { 0x0002_0002 } else { 0x0002_0001 }),
+            (0x1000_0000, all)]
+        {
+            if access & generic != 0 { mapped |= rights; }
+        }
+        if mapped & 0x0100_0000 != 0 { return Err(STATUS_PRIVILEGE_NOT_HELD); }
+        if mapped & 0x0200_0000 != 0 { return Err(STATUS_NOT_SUPPORTED); }
+        return if mapped & !all == 0 { Ok(mapped) } else { Err(STATUS_ACCESS_DENIED) };
+    }
+    if kind == HandleKind::Job {
+        let mut mapped = access & 0x0fff_ffff;
+        for (generic, rights) in [(0x8000_0000, 0x0002_0004), (0x4000_0000, 0x0002_000b),
+            (0x2000_0000, 0x0012_0000), (0x1000_0000, 0x001f_003f)]
+        {
+            if access & generic != 0 { mapped |= rights; }
+        }
+        if mapped & 0x0100_0000 != 0 { return Err(STATUS_PRIVILEGE_NOT_HELD); }
+        if mapped & 0x0200_0000 != 0 { return Err(STATUS_NOT_SUPPORTED); }
+        return if mapped & !0x001f_003f == 0 { Ok(mapped) } else { Err(STATUS_ACCESS_DENIED) };
+    }
     let specific = match kind {
-        HandleKind::Event | HandleKind::Semaphore | HandleKind::Timer => 3,
+        HandleKind::Event | HandleKind::Semaphore | HandleKind::Timer | HandleKind::IoCompletion => 3,
         HandleKind::Mutant => 1,
+        HandleKind::EventPair => 0,
+        HandleKind::KeyedEvent => 3,
         _ => return Err(STATUS_OBJECT_TYPE_MISMATCH),
     };
-    let all = 0x001f_0000 | specific;
+    let all = if kind == HandleKind::KeyedEvent { 0x000f_0003 } else { 0x001f_0000 | specific };
     let mut mapped = access & 0x0fff_ffff;
     if access & 0x8000_0000 != 0 {
-        mapped |= 0x0002_0001;
+        mapped |= if kind == HandleKind::EventPair { 0x0012_0000 } else { 0x0002_0001 };
     }
     if access & 0x4000_0000 != 0 {
-        mapped |= 0x0002_0000 | (specific & 2);
+        mapped |= if kind == HandleKind::EventPair { 0x0012_0000 } else { 0x0002_0000 | (specific & 2) };
     }
     if access & 0x2000_0000 != 0 {
-        mapped |= 0x0012_0000;
+        mapped |= if kind == HandleKind::KeyedEvent { 0x0002_0000 } else { 0x0012_0000 };
     }
     if access & 0x1000_0000 != 0 {
         mapped |= all;
@@ -85,30 +187,20 @@ fn validate_name(name: &[u16], insensitive: bool) -> Result<(), NTSTATUS> {
     if name[0] != b'\\' as u16 {
         return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
     }
-    let prefixes = ["\\BaseNamedObjects\\", "\\Sessions\\0\\BaseNamedObjects\\"];
-    for prefix in prefixes {
-        let prefix: Vec<u16> = prefix.encode_utf16().collect();
-        if name.len() > prefix.len() && equal_sync_name(&name[..prefix.len()], &prefix, insensitive)
-        {
-            let leaf = &name[prefix.len()..];
-            if leaf.contains(&0) {
-                return Err(STATUS_OBJECT_NAME_INVALID);
-            }
-            if leaf.contains(&(b'\\' as u16)) {
-                return Err(STATUS_OBJECT_PATH_NOT_FOUND);
-            }
-            // ASCII folding is exact for this range. Explicitly reject the
-            // missing NLS contract rather than give non-ASCII false negatives.
-            if insensitive && name.iter().any(|&unit| unit > 0x7f) {
-                return Err(STATUS_NOT_SUPPORTED);
-            }
-            return Ok(());
-        }
+    if name.len() > 32766 || name.contains(&0) {
+        return Err(STATUS_OBJECT_NAME_INVALID);
     }
-    Err(STATUS_OBJECT_PATH_NOT_FOUND)
+    if name.len() > 1 && name[1..].split(|&unit| unit == b'\\' as u16).any(|part| part.is_empty()) {
+        return Err(STATUS_OBJECT_NAME_INVALID);
+    }
+    // Until an NLS upcase table is installed, do not silently miscompare Unicode.
+    if insensitive && name.iter().any(|&unit| unit > 0x7f) {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    Ok(())
 }
 
-fn capture_attributes(pointer: *mut ObjectAttributes) -> Result<SyncAttributes, NTSTATUS> {
+pub(crate) fn capture_attributes(pointer: *mut ObjectAttributes) -> Result<SyncAttributes, NTSTATUS> {
     if pointer.is_null() {
         return Ok(SyncAttributes::unnamed());
     }
@@ -123,9 +215,6 @@ fn capture_attributes(pointer: *mut ObjectAttributes) -> Result<SyncAttributes, 
         return Err(STATUS_PRIVILEGE_NOT_HELD);
     }
     if attributes.attributes & !(0x2 | 0x40 | 0x80) != 0 {
-        return Err(STATUS_NOT_SUPPORTED);
-    }
-    if !attributes.root_directory.is_null() {
         return Err(STATUS_NOT_SUPPORTED);
     }
     if !attributes.security_descriptor.is_null()
@@ -150,13 +239,27 @@ fn capture_attributes(pointer: *mut ObjectAttributes) -> Result<SyncAttributes, 
                 .map_err(|_| STATUS_NO_MEMORY)?;
             bytes.resize(length, 0);
             copy_from_user(&mut bytes, string.buffer as u64)?;
-            let name = bytes
+            let mut name = bytes
                 .chunks_exact(2)
                 .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
                 .collect::<Vec<_>>();
+            if !attributes.root_directory.is_null() {
+                if name.first() == Some(&(b'\\' as u16)) {
+                    return Err(STATUS_OBJECT_PATH_SYNTAX_BAD);
+                }
+                let (mut prefix, identity) = file::directory_root(attributes.root_directory)?;
+                if prefix.len() > 1 { prefix.push(b'\\' as u16); }
+                prefix.try_reserve(name.len()).map_err(|_| STATUS_NO_MEMORY)?;
+                prefix.extend_from_slice(&name);
+                name = prefix;
+                result.root_identity = Some(identity);
+            }
             validate_name(&name, result.case_insensitive)?;
             result.name = Some(name);
         }
+    }
+    if result.name.is_none() && !attributes.root_directory.is_null() {
+        return Err(STATUS_OBJECT_NAME_INVALID);
     }
     Ok(result)
 }

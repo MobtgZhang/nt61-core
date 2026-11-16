@@ -8,11 +8,12 @@
 //! References: MSDN Library "Windows 7" — `ntdll.dll` section
 //! APIs.
 
-use super::file::{alloc_handle, free_handle, lookup_handle, HandleKind};
+use super::file::{self, free_handle, lookup_handle, DispatcherState, HandleKind};
+use super::object::{capture_attributes, map_sync_access, SyncAttributes};
 use super::status::{
-    STATUS_ACCESS_DENIED, STATUS_ACCESS_VIOLATION, STATUS_INFO_LENGTH_MISMATCH,
+    STATUS_ACCESS_VIOLATION, STATUS_INFO_LENGTH_MISMATCH,
     STATUS_INVALID_HANDLE, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
-    STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS,
+    STATUS_NOT_IMPLEMENTED, STATUS_NO_MEMORY, STATUS_OBJECT_TYPE_MISMATCH, STATUS_SUCCESS,
 };
 use super::types::{SizeT, HANDLE, NTSTATUS, PVOID};
 use crate::ke::sync::Spinlock;
@@ -29,7 +30,6 @@ pub const SECTION_BASIC_INFORMATION: u32 = 0;
 #[derive(Clone, Copy)]
 struct SectionEntry {
     identity: u64,
-    desired_access: u32,
     maximum_size: i64,
     allocation_attributes: u32,
     file_mapped: bool,
@@ -94,9 +94,10 @@ pub unsafe extern "C" fn nt_create_section(
     if probe_user_write(section_handle as u64, core::mem::size_of::<HANDLE>()).is_err() {
         return STATUS_ACCESS_VIOLATION;
     }
-    if !maximum_size.is_null() && read_user_object::<i64>(maximum_size as u64).is_err() {
-        return STATUS_ACCESS_VIOLATION;
-    }
+    let attributes = match capture_attributes(object_attributes) {
+        Ok(attributes) => attributes,
+        Err(status) => return status,
+    };
     let mut output = 0 as HANDLE;
     let mut maximum_size_value = 0i64;
     if !maximum_size.is_null() {
@@ -105,23 +106,23 @@ pub unsafe extern "C" fn nt_create_section(
             Err(status) => return status,
         };
     }
-    let status = nt_create_section_kernel(
+    let status = create_section(
         &mut output,
         desired_access,
-        object_attributes,
-        Some(&mut maximum_size_value),
+        attributes,
+        maximum_size_value,
         section_page_protection,
         allocation_attributes,
         file_handle,
     );
-    if status != STATUS_SUCCESS {
+    if status < 0 {
         return status;
     }
     if write_user_object(section_handle as u64, &output).is_err() {
         free_handle(output);
         return STATUS_ACCESS_VIOLATION;
     }
-    STATUS_SUCCESS
+    status
 }
 
 pub fn nt_create_section_kernel(
@@ -133,10 +134,30 @@ pub fn nt_create_section_kernel(
     allocation_attributes: u32,
     file_handle: HANDLE,
 ) -> NTSTATUS {
+    create_section(
+        section_handle,
+        desired_access,
+        SyncAttributes::unnamed(),
+        maximum_size.copied().unwrap_or(0),
+        section_page_protection,
+        allocation_attributes,
+        file_handle,
+    )
+}
+
+fn create_section(
+    section_handle: &mut HANDLE,
+    desired_access: u32,
+    attributes: SyncAttributes,
+    maximum_size: i64,
+    section_page_protection: u32,
+    allocation_attributes: u32,
+    file_handle: HANDLE,
+) -> NTSTATUS {
     if !is_supported_page_protection(section_page_protection) {
         return STATUS_INVALID_PARAMETER;
     }
-    if maximum_size.as_ref().is_some_and(|value| **value < 0) {
+    if maximum_size < 0 {
         return STATUS_INVALID_PARAMETER;
     }
     if !file_handle.is_null()
@@ -144,23 +165,76 @@ pub fn nt_create_section_kernel(
     {
         return STATUS_INVALID_HANDLE;
     }
-    static NEXT_IDENTITY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
-    let identity = NEXT_IDENTITY.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    let handle = alloc_handle(HandleKind::Section, identity);
-    if handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-    let entry = SectionEntry {
-        identity,
-        desired_access,
-        maximum_size: maximum_size.copied().unwrap_or(0),
-        allocation_attributes,
-        file_mapped: !file_handle.is_null(),
+    let access = match map_sync_access(HandleKind::Section, desired_access) {
+        Ok(access) => access,
+        Err(status) => return status,
     };
-    let mut sections = SECTION_TABLE.lock();
-    sections.push(entry);
-    *section_handle = handle;
-    STATUS_SUCCESS
+    let result = file::create_object_handle(
+        HandleKind::Section,
+        DispatcherState::None,
+        access,
+        attributes,
+        true,
+        || {
+            // The handle table owns the outer lock. All queries and final
+            // closes use this same handle-table -> section-table lock order.
+            static NEXT_IDENTITY: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(1);
+            let identity = NEXT_IDENTITY
+                .try_update(
+                    core::sync::atomic::Ordering::Relaxed,
+                    core::sync::atomic::Ordering::Relaxed,
+                    |value| value.checked_add(1),
+                )
+                .map_err(|_| STATUS_NO_MEMORY)?;
+            let mut sections = SECTION_TABLE.lock();
+            sections.try_reserve(1).map_err(|_| STATUS_NO_MEMORY)?;
+            sections.push(SectionEntry {
+                identity,
+                maximum_size,
+                allocation_attributes,
+                file_mapped: !file_handle.is_null(),
+            });
+            Ok(identity)
+        },
+    );
+    match result {
+        Ok((handle, status)) => {
+            *section_handle = handle;
+            status
+        }
+        Err(status) => status,
+    }
+}
+
+/// Open an existing named section with an independent granted access mask.
+///
+/// # Safety
+/// Pointer arguments designate caller memory and are captured by user_copy.
+pub unsafe extern "C" fn nt_open_section(
+    output: *mut HANDLE,
+    desired_access: u32,
+    attributes: *mut super::types::ObjectAttributes,
+) -> NTSTATUS {
+    let result = (|| {
+        probe_user_write(output as u64, core::mem::size_of::<HANDLE>())?;
+        let attributes = capture_attributes(attributes)?;
+        let access = map_sync_access(HandleKind::Section, desired_access)?;
+        let (handle, status) = file::create_object_handle(
+            HandleKind::Section,
+            DispatcherState::None,
+            access,
+            attributes,
+            false,
+            || Err(STATUS_INVALID_PARAMETER),
+        )?;
+        if let Err(error) = write_user_object(output as u64, &handle) {
+            free_handle(handle);
+            return Err(error);
+        }
+        Ok(status)
+    })();
+    result.unwrap_or_else(|status| status)
 }
 
 /// # Safety
@@ -230,22 +304,21 @@ pub unsafe extern "C" fn nt_query_section(
     if info.is_null() || length < core::mem::size_of::<SectionBasicInformation>() {
         return STATUS_INFO_LENGTH_MISMATCH;
     }
-    let identity = match lookup_handle(section_handle) {
-        Some(entry) if entry.kind == HandleKind::Section => entry.target,
-        _ => return STATUS_INVALID_HANDLE,
+    let entry = match file::with_sync_access(
+        section_handle,
+        super::types::section_access::SECTION_QUERY,
+        |handles| {
+            if handles[0].kind != HandleKind::Section {
+                return Err(STATUS_OBJECT_TYPE_MISMATCH);
+            }
+            SECTION_TABLE.lock().iter().copied()
+                .find(|entry| entry.identity == handles[0].target)
+                .ok_or(STATUS_INVALID_HANDLE)
+        },
+    ) {
+        Ok(entry) => entry,
+        Err(status) => return status,
     };
-    let sections = SECTION_TABLE.lock();
-    let Some(entry) = sections
-        .iter()
-        .copied()
-        .find(|entry| entry.identity == identity)
-    else {
-        return STATUS_INVALID_HANDLE;
-    };
-    drop(sections);
-    if entry.desired_access & super::types::section_access::SECTION_QUERY == 0 {
-        return STATUS_ACCESS_DENIED;
-    }
     let information = SectionBasicInformation {
         base_address: core::ptr::null_mut(),
         reserved: 0,

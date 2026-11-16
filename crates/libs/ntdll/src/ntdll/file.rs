@@ -56,12 +56,15 @@ fn struct_bytes<T>(value: &T) -> &[u8] {
 #[path = "file/handles.rs"]
 mod handles;
 pub use handles::handle_count;
+pub(crate) use handles::namespace::{directory_entries, symbolic_link_target, set_object_permanent};
 pub(crate) use handles::{
+    create_named_handle, directory_root,
+    create_object_handle,
     alert_user_thread, take_user_alert, terminate_user_alert, thread_alert_target,
-    abandon_mutants, alloc_dispatcher_handle, alloc_handle, begin_wait, close_handle,
-    close_sync_handle, create_sync_handle, duplicate_sync_handle_with_access, free_handle,
+    abandon_mutants, alloc_dispatcher_handle, alloc_handle, alloc_access_handle, begin_keyed_wait, begin_wait, close_handle,
+    close_sync_handle, clone_owned_handle, create_sync_handle, duplicate_sync_handle_with_access, free_handle,
     handle_flags, lookup_handle, pulse_event, signal_and_begin_wait, sync_object_name, tick_timers,
-    update_handle_flags, with_sync_access, with_sync_handles, DispatcherState, HandleEntry,
+    update_handle_flags, with_sync_access, with_sync_handles, with_sync_handles_access, operate_event_pair, DispatcherState, HandleEntry,
     HandleKind, MutantState, TimerState, WaitStart,
 };
 
@@ -1800,3 +1803,8 @@ pub unsafe fn nt_write_file_kernel(
     }
     status
 }
+
+#[path = "file/metadata.rs"]
+pub mod metadata;
+
+pub use metadata::{nt_query_attributes_file, nt_query_full_attributes_file};
