@@ -444,7 +444,7 @@ impl FileInformationClass {
 // ---------------------------------------------------------------------------
 
 /// `FILE_DIRECTORY_INFORMATION` (FileInformationClass = 1).
-/// 0x48-byte fixed prefix followed by the UTF-16 name.
+/// The UTF-16 name starts at byte 0x40; `size_of` includes one name unit and padding.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct FileDirectoryInformation {
@@ -458,14 +458,14 @@ pub struct FileDirectoryInformation {
     pub allocation_size: i64,   // 0x30
     pub file_attributes: u32,   // 0x38
     pub file_name_length: u32,  // 0x3C
-    pub ea_size: u32,           // 0x40
-    // 4 bytes of implicit padding to keep the FAM at 8-byte alignment.
-    pub file_name: [u16; 1], // 0x48 (FAM, variable length)
+    pub file_name: [u16; 1],    // 0x40 (FAM, variable length)
 }
 const _: () = assert!(
     core::mem::size_of::<FileDirectoryInformation>() == 0x48,
-    "FILE_DIRECTORY_INFORMATION fixed prefix must be 0x48 bytes"
+    "FILE_DIRECTORY_INFORMATION including its first name unit must be 0x48 bytes"
 );
+
+const _: () = assert!(core::mem::offset_of!(FileDirectoryInformation, file_name) == 0x40);
 
 /// `FILE_BOTH_DIR_INFORMATION` (FileInformationClass = 3).
 /// Adds the short (8.3) name before the long name.
@@ -490,8 +490,10 @@ pub struct FileBothDirectoryInformation {
 }
 const _: () = assert!(
     core::mem::size_of::<FileBothDirectoryInformation>() == 0x60,
-    "FILE_BOTH_DIR_INFORMATION fixed prefix must be 0x60 bytes (0x5E documented + 2-byte FAM alignment)"
+    "FILE_BOTH_DIR_INFORMATION including its first name unit must be 0x60 bytes"
 );
+
+const _: () = assert!(core::mem::offset_of!(FileBothDirectoryInformation, file_name) == 0x5e);
 
 /// `FILE_ID_BOTH_DIR_INFORMATION` (FileInformationClass = 37).
 /// Adds an 8-byte file_id (typically the NTFS MFT reference) before
@@ -514,13 +516,16 @@ pub struct FileIdBothDirectoryInformation {
     pub short_name_length: u8,  // 0x44
     pub _pad0: [u8; 1],         // 0x45
     pub short_name: [u16; 12],  // 0x46 (24 bytes)
-    pub file_id: i64,           // 0x5E
-    pub file_name: [u16; 1],    // 0x66 (FAM, variable length)
+    pub file_id: i64,           // 0x60 (aligned after short_name)
+    pub file_name: [u16; 1],    // 0x68 (FAM, variable length)
 }
 const _: () = assert!(
     core::mem::size_of::<FileIdBothDirectoryInformation>() == 0x70,
-    "FILE_ID_BOTH_DIR_INFORMATION fixed prefix must be 0x70 bytes (0x66 documented + 0xA trailing alignment)"
+    "FILE_ID_BOTH_DIR_INFORMATION including its first name unit must be 0x70 bytes"
 );
+
+const _: () = assert!(core::mem::offset_of!(FileIdBothDirectoryInformation, file_id) == 0x60);
+const _: () = assert!(core::mem::offset_of!(FileIdBothDirectoryInformation, file_name) == 0x68);
 
 /// Process information class.
 #[repr(u32)]

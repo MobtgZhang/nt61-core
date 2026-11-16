@@ -305,7 +305,7 @@ pub fn execute_status(command:&str,arguments:&str,cwd:&[u8])->u32{
         },
         "whoami" if arguments.is_empty()=>{
             let token=crate::ps::process::get_current_thread_token();
-            let name=if token.is_null(){None}else{unsafe{crate::se::logon::name_for_sid(&(*token).user)}};
+            let name=token.as_ref().and_then(|token|crate::se::logon::name_for_sid(&token.user));
             if let Some(name)=name{output_line(&format!("nt61\\{}",name.to_ascii_lowercase()));0}else{output_line("Unable to resolve the current security token.");1}
         },
         "hostname"|"ver"|"systeminfo"|"driverquery"|"getmac" if arguments.is_empty()=>{execute(command,arguments,cwd);0},
@@ -1499,11 +1499,7 @@ fn cmd_title(arguments: &str) -> bool {
 fn cmd_identity(command: &str) -> bool {
     if command == "whoami" {
         let token = crate::ps::process::get_current_thread_token();
-        let name = if token.is_null() { None } else {
-            // SAFETY: the running thread/process owns its effective token
-            // throughout this synchronous command; no pointer escapes the call.
-            unsafe { crate::se::logon::name_for_sid(&(*token).user) }
-        };
+        let name = token.as_ref().and_then(|token| crate::se::logon::name_for_sid(&token.user));
         match name {
             Some(name) => output_line(&format!("nt61\\{}", name.to_ascii_lowercase())),
             None => output_line("ERROR: Unable to resolve the current security token."),

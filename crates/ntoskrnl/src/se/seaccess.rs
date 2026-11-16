@@ -173,16 +173,21 @@ pub enum AccessCheckResult {
 /// Check if a SID matches a subject (token).
 /// A SID matches if it equals any of the token's group SIDs
 /// or the token's user SID.
-fn sid_matches_token(sid: &sid, token: &Token) -> bool {
+fn sid_matches_token(sid: &sid, token: &Token, restricting: bool) -> bool {
+    if restricting {
+        return token.restricted_groups[..token.restricted_count]
+            .iter()
+            .any(|group| sid.equals(&group.sid));
+    }
     // Check user
-    if sid.equals(&token.user) {
+    if sid.equals(&token.user) && token.user_attributes & SE_GROUP_USE_FOR_DENY_ONLY == 0 {
         return true;
     }
     // Check groups
     for i in 0..token.group_count {
         let g = &token.groups[i];
         // Skip groups that are "deny only"
-        if (g.attributes & SE_GROUP_USE_FOR_DENY_ONLY) != 0 {
+        if !g.is_enabled() || (g.attributes & SE_GROUP_USE_FOR_DENY_ONLY) != 0 {
             continue;
         }
         if sid.equals(&g.sid) {
@@ -193,14 +198,22 @@ fn sid_matches_token(sid: &sid, token: &Token) -> bool {
 }
 
 /// Check if a SID is present in the token (used for access check).
-fn sid_in_token(sid: &sid, token: &Token) -> bool {
+fn sid_in_token(sid: &sid, token: &Token, restricting: bool) -> bool {
+    if restricting {
+        return token.restricted_groups[..token.restricted_count]
+            .iter()
+            .any(|group| sid.equals(&group.sid));
+    }
     // Check user
     if sid.equals(&token.user) {
         return true;
     }
     // Check all groups (including deny-only)
     for i in 0..token.group_count {
-        if sid.equals(&token.groups[i].sid) {
+        if (token.groups[i].is_enabled()
+            || token.groups[i].attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0)
+            && sid.equals(&token.groups[i].sid)
+        {
             return true;
         }
     }
@@ -230,11 +243,41 @@ pub fn check_access(
 }
 
 fn check_access_with_granted(
+    desired_access: u32,
+    token: &Token,
+    owner: &sid,
+    dacl: *const Acl,
+    generic_mapping: Option<&GenericMapping>,
+) -> (AccessCheckResult, u32) {
+    let ordinary = access_pass(desired_access, token, owner, dacl, generic_mapping, false);
+    if ordinary.0 == AccessCheckResult::Denied
+        || token.flags & super::token::TOKEN_IS_RESTRICTED == 0
+    {
+        return ordinary;
+    }
+    let restricted = access_pass(desired_access, token, owner, dacl, generic_mapping, true);
+    let granted = ordinary.1 & restricted.1;
+    let mut explicit = desired_access & !ACCESS_MAXIMUM_ALLOWED;
+    if let Some(mapping) = generic_mapping {
+        mapping.map_generic(&mut explicit);
+    }
+    if restricted.0 == AccessCheckResult::Denied
+        || explicit & !granted != 0
+        || (desired_access & ACCESS_MAXIMUM_ALLOWED != 0 && granted == 0)
+    {
+        (AccessCheckResult::Denied, 0)
+    } else {
+        (AccessCheckResult::Allowed, granted)
+    }
+}
+
+fn access_pass(
     mut desired_access: u32,
     token: &Token,
     _owner: &sid,
     dacl: *const Acl,
     generic_mapping: Option<&GenericMapping>,
+    restricting: bool,
 ) -> (AccessCheckResult, u32) {
     let maximum_allowed = (desired_access & ACCESS_MAXIMUM_ALLOWED) != 0;
     desired_access &= !ACCESS_MAXIMUM_ALLOWED;
@@ -305,13 +348,28 @@ fn check_access_with_granted(
     let walk_limit = acl.acl_size as usize;
     let mut granted_access = 0u32;
     let mut denied_access = 0u32;
+    let mut remaining = desired_access & !privilege_grants;
     let mut offset = 8usize;
 
     while offset + 4 <= walk_limit {
         let ace_type = acl.data[offset];
         let ace_size = acl.data[offset + 2] as usize | ((acl.data[offset + 3] as usize) << 8);
         if ace_size < 8 || offset + ace_size > walk_limit {
-            break;
+            return (AccessCheckResult::Denied, 0);
+        }
+        if acl.data[offset + 1] & AceFlags::INHERIT_ONLY.bits() != 0 {
+            offset += ace_size;
+            continue;
+        }
+        // Audit/label ACEs do not authorize access. Object and callback ACEs
+        // require policy this evaluator cannot yet enforce; fail closed.
+        match AceType::from_u8(ace_type) {
+            Some(AceType::AccessAllowed | AceType::AccessDenied) => {}
+            Some(AceType::SystemAudit | AceType::SystemAlarm | AceType::SystemMandatoryLabel) => {
+                offset += ace_size;
+                continue;
+            }
+            _ => return (AccessCheckResult::Denied, 0),
         }
 
         let mut ace_mask = u32::from_le_bytes([
@@ -337,41 +395,31 @@ fn check_access_with_granted(
         };
 
         match ace_type {
-            AceType::AccessDenied
-            | AceType::AccessDeniedCallback
-            | AceType::AccessDeniedCallbackObject
-                if sid_in_token(&sid, token) =>
-            {
-                denied_access |= ace_mask;
+            AceType::AccessDenied if sid_in_token(&sid, token, restricting) => {
+                if remaining & ace_mask != 0 {
+                    return (AccessCheckResult::Denied, 0);
+                }
+                denied_access |= ace_mask & !granted_access;
             }
-            AceType::AccessAllowed
-            | AceType::AccessAllowedCallback
-            | AceType::AccessAllowedCallbackObject
-                if sid_matches_token(&sid, token) =>
-            {
-                granted_access |= ace_mask;
+            AceType::AccessAllowed if sid_matches_token(&sid, token, restricting) => {
+                granted_access |= ace_mask & !denied_access;
+                remaining &= !ace_mask;
             }
             _ => {}
         }
         offset += ace_size;
+        if !maximum_allowed && remaining == 0 {
+            break;
+        }
     }
 
-    granted_access &= !denied_access;
-    privilege_grants &= !denied_access;
-    if (desired_access & denied_access) != 0 {
-        return (AccessCheckResult::Denied, 0);
-    }
-
-    let remaining = desired_access & !granted_access & !privilege_grants;
-    // MAXIMUM_ALLOWED never denies for ungranted bits; it grants the
-    // largest set the DACL allows. Only an explicit (non-maximum)
-    // request fails when bits remain uncovered.
-    if !maximum_allowed && remaining != 0 {
+    // Explicit rights remain mandatory even alongside MAXIMUM_ALLOWED.
+    if remaining != 0 {
         return (AccessCheckResult::Denied, 0);
     }
 
     let granted = if maximum_allowed {
-        (granted_access | privilege_grants) & maximum_access
+        ((granted_access | privilege_grants) & maximum_access) | desired_access
     } else {
         granted_access & desired_access | privilege_grants & desired_access
     };
@@ -920,6 +968,88 @@ mod tests {
         sid::{sid, WellKnownSid},
         token::Token,
     };
+
+    #[test]
+    fn restricted_kernel_access_intersects_independent_sid_grants() {
+        use super::{check_access_with_granted, GenericMapping};
+        use crate::se::{acl::AceFlags, token::TokenGroup};
+        let user = sid::well_known(WellKnownSid::Users);
+        let restricted = sid::well_known(WellKnownSid::World);
+        let mut token = Token::new_primary(user);
+        token
+            .filter(0, &[], &[], &[TokenGroup::new(restricted, 0)])
+            .unwrap();
+        let mut acl = Acl::new();
+        assert!(acl.add_access_allowed(&user, 3, AceFlags::NONE));
+        assert!(acl.add_access_allowed(&restricted, 6, AceFlags::NONE));
+        let mapping = GenericMapping::new(1, 2, 4, 7);
+        for (desired, expected) in [
+            (1, (AccessCheckResult::Denied, 0)),
+            (2, (AccessCheckResult::Allowed, 2)),
+            (ACCESS_MAXIMUM_ALLOWED, (AccessCheckResult::Allowed, 2)),
+            (ACCESS_MAXIMUM_ALLOWED | 1, (AccessCheckResult::Denied, 0)),
+        ] {
+            assert_eq!(
+                check_access_with_granted(desired, &token, &user, &acl, Some(&mapping)),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_acl_honors_order_and_skips_inherit_only_entries() {
+        use super::{check_access_with_granted, GenericMapping};
+        use crate::se::acl::AceFlags;
+        let token = Token::new_primary(sid::well_known(WellKnownSid::Users));
+        let mapping = GenericMapping::new(1, 2, 4, 7);
+        let mut acl = Acl::new();
+        assert!(acl.add_access_allowed(&token.user, 1, AceFlags::NONE));
+        assert!(acl.add_access_denied(&token.user, 1, AceFlags::NONE));
+        for desired in [1, ACCESS_MAXIMUM_ALLOWED] {
+            assert_eq!(
+                check_access_with_granted(desired, &token, &token.user, &acl, Some(&mapping)),
+                (AccessCheckResult::Allowed, 1)
+            );
+        }
+        let mut acl = Acl::new();
+        assert!(acl.add_access_denied(&token.user, 1, AceFlags::INHERIT_ONLY));
+        assert!(acl.add_access_allowed(&token.user, 1, AceFlags::NONE));
+        assert_eq!(
+            check_access(1, &token, &token.user, &acl, Some(&mapping)),
+            AccessCheckResult::Allowed
+        );
+        let mut acl = Acl::new();
+        assert!(acl.add_access_allowed(&token.user, 1, AceFlags::INHERIT_ONLY));
+        assert_eq!(
+            check_access(1, &token, &token.user, &acl, Some(&mapping)),
+            AccessCheckResult::Denied
+        );
+    }
+
+    #[test]
+    fn empty_restricting_intersection_never_becomes_unrestricted_in_kernel_check() {
+        use crate::se::{acl::AceFlags, token::TokenGroup};
+        let user = sid::well_known(WellKnownSid::Users);
+        let other = sid::well_known(WellKnownSid::World);
+        let mut token = Token::new_primary(user);
+        token
+            .filter(0, &[], &[], &[TokenGroup::new(user, 0)])
+            .unwrap();
+        token
+            .filter(0, &[], &[], &[TokenGroup::new(other, 0)])
+            .unwrap();
+        assert_eq!(token.restricted_count, 0);
+        let mut acl = Acl::new();
+        assert!(acl.add_access_allowed(&user, 7, AceFlags::NONE));
+        assert_eq!(
+            check_access(1, &token, &user, &acl, None),
+            AccessCheckResult::Denied
+        );
+        assert_eq!(
+            check_access(ACCESS_MAXIMUM_ALLOWED, &token, &user, &acl, None),
+            AccessCheckResult::Denied
+        );
+    }
 
     // Under libtest the kernel heap is never initialised, so pool
     // allocations inside SecurityDescriptor::from_token would fail.

@@ -14,8 +14,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::sid::sid;
 use super::token::{
-    luid, ImpersonationLevel, Token, TokenGroup, TokenPrivilege, TokenTypeEnum, SE_GROUP_ENABLED,
-    TOKEN_MAX_GROUPS, TOKEN_MAX_PRIVILEGES,
+    luid, ImpersonationLevel, Token, TokenGroup, TokenPrivilege, TokenTypeEnum, TOKEN_MAX_GROUPS,
+    TOKEN_MAX_PRIVILEGES,
 };
 
 pub const DUPLICATE_SAME_ACCESS: u32 = 0x00000002;
@@ -100,30 +100,19 @@ pub unsafe fn se_duplicate_token(
         return core::ptr::null_mut();
     }
 
-    let new_token_ptr = crate::mm::pool::allocate(
-        crate::mm::pool::PoolType::NonPaged,
-        core::mem::size_of::<Token>(),
-    ) as *mut Token;
-
+    // SAFETY: the caller pins existing_token for this operation.
+    let src = unsafe { &*existing_token };
+    let new_token_ptr = super::token::duplicate_for_process(src);
     if new_token_ptr.is_null() {
         return core::ptr::null_mut();
     }
-
+    // SAFETY: the duplicate owns new token and DACL allocations.
     unsafe {
-        let src = &*existing_token;
-        let dst = &mut *new_token_ptr;
-
-        core::ptr::copy_nonoverlapping(src as *const Token, dst as *mut Token, 1);
-
-        dst.token_type = token_type;
-        dst.impersonation_level = impersonation_level;
-
+        (*new_token_ptr).token_type = token_type;
+        (*new_token_ptr).impersonation_level = impersonation_level;
         static NEXT_TOKEN_ID: AtomicU64 = AtomicU64::new(1000);
-        dst.token_id = luid::from_u64(NEXT_TOKEN_ID.fetch_add(1, Ordering::Relaxed));
-
-        dst.authentication_id = src.authentication_id;
-
-        dst.refcount = 1;
+        (*new_token_ptr).token_id = luid::from_u64(NEXT_TOKEN_ID.fetch_add(1, Ordering::Relaxed));
+        (*new_token_ptr).refcount = 1;
     }
 
     new_token_ptr
@@ -134,7 +123,7 @@ pub unsafe fn se_duplicate_token(
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 pub unsafe fn se_filter_token(
     existing_token: *const Token,
-    _flags: u32,
+    flags: u32,
     sids_to_disable: &[sid],
     privileges_to_delete: &[luid],
     restricted_sids: &[sid],
@@ -143,47 +132,54 @@ pub unsafe fn se_filter_token(
         return core::ptr::null_mut();
     }
 
-    let new_token = se_duplicate_token(
-        existing_token,
-        unsafe { (*existing_token).impersonation_level },
-        unsafe { (*existing_token).token_type },
-    );
-
-    if new_token.is_null() {
+    if restricted_sids.len() > TOKEN_MAX_GROUPS {
         return core::ptr::null_mut();
     }
-
-    unsafe {
-        let token = &mut *new_token;
-
-        for sid_to_disable in sids_to_disable {
-            for i in 0..token.group_count {
-                if token.groups[i].sid.equals(sid_to_disable) {
-                    token.groups[i].attributes &= !SE_GROUP_ENABLED;
-                    token.groups[i].attributes |= super::token::SE_GROUP_USE_FOR_DENY_ONLY;
-                }
-            }
+    // SAFETY: existing_token was checked above and is pinned by the caller.
+    let source = unsafe { &*existing_token };
+    let mut disabled = [TokenGroup::default(); TOKEN_MAX_GROUPS + 1];
+    let mut count = 0;
+    if sids_to_disable.iter().any(|sid| sid.equals(&source.user)) {
+        disabled[count] = TokenGroup::new(source.user, 0);
+        count += 1;
+    }
+    for group in &source.groups[..source.group_count] {
+        if sids_to_disable.iter().any(|sid| sid.equals(&group.sid)) {
+            disabled[count] = *group;
+            count += 1;
         }
-
-        for luid_to_delete in privileges_to_delete {
-            for i in 0..token.privilege_count {
-                if token.privileges[i].luid.equals(luid_to_delete) {
-                    token.privileges[i].attributes = super::token::SE_PRIVILEGE_REMOVED;
-                }
-            }
+    }
+    let mut restricted = [TokenGroup::default(); TOKEN_MAX_GROUPS];
+    for (entry, sid) in restricted.iter_mut().zip(restricted_sids) {
+        *entry = TokenGroup::new(*sid, 0);
+    }
+    // SAFETY: source remains pinned; se_duplicate_token copies its DACL too.
+    let new_token = unsafe {
+        se_duplicate_token(
+            existing_token,
+            source.impersonation_level,
+            source.token_type,
+        )
+    };
+    if new_token.is_null() {
+        return new_token;
+    }
+    // SAFETY: this unpublished duplicate is exclusively owned here.
+    let value = unsafe { &mut *new_token };
+    if value
+        .filter(
+            flags,
+            &disabled[..count],
+            privileges_to_delete,
+            &restricted[..restricted_sids.len()],
+        )
+        .is_err()
+    {
+        if !value.default_dacl.is_null() {
+            crate::mm::pool::free(value.default_dacl.cast());
         }
-
-        for restricted_sid in restricted_sids {
-            if token.group_count < TOKEN_MAX_GROUPS {
-                token.groups[token.group_count] = TokenGroup {
-                    sid: *restricted_sid,
-                    attributes: SE_GROUP_ENABLED | super::token::SE_GROUP_USE_FOR_DENY_ONLY,
-                };
-                token.group_count += 1;
-            }
-        }
-
-        token.flags |= super::token::TOKEN_WRITE_RESTRICTED;
+        crate::mm::pool::free(new_token.cast());
+        return core::ptr::null_mut();
     }
 
     new_token
@@ -196,7 +192,7 @@ pub unsafe fn se_token_is_restricted(token: *const Token) -> bool {
     if token.is_null() {
         return false;
     }
-    unsafe { ((*token).flags & super::token::TOKEN_WRITE_RESTRICTED) != 0 }
+    unsafe { ((*token).flags & super::token::TOKEN_IS_RESTRICTED) != 0 }
 }
 
 pub use self::adjust::{se_adjust_groups_token, se_adjust_privileges_token};
@@ -480,7 +476,7 @@ mod token_capacity_tests {
 
         let added = [TokenGroup {
             sid: sid::well_known(WellKnownSid::Administrators),
-            attributes: SE_GROUP_ENABLED,
+            attributes: super::super::token::SE_GROUP_ENABLED,
         }];
         assert!(!unsafe { se_adjust_groups_token(token, false, &added, None) });
         unsafe {

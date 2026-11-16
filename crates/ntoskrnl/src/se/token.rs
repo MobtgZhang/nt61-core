@@ -227,6 +227,10 @@ pub const TOKEN_HAS_BACKUP_PRIVILEGE: u32 = 0x0002;
 pub const TOKEN_HAS_RESTORE_PRIVILEGE: u32 = 0x0004;
 pub const TOKEN_WRITE_RESTRICTED: u32 = 0x0008;
 pub const TOKEN_HAS_IMPERSONATE_PRIVILEGE: u32 = 0x0010;
+// Internal state flags, independent of the public NtFilterToken option bits.
+pub const TOKEN_IS_RESTRICTED: u32 = 0x0020;
+pub const TOKEN_IS_FILTERED: u32 = 0x0040;
+pub const TOKEN_SANDBOX_INERT: u32 = 0x0080;
 
 /// Integrity level values.
 pub const SECURITY_MANDATORY_UNTRUSTED_RID: u32 = 0x0000;
@@ -300,6 +304,8 @@ pub struct Token {
     pub authentication_id: luid,
     /// User SID
     pub user: sid,
+    /// A disabled user SID participates only in deny ACEs.
+    pub user_attributes: u32,
     /// Primary group SID
     pub primary_group: sid,
     /// Default DACL
@@ -318,6 +324,9 @@ pub struct Token {
     pub groups: [TokenGroup; TOKEN_MAX_GROUPS],
     /// Number of groups
     pub group_count: usize,
+    /// Restricting SIDs are evaluated in a separate access-check pass.
+    pub restricted_groups: [TokenGroup; TOKEN_MAX_GROUPS],
+    pub restricted_count: usize,
     /// Privileges
     pub privileges: [TokenPrivilege; TOKEN_MAX_PRIVILEGES],
     /// Number of privileges
@@ -364,6 +373,7 @@ impl Token {
             token_id: luid::new(),
             authentication_id: luid::new(),
             user: sid::well_known(WellKnownSid::Null),
+            user_attributes: 0,
             primary_group: sid::well_known(WellKnownSid::Null),
             default_dacl: core::ptr::null_mut(),
             session_id: 0,
@@ -381,6 +391,8 @@ impl Token {
                 attributes: 0,
             }; TOKEN_MAX_GROUPS],
             group_count: 0,
+            restricted_groups: [TokenGroup::default(); TOKEN_MAX_GROUPS],
+            restricted_count: 0,
             privileges: [TokenPrivilege {
                 luid: luid::new(),
                 attributes: 0,
@@ -405,6 +417,87 @@ impl Token {
             self.privileges[self.privilege_count] = privilege;
             self.privilege_count += 1;
         }
+    }
+
+    /// Apply captured restrictions to an independently owned duplicate.
+    /// Unsupported token-policy options fail before any mutation.
+    pub fn filter(
+        &mut self,
+        flags: u32,
+        disable: &[TokenGroup],
+        delete: &[luid],
+        restrict: &[TokenGroup],
+    ) -> Result<(), i32> {
+        if flags & !0xf != 0 || restrict.iter().any(|entry| entry.attributes != 0) {
+            return Err(0xc000_000du32 as i32); // STATUS_INVALID_PARAMETER
+        }
+        // LUA elevation policy and write-only restriction need object-specific
+        // policy support. Do not weaken either request into ordinary filtering.
+        if flags & 0xc != 0 {
+            return Err(0xc000_00bbu32 as i32); // STATUS_NOT_SUPPORTED
+        }
+        if restrict.len() > TOKEN_MAX_GROUPS {
+            return Err(0xc000_009au32 as i32); // STATUS_INSUFFICIENT_RESOURCES
+        }
+        for entry in disable {
+            if entry.sid.equals(&self.user) {
+                self.user_attributes = (self.user_attributes
+                    & !(SE_GROUP_ENABLED | SE_GROUP_ENABLED_BY_DEFAULT))
+                    | SE_GROUP_USE_FOR_DENY_ONLY;
+            }
+            for group in &mut self.groups[..self.group_count] {
+                if group.sid.equals(&entry.sid) {
+                    group.attributes = (group.attributes
+                        & !(SE_GROUP_ENABLED | SE_GROUP_ENABLED_BY_DEFAULT))
+                        | SE_GROUP_USE_FOR_DENY_ONLY;
+                }
+            }
+        }
+        let mut count = 0;
+        for index in 0..self.privilege_count {
+            let privilege = self.privileges[index];
+            let remove = if flags & 1 != 0 {
+                privilege.luid != luid::from_u64(23) // SeChangeNotifyPrivilege
+            } else {
+                delete.contains(&privilege.luid)
+            };
+            if !remove {
+                self.privileges[count] = privilege;
+                count += 1;
+            }
+        }
+        self.privileges[count..].fill(TokenPrivilege::default());
+        self.privilege_count = count;
+        if !restrict.is_empty() {
+            let was_restricted = self.flags & TOKEN_IS_RESTRICTED != 0;
+            let mut groups = [TokenGroup::default(); TOKEN_MAX_GROUPS];
+            count = 0;
+            for entry in restrict {
+                if (!was_restricted
+                    || self.restricted_groups[..self.restricted_count]
+                        .iter()
+                        .any(|old| old.sid.equals(&entry.sid)))
+                    && !groups[..count].iter().any(|old| old.sid.equals(&entry.sid))
+                {
+                    groups[count] = TokenGroup::new(
+                        entry.sid,
+                        SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED,
+                    );
+                    count += 1;
+                }
+            }
+            self.restricted_groups = groups;
+            self.restricted_count = count;
+            // Keep this flag even when intersection is empty: an empty
+            // restricting set must not turn a restricted token unrestricted.
+            self.flags |= TOKEN_IS_RESTRICTED;
+        }
+        if flags & 2 != 0 {
+            self.flags |= TOKEN_SANDBOX_INERT;
+        }
+        self.flags |= TOKEN_IS_FILTERED;
+        self.refresh_privilege_flags();
+        Ok(())
     }
 
     /// Check if the token has a specific privilege enabled.
@@ -445,8 +538,10 @@ impl Token {
 
     /// Check if the token belongs to the LocalSystem account.
     pub fn is_local_system(&self) -> bool {
-        self.user
-            .equals(&sid::well_known(WellKnownSid::LocalSystem))
+        self.user_attributes & SE_GROUP_USE_FOR_DENY_ONLY == 0
+            && self
+                .user
+                .equals(&sid::well_known(WellKnownSid::LocalSystem))
     }
 
     /// Reference counting.

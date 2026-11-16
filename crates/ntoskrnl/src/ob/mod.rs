@@ -2377,14 +2377,14 @@ pub unsafe fn open_object_with_access(
     }
 
     // 2. Get the caller's token
+    let current_token = crate::ps::process::get_current_thread_token();
     let caller_token = if !token_ptr.is_null() {
         unsafe { &*token_ptr }
     } else {
-        let current_token = crate::ps::process::get_current_thread_token();
         if current_token.is_null() {
             return Err(crate::ps::process::STATUS_ACCESS_DENIED);
         }
-        unsafe { &*current_token }
+        current_token.as_ref().expect("checked effective token")
     };
 
     // 3. Get the object's security descriptor

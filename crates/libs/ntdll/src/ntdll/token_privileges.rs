@@ -36,7 +36,7 @@ pub struct PrivilegeSet {
     pub privilege: [LuidAndAttributes; 1],
 }
 
-fn capture(address: u64, count: u32) -> Result<Vec<LuidAndAttributes>, NTSTATUS> {
+pub(crate) fn capture(address: u64, count: u32) -> Result<Vec<LuidAndAttributes>, NTSTATUS> {
     let length = (count as usize)
         .checked_mul(12)
         .ok_or(STATUS_INVALID_PARAMETER)?;

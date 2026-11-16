@@ -46,3 +46,5 @@ pub mod sidmgmt;
 pub mod smoke;
 pub mod tests;
 pub mod tokenmgmt;
+
+pub mod subject_context;

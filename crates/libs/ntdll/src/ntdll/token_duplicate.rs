@@ -34,7 +34,7 @@ fn level(value: u32) -> Result<ImpersonationLevel, NTSTATUS> {
 }
 
 /// Final object teardown. No handle table operations are allowed here.
-unsafe fn release_token(target: u64) {
+pub(crate) unsafe fn release_token(target: u64) {
     let token = target as *mut Token;
     // SAFETY: clone_owned_handle transfers one independently allocated payload
     // and calls this only after its last handle/pinned operation has gone away.

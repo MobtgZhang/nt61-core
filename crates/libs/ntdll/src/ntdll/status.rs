@@ -42,13 +42,13 @@ pub fn status_is_error(s: NTSTATUS) -> bool {
 // ---------------------------------------------------------------------------
 
 pub const STATUS_SUCCESS: NTSTATUS = 0x00000000;
+pub const STATUS_DATATYPE_MISALIGNMENT: NTSTATUS = 0x8000_0002u32 as i32;
 pub const STATUS_NOT_ALL_ASSIGNED: NTSTATUS = 0x00000106;
 pub const STATUS_CANT_DISABLE_MANDATORY: NTSTATUS = 0xc000_005du32 as i32;
 pub const STATUS_CANT_ENABLE_DENY_ONLY: NTSTATUS = 0xc000_02b3u32 as i32;
 pub const STATUS_INVALID_SID: NTSTATUS = 0xc000_0078u32 as i32;
-// Informational severity (0x8000001A): enumeration reached the end of the
-// list. Reported by NT_QUERY_DIRECTORY_FILE when no entry matches.
-pub const STATUS_NO_MORE_FILES: NTSTATUS = 0x8000001A_u32 as i32;
+// Warning severity: directory enumeration reached the end of the search.
+pub const STATUS_NO_MORE_FILES: NTSTATUS = 0x80000006_u32 as i32;
 pub const STATUS_PENDING: NTSTATUS = 0x00000103;
 pub const STATUS_TIMEOUT: NTSTATUS = 0x00000102;
 pub const STATUS_WAIT_0: NTSTATUS = 0x00000000;
@@ -89,7 +89,7 @@ pub const STATUS_INVALID_FILE_FOR_SECTION: NTSTATUS = 0xC0000020_u32 as i32;
 pub const STATUS_ALREADY_COMMITTED: NTSTATUS = 0xC0000021_u32 as i32;
 pub const STATUS_ACCESS_DENIED: NTSTATUS = 0xC0000022_u32 as i32;
 pub const STATUS_BUFFER_OVERFLOW: NTSTATUS = 0x80000005_u32 as i32;
-pub const STATUS_NO_MORE_ENTRIES: NTSTATUS = 0x8000001F_u32 as i32;
+pub const STATUS_NO_MORE_ENTRIES: NTSTATUS = 0x8000001A_u32 as i32;
 pub const STATUS_OBJECT_TYPE_MISMATCH: NTSTATUS = 0xC0000024_u32 as i32;
 pub const STATUS_NONCONTINUABLE_EXCEPTION: NTSTATUS = 0xC0000025_u32 as i32;
 pub const STATUS_INVALID_DISPOSITION: NTSTATUS = 0xC0000026_u32 as i32;
@@ -209,7 +209,7 @@ pub fn nt_status_to_dos_error(s: NTSTATUS) -> u32 {
         0xC000005B => 1308, // ERROR_INVALID_PRIMARY_GROUP
         0xC000005C => 1309, // ERROR_NO_IMPERSONATION_TOKEN
         0xC000005D => 1310, // ERROR_CANT_DISABLE_MANDATORY
-        0xC00002B3 => 629, // ERROR_CANT_ENABLE_DENY_ONLY
+        0xC00002B3 => 629,  // ERROR_CANT_ENABLE_DENY_ONLY
         0xC0000077 => 1336, // ERROR_INVALID_ACL
         0xC0000078 => 1337, // ERROR_INVALID_SID
         0xC0000079 => 1338, // ERROR_INVALID_SECURITY_DESCR
@@ -217,7 +217,7 @@ pub fn nt_status_to_dos_error(s: NTSTATUS) -> u32 {
         0x00000106 => 1300, // ERROR_NOT_ALL_ASSIGNED
         0xC00000A5 => 1346, // ERROR_BAD_IMPERSONATION_LEVEL
         0xC00000A6 => 1349, // ERROR_BAD_TOKEN_TYPE
-        0x40000000 => 183, // ERROR_ALREADY_EXISTS
+        0x40000000 => 183,  // ERROR_ALREADY_EXISTS
         0x00000103 => ERROR_IO_PENDING,
         0x00000102 => ERROR_TIMEOUT,
         0xC0000002 => ERROR_INVALID_FUNCTION,
@@ -250,7 +250,7 @@ pub fn nt_status_to_dos_error(s: NTSTATUS) -> u32 {
         0xC0000043 => ERROR_SHARING_VIOLATION,
         0xC0000046 => 288, // ERROR_NOT_OWNER
         0xC0000047 => 298, // ERROR_TOO_MANY_POSTS
-        0xC000004B => 31, // ERROR_GEN_FAILURE
+        0xC000004B => 31,  // ERROR_GEN_FAILURE
         0xC0000054 => ERROR_LOCK_VIOLATION,
         0xC0000056 => ERROR_ACCESS_DENIED,
         0xC000007B => ERROR_BAD_EXE_FORMAT,
@@ -262,8 +262,8 @@ pub fn nt_status_to_dos_error(s: NTSTATUS) -> u32 {
         0xC0000191 => 587, // ERROR_MUTANT_LIMIT_EXCEEDED
         0xC0000235 => ERROR_INVALID_HANDLE,
         0xC0000264 => ERROR_NOT_LOCKED,
-        0x8000001A => ERROR_NO_MORE_FILES,
-        0x8000001F => ERROR_NO_MORE_ITEMS,
+        0x80000006 => ERROR_NO_MORE_FILES,
+        0x8000001A => ERROR_NO_MORE_ITEMS,
         0xC0000061 => ERROR_PRIVILEGE_NOT_HELD,
         0xC0000120 => ERROR_NO_TOKEN,
         0xC0000135 => ERROR_MOD_NOT_FOUND,
@@ -309,6 +309,18 @@ mod tests {
         assert_eq!(
             status_severity(STATUS_INVALID_HANDLE),
             STATUS_SEVERITY_ERROR
+        );
+    }
+
+    #[test]
+    fn enumeration_status_codes_and_dos_errors_are_distinct() {
+        assert_eq!(STATUS_NO_MORE_FILES as u32, 0x80000006);
+        assert_eq!(STATUS_NO_MORE_ENTRIES as u32, 0x8000001a);
+        assert_eq!(nt_status_to_dos_error(STATUS_NO_MORE_FILES), 18);
+        assert_eq!(nt_status_to_dos_error(STATUS_NO_MORE_ENTRIES), 259);
+        assert_eq!(
+            status_severity(STATUS_NO_MORE_FILES),
+            STATUS_SEVERITY_WARNING
         );
     }
 

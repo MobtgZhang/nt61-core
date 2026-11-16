@@ -63,6 +63,7 @@ pub use super::token_privileges::{
     PrivilegeSet, TOKEN_PRIVILEGES,
 };
 
+pub use super::token_filter::nt_filter_token;
 pub use super::token_groups::{nt_adjust_groups_token, SidAndAttributes, TOKEN_GROUPS};
 
 pub use super::access_check::{
@@ -464,7 +465,12 @@ pub extern "C" fn nt_compare_tokens(first: HANDLE, second: HANDLE, output: *mut 
         let (Some(a), Some(b)) = (unsafe { (entries[0].target as *const crate::se::token::Token).as_ref() }, unsafe { (entries[1].target as *const crate::se::token::Token).as_ref() }) else {
             return Err(STATUS_INVALID_HANDLE);
         };
-        let equal = a.user.equals(&b.user) && a.primary_group.equals(&b.primary_group)
+        let equal = a.user_attributes == b.user_attributes
+            && a.restricted_count == b.restricted_count
+            && a.restricted_groups[..a.restricted_count].iter().all(|group|
+                b.restricted_groups[..b.restricted_count].iter().any(|other|
+                    group.sid.equals(&other.sid) && group.attributes == other.attributes))
+            && a.user.equals(&b.user) && a.primary_group.equals(&b.primary_group)
             && a.authentication_id == b.authentication_id && a.token_type == b.token_type
             && a.impersonation_level == b.impersonation_level && a.session_id == b.session_id
             && a.flags == b.flags && a.integrity_level_rid == b.integrity_level_rid

@@ -105,7 +105,7 @@ pub(super) fn encode_groups<'a>(
 
 fn encode(token: &Token, class: u32, base: u64) -> Result<Vec<u8>, NTSTATUS> {
     match class {
-        1 => sid_information(&token.user, Some(0), base),
+        1 => sid_information(&token.user, Some(token.user_attributes), base),
         2 => groups(token, false, base),
         3 => {
             let mut output = bytes(4 + token.privilege_count * 12)?;
@@ -117,6 +117,9 @@ fn encode(token: &Token, class: u32, base: u64) -> Result<Vec<u8>, NTSTATUS> {
             }
             Ok(output)
         }
+        11 => encode_groups(token.restricted_groups[..token.restricted_count].iter(), base),
+        15 => Ok(u32::from(token.flags & token::TOKEN_SANDBOX_INERT != 0).to_le_bytes().to_vec()),
+        21 => Ok(u32::from(token.flags & token::TOKEN_IS_FILTERED != 0).to_le_bytes().to_vec()),
         5 => sid_information(&token.primary_group, None, base),
         6 => {
             // SAFETY: token operations hold the handle-table lock. The token

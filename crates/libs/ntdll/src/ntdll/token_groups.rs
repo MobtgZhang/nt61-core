@@ -28,15 +28,15 @@ pub struct TOKEN_GROUPS {
 
 const STATUS_DATATYPE_MISALIGNMENT: NTSTATUS = 0x8000_0002u32 as i32;
 
-struct Request {
+pub(crate) struct Request {
     // Windows permits 15 SID subauthorities. A valid SID longer than the
     // kernel's current token storage is simply absent, rather than invalid.
-    sid: [u8; 68],
-    attributes: u32,
+    pub(crate) sid: [u8; 68],
+    pub(crate) attributes: u32,
 }
 
 impl Request {
-    fn matches(&self, value: &sid) -> bool {
+    pub(crate) fn matches(&self, value: &sid) -> bool {
         self.sid[0] == value.revision
             && self.sid[1] == value.sub_authority_count
             && self.sid[2..8] == value.identifier_authority
@@ -49,7 +49,7 @@ impl Request {
     }
 }
 
-fn capture(new_state: *const TOKEN_GROUPS) -> Result<Vec<Request>, NTSTATUS> {
+pub(crate) fn capture(new_state: *const TOKEN_GROUPS) -> Result<Vec<Request>, NTSTATUS> {
     if new_state.is_null() {
         return Err(STATUS_INVALID_PARAMETER);
     }
