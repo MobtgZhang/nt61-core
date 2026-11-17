@@ -12,14 +12,25 @@ fn execute(request:&mut Request)->Result<Vec<u8>,u32>{
     let bytes=copy_input(request.path,request.path_length as usize)?;
     let path=core::str::from_utf8(&bytes).map_err(|_|STATUS_INVALID_PARAMETER)?;
     match request.operation{
+        nt61_abi::session_bridge::DISPLAY_MODES=> {
+            let mut bytes=Vec::new();
+            for (w,h) in crate::drivers::bootvid::win7::display_modes() {
+                bytes.extend_from_slice(&w.to_le_bytes());bytes.extend_from_slice(&h.to_le_bytes());
+            } Ok(bytes)
+        },
+        nt61_abi::session_bridge::SOUND=>super::session_service::sound(path),
+        nt61_abi::session_bridge::NETWORK=>super::session_service::network(path),
+        nt61_abi::session_bridge::DISPLAY_SET=>super::session_service::display_set(path),
         nt61_abi::session_bridge::HOTKEYS=>super::session_service::hotkeys(),
         nt61_abi::session_bridge::MONITOR=>super::session_service::monitor(),
+        nt61_abi::session_bridge::ACCOUNTS=>super::session_service::accounts(),
         nt61_abi::session_bridge::SERVICES=>super::session_service::services(),
-        op @ (nt61_abi::session_bridge::SESSION|nt61_abi::session_bridge::TASK_CONTROL|nt61_abi::session_bridge::SERVICE_CONTROL)=>{
+        op @ (nt61_abi::session_bridge::SESSION|nt61_abi::session_bridge::TASK_CONTROL|nt61_abi::session_bridge::SERVICE_CONTROL|nt61_abi::session_bridge::ACCOUNT_CONTROL)=>{
             if request.capacity>512{return Err(STATUS_INVALID_PARAMETER);}
             let mut input=copy_input(request.data,request.capacity as usize)?;
             let result=match op {
                 nt61_abi::session_bridge::SESSION=>super::session_service::session(path,&input),
+                nt61_abi::session_bridge::ACCOUNT_CONTROL=>super::session_service::account_control(path,&input),
                 nt61_abi::session_bridge::TASK_CONTROL=>super::session_service::task_control(path,&input),
                 _=>super::session_service::service_control(path,&input),
             };
@@ -152,6 +163,8 @@ fn execute(request:&mut Request)->Result<Vec<u8>,u32>{
             }
             let token=token.ok_or(STATUS_ACCESS_DENIED)?;
             explorer.set_token(token);
+            crate::drivers::audio::system_sounds::load_for(path);
+            let _=crate::drivers::audio::system_sounds::play("logon");
             crate::ps::process::authorize_logon_handoff();
             crate::hal::serial::write_string_always("[LOGON] interactive session 1 authenticated\r\n");
             Ok(Vec::new())
@@ -172,6 +185,7 @@ pub unsafe fn dispatch(address:u64)->u64{
     // Check result storage before consuming tickets, command results or writing jobs.
     let required=match request.operation {
         nt61_abi::session_bridge::HOTKEYS=>4,
+        nt61_abi::session_bridge::SOUND=>9,
         nt61_abi::dialog_bridge::POLL=>8+nt61_abi::dialog_bridge::PACKET_SIZE,
         nt61_abi::dialog_bridge::COMMAND_START=>CWD_BYTES,
         nt61_abi::dialog_bridge::COMMAND_POLL=>CWD_BYTES+65536,

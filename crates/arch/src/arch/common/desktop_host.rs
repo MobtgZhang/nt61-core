@@ -105,6 +105,7 @@ fn clipped_rect(x: u32, y: u32, width: u32, height: u32) -> Option<(u32, u32, u3
 
 /// Fill a rectangle with an opaque 24-bit RGB color.
 pub fn fill_rect(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> u64 {
+    if !super::session_service::desktop_io_allowed(){return 0xC0000022;}
     let Some((x, y, width, height)) = clipped_rect(x, y, width, height) else {
         return STATUS_SUCCESS;
     };
@@ -132,6 +133,7 @@ pub fn fill_rect(x: u32, y: u32, width: u32, height: u32, rgb: u32) -> u64 {
 ///
 /// `text` must point to `length` readable user bytes.
 pub unsafe fn draw_text(text: *const u8, length: usize, x: u32, y: u32, fg: u32, bg: u32) -> u64 {
+    if !super::session_service::desktop_io_allowed(){return 0xC0000022;}
     if text.is_null() || length == 0 || length > 255 {
         return STATUS_INVALID_PARAMETER;
     }
@@ -161,6 +163,7 @@ pub unsafe fn draw_rgba(
     height: u32,
     stride_bytes: usize,
 ) -> u64 {
+    if !super::session_service::desktop_io_allowed(){return 0xC0000022;}
     let Some(source_width) = (width as usize).checked_mul(4) else {
         return STATUS_INVALID_PARAMETER;
     };
@@ -239,6 +242,7 @@ pub unsafe fn draw_rgba(
 ///
 /// `key` must point to one writable user byte.
 pub unsafe fn poll_key(key: *mut u8) -> u64 {
+    if !super::session_service::desktop_io_allowed(){return 0xC0000022;}
     if key.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -264,6 +268,7 @@ pub unsafe fn poll_key(key: *mut u8) -> u64 {
 ///
 /// `state` must point to writable user memory of at least 16 bytes.
 pub unsafe fn poll_mouse(state_pointer: *mut DesktopMouseState) -> u64 {
+    if !super::session_service::desktop_io_allowed(){return 0xC0000022;}
     if state_pointer.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
@@ -306,8 +311,8 @@ pub fn shell_devices() -> u64 {
 }
 pub fn shell_audio(volume: u64, muted: u64) -> u64 {
     if volume > 100 || muted > 1 { return STATUS_INVALID_PARAMETER; }
-    if crate::drivers::audio::playback::stats().backend == 0 { return STATUS_NO_DATA; }
-    crate::drivers::audio::playback::set_master_volume(volume as u8);
-    crate::drivers::audio::playback::set_master_mute(muted != 0);
-    STATUS_SUCCESS
+    match super::session_service::set_audio_output(volume as u8,muted!=0) {
+        Ok(())=>STATUS_SUCCESS,
+        Err(code)=>u64::from(code),
+    }
 }

@@ -47,9 +47,11 @@ fn exchange_with(
     );
     let capacity = if operation == VOLUME_SPACE {
         16
+    } else if operation == nt61_abi::session_bridge::DISPLAY_MODES {256
     } else if operation == nt61_abi::session_bridge::HOTKEYS {4
+    } else if operation == nt61_abi::session_bridge::SOUND {16
     } else if operation == nt61_abi::session_bridge::SESSION && path=="user" {128
-    } else if matches!(operation,nt61_abi::session_bridge::MONITOR|nt61_abi::session_bridge::SERVICES) {65536
+    } else if matches!(operation,nt61_abi::session_bridge::MONITOR|nt61_abi::session_bridge::SERVICES|nt61_abi::session_bridge::ACCOUNTS|nt61_abi::session_bridge::NETWORK) {65536
     } else if matches!(operation, COMMAND | nt61_abi::dialog_bridge::COMMAND_POLL) {
         CWD_BYTES + 65536
     } else if operation == nt61_abi::dialog_bridge::PRINT_WRITE { input.len().max(4)
@@ -229,3 +231,34 @@ pub fn session(action:&str,input:&[u8])->Result<Vec<u8>,u32>{
     Ok(Vec::new())
 }
 pub fn desktop_hotkeys()->Result<u32,u32>{let b=transfer(nt61_abi::session_bridge::HOTKEYS,"",&[])?;Ok(u32::from_le_bytes(b.as_slice().try_into().map_err(|_|STATUS_INVALID_PARAMETER)?))}
+
+pub fn monitor()->Result<crate::applications::system_monitor::Sample,u32>{crate::applications::system_monitor::Sample::decode(&transfer(nt61_abi::session_bridge::MONITOR,"",&[])?) }
+pub fn service_list()->Result<Vec<crate::applications::system_monitor::Service>,u32>{crate::applications::system_monitor::decode_services(&transfer(nt61_abi::session_bridge::SERVICES,"",&[])?) }
+pub fn task_control(pid:u64,command:&str)->Result<(),u32>{transfer(nt61_abi::session_bridge::TASK_CONTROL,&alloc::format!("{pid}"),command.as_bytes()).map(|_|())}
+pub fn service_control(name:&str,start:bool)->Result<(),u32>{transfer(nt61_abi::session_bridge::SERVICE_CONTROL,name,if start{b"start"}else{b"stop"}).map(|_|())}
+
+pub fn display_modes()->Result<Vec<(u32,u32)>,u32>{
+    let (data,_)=exchange(nt61_abi::session_bridge::DISPLAY_MODES,"",&[])?;
+    if data.len()%8!=0{return Err(STATUS_INVALID_PARAMETER);}
+    Ok(data.chunks_exact(8).map(|b|(u32::from_le_bytes(b[..4].try_into().unwrap()),u32::from_le_bytes(b[4..].try_into().unwrap()))).collect())
+}
+pub fn display_set(w:u32,h:u32)->Result<(),u32>{
+    exchange(nt61_abi::session_bridge::DISPLAY_SET,&alloc::format!("{w}x{h}"),&[]).map(|_|())
+}
+
+pub fn display_preference(command:&str)->Result<(),u32>{
+    exchange(nt61_abi::session_bridge::DISPLAY_SET,command,&[]).map(|_|())
+}
+
+pub fn accounts()->Result<Vec<crate::accounts::Account>,u32>{crate::accounts::decode(&transfer(nt61_abi::session_bridge::ACCOUNTS,"",&[])?) }
+pub fn account_control(name:&str,command:&str,value:&[u8])->Result<(),u32>{
+    if name.len()>64||command.len()>16||value.len()>64{return Err(STATUS_INVALID_PARAMETER);}
+    let mut input=[0u8;82];input[..command.len()].copy_from_slice(command.as_bytes());input[command.len()+1..command.len()+1+value.len()].copy_from_slice(value);
+    let bytes=&mut input[..command.len()+1+value.len()];
+    let result=submit(&mut Request{version:VERSION,operation:nt61_abi::session_bridge::ACCOUNT_CONTROL,path:name.as_ptr()as u64,path_length:name.len()as u64,data:bytes.as_ptr()as u64,capacity:bytes.len()as u64,..Request::default()});
+    for b in bytes {unsafe{core::ptr::write_volatile(b,0);}} result
+}
+
+pub fn play_sound(event:&str)->Result<(),u32>{transfer(nt61_abi::session_bridge::SOUND,event,&[]).map(|_|())}
+
+pub fn sound_settings()->Result<alloc::vec::Vec<u8>,u32>{transfer(nt61_abi::session_bridge::SOUND,"settings",&[])}
