@@ -89,6 +89,8 @@ static mut INITIALIZED: bool = false;
 /// `HKLM\SAM\Domains\Account\Users\<RID>`.
 #[derive(Debug, Clone)]
 pub struct SamRuntimeUser {
+    pub administrator: bool,
+    pub picture: u32,
     pub rid: u32,
     pub name: String,
     pub enabled: bool,
@@ -396,11 +398,19 @@ pub fn export_hive_by_id(hive_id: usize) -> Option<Vec<u8>> {
 /// Register a runtime SAM account in the CM's write-back overlay.
 pub fn add_sam_runtime_user(user: SamRuntimeUser) -> bool {
     let mut users = SAM_RUNTIME_USERS.lock();
-    if users.iter().any(|existing| existing.rid == user.rid) {
-        return false;
+    if let Some(existing) = users.iter_mut().find(|existing| existing.rid == user.rid) {
+        *existing = user;
+        return true;
     }
     users.push(user);
     true
+}
+
+/// Restore an account overlay when writing its hive failed. Used while the
+/// SAM mutation lock is held, so an unsuccessful save never reports success.
+pub fn restore_sam_runtime_user(rid:u32,previous:Option<SamRuntimeUser>) {
+    let mut users=SAM_RUNTIME_USERS.lock();users.retain(|u|u.rid!=rid);
+    if let Some(user)=previous {users.push(user);}
 }
 
 /// Snapshot the runtime SAM accounts loaded from the hive.
@@ -437,6 +447,9 @@ fn merge_sam_runtime_users(root: &mut HiveKey) {
     for user in users {
         let rid_key = ensure_hive_key_mut(users_key, &[&user.rid.to_string()]);
         rid_key.values.clear();
+        for (name, value) in [("Administrator", user.administrator as u32), ("Picture", user.picture)] {
+            rid_key.values.push(HiveValue { name: String::from(name), value_type: super::hive::ValueType::DWord, data: value.to_le_bytes().to_vec() });
+        }
         rid_key.values.push(HiveValue {
             name: String::from("AccountName"),
             value_type: super::hive::ValueType::String,
@@ -497,6 +510,8 @@ pub fn load_sam_runtime_users() -> usize {
         };
 
         if add_sam_runtime_user(SamRuntimeUser {
+            administrator: query_dword(&path, "Administrator").unwrap_or(u32::from(rid == 500)) != 0,
+            picture: query_dword(&path, "Picture").unwrap_or(0),
             rid,
             name,
             enabled: enabled != 0,

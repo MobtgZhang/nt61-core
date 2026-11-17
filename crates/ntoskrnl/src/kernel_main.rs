@@ -383,6 +383,7 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // winload loaded into memory and published via BootInfo.hives.
     // Without this call every cm::query_* path silently returns None.
     registry::cm::init(boot_info);
+    crate::se::init();
     crate::ke::bugcheck::configure_restart_policy();
     crate::hal::common::power::init();
 
@@ -522,11 +523,8 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
     // PHASE 13: End-to-end network verification (QEMU slirp only)
     // ============================================================================
     phase_header!(13, "Network E2E");
-    if boot_options.network_enabled() && crate::netstack::e2e_test::run_e2e_test() {
-        boot_println!("    network E2E: all stages passed");
-    } else {
-        boot_println!("    network E2E: some stages failed (see log)");
-    }
+    // DHCP is maintained by the network poller. A boot must never run a test
+    // that replaces the negotiated DNS/gateway with a developer's LAN.
 
     // Start on-disk services after the network stack is ready. The
     // launcher is content-driven: without an installed configuration it
