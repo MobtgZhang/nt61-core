@@ -151,7 +151,7 @@ mod tests {
         assert!(config.is_some());
 
         // Query service status
-        let status = services::query_service_status_ex(idx);
+        let status = services::query_service_status("RpcSs");
         assert!(status.is_some());
     }
 

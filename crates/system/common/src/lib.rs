@@ -55,6 +55,7 @@ pub fn init() {
     pid1::init();
     pid2::init();
     services::init();
+    services::start();
 }
 pub mod smoke;
 pub mod test_csrss_services;
