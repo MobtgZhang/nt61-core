@@ -507,6 +507,10 @@ unsafe impl GlobalAlloc for KernelHeapAllocator {
     ///
     /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // Large PE buffers must not exhaust the fixed boot heap while physical
+        // pages are available. Retain the fallback for early MM startup.
+        let pages = super::large_heap::allocate(layout);
+        if !pages.is_null() { return pages; }
         KERNEL_HEAP.alloc(layout)
     }
 
@@ -514,7 +518,12 @@ unsafe impl GlobalAlloc for KernelHeapAllocator {
     ///
     /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        KERNEL_HEAP.dealloc(ptr, layout)
+        if ptr.is_null() { return; }
+        if KERNEL_HEAP.is_in_heap_range(ptr, layout.size()) {
+            KERNEL_HEAP.dealloc(ptr, layout);
+        } else {
+            super::large_heap::release(ptr, layout);
+        }
     }
 }
 

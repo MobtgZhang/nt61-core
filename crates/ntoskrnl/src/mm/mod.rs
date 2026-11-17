@@ -73,6 +73,8 @@ pub mod zeropage; // Memory test engine for Windows Memory Diagnostic
 
 pub mod frame;
 pub mod heap;
+mod large_heap;
+mod kernel_heap_map;
 pub mod logging;
 pub mod mdl;
 pub mod perf;
@@ -849,6 +851,15 @@ pub fn init(boot_info: &BootInfo) {
     crate::hal::serial::write_string_always("MM8 subsystems_done\r\n");
     #[cfg(target_arch = "loongarch64")]
     crate::arch::loongarch64::paging::vector_page_check("mm8");
+
+    // Every future process inherits these immutable supervisor aliases.
+    // Allocate backing frames on demand, without adding root-local mappings
+    // from inside the global allocator after process creation.
+    if kernel_heap_map::init(chosen_base, chosen_size) {
+        crate::hal::serial::write_string_always("[mm] shared kernel heap aliases ready\r\n");
+    } else {
+        crate::hal::serial::write_string_always("[mm] shared kernel heap aliases unavailable\r\n");
+    }
 
     // ------------------------------------------------------------------
     // 8. Mark MM as fully initialized.  After this point the
