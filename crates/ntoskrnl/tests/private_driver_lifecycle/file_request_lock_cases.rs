@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 #[test]
 fn file_requests_serialize_position_and_release_on_early_return() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = TEST_LOCK.lock();
     let lock = Arc::new(FileRequestLock::new());
     let inside = Arc::new(AtomicUsize::new(0));
     let position = Arc::new(AtomicUsize::new(0));

@@ -270,8 +270,8 @@ impl Default for ListEntry {
 // IRP
 // ---------------------------------------------------------------------------
 
-/// IRP (I/O Request Packet). We only derive `Clone` (not `Copy`)
-/// because `IoStackLocation` contains a union that is not `Copy`.
+/// Private-source I/O request packet. Owns any retained dispatch route and
+/// cannot be copied or cloned independently of its completion ownership.
 #[repr(C)]
 pub struct Irp {
     pub mdl_address: *mut (),
@@ -303,6 +303,7 @@ pub struct Irp {
     /// Caller-supplied overlapped/APC-context value carried through to the
     /// completion packet.
     pub overlapped: u64,
+    pub(crate) route: Option<request_route::RequestRoute>,
 }
 
 impl Irp {
@@ -326,6 +327,7 @@ impl Irp {
             completion_port: 0,
             completion_key: 0,
             overlapped: 0,
+            route: None,
         }
     }
 
@@ -461,6 +463,7 @@ pub struct FileObject {
     // Private source ABI extension. Retain the registered owner and original
     // device until the file and all pending I/O references have been released.
     device_binding: Option<file_device_binding::FileDeviceBinding>,
+    pub(crate) teardown_requests: file_lifecycle::Requests,
     pub(crate) request_lock: file_request_lock::FileRequestLock,
     // Search lifetime belongs to this open, including all handle aliases.
     pub(crate) directory_search: directory_search::SearchState,
@@ -476,6 +479,7 @@ impl FileObject {
             current_byte_offset: 0,
             flags: 0,
             device_binding: None,
+            teardown_requests: file_lifecycle::Requests::new(),
             request_lock: file_request_lock::FileRequestLock::new(),
             directory_search: directory_search::SearchState::new(),
         }
@@ -845,6 +849,7 @@ pub unsafe fn io_call_driver(device: *mut DeviceObject, irp: *mut Irp) -> i32 {
 
 mod completion;
 pub mod synchronous_request;
+pub(crate) mod file_lifecycle;
 use completion::invoke_completion_routines;
 
 /// # Safety
@@ -956,7 +961,9 @@ pub fn allocate_irp(stack_locations: u8) -> *mut Irp {
     }
 
     unsafe {
-        core::ptr::write_bytes(raw as *mut u8, 0, total);
+        // Construct the owning body; zero bytes alone do not initialize Rust
+        // enum/ownership fields. Stack locations are initialized below.
+        raw.write(Irp::new());
 
         // WRK `ExAllocateIrp`: the stack locations follow the IRP body and
         // are numbered 1..StackCount from the low end. `CurrentLocation`
@@ -992,6 +999,9 @@ pub fn free_irp(irp: *mut Irp) {
 
         // Releasing storage is distinct from completing a request.
         let raw = irp as *mut u8;
+        // SAFETY: completion (or the undispatched issuer) owns this initialized
+        // packet exclusively. Drop route references before releasing storage.
+        core::ptr::drop_in_place(irp);
         let _ = pool::free(raw);
     }
 }
@@ -1272,6 +1282,7 @@ pub mod file_device_binding;
 pub(crate) mod file_request_lock;
 pub use file_device_binding::FileDeviceBinding;
 pub mod target_device;
+pub mod request_route;
 
 
 /// # Safety

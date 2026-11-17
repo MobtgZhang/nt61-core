@@ -41,7 +41,7 @@ unsafe extern "C" fn handler(_: *mut DeviceObject, irp: *mut Irp) -> i32 {
 
 #[test]
 fn synchronous_issuer_waits_for_pending_failure_and_uses_final_iosb() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = TEST_LOCK.lock();
     let baseline = crate::mm::pool::live();
     let mut name = [];
     let mut driver = driver(&mut name);
@@ -68,7 +68,7 @@ fn synchronous_issuer_waits_for_pending_failure_and_uses_final_iosb() {
 
 #[test]
 fn dispatcher_errors_also_complete_and_release_request_storage() {
-    let _serial = TEST_LOCK.lock().unwrap();
+    let _serial = TEST_LOCK.lock();
     let baseline = crate::mm::pool::live();
     let irp = allocate_irp(1);
     let result = unsafe { crate::synchronous_request::submit_and_wait(null_mut(), irp) };

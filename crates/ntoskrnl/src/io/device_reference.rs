@@ -110,6 +110,10 @@ pub struct ReferencedDeviceStack {
 }
 
 impl ReferencedDeviceStack {
+    pub(super) fn into_devices(self) -> Vec<DeviceReference> {
+        self.devices
+    }
+
     pub fn top(&self) -> *mut DeviceObject {
         self.devices[0].as_ptr()
     }

@@ -8,6 +8,80 @@ static TARGET: AtomicUsize = AtomicUsize::new(0);
 static FILE: AtomicUsize = AtomicUsize::new(0);
 static PENDING_IRP: AtomicUsize = AtomicUsize::new(0);
 static REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static TOPOLOGY_CHANGE: AtomicUsize = AtomicUsize::new(0);
+static REPLACEMENT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+struct Filter {
+    driver: Box<DriverObject>,
+    device: *mut DeviceObject,
+    _name: Box<[u16]>,
+}
+impl Filter {
+    fn new(suffix: u16, handler: DriverDispatch) -> Self {
+        let mut name = vec![0x50, 0x46, suffix].into_boxed_slice();
+        let mut driver = driver(&mut name);
+        driver.major_functions[27] = handler;
+        let device = device(&mut *driver, 0);
+        unsafe {
+            assert!(device_lifecycle::publish_device(device));
+            assert!(register_start_type_driver(
+                &mut *driver,
+                ServiceStartType::DemandStart
+            ));
+        }
+        Self {
+            driver,
+            device,
+            _name: name,
+        }
+    }
+}
+impl Drop for Filter {
+    fn drop(&mut self) {
+        unsafe {
+            assert!(unload_driver(&mut *self.driver));
+        }
+    }
+}
+struct TopologyChange {
+    graph: device_stack::DeviceStack,
+    filter: *mut DeviceObject,
+    replacement: *mut DeviceObject,
+    base: *mut DeviceObject,
+}
+unsafe extern "C" fn pending_filter(_: *mut DeviceObject, request: *mut Irp) -> i32 {
+    PENDING_IRP.store(request as usize, Ordering::Release);
+    *YIELD_HOOK.lock().unwrap() = Some(replace_filter_and_forward);
+    STATUS_PENDING
+}
+unsafe extern "C" fn replacement_filter(_: *mut DeviceObject, request: *mut Irp) -> i32 {
+    REPLACEMENT_CALLS.fetch_add(1, Ordering::Relaxed);
+    (*request).io_status.status = STATUS_ACCESS_DENIED as u32;
+    (*request).io_status.information = 0;
+    io_complete_request(request, 0);
+    STATUS_ACCESS_DENIED
+}
+fn replace_filter_and_forward() {
+    let context = TOPOLOGY_CHANGE.load(Ordering::Acquire) as *mut TopologyChange;
+    assert!(!context.is_null());
+    unsafe {
+        let change = &mut *context;
+        assert!(change.graph.detach_filter_device(change.filter));
+        assert!(change.graph.attach_filter_device(change.replacement));
+        assert!(!unload_driver((*change.filter).driver_object));
+        assert!(!unload_driver((*change.base).driver_object));
+        assert!(!delete_device(change.filter));
+        let request = PENDING_IRP.swap(0, Ordering::AcqRel) as *mut Irp;
+        assert!(!request.is_null());
+        assert_eq!(
+            dispatch::forward_irp_to_lower(change.filter, request),
+            STATUS_SUCCESS
+        );
+        // The issuer's MORE_PROCESSING_REQUIRED keeps the original route alive
+        // until query_target_device resumes final completion.
+        assert!(!unload_driver((*change.filter).driver_object));
+    }
+}
 
 unsafe extern "C" fn query(device: *mut DeviceObject, request: *mut Irp) -> i32 {
     let slot = &*(*request).current_stack;
@@ -77,10 +151,11 @@ struct Fixture {
     source: *mut DeviceObject,
     target: *mut DeviceObject,
     file: Box<FileObject>,
+    _name: Box<[u16]>,
 }
 impl Fixture {
     fn new() -> Self {
-        let mut name = [];
+        let mut name: Box<[u16]> = vec![0x50, 0x57, 0x52].into_boxed_slice();
         let mut driver = driver(&mut name);
         driver.major_functions[27] = Some(query);
         let source = device(&mut *driver, 0);
@@ -89,6 +164,12 @@ impl Fixture {
             (*source).next_device = target;
         }
         driver.device_object = source;
+        unsafe {
+            assert!(register_start_type_driver(
+                &mut *driver,
+                ServiceStartType::DemandStart
+            ));
+        }
         let mut file = Box::new(FileObject);
         TARGET.store(target as usize, Ordering::Relaxed);
         FILE.store(&mut *file as *mut _ as usize, Ordering::Relaxed);
@@ -99,6 +180,7 @@ impl Fixture {
             source,
             target,
             file,
+            _name: name,
         }
     }
     unsafe fn run(&mut self) -> Result<DeviceReference, i32> {
@@ -113,14 +195,14 @@ impl Drop for Fixture {
             assert_eq!((*self.source).ref_count.load(Ordering::Relaxed), 1);
             assert_eq!((*self.target).ref_count.load(Ordering::Relaxed), 1);
             assert!(delete_device(self.source));
-            assert!(delete_device(self.target));
+            assert!(unload_driver(&mut *self.driver));
         }
         assert!(self.driver.device_object.is_null());
     }
 }
 #[test]
 fn power_device_reference_defers_deletion_until_last_guard() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let fixture = Fixture::new();
     unsafe {
         let reference = DeviceReference::acquire(fixture.target).unwrap();
@@ -134,7 +216,7 @@ fn power_device_reference_defers_deletion_until_last_guard() {
 }
 #[test]
 fn power_query_sync_returns_transferred_reference_and_native_states() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let before = crate::mm::pool::live();
     let mut fixture = Fixture::new();
     let target = unsafe { fixture.run().unwrap() };
@@ -152,7 +234,7 @@ fn power_query_sync_returns_transferred_reference_and_native_states() {
 }
 #[test]
 fn power_pending_query_waits_for_real_completion_without_graph_lock() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let before = crate::mm::pool::live();
     let mut fixture = Fixture::new();
     MODE.store(6, Ordering::Relaxed);
@@ -163,8 +245,42 @@ fn power_pending_query_waits_for_real_completion_without_graph_lock() {
     drop(target);
 }
 #[test]
+fn power_pending_query_uses_original_route_after_filter_replacement() {
+    let _lock = TEST_LOCK.lock();
+    let before = crate::mm::pool::live();
+    let mut fixture = Fixture::new();
+    let filter = Filter::new(0x31, Some(pending_filter));
+    let replacement = Filter::new(0x32, Some(replacement_filter));
+    let mut change = TopologyChange {
+        graph: device_stack::DeviceStack::new(fixture.source).unwrap(),
+        filter: filter.device,
+        replacement: replacement.device,
+        base: fixture.source,
+    };
+    unsafe {
+        assert!(change.graph.attach_filter_device(filter.device));
+    }
+    TOPOLOGY_CHANGE.store(&mut change as *mut _ as usize, Ordering::Release);
+    REPLACEMENT_CALLS.store(0, Ordering::Relaxed);
+    let target = unsafe { fixture.run().unwrap() };
+    TOPOLOGY_CHANGE.store(0, Ordering::Release);
+    assert_eq!(target.as_ptr(), fixture.target);
+    assert_eq!(REQUESTS.load(Ordering::Relaxed), 1);
+    assert_eq!(REPLACEMENT_CALLS.load(Ordering::Relaxed), 0);
+    assert_eq!(PENDING_IRP.load(Ordering::Relaxed), 0);
+    unsafe {
+        assert_eq!((*filter.device).ref_count.load(Ordering::Relaxed), 1);
+        assert!(change.graph.detach_filter_device(replacement.device));
+    }
+    drop(target);
+    drop(filter);
+    drop(replacement);
+    drop(fixture);
+    assert_eq!(crate::mm::pool::live(), before);
+}
+#[test]
 fn power_query_rejects_missing_ambiguous_or_null_targets_and_releases_all_refs() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let before = crate::mm::pool::live();
     let mut fixture = Fixture::new();
     for mode in 1..=4 {
@@ -179,7 +295,7 @@ fn power_query_rejects_missing_ambiguous_or_null_targets_and_releases_all_refs()
 }
 #[test]
 fn power_query_propagates_driver_and_uncompleted_sync_failures() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let before = crate::mm::pool::live();
     let mut fixture = Fixture::new();
     for mode in [5, 7] {
@@ -190,7 +306,7 @@ fn power_query_propagates_driver_and_uncompleted_sync_failures() {
 }
 #[test]
 fn power_query_allocation_failures_release_irp_and_device_refs() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let before = crate::mm::pool::live();
     let mut fixture = Fixture::new();
     for after in [0, 1] {
@@ -223,7 +339,7 @@ fn power_cached_state_is_synchronized_between_threads() {
 }
 #[test]
 fn power_referenced_stack_keeps_detached_nodes_alive_and_rejects_foreign_filters() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let fixture = Fixture::new();
     unsafe {
         let mut stack = device_stack::DeviceStack::new(fixture.target).unwrap();
@@ -245,7 +361,7 @@ fn power_referenced_stack_keeps_detached_nodes_alive_and_rejects_foreign_filters
 }
 #[test]
 fn power_stack_rejects_a_filter_already_attached_above_another_device() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [];
     let mut driver = driver(&mut name);
     unsafe {

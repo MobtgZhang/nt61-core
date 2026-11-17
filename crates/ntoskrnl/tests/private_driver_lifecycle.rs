@@ -7,7 +7,7 @@ mod types {
     pub type NTSTATUS = i32;
 }
 use std::sync::Mutex;
-static TEST_LOCK: Mutex<()> = Mutex::new(());
+use irp_pool_complete::TEST_LOCK;
 mod ke {
     pub mod scheduler {
         pub fn yield_() {
@@ -38,6 +38,14 @@ mod libs {
     }
 }
 mod mm {
+    pub mod heap {
+        pub struct HostHeap;
+        pub static KERNEL_HEAP: HostHeap = HostHeap;
+        impl HostHeap {
+            pub fn configured_region(&self) -> Option<()> { Some(()) }
+            pub fn configure(&self, _: *mut u8, _: usize) {}
+        }
+    }
     pub mod pool {
         use std::{
             alloc::{alloc_zeroed, dealloc, Layout},
@@ -49,6 +57,11 @@ mod mm {
         };
         pub enum PoolType {
             NonPaged,
+        }
+        #[repr(C, align(16))]
+        pub struct PoolHeader { pub block_size: u32 }
+        impl PoolHeader {
+            pub const HEADER_SIZE: usize = core::mem::size_of::<Self>();
         }
         static ALLOCATIONS: OnceLock<Mutex<HashMap<usize, Layout>>> = OnceLock::new();
         pub static FAIL_AFTER: AtomicIsize = AtomicIsize::new(-1);
@@ -69,17 +82,25 @@ mod mm {
             if remaining > 0 {
                 FAIL_AFTER.fetch_sub(1, Ordering::Relaxed);
             }
-            let layout = Layout::from_size_align(size, 16).unwrap();
-            let ptr = unsafe { alloc_zeroed(layout) };
+            let layout = Layout::from_size_align(size + PoolHeader::HEADER_SIZE, 16).unwrap();
+            let allocation = unsafe { alloc_zeroed(layout) };
+            if allocation.is_null() { return allocation; }
+            let ptr = unsafe {
+                allocation.cast::<PoolHeader>().write(PoolHeader { block_size: layout.size() as u32 });
+                allocation.add(PoolHeader::HEADER_SIZE)
+            };
             if !ptr.is_null() {
                 allocations().lock().unwrap().insert(ptr as usize, layout);
             }
             ptr
         }
+        pub fn allocate_tagged(kind: PoolType, size: usize, _: u32) -> *mut u8 {
+            allocate(kind, size)
+        }
         pub unsafe fn free(ptr: *mut u8) -> *mut u8 {
             let layout = allocations().lock().unwrap().remove(&(ptr as usize));
             if let Some(layout) = layout {
-                dealloc(ptr, layout);
+                dealloc(ptr.sub(PoolHeader::HEADER_SIZE), layout);
             } else {
                 drop(Box::from_raw(ptr as *mut crate::io::DeviceObject));
             }
@@ -108,9 +129,9 @@ pub mod device_stack;
 pub mod file_device_binding;
 #[path = "../src/io/file_request_lock.rs"]
 pub(crate) mod file_request_lock;
-#[path = "private_file_request_lock_cases.rs"]
+#[path = "private_driver_lifecycle/file_request_lock_cases.rs"]
 mod file_request_lock_cases;
-#[path = "private_file_binding_cases.rs"]
+#[path = "private_driver_lifecycle/file_binding_cases.rs"]
 mod file_binding_cases;
 #[path = "../src/io/dispatch.rs"]
 pub mod dispatch;
@@ -118,14 +139,24 @@ pub mod dispatch;
 pub mod driver_loader;
 #[path = "../src/io/irp_stack.rs"]
 pub mod irp_stack;
+#[path = "../src/io/irp_pool_complete.rs"]
+pub mod irp_pool_complete;
 #[path = "../src/io/synchronous_request.rs"]
 pub mod synchronous_request;
-#[path = "private_synchronous_request_cases.rs"]
+#[path = "../src/io/file_lifecycle.rs"]
+pub(crate) mod file_lifecycle;
+#[path = "private_driver_lifecycle/file_lifecycle_cases.rs"]
+mod file_lifecycle_cases;
+#[path = "private_driver_lifecycle/synchronous_request_cases.rs"]
 mod synchronous_request_cases;
-#[path = "private_device_power_cases.rs"]
+#[path = "private_driver_lifecycle/device_power_cases.rs"]
 mod power_cases;
 #[path = "../src/io/target_device.rs"]
 pub mod target_device;
+#[path = "../src/io/request_route.rs"]
+pub mod request_route;
+#[path = "private_driver_lifecycle/request_route_cases.rs"]
+mod request_route_cases;
 mod io {
     use core::ptr::null_mut;
     use core::sync::atomic::AtomicU32;
@@ -135,6 +166,8 @@ mod io {
         pub const IRP_MN_QUERY_DEVICE_RELATIONS: u8 = 7;
     }
     pub mod major {
+        pub const IRP_MJ_CLOSE: u8 = 2;
+        pub const IRP_MJ_CLEANUP: u8 = 18;
         pub const IRP_MJ_PNP: u8 = 27;
         pub const IRP_MJ_READ: u8 = 3;
         pub const IRP_MJ_WRITE: u8 = 4;
@@ -218,6 +251,9 @@ mod io {
             Option<unsafe extern "C" fn(*mut DeviceObject, *mut Irp, *mut ()) -> i32>,
         pub completion_context: *mut (),
     }
+    impl IoStackLocation {
+        pub fn new() -> Self { crate::stack() }
+    }
     pub struct IoStatus {
         pub status: u32,
         pub information: usize,
@@ -227,10 +263,15 @@ mod io {
         pub current_stack: *mut IoStackLocation,
         pub current_location: u8,
         pub stack_count: u8,
+        pub allocate_stack: u8,
         pub flags: u32,
         pub pending_returned: u8,
         pub user_buffer: *mut (),
         pub completed: u32,
+        pub(crate) route: Option<crate::request_route::RequestRoute>,
+    }
+    impl Irp {
+        pub fn new() -> Self { crate::irp(null_mut(), 0) }
     }
     pub unsafe fn io_complete_request(irp: *mut Irp, _: i32) {
         if crate::mm::pool::owns(irp.cast()) {
@@ -271,6 +312,7 @@ mod io {
     }
     pub fn free_irp(irp: *mut Irp) {
         unsafe {
+            core::ptr::drop_in_place(irp);
             crate::mm::pool::free(irp.cast());
         }
     }
@@ -279,6 +321,7 @@ mod io {
     pub use crate::dispatch;
     pub use crate::driver_loader;
     pub use crate::irp_stack;
+    pub use crate::request_route;
     pub use device_lifecycle::delete_device;
 }
 use core::ptr::null_mut;
@@ -324,6 +367,7 @@ unsafe extern "C" fn unload(driver: *mut DriverObject) {
     // Reentry would deadlock if callback ran under the registry lock.
     let _ = loaded_driver_count();
     assert!(!reference_driver(driver));
+    assert!(matches!(DriverReference::acquire(driver), Err(STATUS_NO_SUCH_DEVICE)));
     if !(*driver).device_object.is_null() {
         assert!(delete_device((*driver).device_object));
     }
@@ -345,7 +389,7 @@ unsafe extern "C" fn failure(driver: *mut DriverObject, _: *mut u16) -> u32 {
 }
 #[test]
 fn initialize_unload_and_reference_lifecycle() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [65u16, 66];
     let mut d = driver(&mut name);
     d.driver_init = Some(success);
@@ -371,7 +415,7 @@ fn initialize_unload_and_reference_lifecycle() {
 }
 #[test]
 fn failed_entry_rolls_back_new_devices_and_never_calls_unload() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let before = CALLED.load(Ordering::Relaxed);
     let mut name = [67u16];
     let mut d = driver(&mut name);
@@ -390,7 +434,7 @@ fn failed_entry_rolls_back_new_devices_and_never_calls_unload() {
 }
 #[test]
 fn lookup_second_record_and_enumeration_can_reenter() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut a = [68u16];
     let mut b = [69u16];
     let mut x = driver(&mut a);
@@ -416,7 +460,7 @@ fn lookup_second_record_and_enumeration_can_reenter() {
 }
 #[test]
 fn malformed_counted_names_and_disk_load_are_rejected() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut a = [70u16];
     let mut d = driver(&mut a);
     unsafe {
@@ -436,7 +480,7 @@ fn malformed_counted_names_and_disk_load_are_rejected() {
 }
 #[test]
 fn deleting_busy_attached_or_namespace_referenced_device_is_refused() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [71u16];
     let mut d = driver(&mut name);
     unsafe {
@@ -476,10 +520,12 @@ fn irp(stack: *mut IoStackLocation, count: u8) -> Irp {
         current_stack: stack,
         current_location: count,
         stack_count: count,
+        allocate_stack: 0,
         flags: 0,
         pending_returned: 0,
         user_buffer: null_mut(),
         completed: 0,
+        route: None,
     }
 }
 #[test]
@@ -596,7 +642,7 @@ fn completion_registration_replaces_invocation_flags() {
 
 #[test]
 fn completion_apc_owns_status_after_source_is_freed_and_queue_moves() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     use apc::{ApcMode, IoStatusBlock};
     unsafe extern "C" fn delivered(context: *mut (), status: *mut IoStatusBlock, _: u32) {
         // Reentering the queue is safe because delivery releases its lock.
@@ -638,7 +684,7 @@ fn completion_apc_owns_status_after_source_is_freed_and_queue_moves() {
 
 #[test]
 fn missing_unload_and_disabled_initializer_are_not_run() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [73u16];
     let mut d = driver(&mut name);
     d.driver_unload = None;
@@ -678,7 +724,7 @@ unsafe extern "C" fn busy_failure(driver: *mut DriverObject, _: *mut u16) -> u32
 }
 #[test]
 fn failed_entry_keeps_busy_device_alive_and_rolls_back_other_devices() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [75u16];
     let mut d = driver(&mut name);
     d.driver_init = Some(busy_failure);

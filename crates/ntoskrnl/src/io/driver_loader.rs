@@ -105,12 +105,23 @@ impl DriverReference {
         self.0.as_ptr()
     }
 
+    /// Retain a loaded registry record by identity without dereferencing a
+    /// borrowed driver pointer. Unloading records cannot acquire new users.
+    pub fn acquire(driver: *mut DriverObject) -> Result<Self, i32> {
+        let pointer = NonNull::new(driver).ok_or(STATUS_NO_SUCH_DEVICE)?;
+        let mut registry = DRIVER_REGISTRY.lock();
+        let entry = registry.iter_mut().flatten()
+            .find(|entry| entry.driver_object == driver
+                && entry.load_state == DriverLoadState::Loaded)
+            .ok_or(STATUS_NO_SUCH_DEVICE)?;
+        let next = entry.ref_count.load(Ordering::Relaxed).checked_add(1)
+            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+        entry.ref_count.store(next, Ordering::Relaxed);
+        Ok(Self(pointer))
+    }
+
     pub fn try_clone(&self) -> Result<Self, i32> {
-        if reference_driver(self.as_ptr()) {
-            Ok(Self(self.0))
-        } else {
-            Err(STATUS_INSUFFICIENT_RESOURCES)
-        }
+        Self::acquire(self.as_ptr())
     }
 }
 

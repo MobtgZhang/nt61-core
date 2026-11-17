@@ -17,6 +17,12 @@ use alloc::vec::Vec;
 
 const IRP_TAG: u32 = u32::from_be_bytes(*b"Irp ");
 
+// Host lifecycle fixtures include this module's tests and inject pool failures.
+// Share their lock so allocation tests cannot consume another test's failure
+// budget or change its live-allocation count.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Spinlock<()> = Spinlock::new(());
+
 #[inline]
 fn block_size(stack_locations: usize) -> usize {
     core::mem::size_of::<Irp>() + core::mem::size_of::<IoStackLocation>() * stack_locations
@@ -31,7 +37,9 @@ fn block_size(stack_locations: usize) -> usize {
 /// `CurrentStack` starts at location StackCount, matching WRK
 /// `ExAllocateIrp`, so `IoGetNextStackLocation` walks downwards.
 unsafe fn setup_irp(irp: *mut Irp, stack_locations: usize) {
-    (*irp) = Irp::new();
+    // The block is fresh storage or an empty, reset free-list entry. Construct
+    // the owning body without dropping uninitialized route fields.
+    irp.write(Irp::new());
     (*irp).stack_count = stack_locations as u8;
     (*irp).current_location = stack_locations as u8;
     (*irp).allocate_stack = 0;
@@ -188,6 +196,7 @@ impl DynamicIrpPool {
 
             while self.free_list.len() > target_free {
                 if let Some((irp, _)) = self.free_list.pop() {
+                    core::ptr::drop_in_place(irp);
                     pool::free(irp as *mut u8);
                     freed += 1;
                 }
@@ -258,6 +267,7 @@ mod tests {
 
     #[test]
     fn test_irp_allocation() {
+        let _guard = TEST_LOCK.lock();
         ensure_test_heap();
 
         let mut pool = DynamicIrpPool::new(10, 100);
@@ -280,6 +290,7 @@ mod tests {
 
     #[test]
     fn test_stack_locations_are_honoured() {
+        let _guard = TEST_LOCK.lock();
         ensure_test_heap();
 
         let mut pool = DynamicIrpPool::new(4, 100);
@@ -306,6 +317,7 @@ mod tests {
 
     #[test]
     fn test_pool_growth() {
+        let _guard = TEST_LOCK.lock();
         ensure_test_heap();
 
         let mut pool = DynamicIrpPool::new(2, 100);
@@ -329,6 +341,8 @@ mod tests {
 
     #[test]
     fn test_max_size_limit() {
+        let _guard = TEST_LOCK.lock();
+        ensure_test_heap();
         let mut pool = DynamicIrpPool::new(2, 5);
 
         let mut irps = Vec::new();
@@ -339,18 +353,14 @@ mod tests {
             }
         }
 
-        assert!(irps.len() <= 5);
-        if !irps.is_empty() {
-            assert!(pool.stats.current_allocated <= 5);
-            for irp in irps {
-                unsafe {
-                    pool.free(irp);
-                }
+        assert_eq!(irps.len(), 5);
+        assert_eq!(pool.stats.current_allocated, 5);
+        assert_eq!(pool.stats.allocation_failures, 5);
+        for irp in irps {
+            unsafe {
+                pool.free(irp);
             }
-        } else {
-            // No heap available in libtest: the only observable behaviour
-            // is that every request was counted as a failure.
-            assert!(pool.stats.allocation_failures > 0);
         }
+        assert_eq!(pool.stats.current_allocated, 0);
     }
 }

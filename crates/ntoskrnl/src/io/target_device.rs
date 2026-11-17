@@ -96,8 +96,8 @@ unsafe extern "C" fn capture(_: *mut DeviceObject, irp: *mut Irp, context: *mut 
 ///
 /// # Safety
 /// file must remain live until this call returns. The caller and drivers must
-/// serialize attachment topology changes with raw-link forwarding through the
-/// request's completion; retained references protect storage, not graph reads.
+/// keep file storage live through completion. The IRP owns an immutable route
+/// and loaded-driver guards, including across pending filter forwarding.
 /// Drivers must follow the
 /// private I/O ownership contract: complete a nonpending request before
 /// returning, or return STATUS_PENDING and eventually complete it. A successful
@@ -106,9 +106,9 @@ pub unsafe fn query_target_device(
     device: &DeviceReference,
     file: *mut FileObject,
 ) -> Result<DeviceReference, i32> {
-    let stack = device.reference_stack()?;
+    let route = super::request_route::RequestRoute::capture(device)?;
     // One extra slot belongs to the issuer, above every driver's stack slot.
-    let irp = super::allocate_irp(stack.depth() + 1);
+    let irp = super::allocate_irp(route.depth() + 1);
     if irp.is_null() {
         return Err(STATUS_INSUFFICIENT_RESOURCES);
     }
@@ -120,6 +120,8 @@ pub unsafe fn query_target_device(
     // SAFETY: allocation includes the issuer slot and one slot per retained
     // device; context lives through synchronous or asynchronous completion.
     let dispatched = unsafe {
+        let top = route.top();
+        (*irp).route = Some(route);
         let issuer = (*irp).current_stack;
         (*issuer).completion_routine = Some(capture);
         (*issuer).completion_context = ptr::addr_of!(completion) as *mut ();
@@ -133,7 +135,7 @@ pub unsafe fn query_target_device(
         (*request).parameters.as_u64 = TARGET_DEVICE_RELATION as u64;
         (*request).file_object = file;
         (*irp).io_status.status = STATUS_NOT_SUPPORTED as u32;
-        super::dispatch::dispatch_irp(stack.top(), irp)
+        super::dispatch::dispatch_irp(top, irp)
     };
     if dispatched != STATUS_PENDING && !completion.done.load(Ordering::Acquire) {
         // A driver returning synchronously without completing violates the

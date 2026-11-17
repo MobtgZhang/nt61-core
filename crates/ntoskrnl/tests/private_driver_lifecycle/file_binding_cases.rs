@@ -13,7 +13,7 @@ unsafe extern "C" fn gated_unload(driver: *mut DriverObject) {
 
 #[test]
 fn binding_prevents_unload_callback_and_device_delete_until_final_drop() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [0x46, 0x42, 0x31];
     let mut owner = driver(&mut name);
     let pointer = &mut *owner as *mut _;
@@ -44,7 +44,7 @@ fn binding_prevents_unload_callback_and_device_delete_until_final_drop() {
 
 #[test]
 fn missing_device_and_overflow_roll_back_driver_ownership() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [0x46, 0x42, 0x32];
     let mut owner = driver(&mut name);
     let pointer = &mut *owner as *mut _;
@@ -66,7 +66,7 @@ fn missing_device_and_overflow_roll_back_driver_ownership() {
 
 #[test]
 fn disabled_or_uninitialized_driver_cannot_be_bound() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     for (suffix, start_type) in [(0x33, ServiceStartType::Disabled), (0x34, ServiceStartType::DemandStart)] {
         let mut name = [0x46, 0x42, suffix];
         let mut owner = driver(&mut name);
@@ -81,7 +81,7 @@ fn disabled_or_uninitialized_driver_cannot_be_bound() {
 
 #[test]
 fn binding_clone_retains_original_device_when_list_head_changes() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [0x46, 0x42, 0x35];
     let mut owner = driver(&mut name);
     let pointer = &mut *owner as *mut _;
@@ -106,7 +106,7 @@ fn binding_clone_retains_original_device_when_list_head_changes() {
 
 #[test]
 fn retained_lookup_blocks_concurrent_unload_before_callback() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [0x46, 0x42, 0x36];
     let mut owner = driver(&mut name);
     let pointer = &mut *owner as *mut _;
@@ -134,7 +134,7 @@ fn retained_lookup_blocks_concurrent_unload_before_callback() {
 
 #[test]
 fn retained_device_lookup_races_actual_graph_locked_deletion() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     for _ in 0..100 {
         let mut name = [0x46, 0x42, 0x37];
         let mut owner = driver(&mut name);
@@ -166,7 +166,7 @@ fn retained_device_lookup_races_actual_graph_locked_deletion() {
 
 #[test]
 fn lookup_cannot_enter_driver_after_unload_reservation() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [0x46, 0x42, 0x39];
     let mut owner = driver(&mut name);
     owner.driver_unload = Some(gated_unload);
@@ -193,7 +193,7 @@ fn lookup_cannot_enter_driver_after_unload_reservation() {
 
 #[test]
 fn graph_publication_rejects_duplicates_and_device_limit_atomically() {
-    let _lock = TEST_LOCK.lock().unwrap();
+    let _lock = TEST_LOCK.lock();
     let mut name = [0x46, 0x42, 0x38];
     let mut owner = driver(&mut name);
     let pointer = &mut *owner as *mut _;

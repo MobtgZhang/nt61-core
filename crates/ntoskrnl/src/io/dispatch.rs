@@ -100,7 +100,18 @@ pub unsafe fn dispatch_irp(device: *mut DeviceObject, irp: *mut Irp) -> i32 {
         return complete_irp_with(irp, STATUS_INVALID_DEVICE_REQUEST);
     }
 
-    let driver = (*device).driver_object;
+    // A route owns pending-request lifetimes. This additional device/driver
+    // guard lasts through callback return even if it synchronously frees IRP.
+    let dispatch_guard = if let Some(route) = &(*irp).route {
+        match route.retain_dispatch(device) {
+            Ok(guard) => Some(guard),
+            Err(status) => return complete_irp_with(irp, status),
+        }
+    } else {
+        None
+    };
+    let driver = dispatch_guard.as_ref().map_or_else(
+        || (*device).driver_object, |guard| guard.driver());
     if driver.is_null() {
         return complete_irp_with(irp, STATUS_NO_SUCH_DEVICE);
     }
@@ -158,7 +169,16 @@ pub unsafe fn forward_irp_to_lower(device: *mut DeviceObject, irp: *mut Irp) -> 
     if device.is_null() {
         return complete_irp_with(irp, STATUS_NO_SUCH_DEVICE);
     }
-    let lower = (*device).attached_device;
+    let lower = if let Some(route) = &(*irp).route {
+        match route.lower(device) {
+            Ok(lower) => lower,
+            Err(status) => return complete_irp_with(irp, status),
+        }
+    } else {
+        // Legacy issuers must still serialize topology changes. Routed
+        // requests never consult mutable attachment links after capture.
+        (*device).attached_device
+    };
     if lower.is_null() {
         return complete_irp_with(irp, STATUS_INVALID_DEVICE_REQUEST);
     }
