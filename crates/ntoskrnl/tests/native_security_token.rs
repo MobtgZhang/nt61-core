@@ -42,8 +42,15 @@ mod mm {
 mod ps {
     pub mod process {
         thread_local! { pub static CURRENT: core::cell::Cell<*mut crate::token::Token> = const { core::cell::Cell::new(core::ptr::null_mut()) }; }
-        pub fn get_current_thread_token() -> *mut crate::token::Token {
-            CURRENT.with(|v| v.get())
+        pub struct EffectiveTokenReference(*mut crate::token::Token);
+        impl EffectiveTokenReference {
+            pub fn as_ref(&self) -> Option<&crate::token::Token> {
+                // The test owns CURRENT until this synchronous privilege check returns.
+                unsafe { self.0.as_ref() }
+            }
+        }
+        pub fn get_current_thread_token() -> EffectiveTokenReference {
+            EffectiveTokenReference(CURRENT.with(|v| v.get()))
         }
     }
 }

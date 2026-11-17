@@ -262,6 +262,7 @@ fn object_access_restricted_tokens_intersect_per_property() {
 
 #[test]
 fn object_native_interfaces_write_exact_result_count_and_privilege_size() {
+    let _guard = super::super::file::HANDLE_TEST_LOCK.lock();
     use super::super::file::{alloc_access_handle, free_handle};
     let mut token = token();
     let handle =

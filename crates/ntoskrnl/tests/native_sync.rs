@@ -255,9 +255,8 @@ pub mod mm {
     }
 }
 use ntdll::{status::*, sync::*, types::*};
-static TEST_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn state_guard() -> std::sync::MutexGuard<'static, ()> {
-    let guard = TEST_STATE.lock().unwrap();
+    let guard = ntdll::file::HANDLE_TEST_LOCK.lock();
     ke::time::CLOCK.with(|clock| clock.set((100_000, 0)));
     ke::scheduler::ADVANCE_ON_YIELD.with(|delta| delta.set(0));
     ps::thread::set_tid(701);

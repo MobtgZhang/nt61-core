@@ -2,6 +2,120 @@ use super::*;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 static RETIRED: AtomicUsize = AtomicUsize::new(0);
+static CLEANED: AtomicUsize = AtomicUsize::new(0);
+static CLEANUP_PIN: std::sync::Mutex<Option<ntdll::file::FileHandleReference>> =
+    std::sync::Mutex::new(None);
+
+unsafe fn cleanup(entry: ntdll::file::HandleEntry) {
+    // The final handle is gone, but cleanup owns an independent reference.
+    let _ = ntdll::file::handle_count();
+    assert_eq!(unsafe { *(entry.target as *const usize) }, 0x1234);
+    assert_eq!(RETIRED.load(Ordering::Relaxed), 0);
+    CLEANED.fetch_add(1, Ordering::Relaxed);
+}
+
+#[test]
+fn last_file_handle_cleans_up_before_outstanding_reference_closes() {
+    let _guard = state_guard();
+    RETIRED.store(0, Ordering::Relaxed);
+    CLEANED.store(0, Ordering::Relaxed);
+    let payload = Box::into_raw(Box::new(0x1234usize)) as u64;
+    // SAFETY: these callbacks implement cleanup and destruction of this Box.
+    let handle = unsafe { ntdll::file::alloc_file_handle(payload, cleanup, retire) };
+    let pin = unsafe { ntdll::file::reference_file_handle(handle, retire) }.unwrap();
+    assert!(!ntdll::file::close_handle(handle).unwrap().1);
+    assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
+    assert_eq!(RETIRED.load(Ordering::Relaxed), 0);
+    let replacement = ntdll::file::alloc_handle(ntdll::file::HandleKind::Event, 0);
+    assert_eq!(replacement, handle);
+    drop(pin);
+    assert_eq!(RETIRED.load(Ordering::Relaxed), 1);
+    assert!(ntdll::file::free_handle(replacement));
+}
+
+unsafe fn cleanup_dropping_final_io_pin(entry: ntdll::file::HandleEntry) {
+    drop(CLEANUP_PIN.lock().unwrap().take());
+    // Without the close path's temporary reference the drop above destroys
+    // the payload before the cleanup callback has finished using it.
+    unsafe { cleanup(entry); }
+}
+
+#[test]
+fn cleanup_can_drop_last_io_reference_without_closing_its_own_storage() {
+    let _guard = state_guard();
+    RETIRED.store(0, Ordering::Relaxed);
+    CLEANED.store(0, Ordering::Relaxed);
+    let payload = Box::into_raw(Box::new(0x1234usize)) as u64;
+    let handle = unsafe {
+        ntdll::file::alloc_file_handle(payload, cleanup_dropping_final_io_pin, retire)
+    };
+    *CLEANUP_PIN.lock().unwrap() =
+        Some(unsafe { ntdll::file::reference_file_handle(handle, retire) }.unwrap());
+    assert!(ntdll::file::close_handle(handle).is_ok());
+    assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
+    assert_eq!(RETIRED.load(Ordering::Relaxed), 1);
+    assert!(matches!(ntdll::file::close_handle(handle), Err(STATUS_INVALID_HANDLE)));
+}
+
+#[test]
+fn protected_file_defers_cleanup_and_unpinned_close_runs_both_callbacks() {
+    let _guard = state_guard();
+    RETIRED.store(0, Ordering::Relaxed);
+    CLEANED.store(0, Ordering::Relaxed);
+    let payload = Box::into_raw(Box::new(0x1234usize)) as u64;
+    let handle = unsafe { ntdll::file::alloc_file_handle(payload, cleanup, retire) };
+    ntdll::file::update_handle_flags(handle, 2, 2).unwrap();
+    assert!(matches!(ntdll::file::close_handle(handle), Err(STATUS_HANDLE_NOT_CLOSABLE)));
+    assert_eq!(CLEANED.load(Ordering::Relaxed), 0);
+    assert_eq!(RETIRED.load(Ordering::Relaxed), 0);
+    ntdll::file::update_handle_flags(handle, 2, 0).unwrap();
+    // Callbacks already own teardown; callers must not destroy it again.
+    assert!(!ntdll::file::close_handle(handle).unwrap().1);
+    assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
+    assert_eq!(RETIRED.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn internal_file_rollback_also_runs_cleanup_and_close() {
+    let _guard = state_guard();
+    RETIRED.store(0, Ordering::Relaxed);
+    CLEANED.store(0, Ordering::Relaxed);
+    let payload = Box::into_raw(Box::new(0x1234usize)) as u64;
+    let handle = unsafe { ntdll::file::alloc_file_handle(payload, cleanup, retire) };
+    assert!(ntdll::file::free_handle(handle));
+    assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
+    assert_eq!(RETIRED.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn racing_file_close_and_reference_release_run_each_callback_once() {
+    let _guard = state_guard();
+    for _ in 0..100 {
+        RETIRED.store(0, Ordering::Relaxed);
+        CLEANED.store(0, Ordering::Relaxed);
+        let payload = Box::into_raw(Box::new(0x1234usize)) as u64;
+        let handle = unsafe { ntdll::file::alloc_file_handle(payload, cleanup, retire) } as usize;
+        let pin = unsafe { ntdll::file::reference_file_handle(handle as HANDLE, retire) }.unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let first_barrier = barrier.clone();
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            ntdll::file::close_handle(handle as HANDLE)
+        });
+        let second_barrier = barrier.clone();
+        let second = std::thread::spawn(move || {
+            second_barrier.wait();
+            ntdll::file::close_handle(handle as HANDLE)
+        });
+        barrier.wait();
+        drop(pin);
+        let outcomes = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|result| matches!(result, Err(STATUS_INVALID_HANDLE))).count(), 1);
+        assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
+        assert_eq!(RETIRED.load(Ordering::Relaxed), 1);
+    }
+}
 
 #[test]
 fn file_pin_checks_required_access_before_acquiring_payload() {

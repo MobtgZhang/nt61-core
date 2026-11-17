@@ -55,6 +55,8 @@ fn struct_bytes<T>(value: &T) -> &[u8] {
 #[path = "file/handles.rs"]
 mod handles;
 pub use handles::handle_count;
+#[cfg(test)]
+pub(crate) use handles::HANDLE_TEST_LOCK;
 pub(crate) use handles::namespace::{directory_entries, symbolic_link_target, set_object_permanent};
 pub(crate) use handles::{
     FileHandleReference,
@@ -267,22 +269,17 @@ unsafe fn file_transfer_irp(
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Issue IRP_MJ_CLOSE for a File handle's FileObject, the way the I/O
-/// manager closes a file object when its last handle goes away.
-unsafe fn file_close_irp(file_object: *mut crate::io::FileObject) -> i32 {
-    let device = (*file_object).device_object;
-    if device.is_null() {
-        return STATUS_INVALID_DEVICE_REQUEST;
-    }
-    let irp = crate::io::allocate_irp(1);
-    if irp.is_null() {
-        return STATUS_NO_MEMORY;
-    }
-    let stack = (*irp).current_stack;
-    (*stack).major_function = crate::io::major::IRP_MJ_CLOSE;
-    (*stack).device_object = device;
-    (*stack).file_object = file_object;
-    crate::io::synchronous_request::submit_and_wait(device, irp).0
+/// Issue CLEANUP at last handle removal or CLOSE at final object dereference.
+/// The caller retains the file and its device binding until completion.
+unsafe fn file_teardown_irp(file_object: *mut crate::io::FileObject, major: u8) -> i32 {
+    // SAFETY: cleanup and final close are serialized by the handle-table pins.
+    // End the mutable field borrow before entering a potentially reentrant driver.
+    let request = match unsafe { (*file_object).teardown_requests.take(major) } {
+        Ok(request) => request,
+        Err(status) => return status,
+    };
+    // SAFETY: the handle's file reference retains storage and its device binding.
+    unsafe { request.submit((*file_object).device_object, file_object) }
 }
 
 /// # Safety
@@ -439,10 +436,29 @@ unsafe fn retire_file(entry: HandleEntry) {
     // SAFETY: the handle table transferred its final reference to this path.
     unsafe {
         let file_object = file_object_of(entry.target);
-        let _ = file_close_irp(file_object);
+        let _ = file_teardown_irp(file_object, crate::io::major::IRP_MJ_CLOSE);
         free_file_object(file_object);
     }
+}
+
+/// The handle table retains a temporary file pin for the entire cleanup.
+unsafe fn cleanup_file(entry: HandleEntry) {
+    // SAFETY: allocation registered this callback for its owned FILE_OBJECT.
+    unsafe {
+        let _ = file_teardown_irp(file_object_of(entry.target), crate::io::major::IRP_MJ_CLEANUP);
+    }
     remove_share_entry(entry.identity);
+}
+
+/// Roll back a successful CREATE before publishing its handle. Failed CREATEs
+/// release storage directly because the driver did not establish an open.
+unsafe fn dispose_open_file(file_object: *mut crate::io::FileObject) {
+    // SAFETY: the caller owns the unpublished, successfully opened file.
+    unsafe {
+        let _ = file_teardown_irp(file_object, crate::io::major::IRP_MJ_CLEANUP);
+        let _ = file_teardown_irp(file_object, crate::io::major::IRP_MJ_CLOSE);
+        free_file_object(file_object);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +559,16 @@ fn file_open_common(
             };
         }
 
+        // Reserve teardown storage before CREATE can establish an open. Once
+        // CREATE succeeds, even pool exhaustion must not suppress CLEANUP/CLOSE.
+        (*file_object).teardown_requests = match crate::io::file_lifecycle::Requests::reserve() {
+            Ok(requests) => requests,
+            Err(status) => {
+                free_file_object(file_object);
+                return (status, None, 0);
+            }
+        };
+
         let irp = crate::io::allocate_irp(1);
         if irp.is_null() {
             {
@@ -578,25 +604,24 @@ fn file_open_common(
             let target_is_dir = { (*fcb).is_directory };
             if is_directory && !target_is_dir {
                 {
-                    let _ = file_close_irp(file_object);
-                    free_file_object(file_object)
+                    dispose_open_file(file_object)
                 };
                 return (STATUS_NOT_A_DIRECTORY, None, 0);
             }
             if is_non_directory && target_is_dir {
                 {
-                    let _ = file_close_irp(file_object);
-                    free_file_object(file_object)
+                    dispose_open_file(file_object)
                 };
                 return (STATUS_FILE_IS_A_DIRECTORY, None, 0);
             }
         }
 
-        let handle = alloc_handle(HandleKind::File, file_object as u64);
+        // SAFETY: transfer storage only on successful publication; all file
+        // pins use retire_file, and cleanup_file preserves the payload.
+        let handle = handles::alloc_file_handle(file_object as u64, cleanup_file, retire_file);
         if handle.is_null() {
             {
-                let _ = file_close_irp(file_object);
-                free_file_object(file_object)
+                dispose_open_file(file_object)
             };
             return (STATUS_NO_MEMORY, None, 0);
         }
@@ -1194,9 +1219,8 @@ pub unsafe fn nt_set_information_file_kernel(
 /// Closes the handle in both the ntdll table and the kernel's
 /// object manager (if ob integration is enabled).
 ///
-/// File handles close through the I/O manager: an IRP_MJ_CLOSE is
-/// issued against the FileObject the CREATE IRP produced, the object
-/// and its buffers are released, and the share-mode record is removed.
+/// The last file handle issues CLEANUP and releases share access. The last
+/// outstanding file reference issues CLOSE and releases object storage.
 pub unsafe extern "C" fn nt_close(handle: HANDLE) -> NTSTATUS {
     if handle.is_null() {
         return STATUS_INVALID_HANDLE;

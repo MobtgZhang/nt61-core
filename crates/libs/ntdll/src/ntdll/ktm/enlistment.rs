@@ -520,7 +520,9 @@ pub unsafe extern "C" fn nt_get_notification_resource_manager(handle: HANDLE, ou
 }
 
 #[cfg(test)]
-pub(crate) use notification_key_tests::queued_notification_key_regression;
+pub(crate) fn queued_notification_key_regression() {
+    notification_key_tests::queued_notification_key_regression();
+}
 
 #[cfg(test)]
 mod notification_key_tests {

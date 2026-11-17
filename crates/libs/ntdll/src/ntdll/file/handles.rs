@@ -92,9 +92,21 @@ struct HandleObject {
     parent: Option<u64>,
     /// Optional owner for payloads whose lifetime ends with this object.
     release: Option<unsafe fn(u64)>,
+    file_lifecycle: Option<FileLifecycle>,
+}
+
+#[derive(Clone, Copy)]
+struct FileLifecycle {
+    cleanup: unsafe fn(HandleEntry),
+    retire: unsafe fn(HandleEntry),
 }
 
 static HANDLE_TABLE: Spinlock<HandleTable> = Spinlock::new(HandleTable::new());
+
+// Tests that compare global handle counts must also exclude embedded native
+// interface tests that temporarily publish handles in this same table.
+#[cfg(test)]
+pub(crate) static HANDLE_TEST_LOCK: Spinlock<()> = Spinlock::new(());
 
 struct HandleTable {
     slots: [Option<HandleSlot>; MAX_HANDLES],
@@ -130,6 +142,27 @@ impl HandleTable {
 
 pub(crate) fn alloc_handle(kind: HandleKind, target: u64) -> HANDLE {
     alloc_dispatcher_handle(kind, target, DispatcherState::None)
+}
+
+/// Publish a file with distinct last-handle and last-reference callbacks.
+/// Neither callback runs under the handle-table lock.
+///
+/// # Safety
+/// `target` transfers one owned file payload. `cleanup` must keep its storage
+/// alive; `retire` must destroy it. Every file pin must use the same `retire`.
+pub(crate) unsafe fn alloc_file_handle(
+    target: u64,
+    cleanup: unsafe fn(HandleEntry),
+    retire: unsafe fn(HandleEntry),
+) -> HANDLE {
+    let mut table = HANDLE_TABLE.lock();
+    let Ok(handle) = table.allocate(HandleKind::File, target, DispatcherState::None, u32::MAX, 0) else {
+        return ptr::null_mut();
+    };
+    let index = table.slots[decode_handle(handle)].expect("allocated slot").object;
+    table.objects[index].as_mut().expect("allocated object").file_lifecycle =
+        Some(FileLifecycle { cleanup, retire });
+    handle
 }
 
 /// Publish a handle with an explicit granted access mask and inherit flag.
@@ -226,6 +259,7 @@ impl HandleTable {
             permanent: false,
             parent: None,
             release: None,
+            file_lifecycle: None,
         });
         self.slots[slot] = Some(HandleSlot {
             object,
@@ -636,6 +670,23 @@ fn remove_handle(handle: HANDLE, protect: bool) -> Result<(HandleEntry, bool), N
         .as_mut()
         .ok_or(STATUS_INVALID_HANDLE)?;
     let entry = object.entry;
+    // Keep the payload alive across CLEANUP even if the final I/O pin is
+    // dropped concurrently or by the driver's cleanup callback itself.
+    let file_cleanup = if object.handles == 1 && !object.permanent {
+        if let Some(lifecycle) = object.file_lifecycle {
+            object.file_pins = object.file_pins.checked_add(1)
+                .ok_or(super::super::status::STATUS_INSUFFICIENT_RESOURCES)?;
+            Some((lifecycle.cleanup, FileHandleReference {
+                object: slot.object,
+                entry,
+                retire: lifecycle.retire,
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     object.handles -= 1;
     table.slots[index] = None;
     let object = table.objects[slot.object]
@@ -683,6 +734,12 @@ fn remove_handle(handle: HANDLE, protect: bool) -> Result<(HandleEntry, bool), N
         if matches!(value.kind, HandleKind::TransactionManager | HandleKind::Transaction | HandleKind::ResourceManager | HandleKind::Enlistment) {
             super::super::ktm::release_open(value.target);
         }
+    }
+    if let Some((cleanup, pin)) = file_cleanup {
+        // SAFETY: allocation registered this callback for the owned payload;
+        // the temporary pin prevents final destruction until cleanup returns.
+        unsafe { cleanup(entry); }
+        drop(pin);
     }
     Ok((entry, retired.is_some()))
 }
