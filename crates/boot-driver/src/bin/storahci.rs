@@ -14,7 +14,7 @@ pub unsafe extern "efiapi" fn DriverEntry(
     unsafe {
         register_driver(
             driver_object,
-            nt61_drivers::drivers::storage::ahci::init,
+            nt61_driver::drivers::storage::ahci::init,
             dispatch_unsupported,
             unload_driver,
         )

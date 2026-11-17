@@ -277,6 +277,8 @@ struct Section {
 
 #[cfg(test)]
 mod tests {
+    extern crate alloc;
+    use self::alloc::{vec, vec::Vec};
     use super::*;
     fn put16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());

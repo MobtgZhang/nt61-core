@@ -8,6 +8,30 @@ mod hive;
 use nt61_tools::fs::system::SystemBuilder;
 
 #[test]
+fn bcd_timeout_roundtrips_through_the_kernel_hive_parser() {
+    for timeout in [0, 5, 30, u32::MAX] {
+        let bytes = nt61_tools::hive_gen::build_bcd_with_timeout(timeout);
+        let hive = hive::Hive::parse(&bytes).unwrap();
+        let element = hive
+            .open_path(&[
+                "Objects",
+                "{9dea862c-5cdd-4e70-acc1-f32b344d4795}",
+                "Elements",
+                "15000011",
+            ])
+            .unwrap()
+            .expect("boot-manager timeout");
+        assert_eq!(
+            hive.find_value(&element, "Element").unwrap().unwrap().as_u32(),
+            Some(timeout)
+        );
+        if timeout == 5 {
+            assert_eq!(bytes, nt61_tools::hive_gen::build_bcd());
+        }
+    }
+}
+
+#[test]
 fn system_partition_contains_mountable_registry_hives() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();

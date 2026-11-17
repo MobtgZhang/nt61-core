@@ -181,6 +181,11 @@ fn element_subkey_string_list(type_id: &str, values: &[&str]) -> Node {
 ///   - 0x10100010: Firmware Boot Manager
 ///   - 0x1030000A: BootApp (EFI application)
 pub fn build_bcd() -> Vec<u8> {
+    build_bcd_with_timeout(5)
+}
+
+/// Build the same BCD store with the caller's boot-menu timeout in seconds.
+pub fn build_bcd_with_timeout(timeout: u32) -> Vec<u8> {
     let mut root = node("NewStoreRoot").root();
 
     // --- NewStoreRoot\Description ----------------------------------------
@@ -206,8 +211,8 @@ pub fn build_bcd() -> Vec<u8> {
             }
             {
                 let mut ee = node("Elements");
-                // Timeout = 5 seconds (stored as DWORD, but in Elements as binary with Element value)
-                ee.subkeys.push(element_subkey_dword("15000011", 5));
+                // The project's boot manager reads this DWORD timeout element.
+                ee.subkeys.push(element_subkey_dword("15000011", timeout));
                 ee.subkeys.push(element_subkey_string("23000003", "{9dea862d-5cdd-4e70-acc1-f32b344d4795}"));
                 ee.subkeys
                     .push(element_subkey_string("12000004", "Windows Boot Manager"));

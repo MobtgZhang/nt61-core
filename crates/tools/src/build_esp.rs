@@ -9,29 +9,6 @@ use nt61_tools::{
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const ESP_TEMPLATE: &str = r#"NT6.1.7601 EFI System Partition
-==========================================
-
-Structure:
-  EFI/
-    Boot/
-      BOOTX64.EFI     (Primary bootloader for x64)
-      BOOTAA64.EFI    (Primary bootloader for ARM64)
-      BOOTRISCV64.EFI (Primary bootloader for RISC-V 64)
-      BOOTLOONGARCH64.EFI (Primary bootloader for LoongArch64)
-      BOOTARM.EFI     (Primary bootloader for ARM)
-    Microsoft/
-      Boot/
-        BCD           (Boot Configuration Data)
-        Fonts/        (GNU FreeFont)
-        bootmgfw.efi (Windows Boot Manager)
-        bootmgr.efi  (Boot Manager)
-
-ROOT/
-  Windows/
-    System32/
-"#;
-
 /// Architecture type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Arch {
@@ -121,7 +98,7 @@ impl Default for BuildConfig {
 }
 
 /// Create directory structure
-pub fn create_directories(build_dir: &Path, arch: Arch) -> std::io::Result<EspPaths> {
+pub fn create_directories(build_dir: &Path) -> std::io::Result<EspPaths> {
     // Directory structure:
     // build/ (passed as build_dir)
     //   esp/         <- EFI partition files
@@ -406,47 +383,10 @@ pub fn generate_pe_files_to(system32_dir: &Path, arch: Arch) -> std::io::Result<
 pub fn generate_bcd(paths: &EspPaths, timeout: u32) -> std::io::Result<()> {
     let bcd_path = paths.ms_boot_dir.join("BCD");
     println!("  Generating: {:?}", &bcd_path);
-    let bytes = crate::hive_gen::build_bcd();
+    let bytes = crate::hive_gen::build_bcd_with_timeout(timeout);
     fs::write(&bcd_path, &bytes)?;
     println!("    BCD size: {} bytes", bytes.len());
     Ok(())
-}
-
-/// Pad BCD hive to the standard Windows BCD size of 81920 bytes.
-fn pad_bcd_to_standard_size(mut data: Vec<u8>) -> Vec<u8> {
-    const BCD_STANDARD_SIZE: usize = 81920;
-    if data.len() >= BCD_STANDARD_SIZE {
-        data.truncate(BCD_STANDARD_SIZE);
-        return data;
-    }
-
-    let new_size = BCD_STANDARD_SIZE;
-
-    // Resize to target size (zero-fills new space)
-    data.resize(new_size, 0);
-
-    // Write HBIN headers for ALL pages
-    let num_hbins = (new_size - 0x1000) / 4096;
-    for i in 0..num_hbins {
-        let off = 0x1000 + i * 4096;
-        data[off..off + 4].copy_from_slice(b"hbin");
-        data[off + 4..off + 8].copy_from_slice(&(i as u32 * 4096).to_le_bytes());
-        data[off + 8..off + 12].copy_from_slice(&4096u32.to_le_bytes());
-    }
-
-    // Update blocks field in header
-    let blocks = (num_hbins * 4096) as u32;
-    data[0x28..0x2C].copy_from_slice(&blocks.to_le_bytes());
-
-    // Recompute checksum
-    let mut sum: u32 = 0;
-    for i in (0..0x1FC).step_by(4) {
-        let val = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-        sum ^= val;
-    }
-    data[0x1FC..0x200].copy_from_slice(&sum.to_le_bytes());
-
-    data
 }
 
 /// Copy font files to ESP Fonts directory
@@ -560,7 +500,7 @@ pub fn build_esp(config: &BuildConfig) -> std::io::Result<()> {
     let build_dir = Path::new(&config.build_dir);
 
     println!("Creating directory structure...");
-    let paths = create_directories(build_dir, config.arch)?;
+    let paths = create_directories(build_dir)?;
 
     if let Some(ref boot_path) = config.boot_efi_path {
         println!("Copying boot manager...");

@@ -14,7 +14,7 @@ pub unsafe extern "efiapi" fn DriverEntry(
     unsafe {
         register_driver(
             driver_object,
-            nt61_drivers::drivers::platform::mssmbios::init,
+            nt61_driver::drivers::platform::mssmbios::init,
             dispatch_unsupported,
             unload_driver,
         )

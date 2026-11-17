@@ -8,6 +8,9 @@ static ALLOCATOR: ntoskrnl::mm::heap::KernelHeapAllocator = ntoskrnl::mm::heap::
 
 use nt61_boot_types::boot_driver::{BootDriverDispatch, BootDriverUnload, BOOT_DRIVER_MARKER};
 pub use nt61_boot_types::boot_driver::{BootDriverObject, BootDriverRegistryPath};
+// Payload entry points use the shared adapter for both their private ABI and
+// subsystem initialization, keeping the driver implementation dependency here.
+pub use nt61_drivers::drivers;
 
 pub const STATUS_SUCCESS: i32 = 0;
 pub const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
