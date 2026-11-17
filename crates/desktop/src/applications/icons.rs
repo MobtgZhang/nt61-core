@@ -6,6 +6,8 @@ pub fn draw(frame: &mut Surface, id: AppId, b: Rect) {
         notepad(b.width.max(b.height))
     } else if id == AppId::WordPad {
         wordpad(b.width.max(b.height))
+    } else if id == AppId::TaskManager {
+        task_manager(b.width.max(b.height))
     } else if id == AppId::Paint {
         paint(b.width.max(b.height))
     } else {
@@ -80,5 +82,15 @@ fn paint(size: u32) -> (&'static [u8], u32) {
         33..=48 => (include_bytes!("paint/resources/icon-48.rgba"), 48),
         49..=64 => (include_bytes!("paint/resources/icon-64.rgba"), 64),
         _ => (include_bytes!("paint/resources/icon-256.rgba"), 256),
+    }
+}
+fn task_manager(size: u32) -> (&'static [u8], u32) {
+    match size {
+        0..=16 => (include_bytes!("task_manager/resources/icon-16.rgba"), 16),
+        17..=24 => (include_bytes!("task_manager/resources/icon-24.rgba"), 24),
+        25..=32 => (include_bytes!("task_manager/resources/icon-32.rgba"), 32),
+        33..=48 => (include_bytes!("task_manager/resources/icon-48.rgba"), 48),
+        49..=64 => (include_bytes!("task_manager/resources/icon-64.rgba"), 64),
+        _ => (include_bytes!("task_manager/resources/icon-256.rgba"), 256),
     }
 }

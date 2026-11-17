@@ -100,10 +100,16 @@ mod tests{
     use super::*;
     #[test]fn reads_actual_generated_dlls_with_bounded_io(){
         use std::{fs,io::{Read,Seek,SeekFrom}};
-        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../build/x86_64/ntfs/system/Windows/System32");
-        // Resource generator is tested independently; this also checks the staged
-        // on-disk DLLs used by QEMU when they are present.
-        if !root.join("shell32.dll").exists(){return;}
+        // Generate the same DLLs as the image builder. Staged build files may
+        // be stale or replaced by another build and must not be test fixtures.
+        struct Resources(std::path::PathBuf);
+        impl Drop for Resources {
+            fn drop(&mut self) { let _=fs::remove_dir_all(&self.0); }
+        }
+        let nonce=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let resources=Resources(std::env::temp_dir().join(format!("nt61-shell-icons-{}-{nonce}",std::process::id())));
+        let root=&resources.0;
+        crate::resource_generator::generate_desktop_resources(root,"x86_64").unwrap();
         let mut total=0;
         let icons=ShellIcons::load(|path,offset,length|{
             assert!(length<=65536);total+=length;

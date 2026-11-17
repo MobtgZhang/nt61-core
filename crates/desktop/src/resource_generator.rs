@@ -2,7 +2,7 @@
 //!
 //! The source payloads are the icon files extracted from Windows 7 and
 //! stored under `assets/windows7/icons`. This module packages those
-//! payloads into a real PE32+ resource directory; it does not copy any
+//! payloads into PE32/PE32+ resource directories; it does not copy any
 //! Microsoft DLL.
 
 extern crate std;
@@ -471,6 +471,7 @@ fn resource_section(entries: &[ResourceEntry]) -> Vec<u8> {
 
 fn machine_for_arch(arch: &str) -> u16 {
     match arch {
+        "x86" | "i686" => 0x014C,
         "aarch64" | "arm64" => 0xAA64,
         "riscv64" => 0x5064,
         "loongarch64" => 0x6264,
@@ -488,6 +489,7 @@ fn image_base_for_arch(arch: &str) -> u64 {
 }
 
 fn resource_pe(arch: &str, image_name: &str, entries: &[ResourceEntry]) -> Vec<u8> {
+    let x86 = machine_for_arch(arch) == 0x014C;
     let text = [0xC3u8, 0xC3, 0xC3, 0xC3];
     let rsrc = resource_section(entries);
     let export_name = image_name.as_bytes();
@@ -495,8 +497,16 @@ fn resource_pe(arch: &str, image_name: &str, entries: &[ResourceEntry]) -> Vec<u
     let mut rdata = vec![0u8; rdata_size];
     let dll_name_offset = 0x0D0;
     rdata[dll_name_offset..dll_name_offset + export_name.len()].copy_from_slice(export_name);
+    // All resource references are RVAs. An ABSOLUTE-only relocation block
+    // records that there are no address fixups, while allowing these DLLs to
+    // load together (or alongside an EXE occupying their preferred base).
+    let relocation_offset = 0x80;
+    let relocation_size = 12;
+    put_u32(&mut rdata, relocation_offset, TEXT_RVA);
+    put_u32(&mut rdata, relocation_offset + 4, relocation_size);
 
-    let section_table_offset = 0x188u32;
+    let optional_size = if x86 { 224 } else { 240 };
+    let section_table_offset = 0x98 + u32::from(optional_size);
     let text_raw_size = align_up_u32(text.len() as u32, FILE_ALIGNMENT);
     let rdata_raw_size = align_up_u32(rdata.len() as u32, FILE_ALIGNMENT);
     let rsrc_raw_size = align_up_u32(rsrc.len() as u32, FILE_ALIGNMENT);
@@ -514,18 +524,25 @@ fn resource_pe(arch: &str, image_name: &str, entries: &[ResourceEntry]) -> Vec<u
     let coff = pe_offset + 4;
     put_u16(&mut out, coff, machine_for_arch(arch));
     put_u16(&mut out, coff + 2, 3);
-    put_u16(&mut out, coff + 0x10, 240);
-    put_u16(&mut out, coff + 0x12, 0x2022);
+    put_u16(&mut out, coff + 0x10, optional_size);
+    put_u16(&mut out, coff + 0x12, if x86 { 0x2102 } else { 0x2022 });
 
     let optional = coff + 20;
-    put_u16(&mut out, optional, 0x020B);
+    put_u16(&mut out, optional, if x86 { 0x010B } else { 0x020B });
     put_u16(&mut out, optional + 2, 14);
-    put_u32(&mut out, optional + 6, text_raw_size);
-    put_u32(&mut out, optional + 0x0A, rdata_raw_size);
-    put_u32(&mut out, optional + 0x0E, rsrc_raw_size);
-    put_u32(&mut out, optional + 0x10, TEXT_RVA);
+    put_u32(&mut out, optional + 4, text_raw_size);
+    put_u32(&mut out, optional + 8, rdata_raw_size + rsrc_raw_size);
+    put_u32(&mut out, optional + 0x0C, 0);
+    // Resource-only DLLs have no DllMain; in particular the placeholder text
+    // bytes are not executable entry points on the non-x86 architectures.
+    put_u32(&mut out, optional + 0x10, 0);
     put_u32(&mut out, optional + 0x14, TEXT_RVA);
-    put_u64(&mut out, optional + 0x18, image_base_for_arch(arch));
+    if x86 {
+        put_u32(&mut out, optional + 0x18, RDATA_RVA);
+        put_u32(&mut out, optional + 0x1C, image_base_for_arch(arch) as u32);
+    } else {
+        put_u64(&mut out, optional + 0x18, image_base_for_arch(arch));
+    }
     put_u32(&mut out, optional + 0x20, SECTION_ALIGNMENT);
     put_u32(&mut out, optional + 0x24, FILE_ALIGNMENT);
     put_u16(&mut out, optional + 0x28, 10);
@@ -534,22 +551,34 @@ fn resource_pe(arch: &str, image_name: &str, entries: &[ResourceEntry]) -> Vec<u
     put_u16(&mut out, optional + 0x2E, 0);
     put_u16(&mut out, optional + 0x30, 10);
     put_u16(&mut out, optional + 0x32, 0);
-    put_u32(&mut out, optional + 0x38, SECTION_ALIGNMENT * 4);
+    put_u32(&mut out, optional + 0x38,
+        align_up_u32(RSRC_RVA + rsrc_raw_size, SECTION_ALIGNMENT));
     put_u32(&mut out, optional + 0x3C, headers_size);
     put_u16(&mut out, optional + 0x44, 0x0002);
     put_u16(&mut out, optional + 0x46, 0x0160);
-    put_u64(&mut out, optional + 0x48, 0x0010_0000);
-    put_u64(&mut out, optional + 0x50, 0x0000_1000);
-    put_u64(&mut out, optional + 0x58, 0x0010_0000);
-    put_u64(&mut out, optional + 0x60, 0x0000_1000);
-    put_u32(&mut out, optional + 0x68, 0);
-    put_u32(&mut out, optional + 0x6C, 16);
+    if x86 {
+        put_u32(&mut out, optional + 0x48, 0x0010_0000);
+        put_u32(&mut out, optional + 0x4C, 0x0000_1000);
+        put_u32(&mut out, optional + 0x50, 0x0010_0000);
+        put_u32(&mut out, optional + 0x54, 0x0000_1000);
+        put_u32(&mut out, optional + 0x58, 0);
+        put_u32(&mut out, optional + 0x5C, 16);
+    } else {
+        put_u64(&mut out, optional + 0x48, 0x0010_0000);
+        put_u64(&mut out, optional + 0x50, 0x0000_1000);
+        put_u64(&mut out, optional + 0x58, 0x0010_0000);
+        put_u64(&mut out, optional + 0x60, 0x0000_1000);
+        put_u32(&mut out, optional + 0x68, 0);
+        put_u32(&mut out, optional + 0x6C, 16);
+    }
 
-    let data_directory = optional + 0x70;
+    let data_directory = optional + if x86 { 0x60 } else { 0x70 };
     put_u32(&mut out, data_directory, RDATA_RVA);
     put_u32(&mut out, data_directory + 4, rdata.len() as u32);
     put_u32(&mut out, data_directory + 16, RSRC_RVA);
     put_u32(&mut out, data_directory + 20, rsrc.len() as u32);
+    put_u32(&mut out, data_directory + 5 * 8, RDATA_RVA + relocation_offset as u32);
+    put_u32(&mut out, data_directory + 5 * 8 + 4, relocation_size);
 
     let sections = section_table_offset as usize;
     for (index, section) in [
@@ -618,6 +647,92 @@ pub fn generate_desktop_resources(output_directory: &Path, arch: &str) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_images_allow_rebasing_without_changing_resource_rvas() {
+        for arch in ["i686", "x86_64", "aarch64", "riscv64", "loongarch64"] {
+            let image = resource_pe(arch, "shell32.dll", &[]);
+            let read32 = |at| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+            let x86 = arch == "i686";
+            let directory = 0x98 + if x86 { 0x60 } else { 0x70 };
+            let sections = 0x98 + if x86 { 224 } else { 240 };
+            let rva = read32(directory + 5 * 8);
+            let size = read32(directory + 5 * 8 + 4);
+            assert_eq!(size, 12, "{arch}: valid padded relocation block");
+            let rdata_rva = read32(sections + 40 + 12);
+            let rdata_size = read32(sections + 40 + 8);
+            assert!(rva >= rdata_rva && rva + size <= rdata_rva + rdata_size);
+            let raw = (read32(sections + 40 + 20) + rva - rdata_rva) as usize;
+            assert_eq!(read32(raw), TEXT_RVA);
+            assert_eq!(read32(raw + 4), size);
+            assert_eq!(&image[raw + 8..raw + 12], &[0; 4], "only ABSOLUTE padding, no fixups");
+            assert_eq!(read32(directory + 16), RSRC_RVA);
+            assert_eq!(u16::from_le_bytes(image[0x96..0x98].try_into().unwrap()) & 1, 0,
+                "IMAGE_FILE_RELOCS_STRIPPED must be clear");
+        }
+    }
+
+    #[test]
+    fn resource_image_headers_cover_every_section_and_use_pe_field_offsets() {
+        let entries = [ResourceEntry {
+            type_id: RT_ICON, id: 1, name: None, bytes: vec![0x5a; 0x4321],
+        }];
+        for arch in ["x86_64", "aarch64", "riscv64", "loongarch64"] {
+            let image = resource_pe(arch, "shell32.dll", &entries);
+            let read32 = |offset| u32::from_le_bytes(image[offset..offset + 4].try_into().unwrap());
+            let optional = 0x98;
+            let image_size = read32(optional + 0x38);
+            let mut initialized = 0;
+            for index in 0..3 {
+                let section = 0x188 + index * 40;
+                let virtual_size = read32(section + 8);
+                let rva = read32(section + 12);
+                let raw_size = read32(section + 16);
+                assert!(rva + virtual_size.max(raw_size) <= image_size,
+                    "{arch} section {index} exceeds SizeOfImage");
+                if index > 0 { initialized += raw_size; }
+            }
+            assert_eq!(image_size % SECTION_ALIGNMENT, 0);
+            assert_eq!(read32(optional + 4), FILE_ALIGNMENT, "SizeOfCode");
+            assert_eq!(read32(optional + 8), initialized, "SizeOfInitializedData");
+            assert_eq!(read32(optional + 12), 0, "SizeOfUninitializedData");
+            assert_eq!(read32(optional + 16), 0, "resource-only DLL has no executable entry point");
+        }
+    }
+
+    #[test]
+    fn wow64_resources_use_pe32_headers_and_the_same_resource_payload() {
+        let entries = [ResourceEntry {
+            type_id: RT_ICON, id: 1, name: None, bytes: vec![0x5a; 0x4321],
+        }];
+        let native = resource_pe("x86_64", "shell32.dll", &entries);
+        for arch in ["x86", "i686"] {
+            let image = resource_pe(arch, "shell32.dll", &entries);
+            let read16 = |offset| u16::from_le_bytes(image[offset..offset + 2].try_into().unwrap());
+            let read32 = |offset| u32::from_le_bytes(image[offset..offset + 4].try_into().unwrap());
+            let optional = 0x98;
+            assert_eq!(read16(0x84), 0x14c, "WoW64 requires I386 machine");
+            assert_eq!(read16(0x94), 224);
+            assert_eq!(read16(optional), 0x10b);
+            assert_ne!(read16(0x96) & 0x100, 0, "IMAGE_FILE_32BIT_MACHINE");
+            assert_eq!(read32(optional + 0x18), RDATA_RVA, "PE32 BaseOfData");
+            assert_eq!(read32(optional + 0x1c), image_base_for_arch(arch) as u32);
+            assert_eq!(read32(optional + 0x48), 0x10_0000);
+            assert_eq!(read32(optional + 0x4c), 0x1000);
+            assert_eq!(read32(optional + 0x50), 0x10_0000);
+            assert_eq!(read32(optional + 0x54), 0x1000);
+            assert_eq!(read32(optional + 0x58), 0);
+            assert_eq!(read32(optional + 0x5c), 16);
+            assert_eq!(read32(optional + 0x70), RSRC_RVA, "PE32 resource directory");
+            assert_eq!(read32(optional + 0x74), resource_section(&entries).len() as u32);
+            let section = optional + 224 + 2 * 40;
+            assert_eq!(&image[section..section + 5], b".rsrc");
+            assert!(read32(section + 12) + read32(section + 16) <= read32(optional + 0x38));
+            let raw = read32(section + 20) as usize;
+            let native_raw = u32::from_le_bytes(native[0x188 + 100..0x188 + 104].try_into().unwrap()) as usize;
+            assert_eq!(&image[raw..], &native[native_raw..], "resource identities and bytes match both ABIs");
+        }
+    }
 
     #[test]
     fn windows7_icons_are_loaded_and_have_unique_ids() {
