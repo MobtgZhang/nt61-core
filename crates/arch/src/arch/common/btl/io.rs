@@ -17,6 +17,27 @@ pub const STD_ERROR: u64 = 0x18;
 
 /// Host operations receive owned, validated values rather than guest pointers.
 pub trait IoHost {
+    /// Backend event identifiers are private to IoServices and never guest
+    /// handles. The creator retains ownership until close_event succeeds.
+    fn create_event(&mut self, _manual: bool, _signaled: bool) -> Result<u64, u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn change_event(&mut self, _event: u64, _signaled: bool) -> Result<(), u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn wait_event(&mut self, _event: u64, _timeout: Option<i64>) -> Result<u32, u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn close_event(&mut self, _event: u64) -> Result<(), u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn create_directory(&mut self, _path: &str) -> Result<(), u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn directory_entries(&mut self, _path: &str) -> Result<Vec<nt61::DirectoryEntry>, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn application_log_available(&mut self) -> bool { false }
+    fn report_application_event(&mut self, _event: nt61::ApplicationEvent) -> Result<(), u32> { Err(120) }
+
+    fn native_processor_info(&mut self) -> Result<nt61::NativeProcessorInfo, u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn unbiased_interrupt_time(&mut self) -> Result<u64, u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn time_adjustment(&mut self) -> Result<nt61::TimeAdjustment, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn random_bytes(&mut self, _bytes: &mut [u8]) -> Result<(), u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
     fn printer_available(&mut self) -> bool { false }
     fn print_document(&mut self, _data: &[u8]) -> Result<u32,u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
 
@@ -51,9 +72,10 @@ struct File {
     path: String,
     position: u64,
 }
-pub struct IoServices<H> {
+pub struct IoServices<H: IoHost> {
     pub host: H,
     files: Vec<File>,
+    events: Vec<(u64, u64)>, // guest handle, backend-owned event identifier
     next_handle: u64,
     fs_redirection: bool,
 }
@@ -62,6 +84,7 @@ impl<H: IoHost> IoServices<H> {
         Self {
             host,
             files: Vec::new(),
+            events: Vec::new(),
             next_handle: 0x100,
             fs_redirection: true,
         }
@@ -169,6 +192,11 @@ impl<H: IoHost> IoServices<H> {
                 Ok(0)
             }
             Service::Close => {
+                if let Some(index) = self.events.iter().position(|event| event.0 == a[0]) {
+                    self.host.close_event(self.events[index].1)?;
+                    self.events.remove(index);
+                    return Ok(0);
+                }
                 let index = self
                     .files
                     .iter()
@@ -176,6 +204,13 @@ impl<H: IoHost> IoServices<H> {
                     .ok_or(INVALID_HANDLE)?;
                 self.files.remove(index);
                 Ok(0)
+            }
+            Service::WaitForSingleObject => {
+                if a[1] as u8 != 0 { return Err(nt61::STATUS_NOT_IMPLEMENTED); }
+                let timeout = if a[2] == 0 { None } else {
+                    Some(word(&read(m, a[2], 8)?, 0, 8) as i64)
+                };
+                self.wait_event(a[0], timeout)
             }
             Service::ReadFile | Service::WriteFile => {
                 // APC/event completion and keyed IO require real dispatcher objects.
@@ -237,7 +272,55 @@ impl<H: IoHost> IoServices<H> {
         }
     }
 }
+impl<H: IoHost> Drop for IoServices<H> {
+    fn drop(&mut self) {
+        for (_, event) in self.events.drain(..) { let _ = self.host.close_event(event); }
+    }
+}
 impl<H: IoHost> GuestServices for IoServices<H> {
+    fn create_event(&mut self, manual: bool, signaled: bool) -> Result<u64, u32> {
+        if self.events.len() >= 256 { return Err(0xc000011f); }
+        let handle = self.next_handle;
+        let next = handle.checked_add(4).filter(|value| *value <= u64::from(u32::MAX)).ok_or(0xc000011fu32)?;
+        let event = self.host.create_event(manual, signaled)?;
+        self.events.push((handle, event));
+        self.next_handle = next;
+        Ok(handle)
+    }
+    fn change_event(&mut self, handle: u64, signaled: bool) -> Result<(), u32> {
+        let event = self.events.iter().find(|event| event.0 == handle).ok_or(INVALID_HANDLE)?.1;
+        self.host.change_event(event, signaled)
+    }
+    fn wait_event(&mut self, handle: u64, timeout: Option<i64>) -> Result<u32, u32> {
+        let event = self.events.iter().find(|event| event.0 == handle).ok_or(INVALID_HANDLE)?.1;
+        self.host.wait_event(event, timeout)
+    }
+    fn create_directory(&mut self, abi: GuestAbi, path: &str) -> Result<(), u32> {
+        let path = guest_file_path(abi, path, self.fs_redirection)?;
+        self.host.create_directory(&path)
+    }
+    fn directory_entries(&mut self, abi: GuestAbi, path: &str) -> Result<Vec<nt61::DirectoryEntry>, u32> {
+        let path = guest_file_path(abi, path, self.fs_redirection)?;
+        self.host.directory_entries(&path)
+    }
+    fn application_log_available(&mut self) -> bool { self.host.application_log_available() }
+    fn report_application_event(&mut self, event: nt61::ApplicationEvent) -> Result<(), u32> {
+        self.host.report_application_event(event)
+    }
+
+    fn native_processor_info(&mut self) -> Result<nt61::NativeProcessorInfo, u32> { self.host.native_processor_info() }
+    fn unbiased_interrupt_time(&mut self) -> Result<u64, u32> { self.host.unbiased_interrupt_time() }
+    fn time_adjustment(&mut self) -> Result<nt61::TimeAdjustment, u32> {
+        self.host.time_adjustment()
+    }
+    fn random_bytes(&mut self, bytes: &mut [u8]) -> Result<(), u32> { self.host.random_bytes(bytes) }
+    fn file_type(&mut self, handle: u64) -> Result<u32, u32> {
+        match handle {
+            STD_INPUT | STD_OUTPUT | STD_ERROR => Ok(2), // this context owns console streams
+            h if self.files.iter().any(|file| file.handle == h) => Ok(1),
+            _ => Err(INVALID_HANDLE),
+        }
+    }
     fn printer_available(&mut self) -> bool { self.host.printer_available() }
     fn print_document(&mut self, data: &[u8]) -> Result<u32,u32> { self.host.print_document(data) }
 

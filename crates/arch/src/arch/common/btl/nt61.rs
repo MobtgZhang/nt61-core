@@ -6,6 +6,7 @@
 //! belongs to a typed service handler, after this ABI boundary.
 
 use super::{abi::GuestAbi, ir::X86Reg, memory::GuestMemory};
+use alloc::vec::Vec;
 
 #[path = "../../../../../abi/src/syscall_metadata.rs"]
 mod syscall_metadata;
@@ -149,7 +150,74 @@ pub struct MemoryStatus {
     pub paging_total: u64,
     pub paging_available: u64,
 }
+/// Clock discipline and nominal tick interval, both in 100-ns units. This
+/// describes the actual host clock; QPC frequency is not a timer increment.
+#[derive(Clone, Copy, Debug)]
+pub struct TimeAdjustment {
+    pub adjustment: u32,
+    pub increment: u32,
+    pub disabled: bool,
+}
+/// Native processor identity, distinct from the emulated process's CPUID.
+pub struct NativeProcessorInfo {
+    pub architecture: u16,
+    pub processor_type: u32,
+    pub level: u16,
+    pub revision: u16,
+}
+/// Owned classic Application log data. UTF-16 insertion strings, full DWORD
+/// event identity, SID and binary payload survive the guest ABI boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApplicationEvent {
+    pub source: alloc::vec::Vec<u16>,
+    pub event_type: u16,
+    pub category: u16,
+    pub event_id: u32,
+    pub sid: alloc::vec::Vec<u8>,
+    pub strings: alloc::vec::Vec<alloc::vec::Vec<u16>>,
+    pub data: alloc::vec::Vec<u8>,
+}
+/// Copied mounted-volume metadata. Times use NT FILETIME units.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub name: Vec<u16>,
+    pub attributes: u32,
+    pub size: u64,
+    pub creation_time: u64,
+    pub access_time: u64,
+    pub write_time: u64,
+}
+
 pub trait GuestServices {
+    /// Unnamed, non-inheritable events owned by this guest context. Handles
+    /// returned here must not expose a backend/kernel handle to guest code.
+    fn create_event(&mut self, _manual: bool, _signaled: bool) -> Result<u64, u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn change_event(&mut self, _handle: u64, _signaled: bool) -> Result<(), u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    /// Non-alertable NT wait, with a captured optional 100-ns deadline.
+    fn wait_event(&mut self, _handle: u64, _timeout: Option<i64>) -> Result<u32, u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn create_directory(&mut self, _abi: GuestAbi, _path: &str) -> Result<(), u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn directory_entries(&mut self, _abi: GuestAbi, _path: &str) -> Result<Vec<DirectoryEntry>, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    /// Local Application log backend availability; no remote RPC support.
+    fn application_log_available(&mut self) -> bool { false }
+    /// Only a successful backend commit may make ReportEvent return TRUE.
+    /// Errors are Win32 error codes, unlike the native call method's NTSTATUS.
+    fn report_application_event(&mut self, _event: ApplicationEvent) -> Result<(), u32> { Err(120) }
+
+    fn native_processor_info(&mut self) -> Result<NativeProcessorInfo, u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    /// Running time in 100-ns units, excluding suspended and hibernated time.
+    fn unbiased_interrupt_time(&mut self) -> Result<u64, u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn time_adjustment(&mut self) -> Result<TimeAdjustment, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    /// Fill a kernel-owned buffer from a cryptographic entropy source. An
+    /// unavailable source must return an error rather than predictable bytes.
+    fn random_bytes(&mut self, _bytes: &mut [u8]) -> Result<(), u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    /// Win32 FILE_TYPE_* of a live handle in this guest service context.
+    fn file_type(&mut self, _handle: u64) -> Result<u32, u32> { Err(STATUS_NOT_IMPLEMENTED) }
     fn printer_available(&mut self) -> bool { false }
     fn print_document(&mut self, _data: &[u8]) -> Result<u32,u32> { Err(STATUS_NOT_IMPLEMENTED) }
 
