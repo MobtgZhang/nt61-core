@@ -1,5 +1,5 @@
 //! Compatibility build entry; all application logic lives in applications/.
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
 #[path="../../applications/native/runtime.rs"]
 mod runtime;

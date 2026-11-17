@@ -14,12 +14,16 @@ pub mod bmp;
 pub mod boot;
 pub mod compositor;
 pub mod controls;
+pub mod desktop_files;
+pub mod display_settings;
 pub mod file;
 pub mod fs;
 pub mod graphics;
 pub mod login;
 pub mod platform;
-#[cfg(any(test, feature = "resource-gen"))]
+// Filesystem-based resource generation belongs to the host tool. Keep std out
+// of the desktop library even when Cargo unifies the tool's feature flags.
+#[cfg(test)]
 pub mod resource_generator;
 pub mod resources;
 pub mod shell;
@@ -38,3 +42,13 @@ pub const NT_VERSION: (u16, u16, u16) = (6, 1, 7601);
 mod ico_tests;
 
 pub mod session;
+
+pub mod power_menu;
+pub mod logon_power;
+
+pub mod accounts;
+
+pub mod control_panel;
+
+pub mod sound_settings;
+pub mod network_settings;

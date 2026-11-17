@@ -2,8 +2,12 @@
 extern crate alloc;
 #[allow(dead_code)]
 #[path="../../bin/explorer/arch/mod.rs"] mod arch;
-use nt61_desktop::{applications::{AppId,view},graphics::{Surface,Rect,font::FontLib},shell::ShellModel,theme::Theme,user_allocator::ApplicationHeap};
+use nt61_desktop::{applications::{AppId,view},graphics::{Surface,Rect,font::FontLib},shell::ShellModel,theme::Theme};
+#[cfg(not(test))]
+use nt61_desktop::user_allocator::ApplicationHeap;
+#[cfg(not(test))]
 #[global_allocator] static HEAP:ApplicationHeap<{32*1024*1024}>=ApplicationHeap::new();
+#[cfg(not(test))]
 #[panic_handler]fn panic(_: &core::panic::PanicInfo)->!{arch::debug_str("[APPLICATION] panic\r\n");arch::exit_process(1)}
 /// Kept in a writable load segment, read volatile: no constant folding after packaging specialization.
 #[used]
@@ -68,6 +72,7 @@ pub static mut NT61_APP_IDENTITY:[u8;24]=*b"NT61APP_ID_V1___\x11\x00\x00\x00\x61
         if ticks>=next_process_poll {
             next_process_poll=ticks.saturating_add(1000);
             if model.applications.iter().any(|app|matches!(app.id,AppId::TaskManager|AppId::SystemInformation|AppId::ResourceMonitor)) {
+                model.sample_task_manager();dirty=true;
                 if let Ok(snapshot)=nt61_desktop::platform::services::processes() {
                     if model.process_snapshot.as_ref()!=Some(&snapshot){model.process_snapshot=Some(snapshot);dirty=true;}
                 }

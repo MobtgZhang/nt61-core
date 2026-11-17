@@ -1,4 +1,9 @@
-use nt61_desktop::resource_generator::generate_desktop_resources;
+extern crate alloc;
+
+#[path = "../resource_generator.rs"]
+mod resource_generator;
+
+use resource_generator::generate_desktop_resources;
 use std::path::PathBuf;
 
 fn main() -> Result<(), String> {
