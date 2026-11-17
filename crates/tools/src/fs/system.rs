@@ -50,6 +50,7 @@ const SYSTEM_STRUCTURE: &[(&str, bool)] = &[
     ("Windows/Boot/PCAT", true),
     ("Windows/Boot/Diagnostics", true),
     ("Windows/Fonts", true),
+    ("Windows/Media", true),
     ("Windows/Help", true),
     ("Windows/inf", true),
     ("Windows/Logs", true),
@@ -258,6 +259,21 @@ impl SystemBuilder {
         Ok(())
     }
 
+    /// Install the default Windows 7 scheme from the repository's reference assets.
+    pub fn copy_system_sounds(&self) -> Result<()> {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../references/windows-ui-assets/Sounds/Windows 7");
+        let destination = self.output_dir.join("Windows/Media");
+        std::fs::create_dir_all(&destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|e| e.eq_ignore_ascii_case("wav")) {
+                std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Generate REGF registry hives for the configuration manager, together
     /// with the network configuration files maintained by the hive generator.
     pub fn write_registry_hives(&self) -> Result<()> {
@@ -277,6 +293,7 @@ impl SystemBuilder {
         self.copy_kernel_artifacts()?;
         self.copy_drivers()?;
         self.copy_extra_files()?;
+        self.copy_system_sounds()?;
         self.write_registry_hives()?;
         log::success(&format!(
             "System partition built: {}",

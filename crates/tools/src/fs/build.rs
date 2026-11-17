@@ -3008,8 +3008,8 @@ fn refresh_pe_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
 
 /// Generate Win7 desktop PE resource files into the build output.
 ///
-/// The generator lives in `crates/desktop`; the only artifacts emitted
-/// here are directly under `<System32>` with their Windows names.
+/// The generator lives in `crates/desktop`. Resource libraries must be present
+/// in each guest ABI's library directory as well as native System32.
 fn generate_desktop_resources(system32_dir: &Path) -> Result<()> {
     use std::process::Command;
 
@@ -3027,37 +3027,43 @@ fn generate_desktop_resources(system32_dir: &Path) -> Result<()> {
     }
 
     let arch = arch_name(current_pe_arch());
-    let destination = system32_dir.to_path_buf();
-    let status = Command::new("cargo")
-        .arg("run")
-        .arg("--release")
-        .arg("--features=resource-gen")
-        .arg("-p")
-        .arg("nt61-desktop")
-        .arg("--bin")
-        .arg("resource-gen")
-        .arg("--")
-        .arg("--output")
-        .arg(&destination)
-        .arg("--arch")
-        .arg(arch)
-        .status()
-        .map_err(BuildError::Io)?;
-    if !status.success() {
-        return Err(BuildError::ImageCreateFailed(format!(
-            "desktop resource generation failed with exit code: {status:?}"
-        )));
+    let windows_dir = system32_dir.parent().ok_or_else(|| BuildError::InvalidParam("System32 has no parent".into()))?;
+    let mut views = vec![(system32_dir.to_path_buf(), arch), (windows_dir.join("SysWOW64"), "i686")];
+    if arch != "x86_64" {
+        views.push((windows_dir.join("SysX64"), "x86_64"));
     }
-    for name in ["imageres.dll", "shell32.dll"] {
-        let path = destination.join(name);
-        if !path.is_file() {
-            return Err(BuildError::MissingFile(path.display().to_string()));
+    for (destination, resource_arch) in views {
+        let status = Command::new("cargo")
+            .arg("run")
+            .arg("--release")
+            .arg("--features=resource-gen")
+            .arg("-p")
+            .arg("nt61-desktop")
+            .arg("--bin")
+            .arg("resource-gen")
+            .arg("--")
+            .arg("--output")
+            .arg(&destination)
+            .arg("--arch")
+            .arg(resource_arch)
+            .status()
+            .map_err(BuildError::Io)?;
+        if !status.success() {
+            return Err(BuildError::ImageCreateFailed(format!(
+                "desktop resource generation failed with exit code: {status:?}"
+            )));
         }
+        for name in ["imageres.dll", "shell32.dll"] {
+            let path = destination.join(name);
+            if !path.is_file() {
+                return Err(BuildError::MissingFile(path.display().to_string()));
+            }
+        }
+        log::info(&format!(
+            "Generated Windows 7 resources in {}",
+            destination.display()
+        ));
     }
-    log::info(&format!(
-        "Generated Windows 7 resources in {}",
-        destination.display()
-    ));
     Ok(())
 }
 

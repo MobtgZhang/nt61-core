@@ -601,7 +601,7 @@ fn build_dll_image_native(spec: &DllSpec, machine: u16, return_code: &[u8]) -> V
 
 /// DLLs backed by the isolated x86/x64 runtime gateway. Keeping this set
 /// explicit avoids confusing native architecture placeholders with guest code.
-pub const RUNTIME_DLLS: &[&str] = &["kernel32.dll", "ntdll.dll", "crypt32.dll", "advapi32.dll", "comdlg32.dll", "comctl32.dll", "gdi32.dll", "user32.dll"];
+pub const RUNTIME_DLLS: &[&str] = &["kernel32.dll", "ntdll.dll", "crypt32.dll", "advapi32.dll", "comdlg32.dll", "comctl32.dll", "gdi32.dll", "user32.dll", "bcrypt.dll"];
 
 /// Exact API-set contracts imported by the supplied Firefox UCRT/VCRuntime
 /// packages (both bitnesses). This is a bounded compatibility map, not a prefix
@@ -912,7 +912,7 @@ pub fn build_runtime_dll(file_name: &str, x64: bool) -> Option<Vec<u8>> {
     };
     // Preserve native System32's address plan. crypt32 has its own slot after
     // comctl32, avoiding collisions with user32/gdi32.
-    let slot = [1u64, 0, 10, 11, 12, 9, 3, 2][index];
+    let slot = [1u64, 0, 10, 11, 12, 9, 3, 2, 13][index];
     let base = if x64 {
         0x0000_1000_0000_0000 + slot * 0x1000_0000
     } else {
