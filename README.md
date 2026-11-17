@@ -77,7 +77,7 @@ make download-firmware
 make check-firmware
 ```
 
-The default `make run` path configures the host QEMU bridge if needed and may invoke `sudo` for that setup. The snapshot-based desktop validation command below disables guest networking and does not require bridge setup.
+The x86-64 `make run` path uses QEMU user networking (host NAT), a VirtIO network adapter and Intel HDA audio. Set `QEMU_NET_MODE=bridge` to explicitly use the host bridge, or `QEMU_NET_MODE=none` to disable networking. The snapshot-based desktop validation command below disables guest networking and does not require bridge setup. For a headless audio backend use `QEMU_AUDIO_BACKEND=none`.
 
 ### Start a desktop
 

@@ -133,6 +133,24 @@ QEMU_GENERIC_DISPLAY ?= $(QEMU_DISPLAY)
 
 BRIDGE ?= br0
 QEMU_NET_BRIDGE := -netdev bridge,id=n0,br=$(BRIDGE) -device virtio-net-pci,netdev=n0
+# Normal x86 desktop boots use unprivileged user-mode NAT. Bridge setup is
+# explicit because it changes host networking and needs a working LAN bridge.
+QEMU_NET_MODE ?= user
+QEMU_NIC ?= virtio-net-pci
+ifeq ($(QEMU_NET_MODE),user)
+QEMU_NET_X86 := -netdev user,id=n0 -device $(QEMU_NIC),netdev=n0
+else ifeq ($(QEMU_NET_MODE),bridge)
+QEMU_NET_X86 := -netdev bridge,id=n0,br=$(BRIDGE) -device $(QEMU_NIC),netdev=n0
+else ifeq ($(QEMU_NET_MODE),none)
+QEMU_NET_X86 := -net none
+else
+$(error Invalid QEMU_NET_MODE '$(QEMU_NET_MODE)'. Use user, bridge, or none)
+endif
+# SDL chooses the host's audio output. CI can use none or wav with
+# QEMU_AUDIO_OPTIONS=,path=/absolute/path/output.wav.
+QEMU_AUDIO_BACKEND ?= sdl
+QEMU_AUDIO_OPTIONS ?=
+QEMU_AUDIO_X86 = -audiodev $(QEMU_AUDIO_BACKEND),id=audio0$(QEMU_AUDIO_OPTIONS) -device intel-hda -device hda-duplex,audiodev=audio0
 
 # Per-arch CPU model. Each QEMU virt machine has its own preferred CPU.
 # x86_64 / aarch64 defaults are inherited from QEMU; riscv64 / loongarch64
@@ -500,7 +518,7 @@ endef
 # Disk formats: uses -drive and -boot c (hard disk boot order)
 
 define _run_x86_64
-	@$(SCRIPT_DIR)/scripts/ensure-qemu-bridge.sh
+	@$(if $(filter bridge,$(QEMU_NET_MODE)),$(SCRIPT_DIR)/scripts/ensure-qemu-bridge.sh,true)
 	@rm -f /tmp/nt61-qmp-$(ARCH).sock
 	@echo "Starting QEMU (x86_64/$(FORMAT))..."
 	@echo "QEMU_GPU_MODE=$(QEMU_GPU_MODE)"
@@ -508,7 +526,7 @@ define _run_x86_64
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		$(DISK_FLAGS) \
-		-boot $(if $(filter iso,$(FORMAT)),d,c) $(QEMU_NET_BRIDGE) \
+		-boot $(if $(filter iso,$(FORMAT)),d,c) $(QEMU_NET_X86) $(QEMU_AUDIO_X86) \
 		-device virtio-keyboard-pci \
 		-device virtio-mouse-pci \
 		-device virtio-tablet-pci \
@@ -885,12 +903,13 @@ run-x86_64-ntfs-serial: SERIAL_LOG=$(IMAGES_DIR)/serial_x86_64_ntfs.log
 run-x86_64-ntfs-serial: build-x86_64-ntfs
 	@mkdir -p $(IMAGES_DIR)
 	$(call _setup_firmware_x86_64)
+	@$(if $(filter bridge,$(QEMU_NET_MODE)),$(SCRIPT_DIR)/scripts/ensure-qemu-bridge.sh,true)
 	@echo "Launching QEMU (x86_64/ntfs) with GTK + serial log..."
 	@timeout $(TIMEOUT)s $(QEMU_X86) -machine q35 -m 8G -smp 4 -d int,cpu_reset -D /tmp/qemu_int_x64.log \
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		-drive format=raw,file=$(DISK_IMG) \
-		-boot c -net none \
+		-boot c $(QEMU_NET_X86) $(QEMU_AUDIO_X86) \
 		-device virtio-keyboard-pci \
 		-device virtio-mouse-pci \
 		-device virtio-tablet-pci \
@@ -904,12 +923,13 @@ run-x86_64-fat32-serial: SERIAL_LOG=$(IMAGES_DIR)/serial_x86_64_fat32.log
 run-x86_64-fat32-serial: build-x86_64-fat32
 	@mkdir -p $(IMAGES_DIR)
 	$(call _setup_firmware_x86_64)
+	@$(if $(filter bridge,$(QEMU_NET_MODE)),$(SCRIPT_DIR)/scripts/ensure-qemu-bridge.sh,true)
 	@echo "Launching QEMU (x86_64/fat32) with GTK + serial log..."
 	@timeout $(TIMEOUT)s $(QEMU_X86) -machine q35 -m 8G -smp 4 \
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		-drive format=raw,file=$(DISK_IMG) \
-		-boot c -net none \
+		-boot c $(QEMU_NET_X86) $(QEMU_AUDIO_X86) \
 		-device virtio-keyboard-pci \
 		-device virtio-mouse-pci \
 		-device virtio-tablet-pci \
@@ -923,12 +943,13 @@ run-x86_64-ext4-serial: SERIAL_LOG=$(IMAGES_DIR)/serial_x86_64_ext4.log
 run-x86_64-ext4-serial: build-x86_64-ext4
 	@mkdir -p $(IMAGES_DIR)
 	$(call _setup_firmware_x86_64)
+	@$(if $(filter bridge,$(QEMU_NET_MODE)),$(SCRIPT_DIR)/scripts/ensure-qemu-bridge.sh,true)
 	@echo "Launching QEMU (x86_64/ext4) with GTK + serial log..."
 	@timeout $(TIMEOUT)s $(QEMU_X86) -machine q35 -m 8G -smp 4 \
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		-drive format=raw,file=$(DISK_IMG) \
-		-boot c -net none \
+		-boot c $(QEMU_NET_X86) $(QEMU_AUDIO_X86) \
 		-device virtio-keyboard-pci \
 		-device virtio-mouse-pci \
 		-device virtio-tablet-pci \
@@ -1144,12 +1165,13 @@ run-x86_64-gtk: SERIAL_LOG=$(IMAGES_DIR)/serial_x86_64_ntfs_gtk.log
 run-x86_64-gtk: build-x86_64-ntfs
 	@mkdir -p $(IMAGES_DIR)
 	$(call _setup_firmware_x86_64)
+	@$(if $(filter bridge,$(QEMU_NET_MODE)),$(SCRIPT_DIR)/scripts/ensure-qemu-bridge.sh,true)
 	@echo "Launching QEMU (x86_64/ntfs) GUI-only..."
 	@timeout $(TIMEOUT)s $(QEMU_X86) -machine q35 -m 8G -smp 4 \
 		-drive if=pflash,format=raw,unit=0,readonly=on,file=$(QEMU_FW_CODE) \
 		-drive if=pflash,format=raw,unit=1,file=$(EDK2_OVMF_VARS) \
 		-drive format=raw,file=$(DISK_IMG) \
-		-boot c -net none -vga none $(QEMU_GPU_DEVICE) \
+		-boot c $(QEMU_NET_X86) $(QEMU_AUDIO_X86) -vga none $(QEMU_GPU_DEVICE) \
 		-device virtio-keyboard-pci -device virtio-mouse-pci -device virtio-tablet-pci \
 		-serial null $(QEMU_GENERIC_DISPLAY) || true
 
@@ -1363,8 +1385,8 @@ clean-all:
 #     (each with the corresponding arch feature enabled)
 #   * UEFI bootloader: nt61-boot for x86_64-unknown-uefi
 #   * UEFI OS loader: nt61-winload for x86_64-unknown-uefi
-#   * build-tool (host): one full cargo check + cargo test
-#   * cmd-stub-gen (host): one full cargo check
+#   * host workspace: all-targets check and tests, including desktop resource
+#     generators/previews, optional build tools, and kernel integration fixtures
 #   * image matrix: a `--build all` smoke run for fat32 / ntfs / ext4
 #     (the same matrix the QEMU harness exercises).
 #
@@ -1372,17 +1394,16 @@ clean-all:
 #   * nt61-boot and nt61-winload are documented x86_64-only (see
 #     Cargo.toml in src/boot and src/winload); the build-tool matrix
 #     still runs the other arches at the kernel-library level.
-#   * The host workspace check is intentionally limited to the host
-#     targets (nt61-tools, cmd-stub-gen) because the kernel crate uses
-#     `uefi`'s no_std panic handler and conflicts with `std` on the
-#     host triple.
+#   * Native desktop entry points retain their own panic handler/allocator in
+#     production; host test targets use libtest's runtime instead.
 verify-strict:
-	@echo "=== host: nt61-tools (build-tool) ==="
-	RUSTFLAGS="-D warnings" cargo check -p nt61-tools --all-targets
-	RUSTFLAGS="-D warnings" cargo test -p nt61-tools --no-run
-	cargo test -p nt61-tools
-	@echo "=== host: cmd-stub-gen ==="
-	RUSTFLAGS="-D warnings" cargo check -p cmd-stub-gen --all-targets
+	@echo "=== host: workspace and optional tools ==="
+	RUSTFLAGS="-D warnings" cargo check --workspace --all-targets \
+		--features nt61-desktop/resource-gen,nt61-tools/with-nt61,nt61-tools/testing
+	RUSTFLAGS="-D warnings" cargo test --workspace --no-run \
+		--features nt61-desktop/resource-gen,nt61-tools/with-nt61,nt61-tools/testing
+	cargo test --workspace \
+		--features nt61-desktop/resource-gen,nt61-tools/with-nt61,nt61-tools/testing
 	@echo "=== x86_64 kernel ==="
 	RUSTFLAGS="-D warnings" cargo check -p nt61-init --target x86_64-unknown-none \
 		--features "x86_64,binary_panic,alloc"
