@@ -14,6 +14,8 @@
 extern crate alloc;
 
 pub mod ac97;
+pub mod hda_pcm;
+pub mod system_sounds;
 pub mod capture;
 pub mod intel_hda;
 pub mod mixer;
@@ -27,7 +29,7 @@ pub mod smoke;
 pub fn init() {
     // kprintln!("    Audio drivers: Intel HDA, AC'97, PortCls");
     crate::hal::serial::write_string_always("[AUDIO] hda enter\r\n");
-    intel_hda::init();
+    if !hda_pcm::init(){intel_hda::init();}
     crate::hal::serial::write_string_always("[AUDIO] hda done\r\n");
     crate::hal::serial::write_string_always("[AUDIO] ac97 enter\r\n");
     ac97::init();
@@ -72,8 +74,8 @@ pub fn init_full_audio_paths() {
     if crate::drivers::audio::ac97::count() > 0 {
         playback::attach_ac97();
         capture::attach_ac97();
-    } else if crate::drivers::audio::intel_hda::count() > 0 {
+    } else if hda_pcm::ready() {
         playback::attach_hda();
-        capture::attach_hda();
+        // The PCM backend currently implements output streams only.
     }
 }

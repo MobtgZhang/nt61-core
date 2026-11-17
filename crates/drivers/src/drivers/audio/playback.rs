@@ -190,7 +190,7 @@ impl PlaybackEngine {
             PlaybackBackend::Ac97 => {
                 crate::drivers::audio::ac97::write_pcm_samples(&converted_samples, self.hw_channels)
             }
-            PlaybackBackend::Hda => converted_samples.len(),
+            PlaybackBackend::Hda => crate::drivers::audio::hda_pcm::submit(&converted_samples),
             PlaybackBackend::None => 0,
         };
 
@@ -336,6 +336,7 @@ pub fn set_master_volume(percent: u8) {
     if let Some(e) = engine.as_ref() {
         e.mixer().with(|m| m.set_master_volume(percent));
     }
+    crate::drivers::audio::hda_pcm::volume(percent);
     crate::drivers::audio::ac97::set_master_volume(percent);
 }
 
@@ -345,6 +346,7 @@ pub fn set_master_mute(muted: bool) {
     if let Some(e) = engine.as_ref() {
         e.mixer().with(|m| m.set_master_mute(muted));
     }
+    crate::drivers::audio::hda_pcm::mute(muted);
     crate::drivers::audio::ac97::set_mute(muted);
 }
 
