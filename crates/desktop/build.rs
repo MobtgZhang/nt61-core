@@ -39,6 +39,9 @@ fn main() {
         ("START_MENU_HEIGHT", "start_menu.height"),
         ("START_LEFT_WIDTH", "start_menu.left_pane_width"),
         ("SEARCH_HEIGHT", "start_menu.search_height"),
+        ("POWER_BUTTON_WIDTH", "start_menu.power_button_width"),
+        ("POWER_ARROW_WIDTH", "start_menu.power_arrow_width"),
+        ("POWER_BUTTON_HEIGHT", "start_menu.power_button_height"),
     ] {
         let value = values
             .get(key)

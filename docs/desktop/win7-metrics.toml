@@ -149,6 +149,9 @@ window_inactive_body = [0xF5, 0xF5, 0xF5]
 # Start menu (Win7 two-column layout)
 # ---------------------------------------------------------------------
 [start_menu]
+power_button_width = 82
+power_arrow_width = 18
+power_button_height = 24
 width = 440
 height = 640
 left_pane_width = 260
