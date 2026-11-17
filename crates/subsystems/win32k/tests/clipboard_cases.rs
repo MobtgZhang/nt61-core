@@ -3,7 +3,7 @@ use services::{nt_user_get_priority_clipboard_format as priority, nt_user_get_up
 
 #[test]
 fn native_format_queries_use_storage_and_validate_caller_buffers() {
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock();
     if is_open() {
         close_clipboard();
     }
@@ -49,7 +49,7 @@ fn native_format_queries_use_storage_and_validate_caller_buffers() {
 #[test]
 fn ownership_survives_readonly_opens_and_only_modified_close_notifies_live_listeners() {
     use crate::{window::{WindowStyle, WINDOW_MANAGER}, libs::win32k::message::POSTED};
-    let _guard = TEST_LOCK.lock().unwrap();
+    let _guard = TEST_LOCK.lock();
     if is_open() { close_clipboard(); }
     let owner = WINDOW_MANAGER.lock().create_window(&[], &[], WindowStyle::VISIBLE, 0, 0, 0, 100, 100, None, 0, 0).unwrap();
     let listener = WINDOW_MANAGER.lock().create_window(&[], &[], 0, 0, 0, 0, 50, 50, None, 0, 0).unwrap();

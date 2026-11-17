@@ -26,6 +26,7 @@ pub mod bitmap;
 
 #[path = "bitmap_cases.rs"]
 mod bitmap_cases;
+mod bitmap_binding_cases;
 
 #[path = "path_cases.rs"]
 mod path_cases;
@@ -44,6 +45,7 @@ mod system_color_cases;
 
 #[path = "mapping_cases.rs"]
 mod mapping_cases;
+mod mirror_cases;
 mod metafile_rect_cases;
 #[path = "../src/win32k/server_metafile.rs"]
 pub mod server_metafile;
@@ -535,17 +537,33 @@ fn concurrent_region_mutation_and_deletion_do_not_use_freed_allocations() {
 
 struct DrawingFixture {
     handle: u64,
+    bitmap: u64,
     surface: Box<surface::GdiSurface>,
 }
 
 impl DrawingFixture {
     fn new() -> Self {
-        let mut surface =
-            Box::new(surface::GdiSurface::new(16, 16, surface::PIXEL_FORMAT_32BPP).unwrap());
+        Self::with_format(surface::PIXEL_FORMAT_32BPP)
+    }
+    fn with_format(format: u32) -> Self {
+        let bitmap = objects::gdi_create_bitmap(16, 16, 32);
+        assert_ne!(bitmap, 0);
+        let bits = objects::with_handle_table(|table| {
+            let bitmap = unsafe { &mut *(table.get(bitmap).unwrap().obj_ptr as *mut objects::GdiBitmap) };
+            bitmap.drawing_surface.format = format;
+            bitmap.bits
+        });
+        // Borrow the real selected bitmap's pixels for assertions. The bitmap
+        // owns them; this view must not free that allocation on drop.
+        let mut surface = Box::new(surface::GdiSurface {
+            width: 16, height: 16, format, pitch: 64, bits,
+            flags: 0, owner_pid: 0, ref_count: 0,
+        });
         surface.clear(0x00123456);
-        let handle = dc::get_dc_table().create(2, &mut *surface as *mut _ as u64);
+        let handle = dc::gre_create_compatible_dc(0);
         assert_ne!(handle, 0);
-        Self { handle, surface }
+        dc::gre_select_object(handle, bitmap);
+        Self { handle, bitmap, surface }
     }
     fn pixel(&self, x: i32, y: i32) -> u32 {
         self.surface.get_pixel(x, y).unwrap()
@@ -554,6 +572,7 @@ impl DrawingFixture {
 impl Drop for DrawingFixture {
     fn drop(&mut self) {
         assert!(dc::gre_delete_dc(self.handle));
+        assert!(objects::gdi_delete_object(self.bitmap));
     }
 }
 

@@ -232,14 +232,15 @@ pub extern "C" fn nt_gdi_bit_blt(frame: &SyscallFrame) -> u64 {
         let Some(source) = table.get(hdc_src) else {
             return 0;
         };
-        if source.is_information_dc() {
+        let binding = source.drawing_surface();
+        if binding.is_null() {
             // A detached DC has no readable pixels. Passing no source lets
             // raster::bit_blt preserve its zero-size and source-free ROP
             // semantics without turning surface == 0 into the framebuffer.
             None
         } else {
             let mut snapshot = super::dc::DcObject::new();
-            snapshot.surface = source.surface;
+            snapshot.surface = binding as u64;
             snapshot.world_transform = source.world_transform;
             snapshot.viewport_ext = source.viewport_ext;
             snapshot.window_ext = source.window_ext;

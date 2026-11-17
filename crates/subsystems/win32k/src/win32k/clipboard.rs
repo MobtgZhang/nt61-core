@@ -98,7 +98,7 @@ impl Default for ClipboardState {
 static CLIPBOARD: ClipboardState = ClipboardState::new();
 
 #[cfg(test)]
-pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static TEST_LOCK: Spinlock<()> = Spinlock::new(());
 
 /// Open the clipboard for a window
 pub fn open_clipboard(owner: u64) -> bool {
@@ -259,7 +259,7 @@ mod tests {
     /// test threads would interfere with each other.
     #[test]
     fn clipboard_multi_format_lifecycle() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = TEST_LOCK.lock();
         if is_open() {
             close_clipboard();
         }

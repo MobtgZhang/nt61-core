@@ -77,8 +77,7 @@ fn per_pixel_alpha_uses_premultiplied_channels_and_combines_constant_alpha() {
 #[test]
 fn argb_destination_receives_source_over_alpha() {
     let mut source = DrawingFixture::new();
-    let mut destination = DrawingFixture::new();
-    destination.surface.format = surface::PIXEL_FORMAT_32BPP_ARGB;
+    let mut destination = DrawingFixture::with_format(surface::PIXEL_FORMAT_32BPP_ARGB);
     assert!(destination.surface.set_pixel(0, 0, 0x4012_3456));
     assert!(source.surface.set_pixel(0, 0, 0x8032_6419));
     assert_eq!(

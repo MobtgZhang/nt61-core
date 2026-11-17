@@ -30,11 +30,12 @@ pub extern "C" fn nt_gdi_transparent_blt(frame: &SyscallFrame) -> u64 {
     let Some(source_dc) = table.get(frame.args[5]) else {
         return 0;
     };
-    if source_dc.is_information_dc() {
+    let binding = source_dc.drawing_surface();
+    if binding.is_null() {
         return 0;
     }
     let mut source = DcObject::new();
-    source.surface = source_dc.surface;
+    source.surface = binding as u64;
     source.world_transform = source_dc.world_transform;
     source.viewport_ext = source_dc.viewport_ext;
     source.window_ext = source_dc.window_ext;

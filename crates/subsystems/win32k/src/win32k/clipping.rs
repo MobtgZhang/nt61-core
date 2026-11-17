@@ -15,16 +15,12 @@ pub fn visible_region(dc: &DcObject) -> Result<Region, RegionError> {
     if dc.is_information_dc() {
         return Region::rectangle(dc.bounds);
     }
-    let surface = if dc.surface != 0 {
-        dc.surface as *const super::surface::GdiSurface
-    } else {
-        super::surface::get_primary_surface()
-    };
+    let surface = dc.drawing_surface();
     if surface.is_null() {
         return Ok(Region::default());
     }
-    // The DC guard owns access to the binding. Surface lifetime is still
-    // managed by the display subsystem, which retains the primary allocation.
+    // The DC guard owns access to the binding. Display surfaces are borrowed;
+    // a selected bitmap's ObjectReference pins its view and pixel allocation.
     let surface = unsafe { &*surface };
     Region::rectangle(Rect::new(0, 0, surface.width, surface.height))
 }

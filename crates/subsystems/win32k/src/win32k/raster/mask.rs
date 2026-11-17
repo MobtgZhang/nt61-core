@@ -130,10 +130,11 @@ pub extern "C" fn nt_gdi_mask_blt(frame: &SyscallFrame) -> u64 {
         let Some(dc) = table.get(frame.args[5]) else {
             return 0;
         };
-        if dc.is_information_dc() {
+        let binding = dc.drawing_surface();
+        if binding.is_null() {
             return 0;
         }
-        source.surface = dc.surface;
+        source.surface = binding as u64;
         source.world_transform = dc.world_transform;
         source.viewport_ext = dc.viewport_ext;
         source.window_ext = dc.window_ext;

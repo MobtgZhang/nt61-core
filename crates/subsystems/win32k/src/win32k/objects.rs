@@ -576,6 +576,9 @@ pub struct GdiBitmap {
     pub bits: *mut u8,
     /// Application metadata, independent of the allocated pixel dimensions.
     pub logical_dimensions: super::dc::SizeL,
+    // Stable borrowed raster view. Only GdiBitmap owns/frees the pixel buffer;
+    // a DC's ObjectReference pins this view and those pixels until deselection.
+    pub(super) drawing_surface: super::surface::GdiSurface,
 }
 
 impl GdiBitmap {
@@ -614,6 +617,16 @@ impl GdiBitmap {
             format: 0,
             bits,
             logical_dimensions: super::dc::SizeL::default(),
+            drawing_surface: super::surface::GdiSurface {
+                width,
+                height: rows as i32,
+                format: u32::from(bit_count),
+                pitch: width_bytes,
+                bits,
+                flags: 0,
+                owner_pid: 0,
+                ref_count: 0,
+            },
         })
     }
 }

@@ -505,12 +505,14 @@ impl DcObject {
     }
 
     fn reset_bitmap_bounds(&mut self) {
-        let size = bitmap_size(self.bitmap).unwrap_or(SizeL::new(1, 1));
+        let (size, surface) = bitmap_binding(self.bitmap).unwrap_or((SizeL::new(1, 1), 0));
+        self.surface = surface;
         self.bounds = super::objects::Rect::new(0, 0, size.cx, size.cy);
     }
 }
 
-fn bitmap_size(handle: u64) -> Option<SizeL> {
+// Callers retain a selected ObjectReference while using the returned binding.
+fn bitmap_binding(handle: u64) -> Option<(SizeL, u64)> {
     super::objects::with_handle_table(|table| {
         let entry = table.get(handle)?;
         if entry.get_type()? != super::objects::GdiObjectType::Bitmap || entry.obj_ptr == 0 {
@@ -518,7 +520,10 @@ fn bitmap_size(handle: u64) -> Option<SizeL> {
         }
         // SAFETY: the table guard retains this validated bitmap allocation.
         let bitmap = unsafe { &*(entry.obj_ptr as *const super::objects::GdiBitmap) };
-        Some(SizeL::new(bitmap.width, bitmap.height.wrapping_abs()))
+        Some((
+            SizeL::new(bitmap.width, bitmap.height.checked_abs()?),
+            core::ptr::addr_of!(bitmap.drawing_surface) as u64,
+        ))
     })
 }
 
@@ -736,24 +741,15 @@ pub fn gre_create_display_dc() -> u64 {
 
 /// create a memory DC
 pub fn gre_create_compatible_dc(source_dc: u64) -> u64 {
-    let source_surface = if source_dc != 0 {
+    if source_dc != 0 {
         let mut table = get_dc_table();
-        let _ = &table;
-        if let Some(dc) = table.get(source_dc) {
-            dc.surface
-        } else {
-            0
+        if table.get(source_dc).is_none() {
+            return 0;
         }
-    } else {
-        crate::libs::win32k::surface::get_primary_surface() as u64
-    };
-    let _ = &source_surface;
-
-    let mut table = get_dc_table();
-
-    let _ = &table;
-    let _ = &table;
-    table.create(DC_TYPE_MEMORY, source_surface)
+    }
+    // Compatibility selects device characteristics, never the device's pixels.
+    // The default monochrome bitmap is not yet realized by this backend.
+    get_dc_table().create(DC_TYPE_MEMORY, 0)
 }
 
 /// Delete a DC
@@ -977,7 +973,8 @@ pub fn select_typed_object(
         GdiObjectType::Font => (2, core::mem::replace(&mut dc.font, object_handle)),
         GdiObjectType::Palette => (3, core::mem::replace(&mut dc.palette_handle, object_handle)),
         GdiObjectType::Bitmap => {
-            let Some(size) = bitmap_size(object_handle) else { return 0 };
+            let Some((size, surface)) = bitmap_binding(object_handle) else { return 0 };
+            dc.surface = surface;
             dc.bounds = super::objects::Rect::new(0, 0, size.cx, size.cy);
             (5, core::mem::replace(&mut dc.bitmap, object_handle))
         }

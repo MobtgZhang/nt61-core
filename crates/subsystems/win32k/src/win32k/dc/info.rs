@@ -29,6 +29,8 @@ impl DcObject {
             core::ptr::null_mut()
         } else if self.surface != 0 {
             self.surface as *mut GdiSurface
+        } else if self.dc_type == super::DC_TYPE_MEMORY {
+            core::ptr::null_mut()
         } else {
             super::super::surface::get_primary_surface()
         }

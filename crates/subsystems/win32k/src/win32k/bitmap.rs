@@ -11,6 +11,10 @@ pub mod storage;
 pub mod dib;
 
 fn with_bitmap<R>(handle: u64, operation: impl FnOnce(&mut GdiBitmap) -> R) -> Option<R> {
+    // Selected bitmap pixels are also reachable through DC rendering. Use
+    // the renderer's serialization domain before the object table, matching
+    // selection's lock order and excluding raw pixel reads/writes there.
+    let _dc_table = super::dc::get_dc_table();
     objects::with_handle_table(|table| {
         let entry = table.get(handle)?;
         let process = super::window::input_context::caller_identity().0 as u32;
