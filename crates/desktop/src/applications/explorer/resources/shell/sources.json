@@ -274,6 +274,104 @@
       ],
       "source": "shellbrd.dll RT_BITMAP/1000",
       "sha256": "6b1730af0956e63c85de657f8782e898d1c858191df373243df5944a4d088399"
+    },
+    {
+      "name": "printer-16",
+      "size": [
+        16,
+        16
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/51",
+      "sha256": "4fa81d667ab02c5732784220d35e41b6a982996eafbeec4cb27cdee021d091dd"
+    },
+    {
+      "name": "printer-32",
+      "size": [
+        32,
+        32
+      ],
+      "source": "imageres.dll RT_GROUP_ICON/51",
+      "sha256": "8fd8e90fd167c27e0126f7edbd1051ccff71ff5b8fe0c74058b1b1b9004399e3"
+    },
+    {
+      "name": "control-category-0",
+      "size": [
+        48,
+        48
+      ],
+      "source": "references/windows-ui-assets/Icons/Windows 7/ico/imageres.dll/ICON78_1.ico",
+      "input_sha256": "ec157fc54638de8168db4f3932b21beb63787261e09853badfd34f9ade87317d",
+      "sha256": "7bbb2eb0cc7c45625a44cf4ef0b9a9b74162620df99f740f5fefdbd80d830320"
+    },
+    {
+      "name": "control-category-1",
+      "size": [
+        48,
+        48
+      ],
+      "source": "references/windows-ui-assets/Icons/Windows 7/ico/imageres.dll/ICON25_1.ico",
+      "input_sha256": "838a6354c06148d1e320695801da88e4d0b2d799e8f54cb5c2acf01c13f6b026",
+      "sha256": "61f096043ec65a9f0ce7ec7547e306bd281860d768bfb2ecd49082c9ff42035e"
+    },
+    {
+      "name": "control-category-2",
+      "size": [
+        48,
+        48
+      ],
+      "source": "references/windows-ui-assets/Icons/Windows 7/ico/imageres.dll/ICON26_1.ico",
+      "input_sha256": "0ce52e6b2885cc6481a0504d591a7c72581433f0effeee6594d2174ed5996a7b",
+      "sha256": "8aad782fdbadc83ac38787d7ede00d487cdf9cdaab3ed0f2a99a0238e2fa22a1"
+    },
+    {
+      "name": "control-category-3",
+      "size": [
+        48,
+        48
+      ],
+      "source": "references/windows-ui-assets/Icons/Windows 7/ico/imageres.dll/ICON87_1.ico",
+      "input_sha256": "3b9a561f274787ced14b8d3e415cf34fc9c5afaa69a4dcb06ce8b46ecc900dc7",
+      "sha256": "a4459a0292bbce580ba6b2f8c64f4e84a2c8498974085cdf2cfbbf93ae802b80"
+    },
+    {
+      "name": "control-category-4",
+      "size": [
+        48,
+        48
+      ],
+      "source": "references/windows-ui-assets/Icons/Windows 7/ico/imageres.dll/ICON88_1.ico",
+      "input_sha256": "9c4ee6b80b3e8a25a20e6bde9c48fbff31952a34a2a77044492141f88caac02f",
+      "sha256": "9426882caa286d6e5816a406bd4a82192d40ca51e12c1e1dafac2b3e98fda13f"
+    },
+    {
+      "name": "control-category-5",
+      "size": [
+        48,
+        48
+      ],
+      "source": "references/windows-ui-assets/Icons/Windows 7/ico/imageres.dll/ICON197_1.ico",
+      "input_sha256": "916eb9565ec0353887977307a196a99f0e55a0b4fc9baaceb04e75c7f47689e6",
+      "sha256": "d11ebcd80ab2e3469a1ec0c5ee6c37c19167b8684ed1a505eefe389bd77d08bf"
+    },
+    {
+      "name": "control-category-6",
+      "size": [
+        48,
+        48
+      ],
+      "source": "references/windows-ui-assets/Icons/Windows 7/ico/imageres.dll/ICON144_1.ico",
+      "input_sha256": "874c003c49d51511776c5ef48d1ef805b841a610421bdfb5efb601928bceb89f",
+      "sha256": "a46dcfb85eb19e3b9f0323f48fc026d745c54e61a4bfc3a0953e1a7b63ff8281"
+    },
+    {
+      "name": "control-category-7",
+      "size": [
+        48,
+        48
+      ],
+      "source": "references/windows-ui-assets/Icons/Windows 7/ico/imageres.dll/ICON86_1.ico",
+      "input_sha256": "4987b1611f01991ba6c1498732fb69b87234bd0a8137adea7d761626dcecb319",
+      "sha256": "11c265775d6b0ac02b3f6727754c42a5c748040361a820090a4e7c72f30df9ff"
     }
   ]
 }

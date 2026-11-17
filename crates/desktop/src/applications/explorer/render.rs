@@ -1,6 +1,6 @@
 //! Windows 7 shell layout, painted with the project's own software controls.
 use super::{
-    file_size, file_type, layout::Layout, theme, Edit, Explorer, Hit, Sort, View, COMPUTER,
+    file_size, file_type, layout::Layout, theme, Edit, Explorer, Hit, Sort, View, COMPUTER, NETWORK, namespace_name,
 };
 use crate::{
     compositor::aero,
@@ -165,9 +165,9 @@ fn draw_with_backdrop<F: Fn(&mut Surface, &str, Rect, u32)>(
             ),
             INK,
         );
-    } else if state.directory == COMPUTER {
+    } else if let Some(name) = namespace_name(state.directory) {
         p.label(
-            "Computer",
+            name,
             Rect::new(
                 l.address.x + 26,
                 l.address.y + 5,
@@ -327,6 +327,11 @@ fn draw_with_backdrop<F: Fn(&mut Surface, &str, Rect, u32)>(
             0xFFD6E5F4,
         );
     }
+    if state.directory == NETWORK {
+        p.fill(Rect::new(l.header.x, l.header.y, l.header.width, 34), 0xFFFFF4CE);
+        p.label("Network discovery is turned off.", Rect::new(l.header.x+8,l.header.y+8,l.header.width.saturating_sub(16),20), INK);
+        p.label("Devices appear here when network discovery is available.", Rect::new(l.list.x+12,l.list.y+48,l.list.width.saturating_sub(24),20), MUTED);
+    }
     let rows = state.rows(files);
     if state.directory == COMPUTER {
         p.label(
@@ -387,9 +392,13 @@ fn draw_with_backdrop<F: Fn(&mut Surface, &str, Rect, u32)>(
             let low_space = u128::from(space.free) * 10 < u128::from(space.total);
             p.gradient(
                 fill,
-                if low_space { 0xFFF79D9D } else { 0xFF8DD5FA },
-                if low_space { 0xFFBD1010 } else { 0xFF0878C9 },
+                if low_space { 0xFFF79D9D } else { 0xFF38B9FF },
+                if low_space { 0xFFBD1010 } else { 0xFF0071D9 },
             );
+            if !low_space {
+                p.gradient(Rect::new(fill.x, fill.y, fill.width, fill.height / 2), 0xFF85DCFF, 0xFF0099F1);
+                p.line(Rect::new(fill.x, fill.y, fill.width, 1), 0xFFB0EEFF);
+            }
             let capacity = format!(
                 "{} free of {}",
                 capacity_size(space.free),

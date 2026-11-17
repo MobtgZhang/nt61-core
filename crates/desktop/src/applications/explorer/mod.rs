@@ -13,6 +13,13 @@ pub mod theme;
 
 /// Virtual shell namespace; VFS node identifiers start at one.
 pub const COMPUTER: u32 = 0;
+pub const FAVORITES: u32 = u32::MAX;
+pub const LIBRARIES: u32 = u32::MAX - 1;
+pub const NETWORK: u32 = u32::MAX - 2;
+pub fn namespace_name(id: u32) -> Option<&'static str> {
+    match id { COMPUTER => Some("Computer"), FAVORITES => Some("Favorites"),
+        LIBRARIES => Some("Libraries"), NETWORK => Some("Network"), _ => None }
+}
 use layout::{Layout, ROW_HEIGHT};
 pub use render::{draw, draw_on_glass};
 
@@ -55,6 +62,7 @@ pub enum Hit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Explorer {
     pub window_id: u32,
+    pub profile: String,
     pub directory: u32,
     pub selected: Option<u32>,
     history: Vec<u32>,
@@ -103,6 +111,7 @@ impl Explorer {
     pub fn new(window_id: u32, directory: u32) -> Self {
         Self {
             window_id,
+            profile: "Administrator".into(),
             directory,
             selected: None,
             history: alloc::vec![directory],
@@ -148,8 +157,9 @@ impl Explorer {
         self.status.clear();
     }
     fn load(&mut self, files: &mut FileSystem, id: u32) -> bool {
-        if id == COMPUTER {
-            files.refresh_volume_space();
+        if namespace_name(id).is_some() {
+            if id == COMPUTER { files.refresh_volume_space(); }
+            self.prepare(files);
             return true;
         }
         if !files
@@ -172,6 +182,7 @@ impl Explorer {
             self.history.truncate(self.index + 1);
             self.history.push(id);
             self.index = self.history.len() - 1;
+            let _ = crate::platform::services::play_sound("navigate");
         }
         self.reset_folder(id);
         true
@@ -202,12 +213,20 @@ impl Explorer {
             if self.load(files, id) {
                 self.index = index;
                 self.reset_folder(id);
+                let _ = crate::platform::services::play_sound("navigate");
             }
         }
     }
     pub fn rows<'a>(&self, files: &'a FileSystem) -> Vec<&'a FileNode> {
         if self.directory == COMPUTER {
             return files.node(files.root_id()).into_iter().collect();
+        }
+        if self.directory == NETWORK { return Vec::new(); }
+        if matches!(self.directory, FAVORITES | LIBRARIES) {
+            let names: &[&str] = if self.directory == FAVORITES { &["Desktop", "Downloads", "Recent Places"] }
+                else { &["Documents", "Music", "Pictures", "Videos"] };
+            return self.navigation(files).into_iter().filter(|(name,_,_)| names.contains(name))
+                .filter_map(|(_,id,_)| files.node(id?)).collect();
         }
         let query = self.query.to_lowercase();
         let mut rows = if query.is_empty() {
@@ -250,15 +269,8 @@ impl Explorer {
     pub fn prepare(&mut self, files: &mut FileSystem) {
         files.load_shell_resources();
         let error = files.last_error;
-        for path in [
-            "C:\\Users\\Administrator\\Desktop",
-            "C:\\Users\\Administrator\\Downloads",
-            "C:\\Users\\Administrator\\Documents",
-            "C:\\Users\\Administrator\\Music",
-            "C:\\Users\\Administrator\\Pictures",
-            "C:\\Users\\Administrator\\Videos",
-        ] {
-            let _ = files.resolve(path);
+        for folder in ["Desktop", "Downloads", "Documents", "Music", "Pictures", "Videos", "Recent"] {
+            let _ = files.resolve(&format!("C:\\Users\\{}\\{folder}", self.profile));
         }
         files.last_error = error;
     }
@@ -456,26 +468,28 @@ impl Explorer {
             Some(id)
         };
         alloc::vec![
-            ("Favorites", None, 0),
-            ("Desktop", find("Users\\Administrator\\Desktop"), 1),
-            ("Downloads", find("Users\\Administrator\\Downloads"), 1),
-            ("Libraries", None, 0),
+            ("Favorites", Some(FAVORITES), 0),
+            ("Desktop", find(&format!("Users\\{}\\Desktop", self.profile)), 1),
+            ("Downloads", find(&format!("Users\\{}\\Downloads", self.profile)), 1),
+            ("Recent Places", find(&format!("Users\\{}\\Recent", self.profile)), 1),
+            ("Libraries", Some(LIBRARIES), 0),
             (
                 "Documents",
-                find("Users\\Administrator\\Documents").or_else(|| find("Documents")),
+                find(&format!("Users\\{}\\Documents", self.profile)).or_else(|| find("Documents")),
                 1
             ),
-            ("Music", find("Users\\Administrator\\Music"), 1),
-            ("Pictures", find("Users\\Administrator\\Pictures"), 1),
-            ("Videos", find("Users\\Administrator\\Videos"), 1),
+            ("Music", find(&format!("Users\\{}\\Music", self.profile)), 1),
+            ("Pictures", find(&format!("Users\\{}\\Pictures", self.profile)), 1),
+            ("Videos", find(&format!("Users\\{}\\Videos", self.profile)), 1),
             ("Computer", Some(COMPUTER), 0),
             ("Local Disk (C:)", Some(files.root_id()), 1),
-            ("Network", None, 0)
+            ("Network", Some(NETWORK), 0)
         ]
     }
     /// Poll one visible folder after input has been handled. Compare metadata
     /// only: cloning file bodies here makes multi-window input unresponsive.
     pub fn poll_directory(&mut self, files: &mut FileSystem) -> bool {
+        if matches!(self.directory, FAVORITES | LIBRARIES | NETWORK) { return false; }
         if self.directory == COMPUTER {
             let previous = files.volume_space;
             files.refresh_volume_space();
@@ -525,6 +539,7 @@ impl Explorer {
     }
 
     fn refresh(&mut self, files: &mut FileSystem) {
+        if matches!(self.directory,FAVORITES|LIBRARIES|NETWORK){self.prepare(files);return;}
         if self.directory == COMPUTER {
             files.refresh_volume_space();
             return;
@@ -559,12 +574,12 @@ impl Explorer {
     }
     fn begin_address(&mut self, files: &FileSystem) {
         self.edit = Some(Edit::Address);
-        self.address_edit = Some(files.path(self.directory).unwrap_or_default());
+        self.address_edit = Some(namespace_name(self.directory).map(String::from).unwrap_or_else(||files.path(self.directory).unwrap_or_default()));
     }
     fn command(&mut self, files: &mut FileSystem, command: usize) -> Action {
         files.last_error = None;
         // The Computer namespace is a view of volumes, never a writable folder.
-        if self.directory == COMPUTER && !matches!(command, 0 | 6) {
+        if namespace_name(self.directory).is_some() && !matches!(command, 0 | 6) {
             return Action::None;
         }
         match command {
@@ -704,6 +719,12 @@ impl Explorer {
                 match edit {
                     Edit::Address => {
                         let mut path = self.address_edit.take().unwrap_or_default();
+                        if let Some(id) = [COMPUTER, FAVORITES, LIBRARIES, NETWORK].into_iter()
+                            .find(|id|namespace_name(*id).is_some_and(|name|name.eq_ignore_ascii_case(path.trim()))) {
+                            self.navigate(files,id);
+                            self.edit=None;
+                            return true;
+                        }
                         if !path.contains(':') && !path.starts_with(['\\', '/']) {
                             path = format!(
                                 "{}\\{path}",
@@ -1199,6 +1220,14 @@ mod tests {
     }
     fn click_rect(state: &mut Explorer, files: &mut FileSystem, r: Rect) -> Action {
         state.click(files, body(), r.x + 5, r.y + 5)
+    }
+    #[test]
+    fn shell_namespace_headings_are_navigable() {
+        let files = FileSystem::new();
+        let state = Explorer::new(1, COMPUTER);
+        for title in ["Favorites", "Libraries", "Computer", "Network"] {
+            assert!(state.navigation(&files).iter().any(|(name,id,_)| *name == title && id.is_some()), "{title} has no destination");
+        }
     }
     #[test]
     fn repeated_selection_is_not_an_open_gesture() {

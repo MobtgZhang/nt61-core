@@ -58,6 +58,16 @@ pub fn printer(frame: &mut Surface, at: Rect) {
     draw(frame, asset!("printer-32"), (32, 32), at);
 }
 
+pub fn control_category(frame: &mut Surface, index: usize, at: Rect) {
+    let pixels=match index {
+        0=>asset!("control-category-0"),1=>asset!("control-category-1"),
+        2=>asset!("control-category-2"),3=>asset!("control-category-3"),
+        4=>asset!("control-category-4"),5=>asset!("control-category-5"),
+        6=>asset!("control-category-6"),_=>asset!("control-category-7"),
+    };
+    draw(frame,pixels,(48,48),at);
+}
+
 pub fn large_icon(frame: &mut Surface, name: &str, at: Rect) {
     let pixels = match name {
         "Computer" => asset!("computer-48"),
