@@ -114,6 +114,49 @@ pub struct ImageMemory {
     regions: Vec<Region>,
 }
 impl GuestMemory for ImageMemory {
+    fn locked_compare_exchange(&mut self, va: u64, width: u8, expected: u64, replacement: u64)
+        -> Result<u64, super::memory::AtomicMemoryError> {
+        use super::memory::AtomicMemoryError::Fault;
+        if !matches!(width, 1 | 2 | 4 | 8) { return Err(Fault); }
+        let len = width as usize;
+        let mut bytes = [0; 8];
+        if !self.probe_write(va, len) || self.read_virt(va, &mut bytes[..len]) != len { return Err(Fault); }
+        let old = u64::from_le_bytes(bytes);
+        let mask = u64::MAX >> ((8 - len) * 8);
+        // Owned Vec storage has no shared mappings; the exclusive borrow
+        // excludes every observer for the complete comparison and write cycle.
+        let value = if old == expected & mask { replacement } else { old };
+        if !self.write_virt(va, &value.to_le_bytes()[..len]) { return Err(Fault); }
+        Ok(old)
+    }
+    fn locked_fetch_add(&mut self, va: u64, width: u8, addend: u64)
+        -> Result<u64, super::memory::AtomicMemoryError> {
+        use super::memory::AtomicMemoryError::Fault;
+        if !matches!(width, 1 | 2 | 4 | 8) { return Err(Fault); }
+        // Vec-backed regions are owned without shared aliases. This exclusive
+        // borrow excludes all observers for the complete read-modify-write.
+        let mut bytes = [0; 8];
+        let len = width as usize;
+        if !self.probe_write(va, len) || self.read_virt(va, &mut bytes[..len]) != len { return Err(Fault); }
+        let old = u64::from_le_bytes(bytes);
+        if !self.write_virt(va, &old.wrapping_add(addend).to_le_bytes()[..len]) { return Err(Fault); }
+        Ok(old)
+    }
+    fn locked_inc_dec(&mut self, va: u64, width: u8, decrement: bool)
+        -> Result<u64, super::memory::AtomicMemoryError> {
+        use super::memory::AtomicMemoryError::Fault;
+        if !matches!(width, 1 | 2 | 4 | 8) { return Err(Fault); }
+        // These mappings own Vec storage with no shared aliases. The exclusive
+        // borrow covers read, arithmetic and write; no guest can interleave or
+        // observe a partial update, including unaligned/cross-page operands.
+        let mut bytes = [0; 8];
+        let len = width as usize;
+        if !self.probe_write(va, len) || self.read_virt(va, &mut bytes[..len]) != len { return Err(Fault); }
+        let old = u64::from_le_bytes(bytes);
+        let new = if decrement {old.wrapping_sub(1)} else {old.wrapping_add(1)};
+        if !self.write_virt(va, &new.to_le_bytes()[..len]) { return Err(Fault); }
+        Ok(old)
+    }
     fn probe_write(&mut self, va: u64, len: usize) -> bool {
         self.regions
             .iter()
@@ -477,11 +520,15 @@ struct ModuleMetadata {
     mode: DecodeMode,
     entry: usize,
     directories: [(u32, u32); 16],
+    /// Loader-owned state for DLL_THREAD_ATTACH/DLL_THREAD_DETACH policy.
+    /// Initial process attachment and TLS initialization are unaffected.
+    thread_notifications_disabled: bool,
 }
 impl ModuleMetadata {
     fn from_image(image: &MappedImage) -> Self {
         Self { base: image.region.base, size: image.region.bytes.len(), mode: image.mode,
-            entry: image.entry, directories: image.directories }
+            entry: image.entry, directories: image.directories,
+            thread_notifications_disabled: false }
     }
     fn snapshot(&self, memory: &ImageMemory) -> Result<MappedImage, LoadError> {
         let source = memory.regions.iter().find(|r| r.base == self.base && r.bytes.len() == self.size)

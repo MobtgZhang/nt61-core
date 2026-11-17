@@ -173,6 +173,7 @@ pub(super) fn load(
         libraries.push(module.image);
     }
     let mut image = GuestImage::from_mapped(executable, libraries)?;
+    image.win32.process_dependencies.extend(identities.iter().map(|(_, base)| *base));
     image.win32.modules.extend(identities);
     Ok(image)
 }

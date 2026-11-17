@@ -495,6 +495,7 @@ pub fn encode_block(ir: &[IrInst], guest_start: u64) -> alloc::vec::Vec<u8> {
                     AluOp::Xor => em.emit_xor(rd, rd, rs),
                     AluOp::Cmp => em.emit_sub_d(LA_SCRATCH, rd, rs),
                     AluOp::Test => em.emit_and(LA_SCRATCH, rd, rs),
+                    AluOp::Adc | AluOp::Sbb => em.push(LA64_BREAK),
                 }
             }
             IROp::AluImm { op, dst, imm } => {
@@ -512,6 +513,7 @@ pub fn encode_block(ir: &[IrInst], guest_start: u64) -> alloc::vec::Vec<u8> {
                                 AluOp::Or => em.emit_or(rd, rd, LA_SCRATCH),
                                 AluOp::Xor => em.emit_xor(rd, rd, LA_SCRATCH),
                                 AluOp::Test => em.emit_and(LA_SCRATCH, rd, LA_SCRATCH),
+                                AluOp::Adc | AluOp::Sbb => em.push(LA64_BREAK),
                                 _ => em.push(LA64_NOP),
                             }
                         }
@@ -526,6 +528,7 @@ pub fn encode_block(ir: &[IrInst], guest_start: u64) -> alloc::vec::Vec<u8> {
                         AluOp::Xor => em.emit_xor(rd, rd, LA_SCRATCH),
                         AluOp::Cmp => em.emit_sub_d(LA_SCRATCH, rd, LA_SCRATCH),
                         AluOp::Test => em.emit_and(LA_SCRATCH, rd, LA_SCRATCH),
+                        AluOp::Adc | AluOp::Sbb => em.push(LA64_BREAK),
                     }
                 }
             }
@@ -540,6 +543,7 @@ pub fn encode_block(ir: &[IrInst], guest_start: u64) -> alloc::vec::Vec<u8> {
                     AluOp::Xor => em.emit_xor(rd, rd, LA_SCRATCH),
                     AluOp::Cmp => em.emit_sub_d(LA_SCRATCH, rd, LA_SCRATCH),
                     AluOp::Test => em.emit_and(LA_SCRATCH, rd, LA_SCRATCH),
+                    AluOp::Adc | AluOp::Sbb => em.push(LA64_BREAK),
                 }
             }
             IROp::Lea { dst, mem } => {
@@ -575,10 +579,9 @@ pub fn encode_block(ir: &[IrInst], guest_start: u64) -> alloc::vec::Vec<u8> {
                 // break 0
                 em.push(0x002A_0000);
             }
-            IROp::SimdMov { .. } | IROp::SimdStore { .. } | IROp::SimdArith { .. } => {
-                // LA64 backend has no vector support: break 0
-                em.push(0x002A_0000);
-            }
+            // New shared IR operations execute in the portable interpreter.
+            // The experimental native backend must trap instead of skipping them.
+            _ => em.push(LA64_BREAK),
         }
     }
     em.resolve();
@@ -627,6 +630,7 @@ pub fn translate(
                 AluOp::Xor => em.emit_xor(rd, rd, rs),
                 AluOp::Cmp => em.emit_sub_d(LA_SCRATCH, rd, rs),
                 AluOp::Test => em.emit_and(LA_SCRATCH, rd, rs),
+                AluOp::Adc | AluOp::Sbb => return Err(super::TranslateError::Unsupported),
             }
         }
         IROp::AluImm { op, dst, imm } => {
@@ -644,6 +648,7 @@ pub fn translate(
                             AluOp::Or => em.emit_or(rd, rd, LA_SCRATCH),
                             AluOp::Xor => em.emit_xor(rd, rd, LA_SCRATCH),
                             AluOp::Test => em.emit_and(LA_SCRATCH, rd, LA_SCRATCH),
+                            AluOp::Adc | AluOp::Sbb => return Err(super::TranslateError::Unsupported),
                             _ => em.push(LA64_NOP),
                         }
                     }
@@ -658,6 +663,7 @@ pub fn translate(
                     AluOp::Xor => em.emit_xor(rd, rd, LA_SCRATCH),
                     AluOp::Cmp => em.emit_sub_d(LA_SCRATCH, rd, LA_SCRATCH),
                     AluOp::Test => em.emit_and(LA_SCRATCH, rd, LA_SCRATCH),
+                    AluOp::Adc | AluOp::Sbb => return Err(super::TranslateError::Unsupported),
                 }
             }
         }
@@ -672,6 +678,7 @@ pub fn translate(
                 AluOp::Xor => em.emit_xor(rd, rd, LA_SCRATCH),
                 AluOp::Cmp => em.emit_sub_d(LA_SCRATCH, rd, LA_SCRATCH),
                 AluOp::Test => em.emit_and(LA_SCRATCH, rd, LA_SCRATCH),
+                AluOp::Adc | AluOp::Sbb => return Err(super::TranslateError::Unsupported),
             }
         }
         IROp::Lea { dst, mem } => em.emit_lea(map_reg(*dst), mem),
@@ -691,9 +698,7 @@ pub fn translate(
         IROp::Ret => em.emit_jirl(LA_ZERO, LA_RA, 0),
         IROp::Syscall => em.push(LA64_SYSCALL),
         IROp::Scan { .. } | IROp::Shift { .. } | IROp::Exchange { .. } | IROp::ExchangeMem { .. } | IROp::Loop { .. } | IROp::PushAll | IROp::PopAll | IROp::Leave | IROp::UnaryNotNeg { .. } | IROp::PushMem { .. } | IROp::IncDec { .. } | IROp::AdcReg { .. } | IROp::AdcImm { .. } | IROp::RetImm { .. } | IROp::PushImm { .. } | IROp::StoreImm { .. } | IROp::AluStore { .. } | IROp::AluStoreImm { .. } | IROp::JumpReg { .. } | IROp::JumpMem { .. } | IROp::Unsupported => em.push(LA64_BREAK),
-        IROp::SimdMov { .. } | IROp::SimdStore { .. } | IROp::SimdArith { .. } => {
-            em.push(LA64_BREAK)
-        }
+        _ => return Err(super::TranslateError::Unsupported),
     }
     em.resolve();
     for word in &em.code {

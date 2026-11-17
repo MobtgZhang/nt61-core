@@ -54,6 +54,8 @@ pub fn decode_one(code: &[u8], offset: usize) -> Result<(Decoded, usize), Decode
                 IROp::Store { .. } => 0x89,
                 IROp::AluReg { op, .. } => match op {
                     AluOp::Add => 0x01,
+                    AluOp::Adc => 0x11,
+                    AluOp::Sbb => 0x19,
                     AluOp::Sub => 0x29,
                     AluOp::And => 0x21,
                     AluOp::Or => 0x09,
@@ -85,7 +87,8 @@ pub fn decode_one(code: &[u8], offset: usize) -> Result<(Decoded, usize), Decode
                 IROp::Shift { .. } => 0xC1,
                 IROp::Exchange { .. } | IROp::ExchangeMem { .. } => 0x87,
                 IROp::Loop { .. } => 0xE2,
-                IROp::Unsupported => 0x0F,
+                // Shared interpreter operations without a native opcode adapter.
+                _ => 0x0F,
             };
             Ok((
                 Decoded {

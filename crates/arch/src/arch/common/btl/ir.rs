@@ -144,6 +144,15 @@ pub enum SimdOp {
     Or,
     Xor,
     Compare,
+    UnpackLowBytes,
+    UnpackLowDwords,
+    UnpackHighDoubles,
+    EqualBytes,
+    EqualDwords,
+    EqualWords,
+    GreaterDwords,
+    AddDwords,
+    AddQwords,
 }
 
 impl X86Reg {
@@ -188,7 +197,9 @@ pub struct MemOperand {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AluOp {
     Add,
+    Adc,
     Sub,
+    Sbb,
     And,
     Or,
     Xor,
@@ -244,11 +255,34 @@ impl BranchCond {
 
 /// A single IR operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByteOperand {
+    Register { reg: X86Reg, high_byte: bool },
+    Memory(MemOperand),
+}
+
+/// A single IR operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IROp {
     Nop,
+    ClearX87Exceptions,
+    WaitX87,
+    LoadX87Control { source: MemOperand },
+    StoreX87Control { destination: MemOperand },
+    LoadX87Float { source: MemOperand, double: bool },
+    LoadX87Integer { source: MemOperand, width: u8 },
+    StoreX87Float { destination: MemOperand, double: bool, pop: bool },
+    StoreX87Integer { destination: MemOperand, width: u8, pop: bool },
+    LoadMxcsr { source: MemOperand },
+    StoreMxcsr { destination: MemOperand },
     Scan {
         repeat: u8,
     },
+    /// Store one accumulator element; REP restarts at this instruction until
+    /// the address-sized count reaches zero, allowing bounded execution.
+    StoreString { repeat: bool },
+    /// Copy one source-segment element to the flat ES destination; REP is
+    /// resumed one element at a time, preserving completed work on a fault.
+    MoveString { repeat: bool },
     Shift {
         kind: u8,
         dst: Result<X86Reg, MemOperand>,
@@ -281,9 +315,40 @@ pub enum IROp {
         negate: bool,
     },
     IncDec {
-        dst: X86Reg,
+        dst: Result<X86Reg, MemOperand>,
+        high_byte: bool,
         decrement: bool,
     },
+    LockedIncDec { mem: MemOperand, decrement: bool },
+    LockedExchangeAdd { mem: MemOperand, src: X86Reg, high_byte: bool },
+    LockedCompareExchange { mem: MemOperand, src: X86Reg, high_byte: bool },
+    LockedAddImmediate { mem: MemOperand, immediate: i64, subtract: bool },
+    PushFlags,
+    PopFlags,
+    AccumulatorMemory { address: u64, store: bool },
+    ByteAlu { op: AluOp, dst: ByteOperand, src: ByteOperand },
+    ByteMove { dst: ByteOperand, src: ByteOperand },
+    ByteImmediate { dst: ByteOperand, value: u8 },
+    DoubleShift { dst: Result<X86Reg, MemOperand>, src: X86Reg, right: bool, count: Option<u8> },
+    SimdByteMask { dst: X86Reg, src: X86Xmm },
+    /// Store the flags predicate as a byte without modifying flags.
+    SetCondition {
+        cond: BranchCond,
+        dst: Result<X86Reg, MemOperand>,
+        high_byte: bool,
+    },
+    ConditionalMove { cond: BranchCond, dst: X86Reg, src: Result<X86Reg, MemOperand> },
+    /// Stable capabilities of the portable interpreter, independent of host CPU.
+    CpuId,
+    UnsignedDivide { src: Result<X86Reg, MemOperand>, high_byte: bool },
+    FullMultiply { src: Result<X86Reg, MemOperand>, high_byte: bool, signed: bool },
+    SignedMultiply { dst: X86Reg, src: Result<X86Reg, MemOperand>, immediate: Option<i64> },
+    /// Immediate BT selects a bit modulo the operand width and updates CF.
+    BitTestImmediate { src: Result<X86Reg, MemOperand>, bit: u8 },
+    /// Legacy BSF/BSR; the virtual CPU does not advertise BMI1 or ABM.
+    BitScan { dst: X86Reg, src: Result<X86Reg, MemOperand>, reverse: bool },
+    BitRegister { dst: Result<X86Reg, MemOperand>, index: X86Reg, complement: bool },
+    TestImmediate { src: Result<X86Reg, MemOperand>, high_byte: bool, immediate: i64 },
     AdcReg {
         dst: X86Reg,
         src: X86Reg,
@@ -299,6 +364,13 @@ pub enum IROp {
     MovReg {
         dst: X86Reg,
         src: X86Reg,
+    },
+    ExtendMove {
+        dst: X86Reg,
+        src: Result<X86Reg, MemOperand>,
+        source_width: u8,
+        signed: bool,
+        high_byte: bool,
     },
     Load {
         dst: X86Reg,
@@ -382,6 +454,12 @@ pub enum IROp {
         src: SimdSrc,
         width: SimdWidth,
     },
+    SimdMoveInteger { dst: X86Xmm, src: Result<X86Reg, MemOperand>, width: u8 },
+    SimdShuffleDwords { dst: X86Xmm, src: SimdSrc, control: u8 },
+    SimdExtractWord { dst: X86Reg, src: X86Xmm, index: u8 },
+    SimdStoreInteger { dst: Result<X86Reg, MemOperand>, src: X86Xmm, width: u8 },
+    SimdToInteger { dst: X86Reg, src: SimdSrc, double: bool, width: u8 },
+    IntegerToSimd { dst: X86Xmm, src: Result<X86Reg, MemOperand>, double: bool, width: u8 },
     /// SIMD store: mem = src_xmm.
     SimdStore {
         mem: MemOperand,

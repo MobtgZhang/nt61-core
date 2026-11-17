@@ -13,6 +13,8 @@ const CACHE_LIMIT: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
+    DivideError { pc: u64 },
+    FloatingPointError { pc: u64, exceptions: u8 },
     QuantumExpired,
     /// RIP points after the instruction. The caller must service EAX using
     /// the guest ABI before resuming; execution never calls a host code pointer.
@@ -149,6 +151,12 @@ impl GuestThread {
                 memory,
                 &mut Trap,
             ) {
+                ExecOutcome::DivideError { guest_va } => {
+                    break StopReason::DivideError { pc: guest_va }
+                }
+                ExecOutcome::FloatingPointError { guest_va, exceptions } => {
+                    break StopReason::FloatingPointError { pc: guest_va, exceptions }
+                }
                 ExecOutcome::MemoryFault { guest_va } => {
                     break StopReason::DataFault { pc: guest_va }
                 }

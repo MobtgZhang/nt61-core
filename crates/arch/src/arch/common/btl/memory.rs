@@ -29,7 +29,21 @@ pub trait GuestPaging {
 
 /// Guest memory access surface used by the BTL syscall bridge and
 /// interpreter. Object-safe so the shared layer can take `&mut dyn`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicMemoryError { Unsupported, Fault }
+
 pub trait GuestMemory {
+    /// Atomically change one memory operand and return its old value. The
+    /// implementation must exclude all observers, including shared mappings.
+    /// Plain copy adapters cannot provide that guarantee and fail closed.
+    fn locked_inc_dec(&mut self, _va: u64, _width: u8, _decrement: bool)
+        -> Result<u64, AtomicMemoryError> { Err(AtomicMemoryError::Unsupported) }
+    /// Atomic fetch-add with the same exclusion contract as locked_inc_dec.
+    fn locked_fetch_add(&mut self, _va: u64, _width: u8, _addend: u64)
+        -> Result<u64, AtomicMemoryError> { Err(AtomicMemoryError::Unsupported) }
+    /// Atomic compare/exchange; even a failed comparison needs writable memory.
+    fn locked_compare_exchange(&mut self, _va: u64, _width: u8, _expected: u64, _replacement: u64)
+        -> Result<u64, AtomicMemoryError> { Err(AtomicMemoryError::Unsupported) }
     /// Copy bytes from guest VA into `buf`; returns bytes copied.
     fn read_virt(&mut self, va: u64, buf: &mut [u8]) -> usize;
     /// Copy bytes into guest VA; returns `true` when all copied.
