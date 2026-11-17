@@ -183,8 +183,13 @@ fn handle_lower_sync(tf: &mut TrapFrame) {
             // number in X16 and the first eight arguments in X0-X7.
             // The result is propagated back to the caller in X0.
             let syscall_num = tf.x16;
+            // Exception entry masks IRQs. The full frame is now on the
+            // kernel stack, so allow nested IRQs while services wait for
+            // clock deadlines or remote TLB acknowledgements.
+            crate::arch::enable_interrupts();
             let result =
                 unsafe { crate::arch::aarch64::syscall::syscall_dispatch_with_tf(syscall_num, tf) };
+            crate::arch::disable_interrupts();
 
             tf.x0 = result;
             // SVC saves the address of the following instruction in ELR_EL1.

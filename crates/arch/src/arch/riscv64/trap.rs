@@ -265,16 +265,17 @@ pub extern "C" fn riscv64_trap_dispatch(frame: *mut TrapFrame) {
     if !is_interrupt {
         match kind {
             TrapKind::EnvironmentCallFromUMode => {
-                // Syscall numbers arrive in $a7 (per Linux RISC-V
-                // convention); arguments in $a0..$a5. We hand them
-                // off to the syscall module which fills in $a0
-                // with the return value and patches sepc so it
-                // advances past the `ecall` instruction (we
-                // re-execute it as an `ecall` only by accident —
-                // advance by 4 to be safe).
+                // The complete user frame and FP state are saved, and
+                // sscratch is zero so nested supervisor interrupts grow
+                // this kernel stack. Services run with interrupts enabled:
+                // timed waits need clock interrupts and SMP memory changes
+                // need shootdown acknowledgements. Trap entry clears SIE;
+                // leaving it clear here can stall a service indefinitely.
+                crate::arch::enable_interrupts();
                 unsafe {
                     crate::arch::riscv64::syscall::dispatch_syscall(frame);
                 }
+                crate::arch::disable_interrupts();
                 // Advance sepc past the ecall (4 bytes on RV64).
                 unsafe {
                     let new_sepc = sepc.wrapping_add(4);

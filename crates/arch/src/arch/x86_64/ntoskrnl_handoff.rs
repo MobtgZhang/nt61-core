@@ -305,6 +305,9 @@ pub unsafe extern "C" fn ntoskrnl_kisystemstartup_thunk(
         // the hive list winload published in BootInfo.
         crate::registry::cm::init(unsafe { &*boot_info });
     }
+    // Restore runtime credentials from the mounted SAM before SMSS/LogonUI
+    // enumerate accounts. Static built-ins alone hide every persisted user.
+    crate::se::init();
 
     crate::io::init();
     crate::lpc::init();
