@@ -82,6 +82,7 @@ pub fn nic_count() -> usize {
 /// them to the TCP/IP stack. Commands with synchronous waits (such as
 /// `ping`) call this while waiting for replies.
 pub fn poll_all() {
+    if !crate::netstack::is_initialized() { return; }
     let mut buffer = [0u8; 2048];
 
     for nic_idx in 0..virtio_net::count() {
@@ -125,6 +126,7 @@ pub fn poll_all() {
     }
 
     crate::netstack::tcp::check_retransmit_timers();
+    crate::netstack::autoconfig::poll();
 }
 
 pub mod tcpip;

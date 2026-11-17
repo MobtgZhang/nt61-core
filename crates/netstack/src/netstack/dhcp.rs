@@ -672,7 +672,7 @@ impl DhcpClient {
             return false;
         }
 
-        if msg[0] != 2 {
+        if msg[0] != 2 || msg[1] != 1 || msg[2] != 6 || msg[236..240] != [99, 130, 83, 99] {
             return false;
         }
 
@@ -700,7 +700,7 @@ impl DhcpClient {
                     self.requested_ip = your_ip;
                     self.offered_server = options.server_id.unwrap_or(0);
                     self.state = DhcpState::Requesting;
-                    self.new_xid();
+                    self.retransmit_count = 0;
                     self.state_start_time = crate::hal::common::pit::get_system_time_ms();
                     true
                 } else {
@@ -708,8 +708,10 @@ impl DhcpClient {
                 }
             }
             Some(DhcpMessageType::Ack) => {
-                if self.state == DhcpState::Requesting {
-                    self.lease.set_ip(your_ip);
+                if matches!(self.state, DhcpState::Requesting | DhcpState::Renewing | DhcpState::Rebinding) {
+                    let address = if your_ip == 0 { self.lease.ip_address } else { your_ip };
+                    if address == 0 || address == u32::MAX || address >> 24 == 127 { return false; }
+                    self.lease.set_ip(address);
                     self.lease
                         .set_subnet_mask(options.subnet_mask.unwrap_or(0xFFFFFF00));
                     self.lease.set_gateway(options.router.unwrap_or(0));
@@ -726,48 +728,10 @@ impl DhcpClient {
 
                     if let Some(dns) = options.dns_servers {
                         self.lease.set_dns(dns);
-                        // Propagate the first DNS server to the
-                        // resolver so getaddrinfo can immediately
-                        // use it.
-                        if dns[0] != 0 {
-                            crate::netstack::dns::set_dns_server(dns[0]);
-                            // Use the primary non-loopback
-                            // interface for the route if any,
-                            // otherwise default to if_index 1
-                            // (the first interface registered by
-                            // DHCP itself).
-                            let if_idx = crate::netstack::ipif::get_all_interfaces()
-                                .iter()
-                                .find(|i| i.eth_if != u32::MAX)
-                                .map(|i| i.if_index)
-                                .unwrap_or(1);
-                            crate::netstack::ipif::add_route(
-                                dns[0],
-                                0xFFFFFFFFu32,
-                                self.lease.gateway,
-                                if_idx,
-                                1,
-                            );
-                        }
                     }
 
                     self.lease
                         .set_lease_start(crate::hal::common::pit::get_system_time_ms());
-
-                    // Publish the default gateway into the routing
-                    // table so cross-subnet traffic is routable.
-                    if self.lease.gateway != 0 {
-                        let if_idx = crate::netstack::ipif::get_all_interfaces()
-                            .iter()
-                            .find(|i| i.eth_if != u32::MAX)
-                            .map(|i| i.if_index)
-                            .unwrap_or(1);
-                        crate::netstack::routing::set_default_gateway(
-                            self.lease.gateway,
-                            if_idx,
-                            1,
-                        );
-                    }
 
                     self.state = DhcpState::Bound;
                     true
@@ -789,7 +753,12 @@ impl DhcpClient {
     }
 
     pub fn build_renewal_request(&self, chaddr: &[u8; 6]) -> Vec<u8> {
-        self.build_request(chaddr, self.lease.ip_address, self.lease.server_id)
+        let mut msg = self.build_base_message(DhcpOperation::BootRequest, chaddr);
+        msg[12..16].copy_from_slice(&self.lease.ip_address.to_be_bytes());
+        // RFC 2131 section 4.3.2: renewals use ciaddr; requested-address and
+        // server-identifier options belong to the initial SELECTING exchange.
+        msg.extend_from_slice(&[53, 1, 3, 55, 3, 1, 3, 6, 255]);
+        msg
     }
 
     /// Build a DHCPREQUEST for the IP offered by the server.
@@ -823,14 +792,14 @@ impl DhcpClient {
     pub fn check_lease(&mut self) {
         use crate::hal::common::pit;
 
-        if self.state != DhcpState::Bound {
+        if !matches!(self.state, DhcpState::Bound | DhcpState::Renewing | DhcpState::Rebinding) {
             return;
         }
 
         let now = pit::get_system_time_ms();
         let elapsed = now - self.lease.lease_start;
 
-        if elapsed > (self.lease.renewal_time as u64 * 1000) {
+        if self.state == DhcpState::Bound && elapsed >= (self.lease.renewal_time as u64 * 1000) {
             self.state = DhcpState::Renewing;
             self.new_xid();
             self.state_start_time = now;
@@ -857,7 +826,7 @@ impl DhcpClient {
     }
 
     pub fn increment_retransmit(&mut self) {
-        self.retransmit_count += 1;
+        self.retransmit_count = self.retransmit_count.saturating_add(1);
         self.state_start_time = crate::hal::common::pit::get_system_time_ms();
     }
 

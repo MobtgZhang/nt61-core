@@ -58,13 +58,6 @@ const TCMD_RS: u32 = 1 << 3; // Report Status
 /// TX status bits.
 const TSTA_DD: u32 = 1 << 0; // Descriptor Done
 
-/// Pool tags
-mod tags {
-    use crate::mm::pool::make_tag;
-    pub const NETBUF: u32 = make_tag(b'N', b'B', b'u', b'f');
-    pub const NETDESC: u32 = make_tag(b'N', b'D', b's', b'c');
-}
-
 /// e1000 TX descriptor (16 bytes)
 #[repr(C)]
 struct E1000TxDesc {
@@ -166,6 +159,8 @@ pub fn init() {
                 crate::drivers::bus::pci_bus::find_pci(dev.bus, dev.device, dev.function)
             {
                 if let Some(bar0) = first_mmio_bar(&info) {
+                    let command=pci::read_config_word(dev.bus,dev.device,dev.function,4);
+                    pci::write_config_word(dev.bus,dev.device,dev.function,4,command|6);
                     let mut n = Nic {
                         bar0_phys: bar0,
                         ..Default::default()
@@ -223,6 +218,8 @@ fn init_nic(n: &mut Nic) -> bool {
             }
         }
 
+        if core::ptr::read_volatile((mmio as *const u32).add((REG_CTRL / 4) as usize)) & CTRL_RST != 0 {return false;}
+
         // Set the link up.
         let ctrl = core::ptr::read_volatile((mmio as *const u32).add((REG_CTRL / 4) as usize));
         core::ptr::write_volatile(
@@ -253,9 +250,9 @@ fn init_nic(n: &mut Nic) -> bool {
         let aligned_size = (desc_size + 4095) & !4095;
 
         crate::hal::serial::write_string("NET:e1000:alloc_desc\r\n");
-        n.tx_desc = pool::allocate_tagged(PoolType::NonPaged, aligned_size, tags::NETDESC)
+        n.tx_desc = pool::allocate_aligned(PoolType::NonPaged, aligned_size, 4096)
             as *mut E1000TxDesc;
-        n.rx_desc = pool::allocate_tagged(PoolType::NonPaged, aligned_size, tags::NETDESC)
+        n.rx_desc = pool::allocate_aligned(PoolType::NonPaged, aligned_size, 4096)
             as *mut E1000RxDesc;
         crate::hal::serial::write_string("NET:e1000:desc_ok\r\n");
 
@@ -266,34 +263,36 @@ fn init_nic(n: &mut Nic) -> bool {
 
         // Initialize TX descriptor ring
         for i in 0..32 {
-            let buf = pool::allocate_tagged(PoolType::NonPaged, 8192, tags::NETBUF);
+            let buf = pool::allocate_aligned(PoolType::NonPaged, 4096, 4096);
             n.tx_buf[i] = buf;
             if buf.is_null() {
                 // kprintln!("  [e1000] Failed to allocate TX buffer {}", i);
-                break;
+                return false;
             }
-            let phys = virt_to_phys(buf as u64).unwrap_or(0);
+            let Some(phys) = virt_to_phys(buf as u64) else {return false;};
             core::ptr::write_bytes(&mut (*n.tx_desc.add(i)), 0, 1);
             (*n.tx_desc.add(i)).buffer_addr = phys;
-            (*n.tx_desc.add(i)).length = 8192;
+            // Software owns every descriptor until its first submission.
+            // send() checks DD before reuse, including that first submission.
+            (*n.tx_desc.add(i)).status = TSTA_DD as u8;
         }
 
         // Initialize RX descriptor ring
         for i in 0..32 {
-            let buf = pool::allocate_tagged(PoolType::NonPaged, 8192, tags::NETBUF);
+            let buf = pool::allocate_aligned(PoolType::NonPaged, 4096, 4096);
             n.rx_buf[i] = buf;
             if buf.is_null() {
                 // kprintln!("  [e1000] Failed to allocate RX buffer {}", i);
-                break;
+                return false;
             }
-            let phys = virt_to_phys(buf as u64).unwrap_or(0);
+            let Some(phys) = virt_to_phys(buf as u64) else {return false;};
             core::ptr::write_bytes(&mut (*n.rx_desc.add(i)), 0, 1);
             (*n.rx_desc.add(i)).buffer_addr = phys;
-            (*n.rx_desc.add(i)).length = 8192;
+
         }
 
         // Program TX descriptor ring
-        let tx_phys = virt_to_phys(n.tx_desc as u64).unwrap_or(0);
+        let Some(tx_phys) = virt_to_phys(n.tx_desc as u64) else {return false;};
         core::ptr::write_volatile(
             (mmio as *mut u32).add((REG_TDBAL / 4) as usize),
             (tx_phys & 0xFFFFFFFF) as u32,
@@ -310,7 +309,7 @@ fn init_nic(n: &mut Nic) -> bool {
         core::ptr::write_volatile((mmio as *mut u32).add((REG_TDT / 4) as usize), 0);
 
         // Program RX descriptor ring
-        let rx_phys = virt_to_phys(n.rx_desc as u64).unwrap_or(0);
+        let Some(rx_phys) = virt_to_phys(n.rx_desc as u64) else {return false;};
         core::ptr::write_volatile(
             (mmio as *mut u32).add((REG_RDBAL / 4) as usize),
             (rx_phys & 0xFFFFFFFF) as u32,
@@ -334,16 +333,17 @@ fn init_nic(n: &mut Nic) -> bool {
             // the receiver out of promiscuous mode: defaulting to
             // RCTL_UPE/RCTL_MPE would listen to every frame on the
             // wire, so explicitly clear those bits here.
-            (rctl | RCTL_EN | RCTL_BAM) & !(RCTL_UPE | RCTL_MPE),
+            (rctl | RCTL_EN | RCTL_BAM | (1<<26)) & !(RCTL_UPE | RCTL_MPE),
         );
 
         // Enable transmitter
         let tctl = core::ptr::read_volatile((mmio as *const u32).add((REG_TCTL / 4) as usize));
         core::ptr::write_volatile(
             (mmio as *mut u32).add((REG_TCTL / 4) as usize),
-            tctl | TCTL_EN | TCTL_PSP,
+            tctl | TCTL_EN | TCTL_PSP | (0x10<<4) | (0x40<<12),
         );
 
+        core::ptr::write_volatile((mmio as *mut u32).add(0x410/4),10|(8<<10)|(6<<20));
         n.initialised = true;
     }
     true
@@ -367,7 +367,8 @@ pub fn smoke_test() -> bool {
 /// Send a packet through the e1000 NIC
 pub fn send(nic_idx: usize, data: &[u8]) -> bool {
     let nics = get_nics();
-    let n = match nics[nic_idx].as_mut() {
+    if data.is_empty() || data.len()>1518 {return false;}
+    let n = match nics.get_mut(nic_idx).and_then(Option::as_mut) {
         Some(n) => n,
         None => return false,
     };
@@ -387,12 +388,12 @@ pub fn send(nic_idx: usize, data: &[u8]) -> bool {
         // live descriptor corrupts the TX ring, so bail out if it does
         // not complete promptly.
         for _ in 0..100 {
-            if (*n.tx_desc.add(desc_idx)).status & TSTA_DD as u8 != 0 {
+            if core::ptr::read_volatile(core::ptr::addr_of!((*n.tx_desc.add(desc_idx)).status)) & TSTA_DD as u8 != 0 {
                 break;
             }
             core::hint::spin_loop();
         }
-        if (*n.tx_desc.add(desc_idx)).status & TSTA_DD as u8 == 0 {
+        if core::ptr::read_volatile(core::ptr::addr_of!((*n.tx_desc.add(desc_idx)).status)) & TSTA_DD as u8 == 0 {
             return false;
         }
 
@@ -401,11 +402,11 @@ pub fn send(nic_idx: usize, data: &[u8]) -> bool {
         if buf.is_null() {
             return false;
         }
-        let copy_len = data.len().min(8192);
+        let copy_len = data.len();
         core::ptr::copy_nonoverlapping(data.as_ptr(), buf, copy_len);
 
         // Setup TX descriptor
-        let phys = virt_to_phys(buf as u64).unwrap_or(0);
+        let Some(phys) = virt_to_phys(buf as u64) else {return false;};
         let desc = &mut *n.tx_desc.add(desc_idx);
         desc.buffer_addr = phys;
         desc.length = copy_len as u16;
@@ -426,7 +427,7 @@ pub fn send(nic_idx: usize, data: &[u8]) -> bool {
 /// Receive a packet from the e1000 NIC
 pub fn receive(nic_idx: usize, buffer: &mut [u8]) -> Option<usize> {
     let nics = get_nics();
-    let n = nics[nic_idx].as_mut()?;
+    let n = nics.get_mut(nic_idx)?.as_mut()?;
 
     if !n.initialised {
         return None;
@@ -438,13 +439,16 @@ pub fn receive(nic_idx: usize, buffer: &mut [u8]) -> Option<usize> {
     unsafe {
         // Check for received packets
         let desc_idx = n.rx_next as usize % 32;
-        if (*n.rx_desc.add(desc_idx)).status & RX_STATUS_DD == 0 {
+        let status=core::ptr::read_volatile(core::ptr::addr_of!((*n.rx_desc.add(desc_idx)).status));
+        if status & RX_STATUS_DD == 0 {
             return None;
         }
 
         // read packet length
         let len = (*n.rx_desc.add(desc_idx)).length as usize;
-        let copy_len = len.min(buffer.len());
+        core::sync::atomic::compiler_fence(Ordering::Acquire);
+        let valid=status&2!=0 && (*n.rx_desc.add(desc_idx)).errors==0 && len<=2048 && len<=buffer.len();
+        let copy_len = if valid {len}else{0};
 
         // Copy data
         let buf = n.rx_buf[desc_idx];
@@ -453,7 +457,8 @@ pub fn receive(nic_idx: usize, buffer: &mut [u8]) -> Option<usize> {
         }
 
         // Reset descriptor
-        (*n.rx_desc.add(desc_idx)).status = 0;
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*n.rx_desc.add(desc_idx)).status),0);
+        core::sync::atomic::compiler_fence(Ordering::Release);
 
         // Advance RX tail pointer
         n.rx_next = (n.rx_next + 1) % 32;
@@ -463,27 +468,26 @@ pub fn receive(nic_idx: usize, buffer: &mut [u8]) -> Option<usize> {
         );
 
         n.rx_count.fetch_add(1, Ordering::Relaxed);
-        Some(copy_len)
+        if copy_len>0 {Some(copy_len)}else{None}
     }
 }
 
 /// Get MAC address for a NIC
 pub fn get_mac(nic_idx: usize) -> Option<[u8; 6]> {
     let nics = get_nics();
-    nics[nic_idx].as_ref().map(|n| n.mac)
+    nics.get(nic_idx).and_then(Option::as_ref).map(|n| n.mac)
 }
 
 /// Get link status for a NIC
 pub fn is_link_up(nic_idx: usize) -> bool {
     let nics = get_nics();
-    nics[nic_idx].as_ref().map(|n| n.link_up).unwrap_or(false)
+    nics.get(nic_idx).and_then(Option::as_ref).map(|n| n.link_up).unwrap_or(false)
 }
 
 /// Get TX packet count
 pub fn get_tx_count(nic_idx: usize) -> u32 {
     let nics = get_nics();
-    nics[nic_idx]
-        .as_ref()
+    nics.get(nic_idx).and_then(Option::as_ref)
         .map(|n| n.tx_count.load(Ordering::Relaxed))
         .unwrap_or(0)
 }
@@ -491,8 +495,7 @@ pub fn get_tx_count(nic_idx: usize) -> u32 {
 /// Get RX packet count
 pub fn get_rx_count(nic_idx: usize) -> u32 {
     let nics = get_nics();
-    nics[nic_idx]
-        .as_ref()
+    nics.get(nic_idx).and_then(Option::as_ref)
         .map(|n| n.rx_count.load(Ordering::Relaxed))
         .unwrap_or(0)
 }

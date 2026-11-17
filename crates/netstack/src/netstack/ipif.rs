@@ -133,7 +133,8 @@ pub fn add_interface(address: u32, netmask: u32, gateway: u32, eth_if: u32) -> O
         return None;
     }
 
-    let if_index = interfaces.len() as u32;
+    let if_index = (0..MAX_IP_INTERFACES as u32)
+        .find(|id| !interfaces.iter().any(|interface| interface.if_index == *id))?;
     let ip_if = IpInterface::new(if_index, address, netmask, gateway, eth_if);
     interfaces.push(ip_if);
 
@@ -144,7 +145,7 @@ pub fn add_interface(address: u32, netmask: u32, gateway: u32, eth_if: u32) -> O
     // Add a default route for this interface's subnet.  Drop the
     // interface lock first: `add_route` updates routing tables and
     // must not be reached while holding the interface lock.
-    add_route(subnet, netmask, gateway, if_index, 0);
+    add_route(subnet, netmask, 0, if_index, 0);
 
     // Install the default route only for a real gateway; loopback has
     // none and must not shadow physical networks.
@@ -163,6 +164,7 @@ pub fn remove_interface(if_index: u32) {
     // Also remove routes for this interface
     let mut routes = ROUTING_TABLE.lock();
     routes.retain(|r| r.if_index != if_index);
+    crate::netstack::routing::remove_interface(if_index);
 }
 
 /// Get an interface by index
@@ -283,6 +285,9 @@ pub fn configure_static_ip(
 /// because `IpInterface::address` is documented as "network byte
 /// order" and `ip_to_string` decomposes in big-endian order.
 pub fn seed_loopback() -> Option<u32> {
+    if let Some(existing) = IP_INTERFACES.lock().iter().find(|i| i.eth_if == u32::MAX) {
+        return Some(existing.if_index);
+    }
     let addr = u32::from_be_bytes([127, 0, 0, 1]);
     let mask = u32::from_be_bytes([255, 0, 0, 0]);
     let gw = u32::from_be_bytes([0, 0, 0, 0]);

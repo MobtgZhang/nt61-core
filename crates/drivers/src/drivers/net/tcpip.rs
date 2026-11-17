@@ -344,15 +344,7 @@ pub fn init() {
         interfaces[0].loopback = true;
         interfaces[0].multicast = false;
 
-        interfaces[1].valid = true;
-        interfaces[1].interface_index = 2;
-        interfaces[1].ip_address = [10, 0, 2, 15];
-        interfaces[1].subnet_mask = [255, 255, 255, 0];
-        interfaces[1].gateway = [10, 0, 2, 2];
-        interfaces[1].mtu = 1500;
-        interfaces[1].up = true;
-        interfaces[1].loopback = false;
-        interfaces[1].multicast = true;
+
     }
 
     crate::netstack::init();
@@ -833,12 +825,26 @@ pub fn get_interface(interface_index: u32) -> Option<NetworkInterface> {
 }
 
 pub fn get_interfaces() -> Vec<NetworkInterface> {
-    let interfaces = NETWORK_INTERFACES.lock();
-    interfaces
-        .iter()
-        .filter(|iface| iface.valid)
-        .copied()
-        .collect()
+    let mut result = Vec::new();
+    for ip in crate::netstack::ipif::get_all_interfaces() {
+        let mut interface = NetworkInterface::new();
+        interface.valid = true;
+        interface.interface_index = ip.if_index + 1;
+        interface.ip_address = ip.address.to_be_bytes();
+        interface.subnet_mask = ip.netmask.to_be_bytes();
+        interface.gateway = ip.gateway.to_be_bytes();
+        interface.loopback = ip.eth_if == u32::MAX;
+        interface.up = interface.loopback;
+        interface.link_speed = 0; // Unknown unless the miniport measures it.
+        if let Some(ethernet) = crate::netstack::ethif::get_interface(ip.eth_if) {
+            interface.mac_address = ethernet.mac;
+            interface.mtu = ethernet.mtu;
+            interface.up = ethernet.link_up;
+            interface.multicast = ethernet.accept_multicast;
+        }
+        result.push(interface);
+    }
+    result
 }
 
 pub fn ipv4_input(src_ip: u32, dst_ip: u32, protocol: u8, data: &[u8]) {
@@ -1487,7 +1493,7 @@ pub fn get_connection_object_count() -> usize {
 }
 
 pub fn get_interface_count() -> usize {
-    NETWORK_INTERFACES.lock().iter().filter(|i| i.valid).count()
+    get_interfaces().len()
 }
 
 /// # Safety

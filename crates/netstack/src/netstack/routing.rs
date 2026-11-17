@@ -98,6 +98,10 @@ pub fn remove_route(destination: u32, netmask: u32) -> bool {
     table.len() != before
 }
 
+pub fn remove_interface(interface: u32) {
+    ROUTING_TABLE.lock().retain(|route| route.interface != interface);
+}
+
 pub fn find_route(dst_ip: u32) -> Option<RouteEntry> {
     let table = ROUTING_TABLE.lock();
 

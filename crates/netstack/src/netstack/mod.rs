@@ -7,12 +7,14 @@
 
 pub mod afd;
 pub mod arp;
+pub mod autoconfig;
 pub mod dhcp;
 pub mod dns;
 pub mod e2e_test;
 pub mod eth;
 pub mod ethif;
 pub mod icmp;
+pub mod http;
 pub mod ipif;
 pub mod ipv4;
 pub mod ipv6;
@@ -24,9 +26,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Global network stack state
 static NETWORK_STACK_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static INITIALIZE: spin::Once<()> = spin::Once::new();
 
 /// Initialize the network stack
 pub fn init() {
+    INITIALIZE.call_once(|| {
     // kprintln!("    Network stack: initializing...");
 
     // Initialize submodules
@@ -43,8 +47,11 @@ pub fn init() {
     ipsec::init();
     wfp::init();
     dns::flush_cache();
+    ipif::seed_loopback();
+    autoconfig::init();
 
     NETWORK_STACK_INITIALIZED.store(true, Ordering::Release);
+    });
 
     // kprintln!("    Network stack: ready");
 }

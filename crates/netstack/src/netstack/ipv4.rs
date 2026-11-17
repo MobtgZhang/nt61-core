@@ -470,6 +470,9 @@ pub fn ipv4_input(header: &Ipv4Header, payload: &[u8], nic_type: NicType, nic_in
         return;
     }
 
+    if header.protocol == 17 && crate::netstack::autoconfig::input(
+        header.src_ip, header.dst_ip, payload, nic_type, nic_index) { return; }
+
     // Check if the packet is for us
     let our_ips = ipif::get_our_ip_addresses();
     let is_for_us = our_ips.contains(&header.dst_ip);

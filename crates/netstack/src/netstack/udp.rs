@@ -244,9 +244,10 @@ pub fn send(socket_idx: usize, dst_ip: u32, dst_port: Port, data: &[u8]) -> Opti
             socket.local_ip
         } else {
             // Get primary IP
-            crate::netstack::ipif::get_our_ip_addresses()
-                .first()
-                .copied()?
+            crate::netstack::routing::find_route(dst_ip)
+                .and_then(|route| crate::netstack::ipif::get_interface(route.interface))
+                .map(|interface| interface.address)
+                .or_else(crate::netstack::ipif::get_outbound_ip)?
         };
         (src_ip, socket.local_port)
     };

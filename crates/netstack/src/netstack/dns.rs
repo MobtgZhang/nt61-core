@@ -21,7 +21,7 @@ extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::ke::sync::Spinlock;
 use crate::netstack::ipif;
@@ -58,6 +58,15 @@ pub struct DnsRecord {
     pub addr: u32,
     /// Absolute expiry in PIT milliseconds.
     pub expires_at_ms: u64,
+}
+
+static CACHE_SERVICE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// DNS Client service controls caching; direct DNS resolution remains available when stopped.
+pub fn set_cache_service_enabled(enabled: bool) {
+    let mut cache = CACHE.lock();
+    CACHE_SERVICE_ENABLED.store(enabled, Ordering::Release);
+    cache.clear();
 }
 
 static CACHE: Spinlock<BTreeMap<(String, u16), DnsRecord>> = Spinlock::new(BTreeMap::new());
@@ -222,7 +231,7 @@ pub fn resolve_af(name: &str, family: u16) -> Result<u32, DnsError> {
         let cache = CACHE.lock();
         if let Some(rec) = cache.get(&key) {
             let now = crate::hal::common::pit::get_system_time_ms();
-            if rec.expires_at_ms > now {
+            if CACHE_SERVICE_ENABLED.load(Ordering::Acquire) && rec.expires_at_ms > now {
                 return Ok(rec.addr);
             }
         }
@@ -259,7 +268,10 @@ pub fn resolve_af(name: &str, family: u16) -> Result<u32, DnsError> {
         }
     }
 
-    udp::send(sock, server, server_port, &datagram).ok_or(DnsError::Other)?;
+    if udp::send(sock, server, server_port, &datagram).is_none() {
+        udp::close_socket(sock);
+        return Err(DnsError::Other);
+    }
 
     // Block up to 2 seconds for a reply.
     let deadline = crate::hal::common::pit::get_system_time_ms() + 2000;
@@ -270,6 +282,7 @@ pub fn resolve_af(name: &str, family: u16) -> Result<u32, DnsError> {
             udp::close_socket(sock);
             return Err(DnsError::Timeout);
         }
+        crate::drivers::net::poll_all();
         if let Some((src_ip, src_port, n)) = udp::receive(sock, &mut buf) {
             if src_ip == server && src_port == server_port && n >= 12 {
                 if let Some(ip) = parse_response(&buf[..n], qtype, query_id) {
@@ -294,6 +307,7 @@ pub fn resolve_af(name: &str, family: u16) -> Result<u32, DnsError> {
 fn cache_insert(name: &str, family: u16, addr: u32, ttl_ms: u64) {
     let expires_at_ms = crate::hal::common::pit::get_system_time_ms() + ttl_ms;
     let mut cache = CACHE.lock();
+    if !CACHE_SERVICE_ENABLED.load(Ordering::Acquire) { return; }
     if cache.len() >= MAX_CACHE {
         // Drop the entry with the earliest expiry.
         if let Some((k, _)) = cache

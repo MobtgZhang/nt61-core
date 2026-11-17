@@ -271,6 +271,7 @@ pub fn is_reference_command(command: &str) -> bool {
 /// never sufficient to report successful execution.
 pub fn execute_status(command:&str,arguments:&str,cwd:&[u8])->u32{
     match command{
+        "certutil" if arguments.split_whitespace().any(|s|s.eq_ignore_ascii_case("-urlcache"))=>http_download_status(arguments,cwd),
         "diskpart"=>cmd_diskpart_status(arguments,cwd),
         "bcdedit"=>cmd_bcdedit_status(arguments,cwd),
         "find"|"findstr"|"fc"|"sort"|"more"=>text_command_status(command,arguments,cwd),
@@ -298,6 +299,8 @@ pub fn execute_status(command:&str,arguments:&str,cwd:&[u8])->u32{
             }
         },
         "ipconfig" if arguments.is_empty()||arguments.eq_ignore_ascii_case("/all")=>{cmd_ipconfig(arguments);0},
+        "ping" => cmd_ping_status(arguments),
+        "nslookup" => cmd_nslookup_status(arguments),
         "netstat" if arguments.eq_ignore_ascii_case("-r")=>{cmd_netstat();0},
         "tasklist" if arguments.is_empty()=>match crate::ps::process_mgmt::get_all_processes(){
             Ok(processes)=>{output_line("Image Name                     PID   Mem Usage");for p in processes{output_line(&format!("{:<28} {:>5} {:>7} K",p.name,p.pid,p.memory_usage/1024));}0},
@@ -1895,20 +1898,21 @@ fn cmd_netsh(arguments: &str) -> bool {
     false
 }
 
-fn cmd_nslookup(arguments: &str) -> bool {
-    let name = arguments.split_whitespace().next().unwrap_or("");
-    if name.is_empty() {
-        output_line("Syntax: NSLOOKUP hostname");
-        return false;
-    }
+fn cmd_nslookup(arguments: &str) -> bool { cmd_nslookup_status(arguments); false }
+fn cmd_nslookup_status(arguments: &str) -> u32 {
+    let names: Vec<_> = arguments.split_whitespace().collect();
+    if names.len() != 1 { output_line("Syntax: NSLOOKUP hostname"); return 1; }
+    let name = names[0];
+    let server = crate::netstack::dns::get_dns_server();
+    output_line(&format!("Server:  {}", format_ipv4(server)));
     match crate::netstack::dns::resolve(name) {
         Ok(address) => {
             output_line(&format!("Name:    {}", name));
             output_line(&format!("Address: {}", format_ipv4(address)));
+            0
         }
-        Err(_) => output_line(&format!("** server can't find {}: NXDOMAIN", name)),
+        Err(error) => { output_line(&format!("DNS lookup failed for {}: {:?}", name, error)); 1 }
     }
-    false
 }
 
 fn cmd_setx(arguments: &str) -> bool {
@@ -3050,7 +3054,8 @@ fn cmd_redirusr(_arguments: &str) -> bool {
     false
 }
 
-fn cmd_ping(arguments: &str) -> bool {
+fn cmd_ping(arguments: &str) -> bool { cmd_ping_status(arguments); false }
+fn cmd_ping_status(arguments: &str) -> u32 {
     let mut tokens = arguments.split_whitespace();
     let mut target = "";
     let mut count = 4u32;
@@ -3061,13 +3066,13 @@ fn cmd_ping(arguments: &str) -> bool {
                     count = value;
                 }
             }
-            "-t" => count = 0,
+            "-t" => {output_line("Continuous ping is not supported by this command worker.");return 50;},
             _ => target = token,
         }
     }
     if target.is_empty() {
         output_line("Usage: ping [-n count] [-t] hostname | IP address");
-        return false;
+        return 1;
     }
     let address = match crate::netstack::dns::resolve(target) {
         Ok(address) => address,
@@ -3076,7 +3081,7 @@ fn cmd_ping(arguments: &str) -> bool {
                 "Ping request could not find host {}. Please check the name and try again.",
                 target
             ));
-            return false;
+            return 1;
         }
     };
     output_line(&format!(
@@ -3085,7 +3090,7 @@ fn cmd_ping(arguments: &str) -> bool {
         format_ipv4(address)
     ));
 
-    let probe_count = if count == 0 { 10 } else { count };
+    let probe_count = count.clamp(1, 100);
     let identifier = 0x4E61u16;
     let mut received = 0u32;
     let mut replies_size = 32usize;
@@ -3093,7 +3098,12 @@ fn cmd_ping(arguments: &str) -> bool {
     for sequence in 0..probe_count {
         let sequence = sequence as u16;
         crate::netstack::icmp::arm_echo_reply(identifier, sequence);
-        let sent = crate::netstack::icmp::send_echo_request(address, identifier, sequence);
+        let arp_deadline = crate::hal::common::pit::get_system_time_ms() + 1000;
+        let sent = loop {
+            if crate::netstack::icmp::send_echo_request(address, identifier, sequence) { break true; }
+            crate::drivers::net::poll_all();
+            if crate::hal::common::pit::get_system_time_ms() >= arp_deadline { break false; }
+        };
         if !sent {
             output_line("Transmission failed.");
             continue;
@@ -3102,21 +3112,23 @@ fn cmd_ping(arguments: &str) -> bool {
         let start = crate::hal::common::pit::get_system_time_ms();
         let deadline = start + 1_000;
         let mut got_reply = false;
+        let mut elapsed=0;
         while crate::hal::common::pit::get_system_time_ms() < deadline {
             crate::drivers::net::poll_all();
             if let Some((_, size)) = crate::netstack::icmp::take_echo_reply(identifier, sequence) {
                 replies_size = size;
                 received += 1;
                 got_reply = true;
+                elapsed=crate::hal::common::pit::get_system_time_ms().saturating_sub(start);
                 break;
             }
         }
 
         if got_reply {
             output_line(&format!(
-                "Reply from {}: bytes={} time<1ms TTL=128",
+                "Reply from {}: bytes={} time={}ms",
                 format_ipv4(address),
-                replies_size
+                replies_size,elapsed
             ));
         } else {
             output_line("Request timed out.");
@@ -3133,7 +3145,7 @@ fn cmd_ping(arguments: &str) -> bool {
         lost,
         (lost * 100) / probe_count.max(1)
     ));
-    false
+    if received > 0 { 0 } else { 1 }
 }
 
 fn cmd_tracert(arguments: &str) -> bool {
@@ -3717,4 +3729,18 @@ fn cmd_bcdedit_status(arguments:&str,cwd:&[u8])->u32 {
         output_line("The operation completed successfully.");Ok(())
     })();
     match result{Ok(())=>0,Err(e)=>{output_line(&e);1}}
+}
+
+/// CertUtil's basic URL retrieval uses the same TCP backend as guest sockets.
+fn http_download_status(arguments:&str,cwd:&[u8])->u32 {
+    let Ok(args)=super::command_tools::arguments(arguments)else{output_line("Invalid arguments.");return 1;};
+    let mut positional=Vec::new();
+    for arg in &args {if ["-urlcache","-split","-f"].iter().any(|flag|arg.eq_ignore_ascii_case(flag)){continue;}positional.push(arg);}
+    if positional.len()!=2{output_line("Supported syntax: CERTUTIL -urlcache -split -f http://host/path output_file");return 1;}
+    let bytes=match crate::netstack::http::get(positional[0]){Ok(b)=>b,Err(e)=>{output_line(e);return 1;}};
+    let path=super::command_tools::path(positional[1],cwd);
+    match crate::fs::system_volume::write(&path,&bytes).and_then(|_|crate::fs::system_volume::flush()){
+        Ok(())=>{output_line(&format!("Downloaded {} bytes to {}.",bytes.len(),path));output_line("CertUtil: -URLCache command completed successfully.");0},
+        Err(code)=>{output_line(&format!("Cannot save the download (0x{code:08X})."));1}
+    }
 }
