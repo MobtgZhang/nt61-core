@@ -19,6 +19,9 @@ pub trait DiskBackend: Sync {
     fn disk_count(&self) -> usize;
     fn disk_read(&self, index: usize, offset: u64, byte_count: usize, buf: &mut [u8]) -> usize;
     fn disk_write(&self, index: usize, offset: u64, byte_count: usize, buf: &[u8]) -> usize;
+    /// Complete outstanding writes on persistent media. Unsupported backends
+    /// return false instead of promising that volatile writes are durable.
+    fn flush(&self, _index: usize) -> bool { false }
     fn get_disk(&self, index: usize) -> Option<DiskInfo>;
     fn smoke_test(&self) -> bool;
     fn read_count(&self) -> u32;
@@ -60,6 +63,10 @@ pub fn disk_write(index: usize, offset: u64, byte_count: usize, buf: &[u8]) -> u
     backend().map_or(0, |backend| {
         backend.disk_write(index, offset, byte_count, buf)
     })
+}
+
+pub fn flush(index: usize) -> bool {
+    backend().is_some_and(|backend| backend.flush(index))
 }
 
 pub fn smoke_test() -> bool {

@@ -370,6 +370,10 @@ impl crate::drivers::storage::disk::DiskBackend for X86DiskBackend {
         })
     }
 
+    fn flush(&self, index: usize) -> bool {
+        index >= disk_count() && crate::drivers::storage::virtio_disk::flush(index - disk_count())
+    }
+
     fn smoke_test(&self) -> bool {
         smoke_test()
     }

@@ -153,6 +153,14 @@ pub fn write(index: usize, offset: u64, buffer: &[u8]) -> usize {
 }
 
 /// Disk class facade for architectures whose storage is carried by VirtIO.
+pub fn flush(index: usize) -> bool {
+    let mut state = STATE.lock();
+    let Some(device) = state.devices.get_mut(index) else { return false; };
+    // A device without FLUSH advertises write-through operation. With FLUSH
+    // negotiated, explicitly wait for completion before reporting durability.
+    !device.block.has_flush() || unsafe { device.block.flush(device.transport.as_mut()) }
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 pub struct VirtioDiskBackend;
 
@@ -182,6 +190,7 @@ impl super::disk::DiskBackend for VirtioDiskBackend {
             .get(..byte_count)
             .map_or(0, |buffer| write(index, offset, buffer))
     }
+    fn flush(&self, index: usize) -> bool { flush(index) }
     fn smoke_test(&self) -> bool {
         (0..count()).all(|index| read(index, 0, &mut [0; 512]) == 512)
     }

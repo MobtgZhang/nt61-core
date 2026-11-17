@@ -13,6 +13,13 @@ const UNSUPPORTED: u32 = 0xC000_00BB;
 const IO_ERROR: u32 = 0xC000_0001;
 static BUSY: AtomicBool = AtomicBool::new(false);
 
+/// Persist pending NTFS system-volume mutations to its identified boot disk.
+/// Returns an error for unsupported/ambiguous media or a short write.
+pub fn flush() -> Result<(), u32> {
+    let _guard = VolumeGuard::acquire()?;
+    super::system_mirror::flush()
+}
+
 struct VolumeGuard(Option<*const u8>);
 impl VolumeGuard {
     fn acquire() -> Result<Self, u32> {
@@ -31,6 +38,20 @@ impl Drop for VolumeGuard {
 
 #[derive(Debug)]
 pub struct Entry { pub name: String, pub directory: bool, pub size: u64 }
+
+/// Full mounted NTFS directory metadata for Win32 enumeration. Other volume
+/// formats must supply their own timestamp/attribute conversion before use.
+pub fn directory_metadata(path: &str) -> Result<Vec<ntfs::DirectoryEntry>, u32> {
+    let path = normalize(path)?;
+    let _guard = VolumeGuard::acquire()?;
+    if super::detect_system_partition_type() != FsType::Ntfs { return Err(UNSUPPORTED); }
+    let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+    let record = if path == "C:\\" { 5 } else {
+        ntfs::open_file(fs, &utf16(&path), None)
+            .filter(|handle| handle.is_directory).ok_or(0xc000003au32)?.mft_record
+    };
+    ntfs::list_directory_checked(fs, record).map_err(|status| status as u32)
+}
 
 /// Canonical absolute system-volume path. Reject other drives and traversal
 /// above the root before a filesystem-specific resolver sees the input.

@@ -13,6 +13,7 @@ pub mod refs; // ReFS (Resilient File System) support
 pub mod smoke;
 pub mod vfs;
 pub mod system_volume;
+mod system_mirror;
 pub mod windows_paths; // Windows 7 path and directory mapping
 
 use crate::ke::sync::Spinlock;
@@ -1119,9 +1120,10 @@ pub fn sys_ramdisk_write_sector(sector: u64, buffer: &[u8]) -> Result<(), NTSTAT
     let offset = (sector as usize)
         .checked_mul(512)
         .ok_or(STATUS_UNSUCCESSFUL)?;
-    if offset + buffer.len() > disk.size {
+    if offset.checked_add(buffer.len()).is_none_or(|end| end > disk.size) {
         return Err(STATUS_UNSUCCESSFUL);
     }
+    system_mirror::mark(offset, buffer.len());
     unsafe {
         let destination = disk.base.add(offset) as *mut u8;
         for (index, byte) in buffer.iter().enumerate() {
@@ -1326,6 +1328,7 @@ pub fn mount_sys_from_bootinfo(boot_info: &crate::boot_types::BootInfo) {
         size,
         block_size,
     });
+    system_mirror::reset(size);
     // Stash the size/sector_size for the EXT4 mount path so that
     // branch can install the system partition into the global
     // RAM_DISK layer that ext2::read_sector reaches through.

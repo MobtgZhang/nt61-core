@@ -230,9 +230,12 @@ impl FlushManager {
             _ => return false,
         };
 
-        crate::fs::vfs::vfs_write(path, &bytes)
-            .map(|written| written == bytes.len())
-            .unwrap_or(false)
+        // Hive files belong to the mounted boot volume. The legacy VFS
+        // writer does not resolve that volume and a mirror write alone is
+        // not durable: acknowledge persistence only after block writeback.
+        crate::fs::system_volume::write(path, &bytes)
+            .and_then(|()| crate::fs::system_volume::flush())
+            .is_ok()
     }
 
     pub fn flush_all(&self, timestamp: u64) -> Result<(), HiveError> {
