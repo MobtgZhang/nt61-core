@@ -113,3 +113,9 @@ fn changed_install_updates_mui_cache_but_same_install_preserves_initial_override
     );
     assert_eq!(state.mui_fallback_language(), 0x804);
 }
+
+#[test]
+fn global_install_language_starts_with_the_uncommitted_windows_default() {
+    assert_eq!(production::INSTALL_LANGUAGE.language(), 0x409);
+    assert_eq!(production::INSTALL_LANGUAGE.committed_status(), MISSING);
+}

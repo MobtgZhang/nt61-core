@@ -14,7 +14,7 @@
 //! References: Windows Internals, WRK
 
 use super::seaccess::{AccessCheckResult, GenericMapping, SecurityDescriptor};
-use super::token::{luid, ImpersonationLevel, Token};
+use super::token::Token;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 static SRM_INITIALIZED: AtomicBool = AtomicBool::new(false);

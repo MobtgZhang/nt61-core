@@ -19,6 +19,87 @@ impl Drop for VolumeIo {
     fn drop(&mut self){if self.desktop_windows{let mut packet=nt61_abi::dialog_bridge::EMPTY;packet.values[0]=nt61_abi::dialog_bridge::WINDOW;packet.values[4]=8;packet.values[63]=self.desktop_client;let _=crate::arch::common::dialog_broker::request(packet);}}
 }
 impl IoHost for VolumeIo {
+    fn create_event(&mut self, manual: bool, signaled: bool) -> Result<u64, u32> {
+        crate::libs::ntdll::sync::create_event_kernel(u32::from(!manual), signaled)
+            .map(|handle| handle as u64).map_err(|status| status as u32)
+    }
+    fn change_event(&mut self, event: u64, signaled: bool) -> Result<(), u32> {
+        // SAFETY: IoServices supplies only its owned backend handle. The
+        // optional previous-state pointer is null; no guest pointer enters NT.
+        let status = unsafe {
+            if signaled { crate::libs::ntdll::sync::nt_set_event(event as _, core::ptr::null_mut()) }
+            else { crate::libs::ntdll::sync::nt_reset_event(event as _, core::ptr::null_mut()) }
+        };
+        if status < 0 { Err(status as u32) } else { Ok(()) }
+    }
+    fn wait_event(&mut self, event: u64, timeout: Option<i64>) -> Result<u32, u32> {
+        let status = crate::libs::ntdll::sync::nt_wait_for_single_object_kernel(event as _, 0, timeout);
+        if status < 0 { Err(status as u32) } else { Ok(status as u32) }
+    }
+    fn close_event(&mut self, event: u64) -> Result<(), u32> {
+        // SAFETY: this is an owned opaque native handle, not a guest address.
+        let status = unsafe { crate::libs::ntdll::file::nt_close(event as _) };
+        if status < 0 { Err(status as u32) } else { Ok(()) }
+    }
+    fn create_directory(&mut self, path: &str) -> Result<(), u32> {
+        crate::fs::system_volume::mkdir(path)
+    }
+    fn directory_entries(&mut self, path: &str) -> Result<Vec<crate::arch::common::btl::nt61::DirectoryEntry>, u32> {
+        Ok(crate::fs::system_volume::directory_metadata(path)?.into_iter().map(|entry| {
+            crate::arch::common::btl::nt61::DirectoryEntry {
+                name: entry.name, attributes: entry.file_attributes,
+                size: entry.file_size, creation_time: entry.creation_time,
+                access_time: entry.access_time, write_time: entry.modification_time,
+            }
+        }).collect())
+    }
+    fn application_log_available(&mut self) -> bool { true }
+    fn report_application_event(&mut self, event: crate::arch::common::btl::nt61::ApplicationEvent) -> Result<(), u32> {
+        crate::rtl::eventlog::classic::report(event, crate::ke::time::get_system_time())
+    }
+
+    fn native_processor_info(&mut self) -> Result<crate::arch::common::btl::nt61::NativeProcessorInfo, u32> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: CPUID is available on every x86-64 processor; leaf 1
+            // is a read-only processor identification query.
+            let signature = core::arch::x86_64::__cpuid(1).eax;
+            let family = (signature >> 8) & 15;
+            let model = (signature >> 4) & 15;
+            let level = family + if family == 15 {(signature >> 20) & 255} else {0};
+            let model = model | if family == 6 || family == 15 {(signature >> 12) & 0xf0} else {0};
+            return Ok(crate::arch::common::btl::nt61::NativeProcessorInfo {
+                architecture: 9, processor_type: 8664, level: level as u16,
+                revision: ((model << 8) | (signature & 15)) as u16,
+            });
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        Err(0xc0000002)
+    }
+    fn unbiased_interrupt_time(&mut self) -> Result<u64, u32> {
+        // This counter advances on running timer ticks only. There is no
+        // suspended-time correction applied to it on this kernel.
+        Ok(crate::ke::time::get_interrupt_time())
+    }
+    fn time_adjustment(&mut self) -> Result<crate::arch::common::btl::nt61::TimeAdjustment, u32> {
+        // advance_tick advances both clocks by this interval. The kernel has
+        // no periodic clock adjustment, so automatic adjustment is disabled.
+        let increment = crate::ke::time::HUNDRED_NS_PER_MS as u32;
+        Ok(crate::arch::common::btl::nt61::TimeAdjustment {
+            adjustment: increment,
+            increment,
+            disabled: true,
+        })
+    }
+    fn random_bytes(&mut self, bytes: &mut [u8]) -> Result<(), u32> {
+        // The architecture checks hardware feature availability and retries
+        // transient failures. No clock, address or fixed-seed fallback.
+        for chunk in bytes.chunks_mut(8) {
+            let word = crate::arch::hardware_random_u64().ok_or(0xc00000bbu32)?;
+            chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]);
+        }
+        Ok(())
+    }
     fn printer_available(&mut self) -> bool { true }
     fn print_document(&mut self, data: &[u8]) -> Result<u32,u32> { crate::arch::common::dialog_broker::spool(data) }
 
@@ -133,6 +214,7 @@ pub fn try_execute(
             output(b"The file is not a valid Windows executable.\r\n");
             return Some(193);
         }
+        crate::hal::serial::write_string_always(&format!("[PE] Loading {candidate}\r\n"));
         let mut image =
             match crate::userspace::loader::load_translated_image(&candidate, line, directory) {
                 Ok(image) => image,
@@ -147,6 +229,7 @@ pub fn try_execute(
                     return Some(status);
                 }
             };
+        crate::hal::serial::write_string_always(&format!("[PE] Running {candidate}\r\n"));
         static NEXT_DESKTOP_CLIENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
         let mut services = IoServices::new(VolumeIo {
             desktop_client: NEXT_DESKTOP_CLIENT.fetch_add(1,core::sync::atomic::Ordering::Relaxed),
@@ -159,11 +242,33 @@ pub fn try_execute(
         });
         // Bounded maintenance/desktop console execution. Every quantum lets
         // runnable kernel/desktop threads proceed; no global BTL lock is held.
-        // The supplied Firefox SFX executes ~3.7M instructions just to unpack
-        // itself. Keep a finite bound while retaining a scheduler yield per quantum.
-        for _ in 0..4096 {
-            match image.run(2048, &mut services) {
+        // Large SFX installers need more than 8M instructions just to inspect
+        // their embedded archive. Keep a finite 128M-instruction cap and
+        // retain a scheduler yield after every 8192-instruction quantum.
+        let execution_started = crate::ke::time::get_interrupt_time();
+        let mut run_elapsed = 0u64;
+        for quantum in 0..16384 {
+            if quantum != 0 && quantum % 128 == 0 {
+                crate::hal::serial::write_string_always(&format!(
+                    "[PE] Progress {candidate}: retired={} pc=0x{:X}\r\n",
+                    image.thread.retired, image.thread.context.rip,
+                ));
+            }
+            let run_started = crate::ke::time::get_interrupt_time();
+            let result = image.run(8192, &mut services);
+            run_elapsed = run_elapsed.saturating_add(
+                crate::ke::time::get_interrupt_time().saturating_sub(run_started));
+            if !matches!(result, ImageRunResult::Yielded) {
+                crate::hal::serial::write_string_always(&format!(
+                    "[PE] Timing {candidate}: run_elapsed_ms={} wall_elapsed_ms={} batches={}\r\n",
+                    run_elapsed / 10_000,
+                    crate::ke::time::get_interrupt_time().saturating_sub(execution_started) / 10_000,
+                    quantum + 1,
+                ));
+            }
+            match result {
                 ImageRunResult::Exited(code) => {
+                    crate::hal::serial::write_string_always(&format!("[PE] Guest exited {candidate}: {code}\r\n"));
                     if !image.win32.failures.is_empty() {
                         let diagnostic = format!(
                             "[PE] Guest exited {code}; recent API failures: {:?}\r\n",
@@ -176,7 +281,24 @@ pub fn try_execute(
                 }
                 ImageRunResult::Yielded => crate::ke::scheduler::yield_(),
                 ImageRunResult::Fault(reason) => {
+                    use crate::arch::common::btl::memory::GuestMemory;
+                    let mut bytes = [0; 15];
+                    let mut count = 0;
+                    while count < bytes.len() && image.memory.fetch_virt(
+                        image.thread.context.rip.wrapping_add(count as u64),
+                        &mut bytes[count..count + 1],
+                    ) == 1 { count += 1; }
                     let status = match reason {
+                        StopReason::DataFault { .. } | StopReason::InstructionFault { .. } => 0xc0000005,
+                        StopReason::DivideError { .. } => 0xc0000094,
+                        StopReason::FloatingPointError { exceptions, .. } => {
+                            if exceptions & 1 != 0 { 0xc0000090 }
+                            else if exceptions & 2 != 0 { 0xc000008d }
+                            else if exceptions & 4 != 0 { 0xc000008e }
+                            else if exceptions & 8 != 0 { 0xc0000091 }
+                            else if exceptions & 16 != 0 { 0xc0000093 }
+                            else { 0xc000008f }
+                        }
                         StopReason::InitializationFailed { .. } => 0xc0000142,
                         _ => 0xc000001d,
                     };
@@ -192,11 +314,17 @@ pub fn try_execute(
                     crate::hal::serial::write_string_always("[PE] ");
                     crate::hal::serial::write_string_always(&diagnostic);
                     output(diagnostic.as_bytes());
+                    crate::hal::serial::write_string_always(&format!(
+                        "[PE] Fault details: retired={} bytes={:02X?} last_api_arguments={:X?} recent_api_failures={:?}\r\n",
+                        image.thread.retired, &bytes[..count], image.win32.last_arguments, image.win32.failures,
+                    ));
                     return Some(status);
                 }
             }
         }
-        output(b"Guest instruction budget exceeded; console invocation stopped.\r\n");
+        let diagnostic = format!("[PE] Guest instruction budget exceeded in {candidate}; console invocation stopped.\r\n");
+        crate::hal::serial::write_string_always(&diagnostic);
+        output(diagnostic.as_bytes());
         return Some(1460);
     }
     None

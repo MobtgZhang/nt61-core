@@ -10,6 +10,7 @@
 extern crate alloc;
 
 pub mod channels;
+pub mod classic;
 pub mod evtx;
 pub mod xml_export;
 
@@ -292,6 +293,14 @@ pub fn init() {
     record.set_description("The system boot has begun.");
     if let Some(log) = logs[0].as_mut() {
         log.write(record);
+    }
+}
+
+/// Attach SCM to initialized channels without erasing records collected during boot.
+pub fn ensure_initialized() {
+    let mut logs = LOGS.lock();
+    for (slot, channel) in logs.iter_mut().zip([EventChannel::System,EventChannel::Application,EventChannel::Security,EventChannel::Setup]) {
+        if slot.is_none() { *slot = Some(EventLog::new(channel)); }
     }
 }
 

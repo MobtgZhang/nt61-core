@@ -73,7 +73,7 @@ mod ps {
             None
         }
         pub use crate::effective_token::get_current_thread_token;
-        pub fn find_thread_in_process(_: *mut Eprocess, _: u64) -> Option<*mut Ethread> {
+        pub unsafe fn find_thread_in_process(_: *mut Eprocess, _: u64) -> Option<*mut Ethread> {
             None
         }
         pub struct ProcessList {
@@ -141,6 +141,9 @@ mod ke {
         }
         pub fn get_current_cpu() -> usize { 0 }
         pub unsafe fn add_ready(_: *mut crate::thread_code::Ethread, _: u8) {}
+        pub unsafe fn set_priority(thread: *mut crate::thread_code::Ethread, priority: i8) {
+            (*thread).kthread.priority = priority;
+        }
         pub unsafe fn remove_ready(_: *mut crate::thread_code::Ethread) -> bool {
             true
         }
@@ -173,7 +176,7 @@ mod ke {
             User,
             Kernel,
         }
-        pub fn queue_thread_apc(
+        pub unsafe fn queue_thread_apc(
             _: *mut crate::thread_code::Ethread,
             _: ApcKind,
             _: ApcRoutine,
@@ -184,10 +187,10 @@ mod ke {
         ) -> bool {
             false
         }
-        pub fn deliver_thread_apc(_: *mut crate::thread_code::Ethread, _: ApcKind) -> bool {
+        pub unsafe fn deliver_thread_apc(_: *mut crate::thread_code::Ethread, _: ApcKind) -> bool {
             false
         }
-        pub fn has_pending_apc(_: *mut crate::thread_code::Ethread, _: ApcKind) -> bool {
+        pub unsafe fn has_pending_apc(_: *mut crate::thread_code::Ethread, _: ApcKind) -> bool {
             false
         }
     }

@@ -5,7 +5,9 @@ use std::sync::{mpsc, Mutex};
 use std::time::Duration;
 
 #[path = "../src/ke/tlb_shootdown.rs"]
-mod shootdown;
+pub mod shootdown;
+#[path = "../src/ke/instruction_shootdown.rs"]
+pub mod instruction_shootdown;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 static CPUS: AtomicU32 = AtomicU32::new(1);
@@ -19,6 +21,14 @@ mod arch {
     pub fn disable_interrupts() {}
     pub fn enable_interrupts() {}
     pub mod common {
+        pub mod instruction_cache {
+            pub fn publish_code_stores() {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+            pub fn synchronize_code_fetch() {
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+        }
         pub mod percpu {
             thread_local! { pub static CPU: core::cell::Cell<u32> = const { core::cell::Cell::new(0) }; }
             pub fn get_current_cpu_id() -> u32 {
