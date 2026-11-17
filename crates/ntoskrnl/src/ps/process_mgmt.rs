@@ -108,7 +108,7 @@ pub fn get_all_processes() -> Result<Vec<KernelProcessInfo>, NTSTATUS> {
             pid: process.unique_process_id,
             name: String::from_utf8_lossy(process.image_name()).into_owned(),
             memory_usage: process.mm_size_of_working_set,
-            cpu_time: process.kernel_time.saturating_add(process.user_time),
+            cpu_time: process.activity_ticks.load(core::sync::atomic::Ordering::Relaxed),
             session_id: process.session_id,
             status: String::from(if terminated {
                 ProcessState::Terminated.as_str()
@@ -129,7 +129,7 @@ fn process_user_name(process: &crate::ps::process::Eprocess) -> alloc::string::S
     let Some(token) = (unsafe { process.get_token().as_ref() }) else {
         return alloc::string::String::from("NT AUTHORITY\\SYSTEM");
     };
-    if let Some(name) = crate::se::logon::name_for_sid(&token.user) {
+    if let Some(name) = crate::se::users::account_name(&token.user) {
         return name.into();
     }
     if token.is_local_system() {

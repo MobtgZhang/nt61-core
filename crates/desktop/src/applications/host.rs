@@ -13,12 +13,16 @@ impl ShellModel {
             network_adapters: self.network_adapters,
             audio: self.audio_available,
             processes: self.process_snapshot.clone(),
+            monitor: self.monitor_sample.clone(),
+            services: self.service_snapshot.clone(),
+            users: core::iter::once((self.session.identity.clone(),true)).chain(self.saved_desktops.iter().map(|d|(d.user.clone(),false))).collect(),
             tasks: self
                 .taskbar
                 .windows
                 .iter()
                 .map(|w| Task {
                     id: w.id,
+                    icon: self.applications.iter().find(|app| app.window_id==w.id).map(|app|app.id).or_else(||self.explorers.iter().any(|ex|ex.window_id==w.id).then_some(AppId::Explorer)),
                     title: w.title.clone(),
                     minimized: w.minimized,
                 })
@@ -29,6 +33,7 @@ impl ShellModel {
         self.applications.iter().find(|a| a.window_id == id)
     }
     pub fn launch_application(&mut self, id: AppId) -> u32 {
+        if id==AppId::TaskManager {if let Some(window)=self.applications.iter().find(|a|a.id==id).map(|a|a.window_id){if let Some(w)=self.taskbar.windows.iter_mut().find(|w|w.id==window){w.minimized=false;}self.select_window(window);return window;}}
         if id == AppId::Explorer {
             return self.open_window_with_kind(
                 "Windows Explorer",
@@ -44,6 +49,7 @@ impl ShellModel {
             AppId::Calculator => (350, 430),
             AppId::StickyNotes => (430, 350),
             AppId::Run => (540, 240),
+            AppId::TaskManager => (480, 440),
             AppId::Minesweeper => (510, 420),
             AppId::OnScreenKeyboard => (520, 340),
             _ => (640, 460),
@@ -80,6 +86,7 @@ impl ShellModel {
         })
     }
     pub fn application_key(&mut self, id: u32, key: u8) -> bool {
+        if self.taskbar.windows.iter().any(|w|w.id==id&&w.kind==WindowKind::UserAccounts){return self.account_settings.key(key); }
         if let Some(modal) = self.guest_modal_for(id) { self.select_window(modal); return true; }
         if let Some(explorer) = self.explorers.iter_mut().find(|e| e.window_id == id) {
             let changed = explorer.stream_key(&mut self.files, key);
@@ -485,7 +492,7 @@ impl ShellModel {
     /// A dragged thumb keeps receiving motion outside its window until release.
     pub fn captured_pointer_window(&self) -> Option<u32> {
         self.explorers.iter().find(|e| e.captures_pointer()).map(|e| e.window_id)
-            .or_else(|| self.applications.iter().find(|app| app.dialog.as_ref().is_some_and(|d| d.captures_pointer()) || super::common_dialogs::captures_pointer(app) || app.guest_window.as_ref().is_some_and(|s|s.captures_pointer())).map(|app| app.window_id))
+            .or_else(|| self.applications.iter().find(|app| app.manager.scroll_grab.is_some() || app.dialog.as_ref().is_some_and(|d| d.captures_pointer()) || super::common_dialogs::captures_pointer(app) || app.guest_window.as_ref().is_some_and(|s|s.captures_pointer())).map(|app| app.window_id))
     }
 
     pub fn application_wheel(&mut self, id: u32, x: i32, y: i32, delta: i32) -> bool {
@@ -495,7 +502,9 @@ impl ShellModel {
         if let Some(explorer) = self.explorers.iter_mut().find(|e| e.window_id == id) {
             return explorer.wheel(&self.files, body, delta);
         }
+        let env = self.application_environment();
         if let Some(app) = self.applications.iter_mut().find(|a| a.window_id == id) {
+            if app.id == AppId::TaskManager { return super::task_manager::wheel(app,body,&env,delta); }
             if let Some(dialog) = &mut app.dialog { return dialog.wheel(body, delta); }
             if app.common_dialog.is_some() { return super::common_dialogs::wheel(app, body, delta); }
         }
@@ -527,7 +536,7 @@ impl ShellModel {
             scene.pointer(body,x,y,down,held);return true;
         }
         let dialog_capture = self.applications.iter().find(|app| app.window_id == id)
-            .is_some_and(|app| app.dialog.as_ref().is_some_and(|d| d.captures_pointer()) || super::common_dialogs::captures_pointer(app) || app.guest_window.as_ref().is_some_and(|s|s.captures_pointer()));
+            .is_some_and(|app| app.manager.scroll_grab.is_some() || app.dialog.as_ref().is_some_and(|d| d.captures_pointer()) || super::common_dialogs::captures_pointer(app) || app.guest_window.as_ref().is_some_and(|s|s.captures_pointer()));
         if !body.contains(x, y) && !dialog_capture {
             if !held {
                 if let Some(app) = self.applications.iter_mut().find(|a| a.window_id == id) {
@@ -548,6 +557,7 @@ impl ShellModel {
         let Some(app) = self.applications.iter_mut().find(|a| a.window_id == id) else {
             return false;
         };
+        if app.id == AppId::TaskManager && super::task_manager::scroll_pointer(app,body,&env,x,y,down,held) { return true; }
         app.notepad.clipboard = clipboard;
         if app.confirm {
             if down {
@@ -717,12 +727,15 @@ impl ShellModel {
                 }
             }
             AppAction::Activate(target) => {
+                let minimize=self.application(id).is_some_and(|a|a.id==AppId::TaskManager&&a.manager.minimize_on_use);
+                if minimize {if let Some(w)=self.taskbar.windows.iter_mut().find(|w|w.id==id){w.minimized=true;}}
                 if let Some(w) = self.taskbar.windows.iter_mut().find(|w| w.id == target) {
                     w.minimized = false;
                 }
                 self.select_window(target);
             }
-            AppAction::EndTask(target) => self.close_window(target),
+            AppAction::EndTask(target) => self.request_application_close(target),
+            AppAction::Manage(action) => self.task_manager_action(id, action),
             AppAction::Type(key) => {
                 if let Some(target) = self.text_target.filter(|target| *target != id) {
                     if self.applications.iter().any(|a| a.window_id == target) {

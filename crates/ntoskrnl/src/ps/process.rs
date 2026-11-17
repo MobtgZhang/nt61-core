@@ -792,6 +792,8 @@ pub struct Eprocess {
     pub wow64_peb32_ptr: u64,
     pub wow64_vas_ptr: u64,
     pub wow64_reserved: [u64; 4],
+    /// Clock ticks charged to this process across CPUs; separate from the NT ABI fields.
+    pub activity_ticks: AtomicU64,
     // === 0x500: END ===
     // Structure ends here - total size should be approximately 0x540 for Windows 7 x64
 }
@@ -1001,6 +1003,7 @@ impl Eprocess {
             wow64_vas_ptr: 0,
             // Reserved for future WoW64 extension data
             wow64_reserved: [0; 4],
+            activity_ticks: AtomicU64::new(0),
         }
     }
 
@@ -1014,11 +1017,12 @@ impl Eprocess {
     pub fn set_name(&mut self, name: &[u8]) {
         let base_start = name
             .iter()
-            .rposition(|&b| b == b'\\')
+            .rposition(|&b| b == b'\\' || b == b'/')
             .map(|p| p + 1)
             .unwrap_or(0);
         let base_name = &name[base_start..];
         let len = base_name.len().min(14);
+        self.image_file_name.fill(0);
         self.image_file_name[..len].copy_from_slice(&base_name[..len]);
     }
 
@@ -2702,4 +2706,10 @@ pub fn gui_resource_process(handle: u64) -> Option<u64> {
 /// Only records requests; the scheduler owns state changes and stack lifetime.
 pub unsafe fn request_process_members_termination(process:*mut Eprocess){
     unsafe{super::thread_list::request_termination(process);}
+}
+
+/// # Safety
+/// The process registry must retain the process and all linked threads.
+pub unsafe fn configure_process_members(process:*mut Eprocess,priority:Option<i8>,affinity:Option<u64>){
+    unsafe{crate::ps::thread_list::configure(process,priority,affinity);}
 }

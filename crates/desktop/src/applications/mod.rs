@@ -21,6 +21,8 @@ pub mod minesweeper;
 pub mod notepad;
 pub mod paint;
 pub mod processes;
+pub mod system_monitor;
+pub mod task_manager;
 pub mod resource_monitor;
 pub mod view;
 pub mod wordpad;
@@ -50,6 +52,7 @@ pub enum AppAction {
     Type(u8),
     Capture,
     InsertTime,
+    Manage(task_manager::Action),
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppState {
@@ -113,10 +116,12 @@ pub struct ApplicationSession {
     pub input_time: u64,
     pub notepad: notepad::Notepad,
     pub wordpad: wordpad::WordPad,
+    pub manager: task_manager::Manager,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Task {
     pub id: u32,
+    pub icon: Option<AppId>,
     pub title: String,
     pub minimized: bool,
 }
@@ -128,6 +133,9 @@ pub struct Environment {
     pub audio: bool,
     pub tasks: Vec<Task>,
     pub processes: Option<processes::Snapshot>,
+    pub monitor: Option<system_monitor::Sample>,
+    pub services: Vec<system_monitor::Service>,
+    pub users: Vec<(String,bool)>,
 }
 impl ApplicationSession {
     pub fn new(window_id: u32, id: AppId, seed: u64) -> Self {
@@ -202,9 +210,11 @@ impl ApplicationSession {
             input_time: 0,
             notepad: notepad::Notepad::default(),
             wordpad: wordpad::WordPad::default(),
+            manager: task_manager::Manager::default(),
         }
     }
     pub fn key(&mut self, key: u8) -> AppAction {
+        if self.id==AppId::TaskManager {return task_manager::key(self,key);}
         if let Some(scene)=&mut self.guest_window {scene.key(key);return AppAction::None;}
         if self.common_dialog.is_some() { return common_dialogs::key(self, key); }
         if key == 16 && matches!(self.state, AppState::Document(_) | AppState::Paint(_)) {

@@ -124,3 +124,20 @@ pub unsafe fn request_termination(process:*mut Eprocess) {
         }
     }
 }
+
+/// # Safety
+/// Registry ownership must retain the process and all members. Configuration is
+/// applied through dispatcher APIs so ready queue priority indices stay valid.
+pub unsafe fn configure(process:*mut Eprocess,priority:Option<i8>,affinity:Option<u64>) {
+    let _guard=MEMBERSHIP.lock();
+    unsafe{
+        let head=core::ptr::addr_of_mut!((*process).kprocess_thread_list_head);
+        let mut entry=(*head).flink;
+        while !entry.is_null()&&entry!=head {
+            let thread=entry.cast::<u8>().sub(core::mem::offset_of!(Ethread,thread_list_entry)).cast::<Ethread>();
+            if let Some(p)=priority{crate::ke::scheduler::set_priority(thread,p);}
+            if let Some(mask)=affinity{crate::ke::scheduler::set_thread_affinity(thread,mask);}
+            entry=(*entry).flink;
+        }
+    }
+}

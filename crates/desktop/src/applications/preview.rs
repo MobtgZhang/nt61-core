@@ -37,7 +37,7 @@ fn main() {
             &args[2],
             10,
             10,
-            nt61_desktop::shell::layout::UI_FONT_SIZE,
+            args.get(4).and_then(|size| size.parse().ok()).unwrap_or(nt61_desktop::shell::layout::UI_FONT_SIZE),
             if label {
                 0xFF182534
             } else if status {
@@ -295,14 +295,28 @@ fn main() {
             }
         }
     }
-    let env = Environment {
+    let mut env = Environment {
         width: 1024,
         height: 768,
         network_adapters: 0,
         audio: false,
         processes: None,
+        monitor: None,
+        services: vec![],
+        users: vec![],
         tasks: vec![],
     };
+    if id == AppId::TaskManager {
+        use nt61_desktop::applications::{Task, processes::{Snapshot, Process},system_monitor::{Sample,Service}};
+        env.users=vec![("Administrator".into(),true)];
+        env.tasks=vec![Task{id:10,title:"Documents".into(),icon:Some(AppId::Explorer),minimized:false},Task{id:11,title:"Untitled - Notepad".into(),icon:Some(AppId::Notepad),minimized:true},Task{id:12,title:"Windows Task Manager".into(),icon:Some(AppId::TaskManager),minimized:false}];
+        env.processes=Some(Snapshot{cpu_count:4,processes:["System","smss.exe","winlogon.exe","explorer.exe","notepad.exe"].iter().enumerate().map(|(i,name)|Process{pid:4+i as u64*32,working_set:(i as u64+1)*1024*1024,cpu_ticks:i as u64*12,session:1,name:String::from(*name),user:if i<3{"SYSTEM"}else{"Administrator"}.into()}).collect()});
+        env.services=vec![Service{name:"Dnscache".into(),description:"DNS Client".into(),group:"NetworkService".into(),state:4,pid:0,start_type:2,accepted:1,exit_code:0},Service{name:"EventLog".into(),description:"Windows Event Log".into(),group:"LocalServiceNetworkRestricted".into(),state:4,pid:0,start_type:2,accepted:0,exit_code:0}];
+        app.manager.last=Some(Sample{ticks:100,idle:25,uptime:543000,total:1024*1024*1024,available:600*1024*1024,threads:27,pool:12*1024*1024,..Sample::default()});
+        app.manager.cpu=Some(12);app.manager.show_all=true;
+        app.manager.page=match args.get(4).map(String::as_str){Some("processes")=>1,Some("services")=>2,Some("performance")=>3,_=>0};
+        if args.get(4).is_some_and(|v|v=="menu"){app.manager.menu=Some(0);}
+    }
     let mut frame = Surface::new(width, height);
     let font = FontLib::ui().unwrap();
     let size = nt61_desktop::shell::layout::UI_FONT_SIZE;

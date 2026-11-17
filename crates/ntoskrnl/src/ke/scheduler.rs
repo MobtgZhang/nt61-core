@@ -1505,7 +1505,8 @@ pub fn schedule() -> bool {
     };
 
     // Try to pick the next thread from per-CPU PRCB queue
-    let next = if SMP_INITIALIZED.load(Ordering::SeqCst) && cpu < MAX_CPUS {
+    let next = loop {
+    let candidate = if SMP_INITIALIZED.load(Ordering::SeqCst) && cpu < MAX_CPUS {
         if let Some(ref mut prcb) = scheduler.prcb_mut(cpu) {
             // Find highest priority non-empty queue
             let summary = prcb.ready_summary.load(Ordering::Acquire);
@@ -1588,11 +1589,18 @@ pub fn schedule() -> bool {
         }
     };
 
-    // A foreign process termination only records a request; the dispatcher
-    // owns state transitions and leaves active allocations pinned.
-    let next=next.filter(|thread|unsafe{
-        if (**thread).execution_request.is_terminating(){(**thread).kthread.state=KThreadState::Terminated;false}else{true}
-    });
+    // Drain terminated ready entries in this dispatch, rather than returning
+    // to a terminating current thread for another user-mode instruction.
+    if let Some(thread)=candidate {
+        if unsafe{(*thread).execution_request.is_terminating()} {
+            unsafe{(*thread).kthread.state=KThreadState::Terminated;}
+            continue;
+        }
+        break Some(thread);
+    }
+    let exiting=current.is_some_and(|t|unsafe{(*t).execution_request.is_terminating()});
+    break if exiting {scheduler.prcb(cpu).and_then(|p|if p.idle_thread.is_null(){None}else{Some(p.idle_thread)})}else{None};
+    };
     // Update current_thread in PRCB
     if let Some(next_thread) = next {
         if Some(next_thread) != current {
@@ -1788,6 +1796,8 @@ pub fn tick() {
                 return;
             }
             ACTIVITY_TOTAL.fetch_add(1,Ordering::Relaxed);
+            let process=(*current).threads_process;
+            if !process.is_null(){(*process).activity_ticks.fetch_add(1,Ordering::Relaxed);}
             if current==prcb.idle_thread {ACTIVITY_IDLE.fetch_add(1,Ordering::Relaxed);}
             if (*current).execution_request.is_terminating() {
                 (*current).kthread.state=KThreadState::Terminated;
@@ -1832,6 +1842,7 @@ pub fn poll_services() {
         crate::arch::boot::poll_boot_animation();
     }
     crate::drivers::net::poll_all();
+    crate::drivers::audio::hda_pcm::poll();
 }
 
 /// Per-CPU reschedule requests raised by the clock ISR.

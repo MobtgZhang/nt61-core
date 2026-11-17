@@ -11,6 +11,7 @@ use crate::{
 use alloc::{format, string::String, vec::Vec};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    TaskManager(super::task_manager::Command),
     WordPad(super::wordpad::Command),
     Notepad(super::notepad::Command),
     Key(u8),
@@ -90,6 +91,7 @@ fn button(
 }
 pub fn buttons(app: &ApplicationSession, b: Rect, env: &Environment) -> Vec<Button> {
     let mut out = Vec::new();
+    if app.id==AppId::TaskManager {return super::task_manager::buttons(app,b,env);}
     if app.id == AppId::WordPad {
         return super::wordpad::buttons(app, b);
     }
@@ -535,6 +537,7 @@ pub fn click(
     y: i32,
     right: bool,
 ) -> AppAction {
+    if app.id==AppId::TaskManager {return super::task_manager::click(app,body,env,x,y,right);}
     if app.common_dialog.is_some() {
         if !right { super::common_dialogs::pointer(app, body, x, y); }
         return AppAction::None;
@@ -563,6 +566,7 @@ pub fn click(
         app.menu = false;
     }
     match button.command {
+        Command::TaskManager(_) => {},
         Command::WordPad(command) => return super::wordpad::execute(app, command),
         Command::Notepad(command) => return super::notepad::execute(app, command),
         Command::File => {
@@ -811,6 +815,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
     env: &Environment,
     text: F,
 ) {
+    if app.id==AppId::TaskManager {super::task_manager::draw(app,frame,b,env,text);return;}
     if let Some(scene)=&app.guest_window {scene.draw(frame,b,&text);return;}
     if app.guest_dialog.is_some() {
         frame.fill_rect(b.x,b.y,b.width,b.height,0xfff0f0f0);
