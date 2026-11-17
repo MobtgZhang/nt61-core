@@ -354,10 +354,11 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         return;
     }
     if value != KEY_VALUE_RELEASE {
-        let usage = match code { 111 => 0x4c, 62 => 0x3d, 1 => 0x29, _ => 0 };
+        let usage = match code { 111 => 0x4c, 62 => 0x3d, 1 => 0x29, 38=>0x0f, _ => 0 };
         let modifiers = u8::from(CONTROL_KEYS.load(Ordering::Relaxed) != 0)
             | (u8::from(ALT_KEYS.load(Ordering::Relaxed) != 0) << 2)
-            | (u8::from(shift_state()) << 1);
+            | (u8::from(shift_state()) << 1)
+            | (u8::from(GUI_KEYS.load(Ordering::Relaxed)!=0)<<3);
         if crate::hal::common::desktop_hotkeys::intercept(usage, modifiers) { return; }
     }
     // Linux key codes 1..=83 retain set-1 make codes; navigation and right
@@ -391,6 +392,7 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
             extended,
         );
     }
+    if code==125||code==126 {let bit=if code==125{1}else{2};if value==KEY_VALUE_RELEASE{GUI_KEYS.fetch_and(!bit,Ordering::Relaxed);}else{GUI_KEYS.fetch_or(bit,Ordering::Relaxed);}return;}
     // Control keys produce ASCII control bytes for the shared desktop ABI.
     if code == 29 || code == 97 {
         let bit = if code == 29 { 1 } else { 2 };
@@ -973,6 +975,7 @@ fn translate(virtual_address: u64) -> Option<u64> {
 }
 
 static CONTROL_KEYS: AtomicU8 = AtomicU8::new(0);
+static GUI_KEYS:AtomicU8=AtomicU8::new(0);
 static ALT_KEYS: AtomicU8 = AtomicU8::new(0);
 static DEVICE: AtomicPtr<Device> = AtomicPtr::new(core::ptr::null_mut());
 static MOUSE_DEVICE: AtomicPtr<Device> = AtomicPtr::new(core::ptr::null_mut());

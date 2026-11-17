@@ -260,6 +260,21 @@ impl VirtioGpu {
         initialized
     }
 
+    /// Replace scanout while retaining the old resource until SET_SCANOUT succeeds.
+    /// Both old and new backing stores must remain mapped across this call.
+    pub unsafe fn change_display(&mut self, transport: &mut dyn Transport,
+        fb_addr: *const u8, width: u32, height: u32) -> bool {
+        let _commands = COMMAND_LOCK.lock();
+        if self.failed || self.resource_id == 0 || fb_addr.is_null() || width < 640 || height < 480
+            || width > 1920 || height > 1200 { return false; }
+        let previous = self.resource_id;
+        // Use standard 2D resources for runtime mode changes on all hosts.
+        if !self.initialize_display_2d(transport, 0, fb_addr, width, height) { return false; }
+        self.blob_supported = false;
+        self.release_resource(transport, previous);
+        true
+    }
+
     unsafe fn initialize_display_locked(
         &mut self, transport: &mut dyn Transport, scanout_id: u32,
         fb_addr: *const u8, width: u32, height: u32,
@@ -412,6 +427,16 @@ impl VirtioGpu {
         width: u32,
         height: u32,
     ) -> bool {
+        // The single VirtIO backing entry requires physical contiguity. Validate
+        // every page before creating a device resource or changing scanout.
+        let Some(size) = width.checked_mul(height).and_then(|n| n.checked_mul(4)) else { return false; };
+        if size == 0 || fb_addr.is_null() { return false; }
+        let Some(backing_phys) = crate::mm::virt_to_phys(fb_addr as u64) else { return false; };
+        let mut offset = (4096 - (fb_addr as u64 & 4095)).min(size as u64);
+        while offset < size as u64 {
+            if crate::mm::virt_to_phys(fb_addr as u64 + offset) != Some(backing_phys + offset) { return false; }
+            offset += 4096;
+        }
         let resource_id = self.next_resource_id;
         self.next_resource_id += 1;
         let create = ResourceCreate2d {
@@ -441,10 +466,6 @@ impl VirtioGpu {
             return false;
         }
 
-        let Some(backing_phys) = crate::mm::virt_to_phys(fb_addr as u64) else {
-            crate::hal::serial::write_string_always("[GPU] backing translate failed\r\n");
-            return false;
-        };
         let backing = ResourceMemoryEntry {
             addr: backing_phys,
             size: width * height * 4,
@@ -461,6 +482,7 @@ impl VirtioGpu {
             Self::response_buffer(),
         ]) else {
             crate::hal::serial::write_string_always("[GPU] attach add_chain failed\r\n");
+            self.release_resource(transport, resource_id);
             return false;
         };
         unsafe { transport.notify(0) };
@@ -471,6 +493,7 @@ impl VirtioGpu {
         let response = Self::read_response();
         if response.cmd_type != CMD_RESP_OK_NODATA {
             crate::hal::serial::write_string_always("[GPU] attach response failed\r\n");
+            self.release_resource(transport, resource_id);
             return false;
         }
 
@@ -488,6 +511,7 @@ impl VirtioGpu {
             .add_chain(&[Self::scratch_buffer(scanout), Self::response_buffer()])
         else {
             crate::hal::serial::write_string_always("[GPU] scanout add_chain failed\r\n");
+            self.release_resource(transport, resource_id);
             return false;
         };
         unsafe { transport.notify(0) };
@@ -498,6 +522,7 @@ impl VirtioGpu {
         let response = Self::read_response();
         if response.cmd_type != CMD_RESP_OK_NODATA {
             crate::hal::serial::write_string_always("[GPU] scanout response failed\r\n");
+            self.release_resource(transport, resource_id);
             return false;
         }
 

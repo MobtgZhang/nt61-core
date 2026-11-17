@@ -131,13 +131,13 @@ impl ShellLayout {
         Rect::new(
             s.x + self.left_width() as i32 + 12,
             s.y + s.height as i32 - 36,
-            s.width.saturating_sub(self.left_width() + 24 + 22),
-            SEARCH_HEIGHT,
+            POWER_BUTTON_WIDTH.min(s.width.saturating_sub(self.left_width() + 24 + POWER_ARROW_WIDTH)),
+            POWER_BUTTON_HEIGHT,
         )
     }
     pub fn power_arrow(self) -> Rect {
         let b = self.shutdown();
-        Rect::new(b.x + b.width as i32, b.y, 22, b.height)
+        Rect::new(b.x + b.width as i32, b.y, POWER_ARROW_WIDTH, b.height)
     }
     pub fn flyout(self, kind: Flyout) -> Rect {
         let (width, height, anchor) = match kind {

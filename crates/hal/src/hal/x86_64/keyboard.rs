@@ -44,6 +44,7 @@ static HEAD: AtomicUsize = AtomicUsize::new(0);
 static TAIL: AtomicUsize = AtomicUsize::new(0);
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+static GUI_DOWN:AtomicBool=AtomicBool::new(false);
 static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_LOCK: AtomicBool = AtomicBool::new(false);
 static EXTENDED_PREFIX: AtomicBool = AtomicBool::new(false);
@@ -270,13 +271,15 @@ pub fn process_scancode(sc: u8) {
     let code = sc & 0x7F;
     let extended = EXTENDED_PREFIX.swap(false, Ordering::Relaxed);
     if !release {
-        let usage = match (code, extended) { (0x53, true) => 0x4c, (0x3e, false) => 0x3d, (0x01, false) => 0x29, _ => 0 };
+        let usage = match (code, extended) { (0x53, true) => 0x4c, (0x3e, false) => 0x3d, (0x01, false) => 0x29, (0x26,false)=>0x0f, _ => 0 };
         let modifiers = u8::from(CTRL_DOWN.load(Ordering::Relaxed))
             | (u8::from(ALT_DOWN.load(Ordering::Relaxed)) << 2)
-            | (u8::from(SHIFT_DOWN.load(Ordering::Relaxed)) << 1);
+            | (u8::from(SHIFT_DOWN.load(Ordering::Relaxed)) << 1)
+            | (u8::from(GUI_DOWN.load(Ordering::Relaxed))<<3);
         if crate::hal::common::desktop_hotkeys::intercept(usage, modifiers) { return; }
     }
     if extended {
+        if code==0x5b||code==0x5c{GUI_DOWN.store(!release,Ordering::Relaxed);return;}
         if code == 0x1D { CTRL_DOWN.store(!release, Ordering::Relaxed); return; }
         if code == 0x38 { ALT_DOWN.store(!release, Ordering::Relaxed); return; }
         if release { return; }

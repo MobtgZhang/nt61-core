@@ -46,10 +46,10 @@ impl Shell {
             if self.model.controls.pressed() == id { aero::blend_rounded_rect(frame, inset(b, 1), 2, 0x304896CC); }
         }
     }
-    fn label(&self, frame: &mut Surface, text: &str, b: Rect, color: u32) {
+    pub(super) fn label(&self, frame: &mut Surface, text: &str, b: Rect, color: u32) {
         self.fonts.draw_fit(frame, text, b.x, b.y, b.width, color);
     }
-    fn centered(&self, frame: &mut Surface, text: &str, b: Rect, color: u32) {
+    pub(super) fn centered(&self, frame: &mut Surface, text: &str, b: Rect, color: u32) {
         let x = b.x + (b.width.saturating_sub(self.fonts.measure(text)) / 2) as i32;
         self.fonts.draw_fit(frame, text, x, b.y, b.width, color);
     }
@@ -69,6 +69,8 @@ impl Shell {
         }
     }
     pub(super) fn draw_namespace_window(&self, frame: &mut Surface, body: Rect, kind: WindowKind) {
+        if kind==WindowKind::SoundSettings {nt61_desktop::sound_settings::draw(&self.model.sound_settings,frame,body,|f,t,b,c|self.label(f,t,b,c));return;}
+        if kind==WindowKind::UserAccounts {nt61_desktop::control_panel::draw(&self.model.account_settings,frame,body,|f,t,b,c|self.label(f,t,b,c));return;}
         if kind == WindowKind::System {
             nt61_desktop::applications::explorer::system::draw(
                 frame, body, self.model.process_snapshot.as_ref().map(|s| s.cpu_count),
@@ -80,6 +82,12 @@ impl Shell {
         let heading = match kind {
             WindowKind::System => "View basic information about your computer",
             WindowKind::ControlPanel => "Adjust your computer's settings",
+            WindowKind::ControlCategory(index) => match index {
+                0 => "System and Security", 1 => "Network and Internet",
+                2 => "Hardware and Sound", 3 => "Programs", 4 => "User Accounts and Family Safety",
+                5 => "Appearance and Personalization", 6 => "Clock, Language, and Region",
+                _ => "Ease of Access",
+            },
             WindowKind::ComputerManagement => "Computer Management (Local)",
             WindowKind::RecycleBin => "Recycle Bin",
             WindowKind::RecycleBinProperties => "Recycle Bin Properties",
@@ -88,9 +96,19 @@ impl Shell {
             _ => "Delete Items",
         };
         self.label(frame,heading,Rect::new(body.x+16,body.y+14,body.width.saturating_sub(32),20),BLUE);
+        if kind==WindowKind::DisplaySettings {
+            nt61_desktop::display_settings::draw(&self.model.display,frame,body,self.model.display.now,|f,t,b,c|self.label(f,t,b,c));return;
+        }
         let links = ShellModel::namespace_links(kind);
         for (index,(title,_)) in links.iter().enumerate() {
-            let row = Rect::new(body.x+12,body.y+56+index as i32*36,body.width.saturating_sub(24),32);
+            let row = ShellModel::namespace_link_rect(body,kind,index);
+            if kind==WindowKind::ControlPanel&&body.width>=640 {
+                nt61_desktop::applications::explorer::theme::control_category(frame,index,Rect::new(row.x,row.y+2,48,48));
+                self.label(frame,title,Rect::new(row.x+60,row.y+4,row.width.saturating_sub(60),22),0xFF006600);
+                let descriptions=["System and administrative tools","Network and Sharing Center","Sound and display settings","Default Programs","User Accounts","Personalization and resolution","Date and Time","Accessibility tools"];
+                self.label(frame,descriptions[index],Rect::new(row.x+60,row.y+30,row.width.saturating_sub(60),22),TEXT);
+                continue;
+            }
             aero::blend_rounded_rect(frame,row,3,0xFFF0F7FC);
             self.label(frame,title,Rect::new(row.x+12,row.y+8,row.width.saturating_sub(24),18),BLUE);
         }
@@ -479,29 +497,37 @@ impl Shell {
                 );
             }
         }
-        for (button, id, title) in [
-            (l.shutdown(), CONTROL_SHUTDOWN, "Shut down"),
-            (l.power_arrow(), CONTROL_POWER_ARROW, ""),
-        ] {
-            aero::blend_rounded_rect(frame, button, 3, 0xFF162F43);
-            let hot=self.model.controls.hot()==id;
-            let pressed=self.model.controls.pressed()==id;
-            let top=if pressed{0xFF497799}else if hot{0xFFA5D7F9}else{0xFF8FAABF};
-            let bottom=if pressed{0xFF729CBC}else if hot{0xFF4C8EBB}else{0xFF3C5F7C};
-            let inner=inset(button,1);
-            for row in 0..inner.height {let color=nt61_desktop::graphics::lerp_color(top,bottom,row*255/inner.height.max(1));frame.fill_rect(inner.x,inner.y+row as i32,inner.width,1,color);}
-            frame.fill_rect(inner.x+1,inner.y,inner.width.saturating_sub(2),1,0xC0F2FAFF);
-            frame.blend_rect(Rect::new(inner.x,inner.y,inner.width,inner.height/2),0x28FFFFFF);
-            if self.model.controls.focus()==id {frame.stroke_rounded_rect(inset(button,2),2,1,0xFFB3D9F2);}
-            self.centered(
-                frame,
-                title,
-                Rect::new(button.x, button.y + 5, button.width, 16),
-                0xFFFFFFFF,
-            );
-        }
+        let primary = l.shutdown();
         let arrow = l.power_arrow();
-        aero::arrow_right(frame, Rect::new(arrow.x + 8, arrow.y + 8, 6, 9), 0xFFFFFFFF);
+        let joined = Rect::new(primary.x, primary.y, primary.width + arrow.width, primary.height);
+        // One glass frame with a narrow internal seam: the primary command is
+        // sized to its label rather than stretched across the entire right pane.
+        aero::blend_rounded_rect(frame, joined, 3, 0xE017293B);
+        let inner = inset(joined, 1);
+        for row in 0..inner.height {
+            let color = nt61_desktop::graphics::lerp_color(0xFF819EB3, 0xFF354F68,
+                row * 255 / inner.height.max(1));
+            let corner = u32::from(row == 0 || row + 1 == inner.height);
+            frame.blend_rect(Rect::new(inner.x + corner as i32, inner.y + row as i32,
+                inner.width.saturating_sub(corner * 2), 1), 0xC0000000 | (color & 0xFFFFFF));
+        }
+        frame.blend_rect(Rect::new(inner.x + 1, inner.y, inner.width - 2, 1), 0xA0ECF7FF);
+        frame.blend_rect(Rect::new(inner.x, inner.y + 1, inner.width, inner.height / 2 - 1), 0x20FFFFFF);
+        for (button, id) in [(primary, CONTROL_SHUTDOWN), (arrow, CONTROL_POWER_ARROW)] {
+            let pressed = self.model.controls.pressed() == id
+                || (id == CONTROL_POWER_ARROW && self.model.flyout == Some(Flyout::Power));
+            if pressed || self.model.controls.hot() == id {
+                aero::blend_rounded_rect(frame, inset(button, 1), 2,
+                    if pressed { 0x80618AAB } else { 0x607AC8FC });
+            }
+            if self.model.controls.focus() == id {
+                frame.stroke_rounded_rect(inset(button, 2), 2, 1, 0xB0C1E5FF);
+            }
+        }
+        frame.blend_rect(Rect::new(arrow.x, arrow.y + 1, 1, arrow.height - 2), 0xB0254058);
+        frame.blend_rect(Rect::new(arrow.x + 1, arrow.y + 2, 1, arrow.height - 4), 0x60D4E9F8);
+        self.centered(frame, "Shut down", Rect::new(primary.x, primary.y + 5, primary.width, 16), 0xFFFFFFFF);
+        aero::arrow_right(frame, Rect::new(arrow.x + 6, arrow.y + 8, 5, 8), 0xFFFFFFFF);
         if self.model.start_menu.submenu.is_some() {
             if let Some(bounds) = self.model.context_submenu_bounds(fb.width, fb.height) {
                 aero::menu_surface(frame, bounds);
@@ -605,17 +631,22 @@ impl Shell {
                 image(frame, &self.network, Rect::new(b.x + 24, b.y + 58, 40, 40));
                 self.label(
                     frame,
-                    if self.model.network_adapters == 0 {
+                    if self.model.network_settings.adapters.is_empty() {
                         "No network adapters detected"
                     } else {
-                        "Network adapter available"
+                        "Local Area Connection"
                     },
                     Rect::new(b.x + 78, b.y + 60, b.width - 92, 18),
                     TEXT,
                 );
                 self.label(
                     frame,
-                    "Connection status is not reported.",
+                    &self.model.network_settings.adapters.first().map(|adapter|{
+                        if adapter.configured {
+                            let [a,b,c,d]=adapter.address.to_be_bytes();
+                            alloc::format!("IPv4 address: {a}.{b}.{c}.{d}")
+                        }else{alloc::string::String::from("No network address")}
+                    }).unwrap_or_else(||if self.model.network_settings.message.is_empty(){alloc::string::String::from("No network connection")}else{self.model.network_settings.message.clone()}),
                     Rect::new(b.x + 18, b.y + 120, b.width - 36, 18),
                     0xFF677888,
                 );
@@ -696,6 +727,7 @@ impl Shell {
         }
     }
     pub(super) fn draw_shell_settings(&self, frame: &mut Surface, b: Rect, kind: Flyout) {
+        if kind==Flyout::Network {nt61_desktop::network_settings::draw(&self.model.network_settings,frame,b,|f,t,b,c|self.label(f,t,b,c));return;}
         frame.fill_rect(b.x, b.y, b.width, b.height, 0xFFFFFFFF);
         let (heading, lines) = match kind {
             Flyout::Volume => (

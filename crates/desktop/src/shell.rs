@@ -37,6 +37,9 @@ pub enum WindowKind {
     Computer,
     Explorer,
     ControlPanel,
+    ControlCategory(u8),
+    UserAccounts,
+    SoundSettings,
     RecycleBin,
     System,
     ComputerManagement,
@@ -52,6 +55,7 @@ use alloc::vec::Vec;
 pub struct DesktopItem {
     pub name: String,
     pub icon: ImageResource,
+    pub file_id: Option<u32>,
     pub x: i32,
     pub y: i32,
 }
@@ -169,6 +173,7 @@ impl DesktopState {
         self.items.push(DesktopItem {
             name: String::from(name),
             icon,
+            file_id: None,
             x,
             y,
         });
@@ -238,6 +243,31 @@ impl DesktopState {
 impl Default for DesktopState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod desktop_integration_regressions {
+    use super::*;
+
+    #[test]
+    fn desktop_new_entries_are_actionable() {
+        for index in 0..ShellModel::submenu_items(MenuGroup::DesktopNew).len() {
+            assert!(ShellModel::submenu_item_enabled(MenuGroup::DesktopNew, index));
+        }
+    }
+
+    #[test]
+    fn desktop_refresh_projects_files_from_the_desktop_directory() {
+        let mut shell = ShellModel::new(Theme::aero());
+        let users = shell.files.mkdir(shell.files.root_id(), "Users");
+        let user = shell.files.mkdir(users, "Administrator");
+        let directory = shell.files.mkdir(user, "Desktop");
+        shell.files.touch(directory, "from-explorer.txt", b"shared volume");
+        shell.context_menu = Some(ContextMenuState { target: ContextMenuTarget::Desktop,
+            x: 200, y: 200, submenu: None });
+        shell.activate_context_menu_command(2);
+        assert!(shell.desktop.items.iter().any(|item| item.name == "from-explorer.txt"));
     }
 }
 
@@ -681,6 +711,8 @@ mod program_catalog_tests {
 pub struct ShellModel {
     pub fonts: crate::graphics::font::FontLibrary,
     pub applications: Vec<ApplicationSession>,
+    pub monitor_sample: Option<crate::applications::system_monitor::Sample>,
+    pub service_snapshot: Vec<crate::applications::system_monitor::Service>,
     pub process_snapshot: Option<crate::applications::processes::Snapshot>,
     pub explorers: Vec<Explorer>,
     pub text_target: Option<u32>,
@@ -708,15 +740,33 @@ pub struct ShellModel {
     pub calendar_month: Option<CalendarDate>,
     pub power_action: Option<PowerAction>,
     pub session: crate::session::Session,
+    pub account_settings: crate::control_panel::Accounts,
+    pub sound_settings:crate::sound_settings::Settings,
+    pub network_settings:crate::network_settings::Settings,
     pub saved_desktops: Vec<crate::session::SavedDesktop>,
+    pub desktop_editor: Option<crate::desktop_files::Editor>,
+    pub desktop_error: String,
+    pub display: crate::display_settings::Settings,
 }
 
 impl ShellModel {
+    pub fn window_z_order(&self, id: u32) -> (bool, bool, u32) {
+        (
+            self.application(id).is_some_and(|application| {
+                application.id == AppId::TaskManager && application.manager.always_on_top
+            }),
+            Some(id) == self.selected_window,
+            id,
+        )
+    }
+
     pub fn new(theme: Theme) -> Self {
         Self {
             fonts: crate::graphics::font::FontLibrary::default(),
             applications: Vec::new(),
             process_snapshot: None,
+            monitor_sample: None,
+            service_snapshot: Vec::new(),
             explorers: Vec::new(),
             text_target: None,
             desktop: DesktopState::new(),
@@ -743,7 +793,22 @@ impl ShellModel {
             calendar_month: None,
             power_action: None,
             session: crate::session::Session::default(),
+            account_settings: Default::default(),
+            sound_settings:Default::default(),
+            network_settings:Default::default(),
             saved_desktops: Vec::new(),
+            desktop_editor: None,
+            desktop_error: String::new(),
+            display: Default::default(),
+        }
+    }
+
+    /// Keep the tray and Sound properties on the same per-user output settings.
+    pub fn refresh_audio(&mut self) {
+        self.sound_settings.refresh();
+        if self.sound_settings.message.is_empty() {
+            self.volume=self.sound_settings.volume;
+            self.muted=self.sound_settings.muted;
         }
     }
 
@@ -1152,6 +1217,10 @@ impl ShellModel {
         } else {
             Some(kind)
         };
+        if self.flyout.is_some() {
+            if kind==Flyout::Volume {self.refresh_audio();}
+            if kind==Flyout::Network {self.network_settings.refresh();}
+        }
         if kind == Flyout::Clock {
             self.calendar_month = self.taskbar.date.map(|d| CalendarDate { day: 1, ..d });
         }
@@ -1416,7 +1485,7 @@ impl ShellModel {
     pub fn submenu_items(group: MenuGroup) -> &'static [&'static str] {
         const VIEW: &[&str] = &["Large icons", "Medium icons", "Small icons", "Auto arrange"];
         const SORT: &[&str] = &["Name", "Size", "Item type", "Date modified"];
-        const NEW: &[&str] = &["Folder", "Shortcut", "Text Document", "Bitmap image"];
+        const NEW: &[&str] = &["Folder", "Shortcut", "Text Document", "Bitmap image", "Rich Text Document", "Compressed (zipped) Folder", "Contact"];
         const PROGRAMS: &[&str] = &["Windows Explorer", "Command Prompt", "Notepad"];
         const DOCUMENTS: &[&str] = &["readme.txt", "Recent documents"];
         const PICTURES: &[&str] = &["Pictures library", "Sample Pictures"];
@@ -1450,6 +1519,7 @@ impl ShellModel {
         self.context_menu = None;
         self.context_submenu = None;
         match group {
+            MenuGroup::DesktopNew => self.create_desktop_item(index),
             MenuGroup::DesktopSortBy if index == 0 => {
                 self.desktop.sort_mode = SortMode::Name;
                 self.desktop.sort();
@@ -1474,7 +1544,7 @@ impl ShellModel {
         match group {
             MenuGroup::DesktopView => matches!(index, 1 | 3),
             MenuGroup::DesktopSortBy => matches!(index, 0 | 2),
-            MenuGroup::DesktopNew => false,
+            MenuGroup::DesktopNew => true,
             _ => true,
         }
     }
@@ -1509,7 +1579,7 @@ impl ShellModel {
             return true;
         }
         self.start_menu.close();
-        self.open_window(title, 80, 80, 480, 320);
+        if submenu.group==MenuGroup::StartControlPanel&&index==0{self.open_window_with_kind(title,80,80,720,500,WindowKind::ControlPanel);}else{self.open_window(title,80,80,480,320);}
         true
     }
 
@@ -1544,6 +1614,7 @@ impl ShellModel {
         };
         let kind = match group {
             MenuGroup::StartComputer => WindowKind::Computer,
+            MenuGroup::StartControlPanel => WindowKind::ControlPanel,
             MenuGroup::StartDocuments
             | MenuGroup::StartPictures
             | MenuGroup::StartMusic
@@ -1566,7 +1637,7 @@ impl ShellModel {
         } else if kind == WindowKind::Computer {
             self.files.navigate(self.files.root_id());
         }
-        let opened = self.open_window_with_kind(title, 80, 80, 480, 320, kind) > 0;
+        let opened = self.open_window_with_kind(title, 80, 80, 720, 500, kind) > 0;
         self.start_menu.close();
         self.context_menu = None;
         self.context_submenu = None;
@@ -1736,14 +1807,14 @@ impl ShellModel {
                 true
             }
             ContextMenuCommand::ScreenResolution => {
-                self.open_window_with_kind("Screen Resolution", 180, 110, 560, 390, WindowKind::DisplaySettings);
+                self.open_window_with_kind("Screen Resolution", 180, 70, 560, 480, WindowKind::DisplaySettings);
                 true
             }
             ContextMenuCommand::Personalize => {
                 self.open_window_with_kind("Personalization", 180, 110, 560, 390, WindowKind::Personalization);
                 true
             }
-            ContextMenuCommand::Refresh => true,
+            ContextMenuCommand::Refresh => { self.refresh_desktop_files(); true },
             ContextMenuCommand::SortByName => {
                 self.desktop.sort_mode = SortMode::Name;
                 self.desktop.sort();
@@ -1825,26 +1896,45 @@ impl ShellModel {
         }
     }
 
+    /// Shared by category painting and hit testing. The Windows category order
+    /// runs down the left column before continuing down the right.
+    pub fn namespace_link_rect(body:Rect,kind:WindowKind,index:usize)->Rect {
+        if kind==WindowKind::ControlPanel && body.width>=640 {
+            let width=body.width.saturating_sub(48)/2;
+            Rect::new(body.x+16+(index/4)as i32*width as i32,body.y+60+(index%4)as i32*88,width.saturating_sub(12),80)
+        }else{Rect::new(body.x+12,body.y+56+index as i32*36,body.width.saturating_sub(24),32)}
+    }
     pub fn namespace_links(kind: WindowKind) -> &'static [(&'static str, WindowKind)] {
         const CONTROL: &[(&str, WindowKind)] = &[
-            ("System and Security", WindowKind::System),
-            ("Screen resolution", WindowKind::DisplaySettings),
-            ("Personalization", WindowKind::Personalization),
-            ("Network and Sharing Center", WindowKind::ShellSettings(Flyout::Network)),
-            ("Sound", WindowKind::ShellSettings(Flyout::Volume)),
-            ("Date and Time", WindowKind::ShellSettings(Flyout::Clock)),
+            ("System and Security", WindowKind::ControlCategory(0)),
+            ("Network and Internet", WindowKind::ControlCategory(1)),
+            ("Hardware and Sound", WindowKind::ControlCategory(2)),
+            ("Programs", WindowKind::ControlCategory(3)),
+            ("User Accounts and Family Safety", WindowKind::ControlCategory(4)),
+            ("Appearance and Personalization", WindowKind::ControlCategory(5)),
+            ("Clock, Language, and Region", WindowKind::ControlCategory(6)),
+            ("Ease of Access", WindowKind::ControlCategory(7)),
         ];
+        const SYSTEM: &[(&str,WindowKind)]=&[("System",WindowKind::System),("Administrative Tools",WindowKind::ComputerManagement)];
+        const NETWORK: &[(&str,WindowKind)]=&[("Network and Sharing Center",WindowKind::ShellSettings(Flyout::Network))];
+        const HARDWARE: &[(&str,WindowKind)]=&[("Sound",WindowKind::SoundSettings),("Display",WindowKind::DisplaySettings)];
+        const ACCOUNTS: &[(&str,WindowKind)]=&[("User Accounts",WindowKind::UserAccounts),("Manage another account",WindowKind::UserAccounts)];
+        const APPEARANCE: &[(&str,WindowKind)]=&[("Personalization",WindowKind::Personalization),("Screen Resolution",WindowKind::DisplaySettings)];
+        const CLOCK: &[(&str,WindowKind)]=&[("Date and Time",WindowKind::ShellSettings(Flyout::Clock))];
+        const PROGRAMS: &[(&str,WindowKind)]=&[("Default Programs",WindowKind::Application(AppId::DefaultPrograms))];
+        const ACCESS: &[(&str,WindowKind)]=&[("On-Screen Keyboard",WindowKind::Application(AppId::OnScreenKeyboard)),("Magnifier",WindowKind::Application(AppId::Magnifier))];
         const MANAGE: &[(&str, WindowKind)] = &[
             ("System information", WindowKind::System),
             ("Display adapter", WindowKind::DisplaySettings),
             ("Network adapters", WindowKind::ShellSettings(Flyout::Network)),
-            ("Sound devices", WindowKind::ShellSettings(Flyout::Volume)),
+            ("Sound devices", WindowKind::SoundSettings),
         ];
-        match kind { WindowKind::ControlPanel => CONTROL, WindowKind::ComputerManagement => MANAGE, _ => &[] }
+        match kind { WindowKind::ControlCategory(0)=>SYSTEM,WindowKind::ControlCategory(1)=>NETWORK,WindowKind::ControlCategory(2)=>HARDWARE,WindowKind::ControlCategory(3)=>PROGRAMS,WindowKind::ControlCategory(4)=>ACCOUNTS,WindowKind::ControlCategory(5)=>APPEARANCE,WindowKind::ControlCategory(6)=>CLOCK,WindowKind::ControlCategory(7)=>ACCESS,WindowKind::ControlPanel => CONTROL, WindowKind::ComputerManagement => MANAGE, _ => &[] }
     }
 
     pub fn open_desktop_item(&mut self, index: usize) -> bool {
         let Some(item) = self.desktop.items.get(index) else { return false; };
+        if let Some(id) = item.file_id { return self.open_desktop_file(id); }
         let name = item.name.clone();
         let kind = match item.icon {
             ImageResource::Computer => WindowKind::Computer,
@@ -1871,6 +1961,7 @@ impl ShellModel {
         height: i32,
         kind: WindowKind,
     ) -> u32 {
+        if kind==WindowKind::ShellSettings(Flyout::Network){self.network_settings.refresh();}
         let id = self.next_window_id;
         self.next_window_id += 1;
         self.taskbar
@@ -1883,6 +1974,7 @@ impl ShellModel {
             };
             let result = if directory == crate::applications::explorer::COMPUTER { Ok(()) } else { self.files.refresh_directory(directory) };
             let mut explorer=Explorer::new(id,directory);
+            explorer.profile=self.session.identity.clone();
             explorer.prepare(&mut self.files);
             if let Err(status)=result{explorer.status=alloc::format!("Cannot open folder (0x{status:08X})");}
             self.explorers.push(explorer);
@@ -1893,6 +1985,10 @@ impl ShellModel {
     }
 
     pub fn close_window(&mut self, id: u32) {
+        if self.taskbar.windows.iter().any(|w| w.id==id && w.kind==WindowKind::DisplaySettings) {
+            self.display.open=false;
+            self.revert_display();
+        }
         if let Some(modal) = self.guest_modal_for(id) { self.select_window(modal); return; }
         if let Some(scene)=self.applications.iter_mut().find(|a|a.window_id==id).and_then(|a|a.guest_window.as_mut()) {
             scene.close_request();return;
@@ -2085,6 +2181,25 @@ impl ShellModel {
             return false;
         }
         let kind = window.kind;
+        if kind==WindowKind::ShellSettings(Flyout::Network) && window.caption_control_at(cursor_x,cursor_y).is_none(){
+            let b=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
+            return self.network_settings.click(b,cursor_x,cursor_y);
+        }
+        if kind==WindowKind::SoundSettings && window.caption_control_at(cursor_x,cursor_y).is_none(){
+            let b=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
+            let handled=self.sound_settings.click(b,cursor_x,cursor_y);
+            if self.sound_settings.message.is_empty(){self.volume=self.sound_settings.volume;self.muted=self.sound_settings.muted;}
+            return handled;
+        }
+        if kind==WindowKind::UserAccounts && window.caption_control_at(cursor_x,cursor_y).is_none() {
+            let b=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
+            return self.account_settings.click(b,cursor_x,cursor_y);
+        }
+        if kind == WindowKind::DisplaySettings && window.caption_control_at(cursor_x,cursor_y).is_none() {
+            let b=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
+            let ticks=self.display.now;
+            return self.display_click(b,cursor_x,cursor_y,ticks);
+        }
         if kind == WindowKind::System {
             let body = Rect::new(window.x + 6, window.y + 30, window.width.saturating_sub(12) as u32, window.height.saturating_sub(36) as u32);
             if crate::applications::explorer::system::home_link(body).contains(cursor_x, cursor_y) {
@@ -2093,12 +2208,14 @@ impl ShellModel {
             }
         }
         let links = Self::namespace_links(kind);
-        if (window.x+18..window.x+window.width-18).contains(&cursor_x) && cursor_y >= window.y+86 {
-            let row = (cursor_y-window.y-86) / 36;
-            if let Some((title, destination)) = links.get(row as usize) {
-                self.open_window_with_kind(title, 190, 120, 560, 390, *destination);
+        let body=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
+        if let Some((title,destination))=links.iter().enumerate().find_map(|(index,entry)|Self::namespace_link_rect(body,kind,index).contains(cursor_x,cursor_y).then_some(entry)) {
+                let title=*title;let destination=*destination;
+                if let WindowKind::Application(app)=destination {self.launch_application(app);return true;}
+                if destination==WindowKind::SoundSettings {self.refresh_audio();}
+                if destination==WindowKind::UserAccounts {self.account_settings.page=crate::control_panel::Page::Accounts;self.account_settings.refresh();}
+                self.open_window_with_kind(title, 150, 70, if destination==WindowKind::UserAccounts {660}else{600}, if matches!(destination,WindowKind::DisplaySettings|WindowKind::UserAccounts|WindowKind::SoundSettings|WindowKind::ControlPanel) { 500 } else { 420 }, destination);
                 return true;
-            }
         }
         if kind == WindowKind::ConfirmEmptyRecycleBin {
             let yes = Rect::new(window.x+window.width-200,window.y+window.height-42,80,26);
@@ -2106,6 +2223,7 @@ impl ShellModel {
             if yes.contains(cursor_x,cursor_y) {
                 let ids: Vec<u32> = self.files.recycle_bin().iter().map(|n| n.id).collect();
                 for id in ids { self.files.recycle_permanently(id); }
+                if self.files.recycle_bin().is_empty(){let _=crate::platform::services::play_sound("recycle");}
                 self.request_application_close(window_id);
                 return true;
             }
@@ -2165,6 +2283,9 @@ impl ShellModel {
         let Some(window_id) = self.selected_window else {
             return false;
         };
+        if self.taskbar.windows.iter().any(|w|w.id==window_id && w.kind==WindowKind::DisplaySettings) {
+            return self.display_key(key);
+        }
         if self.application_key(window_id,key) {return true;}
         let Some(textbox) = self
             .textboxes
@@ -2191,6 +2312,7 @@ impl ShellModel {
     }
 
     pub fn handle_shell_key(&mut self, key: u8) -> bool {
+        if self.desktop_editor.is_some() { return self.desktop_editor_key(key); }
         match key {
             27 => {
                 if self.context_menu.is_some() || self.start_menu.open || self.flyout.is_some() {
@@ -2202,7 +2324,7 @@ impl ShellModel {
                 false
             }
             5 => {
-                self.desktop.sort();
+                self.refresh_desktop_files();
                 true
             }
             1 => {
@@ -2417,7 +2539,7 @@ impl ShellModel {
                     && (window.x..window.x.saturating_add(window.width)).contains(&x)
                     && (window.y..window.y.saturating_add(window.height)).contains(&y)
             })
-            .max_by_key(|window| (Some(window.id) == self.selected_window, window.id))
+            .max_by_key(|window| self.window_z_order(window.id))
             .map(|window| window.id)
     }
 
@@ -2492,6 +2614,21 @@ pub enum SnapSide {
 mod tests {
     use super::*;
     use crate::theme::Theme;
+
+    #[test]
+    fn topmost_task_manager_wins_both_drawing_and_pointer_order() {
+        let mut shell = ShellModel::new(Theme::aero());
+        let manager = shell.launch_application(AppId::TaskManager);
+        let other = shell.launch_application(AppId::Notepad);
+        let point = {
+            let window = shell.taskbar.windows.iter().find(|w| w.id == other).unwrap();
+            (window.x + 20, window.y + 40)
+        };
+        assert_eq!(shell.window_hit_test(point.0, point.1), Some(other));
+        shell.applications.iter_mut().find(|a| a.window_id == manager).unwrap().manager.always_on_top = true;
+        assert!(shell.window_z_order(manager) > shell.window_z_order(other));
+        assert_eq!(shell.window_hit_test(point.0, point.1), Some(manager));
+    }
 
     #[test]
     fn desktop_namespace_context_open_uses_the_real_application() {
@@ -2958,14 +3095,22 @@ mod shell_popup_tests {
         shell.open_window("Command Prompt", 60, 60, 480, 320);
         click(&mut shell, CONTROL_START);
         shell.refresh_controls(1024, 768);
-        assert_eq!(shell.controls.hit_test(416, 704), CONTROL_POWER_ARROW);
-        assert!(shell.popup_contains(416, 704, 1024, 768));
-        assert!(!shell.close_popups_if_outside(416, 704, 1024, 768));
+        let layout = ShellLayout::new(1024, 768);
+        let arrow = layout.power_arrow();
+        let (x, y) = (arrow.x + 9, arrow.y + 12);
+        assert_eq!(layout.shutdown().width + arrow.width, 100);
+        assert_eq!(shell.controls.hit_test(x, y), CONTROL_POWER_ARROW);
+        assert!(shell.popup_contains(x, y, 1024, 768));
+        assert!(!shell.close_popups_if_outside(x, y, 1024, 768));
+        // The unused right-pane space must no longer act like an oversized button.
+        assert_ne!(shell.controls.hit_test(416, 704), CONTROL_SHUTDOWN);
+        assert_ne!(shell.controls.hit_test(416, 704), CONTROL_POWER_ARROW);
         click(&mut shell, CONTROL_POWER_ARROW);
         shell.refresh_controls(1024, 768);
         assert_eq!(shell.flyout, Some(Flyout::Power));
         assert!(shell.start_menu.open);
-        assert!(shell.controls.hit_test(460, 668) >= CONTROL_POWER_BASE);
+        let popup = layout.flyout(Flyout::Power);
+        assert!(shell.controls.hit_test(popup.x + 20, popup.y + 20) >= CONTROL_POWER_BASE);
         click(&mut shell, CONTROL_POWER_ARROW);
         assert_eq!(shell.flyout, None);
     }

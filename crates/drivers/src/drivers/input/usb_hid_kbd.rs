@@ -332,6 +332,7 @@ fn enqueue_usb_char(ch: u8) {
 
 /// handle a single key press event.
 fn handle_key_event(modifier: u8, key_code: u8) {
+    if crate::hal::common::desktop_hotkeys::intercept(key_code,modifier){return;}
     let vk = hid_to_vk(key_code);
     if vk == 0 {
         return;

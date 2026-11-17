@@ -21,7 +21,6 @@ const START_BUTTON_PRESSED_PNG: &[u8] =
     include_bytes!("../../../assets/windows7/start_button_pressed.png");
 
 #[cfg(not(test))]
-#[cfg(not(test))]
 use core::panic::PanicInfo;
 use nt61_desktop::bmp;
 use nt61_desktop::compositor::aero;
@@ -35,10 +34,14 @@ use nt61_desktop::user_account_pictures::USER;
 
 extern crate alloc;
 
+#[cfg(not(test))]
 use nt61_desktop::user_allocator::ApplicationHeap;
 
+#[cfg(not(test))]
 #[global_allocator]
-static EXPLORER_ALLOCATOR: ApplicationHeap<{ 64 * 1024 * 1024 }> = ApplicationHeap::new();
+// Keep the complete PE image below the loader's 128 MiB limit. The
+// framebuffer/cache budget must fit here as well as the decoded shell assets.
+static EXPLORER_ALLOCATOR: ApplicationHeap<{ 112 * 1024 * 1024 }> = ApplicationHeap::new();
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -82,6 +85,7 @@ struct Shell {
     start_button_hover: png::Image,
     start_button_pressed: png::Image,
     wallpaper_asset: png::Image,
+    session_background: nt61_desktop::graphics::Surface,
     fonts: font_view::FontPack,
     model: ShellModel,
     wallpaper: nt61_desktop::graphics::Surface,
@@ -135,8 +139,13 @@ fn desktop_main() -> ! {
         }
     };
 
+    if nt61_desktop::platform::services::display_preference("restore").is_ok() {
+        arch::desktop_info(&mut framebuffer);
+    }
     let mut frame = nt61_desktop::graphics::Surface::new(framebuffer.width, framebuffer.height);
     shell.prepare_aero(framebuffer.width, framebuffer.height);
+    shell.model.refresh_controls(framebuffer.width, framebuffer.height);
+    shell.model.refresh_desktop_files();
     shell.model.update_clock(arch::shell_time());
     let devices = arch::shell_devices();
     shell.model.network_adapters = (devices >> 8) as u32;
@@ -154,8 +163,11 @@ fn desktop_main() -> ! {
     let mut next_explorer_job = 0usize;
     let mut next_directory_poll = 0u64;
     let mut next_process_poll = 0u64;
+    let mut telemetry_dirty = false;
     let mut directory_poll_index = 0usize;
     let mut session_decoder=nt61_desktop::applications::explorer::input::Decoder::default();
+    let mut display_decoder=nt61_desktop::applications::explorer::input::Decoder::default();
+    let mut secure_desktop=false;
     let mut committed_power:Option<(nt61_desktop::shell::PowerAction,u64)>=None;
     let mut frame_rgba = alloc::vec![0u8; frame.pixels().len() * 4];
     shell.compose_desktop(&framebuffer, &mut frame);
@@ -166,21 +178,41 @@ fn desktop_main() -> ! {
         .refresh_controls(framebuffer.width, framebuffer.height);
     arch::debug_str("[EXPLORER] desktop frame ready\r\n");
     loop {
-        let mut redraw = false;
+        let mut redraw = core::mem::take(&mut telemetry_dirty);
         let ticks = arch::shell_ticks();
+        let previous_display_second = shell.model.display.now / 1000;
+        if shell.model.display_tick(ticks) || shell.model.display.previous.is_some() && ticks / 1000 != previous_display_second {
+            shell.scene_dirty.set(true); redraw = true;
+        }
+        if shell.model.taskbar.windows.iter().any(|w|w.kind==nt61_desktop::shell::WindowKind::DisplaySettings) {
+            shell.model.load_display_modes();
+        }
+        let secure=matches!(shell.model.session.screen,nt61_desktop::session::Screen::Users|nt61_desktop::session::Screen::Security|nt61_desktop::session::Screen::Credentials|nt61_desktop::session::Screen::ChangePassword|nt61_desktop::session::Screen::Progress);
+        if secure!=secure_desktop{if nt61_desktop::platform::services::session(if secure{"secure"}else{"unsecure"},&[]).is_ok(){secure_desktop=secure;}}
         if let Some((action,due))=committed_power.filter(|(_,due)|ticks>=*due) {
             let _=due;committed_power=None;
             use nt61_desktop::{platform::services,session::Screen,shell::PowerAction};
             let operation=match action {PowerAction::LogOff=>"logoff",PowerAction::Restart=>"restart",_=>"shutdown"};
             let result=services::session(operation,&[]);
             if action==PowerAction::LogOff && result.is_ok(){
-                shell.model.session.show(Screen::Credentials);shell.model.session.logged_off=true;shell.model.session.locked=true;shell.model.session.switching=true;shell.model.session.user.clear();
+                shell.model.session.logged_off=true;shell.model.session.locked=true;shell.model.session.switching=true;shell.model.session.select_users();
             }else{shell.model.session.show(Screen::ShutDown);shell.model.session.message=alloc::format!("The operation could not be completed (0x{:08X}).",result.err().unwrap_or(0));}
             shell.scene_dirty.set(true);redraw=true;
         }
         if let Ok(keys)=nt61_desktop::platform::services::desktop_hotkeys(){if keys!=0{shell.model.session_hotkeys(keys);session_decoder=Default::default();shell.scene_dirty.set(true);redraw=true;}}
         if shell.model.session.screen!=nt61_desktop::session::Screen::Desktop {
             if let Some(key)=session_decoder.expire(ticks){let intent=shell.model.session.key(key);shell.model.session_intent(intent);shell.scene_dirty.set(true);redraw=true;}
+        }
+        let display_focused = shell.model.taskbar.windows.iter().any(|w|
+            Some(w.id) == shell.model.selected_window && w.kind == nt61_desktop::shell::WindowKind::DisplaySettings);
+        if display_focused {
+            if let Some(key) = display_decoder.expire(ticks) {
+                shell.model.display_key(key);
+                shell.scene_dirty.set(true);
+                redraw = true;
+            }
+        } else {
+            display_decoder = Default::default();
         }
         if shell.model.poll_guest_dialogs() {
             shell.scene_dirty.set(true);
@@ -211,6 +243,16 @@ fn desktop_main() -> ! {
                 cursor_x=mouse.x.clamp(0,framebuffer.width.saturating_sub(1)as i32);cursor_y=mouse.y.clamp(0,framebuffer.height.saturating_sub(1)as i32);
                 if mouse.buttons&1!=0 && previous_buttons&1==0 {let intent=shell.model.session.hit(cursor_x,cursor_y,framebuffer.width,framebuffer.height);shell.model.session_intent(intent);shell.scene_dirty.set(true);pointer_full=true;}
                 pointer_moved|=cursor_x!=previous_cursor_x||cursor_y!=previous_cursor_y;previous_buttons=mouse.buttons;continue;
+            }
+            if shell.model.desktop_editor.is_some() || !shell.model.desktop_error.is_empty() {
+                cursor_x = mouse.x.clamp(0, framebuffer.width.saturating_sub(1) as i32);
+                cursor_y = mouse.y.clamp(0, framebuffer.height.saturating_sub(1) as i32);
+                if mouse.buttons & 1 != 0 && previous_buttons & 1 == 0 {
+                    shell.model.desktop_editor_click(cursor_x, cursor_y);
+                    shell.scene_dirty.set(true); pointer_full = true;
+                }
+                pointer_moved |= cursor_x != previous_cursor_x || cursor_y != previous_cursor_y;
+                previous_buttons = mouse.buttons; continue;
             }
             let previous_scene = shell.window_geometry();
             cursor_x = mouse.x.clamp(0, framebuffer.width.saturating_sub(1) as i32);
@@ -544,6 +586,24 @@ fn desktop_main() -> ! {
             let changed = if shell.model.session.screen!=nt61_desktop::session::Screen::Desktop {
                 if let Some(decoded)=session_decoder.feed(key,ticks){let decoded=match decoded{nt61_desktop::applications::explorer::input::UP=>0x26,nt61_desktop::applications::explorer::input::DOWN=>0x28,_=>decoded};let intent=shell.model.session.key(decoded);shell.model.session_intent(intent);}
                 shell.scene_dirty.set(true);true
+            } else if display_focused && shell.model.context_menu.is_none()
+                && !shell.model.start_menu.open && shell.model.flyout.is_none() {
+                if let Some(decoded) = display_decoder.feed(key, ticks) {
+                    let decoded = match decoded {
+                        nt61_desktop::applications::explorer::input::UP => 0x26,
+                        nt61_desktop::applications::explorer::input::DOWN => 0x28,
+                        // Printable &/( are ordinary characters, never arrow keys.
+                        b'&' | b'(' => 0,
+                        _ => decoded,
+                    };
+                    shell.model.display_key(decoded);
+                    shell.scene_dirty.set(true);
+                    true
+                } else { false }
+            } else if shell.model.desktop_editor.is_some() || !shell.model.desktop_error.is_empty() {
+                shell.scene_dirty.set(true);
+                if shell.model.desktop_editor.is_some() { shell.model.desktop_editor_key(key) }
+                else { if matches!(key, 27 | 13 | 10) { shell.model.desktop_error.clear(); } true }
             } else if shell.model.context_menu.is_some()
                 || shell.model.start_menu.open
                 || shell.model.flyout.is_some()
@@ -562,6 +622,8 @@ fn desktop_main() -> ! {
                         .first()
                         .copied()
                         .is_some_and(|index| shell.model.open_desktop_item(index))
+                } else if shell.model.selected_window.is_none() {
+                    shell.model.handle_shell_key(key)
                 } else {
                     shell.model.handle_window_key(key)
                 }
@@ -586,6 +648,10 @@ fn desktop_main() -> ! {
                 redraw = true;
             }
         }
+        if shell.model.sync_desktop_files() {
+            shell.scene_dirty.set(true); redraw = true;
+            shell.model.refresh_controls(framebuffer.width, framebuffer.height);
+        }
         // Give input priority, then service one cancellable directory-search batch.
         let count = shell.model.explorers.len();
         for step in 0..count {
@@ -600,17 +666,61 @@ fn desktop_main() -> ! {
         }
         // Round-robin volume polling also observes changes made by CMD and
         // other applications. At most one directory is read per interval.
-        if ticks >= next_directory_poll && count != 0 {
+        if ticks >= next_directory_poll {
             next_directory_poll = ticks.saturating_add(250);
-            let index = directory_poll_index % count;
-            directory_poll_index = (index + 1) % count;
-            if shell.model.explorers[index].poll_directory(&mut shell.model.files) {
+            let index = directory_poll_index % (count + 1);
+            directory_poll_index = (index + 1) % (count + 1);
+            let changed = if index == count { shell.model.refresh_desktop_files() }
+                else { shell.model.explorers[index].poll_directory(&mut shell.model.files) };
+            if changed {
                 shell.scene_dirty.set(true);
                 redraw = true;
+                shell.model.refresh_controls(framebuffer.width, framebuffer.height);
             }
         }
-        if ticks >= next_process_poll {
-            next_process_poll = ticks.saturating_add(1000);
+        if old_audio != (shell.model.volume, shell.model.muted) {
+            if arch::shell_audio(shell.model.volume, shell.model.muted)!=0 {
+                shell.model.refresh_audio();
+                shell.scene_dirty.set(true);redraw=true;
+            }
+        }
+        let old_session=shell.model.session.screen;
+        let closing=shell.model.session.pending_close.is_some() || shell.model.power_action.is_some();
+        if let Some(action)=shell.model.advance_session(){committed_power=Some((action,ticks.saturating_add(250)));}
+        if closing || old_session!=shell.model.session.screen {shell.scene_dirty.set(true);redraw=true;shell.model.refresh_controls(framebuffer.width,framebuffer.height);}
+        let mut updated = arch::DesktopFramebufferInfo::default();
+        arch::desktop_info(&mut updated);
+        if updated.width != 0 && updated.height != 0 && (updated.width,updated.height)!=(framebuffer.width,framebuffer.height) {
+            framebuffer = updated;
+            frame = nt61_desktop::graphics::Surface::new(framebuffer.width,framebuffer.height);
+            frame_rgba.resize(frame.pixels().len()*4,0);
+            shell.prepare_aero(framebuffer.width,framebuffer.height);
+            shell.model.refresh_controls(framebuffer.width,framebuffer.height);
+            for window in &mut shell.model.taskbar.windows {
+                window.x=window.x.clamp(0,framebuffer.width.saturating_sub(80)as i32);
+                window.y=window.y.clamp(0,framebuffer.height.saturating_sub(TASKBAR_HEIGHT+60)as i32);
+            }
+            cursor_x=cursor_x.clamp(0,framebuffer.width as i32-1);
+            cursor_y=cursor_y.clamp(0,framebuffer.height as i32-1);
+            previous_cursor_bounds=shell.cursor_bounds(cursor_x,cursor_y);
+            redraw=true;
+        }
+        if redraw {
+            shell.draw_desktop(&framebuffer, &mut frame, &mut frame_rgba);
+            present_surface_region(&frame, &mut frame_rgba, previous_cursor_bounds);
+            shell.draw_cursor(&frame, cursor_x, cursor_y, &mut cursor_rgba);
+        } else if pointer_moved {
+            shell.update_cursor(
+                &frame,
+                previous_cursor_bounds,
+                cursor_x,
+                cursor_y,
+                &mut frame_rgba,
+                &mut cursor_rgba,
+            );
+        }
+        if ticks >= next_process_poll && !key_pending {
+            next_process_poll = ticks.saturating_add(500);
             let observers: alloc::vec::Vec<_> = shell
                 .model
                 .applications
@@ -634,37 +744,20 @@ fn desktop_main() -> ! {
                 .map(|app| app.window_id)
                 .collect();
             if !observers.is_empty() {
+                shell.model.sample_task_manager();
+                for id in &observers {shell.mark_window_dirty(*id);}
+                // Paint telemetry on the next loop, after input has been consumed.
+                telemetry_dirty = true;
                 if let Ok(snapshot) = nt61_desktop::platform::services::processes() {
                     if shell.model.process_snapshot.as_ref() != Some(&snapshot) {
                         shell.model.process_snapshot = Some(snapshot);
                         for id in observers {
                             shell.mark_window_dirty(id);
                         }
-                        redraw = true;
+                        telemetry_dirty = true;
                     }
                 }
             }
-        }
-        if old_audio != (shell.model.volume, shell.model.muted) {
-            let _ = arch::shell_audio(shell.model.volume, shell.model.muted);
-        }
-        let old_session=shell.model.session.screen;
-        let closing=shell.model.session.pending_close.is_some() || shell.model.power_action.is_some();
-        if let Some(action)=shell.model.advance_session(){committed_power=Some((action,ticks.saturating_add(250)));}
-        if closing || old_session!=shell.model.session.screen {shell.scene_dirty.set(true);redraw=true;shell.model.refresh_controls(framebuffer.width,framebuffer.height);}
-        if redraw {
-            shell.draw_desktop(&framebuffer, &mut frame, &mut frame_rgba);
-            present_surface_region(&frame, &mut frame_rgba, previous_cursor_bounds);
-            shell.draw_cursor(&frame, cursor_x, cursor_y, &mut cursor_rgba);
-        } else if pointer_moved {
-            shell.update_cursor(
-                &frame,
-                previous_cursor_bounds,
-                cursor_x,
-                cursor_y,
-                &mut frame_rgba,
-                &mut cursor_rgba,
-            );
         }
         if !key_pending && !pointer_moved {
             core::hint::spin_loop();
@@ -768,6 +861,13 @@ impl CursorImage {
 impl Shell {
     fn load() -> Option<Self> {
         let mut model = ShellModel::new(Theme::aero());
+        // LogonUI installs the authenticated token before Explorer starts.
+        // Resolve it before projecting profile folders or creating windows.
+        let user=alloc::string::String::from_utf8(nt61_desktop::platform::services::session("user",&[]).ok()?).ok()?;
+        if user.is_empty(){return None;}
+        model.session.user=user.clone();
+        model.session.identity=user;
+        model.refresh_audio();
         model.files = match nt61_desktop::file::FileSystem::mounted(nt61_desktop::file::Backend(
             nt61_desktop::platform::services::transfer,
         )) {
@@ -851,6 +951,7 @@ impl Shell {
             start_button_hover: png::decode_png(START_BUTTON_HOVER_PNG).ok()?,
             start_button_pressed: png::decode_png(START_BUTTON_PRESSED_PNG).ok()?,
             wallpaper_asset: decoded_wallpaper()?,
+            session_background: {let asset=png::decode_png(include_bytes!("../../../assets/windows7/wallpapers/login-1024.png")).ok()?;let mut surface=nt61_desktop::graphics::Surface::new(1024,768);cover_image(&asset,&mut surface);surface},
             fonts: font_view::FontPack::with_library(
                 nt61_desktop::shell::layout::UI_FONT_SIZE,
                 &model.fonts,
@@ -862,6 +963,9 @@ impl Shell {
     }
 
     fn prepare_aero(&mut self, width: u32, height: u32) {
+        if self.session_background.width()!=width||self.session_background.height()!=height {
+            if let Ok(asset)=png::decode_png(include_bytes!("../../../assets/windows7/wallpapers/login-1024.png")){let mut surface=nt61_desktop::graphics::Surface::new(width,height);cover_image(&asset,&mut surface);self.session_background=surface;}
+        }
         let Some(mut wallpaper) = nt61_desktop::graphics::Surface::try_new(width, height) else {
             return;
         };
@@ -980,7 +1084,38 @@ impl Shell {
         }
         self.draw_context_menu(frame, framebuffer);
         self.draw_flyout(frame, framebuffer);
-        nt61_desktop::session::draw(&self.model.session,frame,|frame,text,b,color|self.label(frame,text,b,color));
+        self.draw_desktop_editor(frame);
+        nt61_desktop::session::draw_with_background(&self.model.session,frame,Some(&self.session_background),|frame,text,b,color|{if matches!(self.model.session.screen,nt61_desktop::session::Screen::Users|nt61_desktop::session::Screen::Credentials){self.centered(frame,text,b,color);}else{self.label(frame,text,b,color);}});
+    }
+
+    fn draw_desktop_editor(&self, frame: &mut nt61_desktop::graphics::Surface) {
+        use nt61_desktop::{desktop_files::Editor, graphics::Rect};
+        if self.model.desktop_editor.is_none() && self.model.desktop_error.is_empty() { return; }
+        let b = self.model.desktop_editor_bounds();
+        aero::blend_rounded_rect(frame, Rect::new(b.x-4,b.y-4,b.width+8,b.height+10),6,0x70546D88);
+        frame.fill_rect(b.x,b.y,b.width,b.height,0xFFF0F0F0);
+        frame.fill_rect(b.x+1,b.y+1,b.width-2,32,0xFFE1ECF7);
+        let (title, prompt, value, button) = match &self.model.desktop_editor {
+            Some(Editor::Rename { value, .. }) => ("Rename", "Type a name (Ctrl+A to replace):", Some(value.as_str()), "OK"),
+            Some(Editor::Shortcut { target, name, naming }) => ("Create Shortcut",
+                if *naming { "Type a name for this shortcut:" } else { "Type the location of the item:" },
+                Some(if *naming { name.as_str() } else { target.as_str() }), if *naming { "Finish" } else { "Next" }),
+            None => ("Desktop", "", None, "OK"),
+        };
+        self.label(frame,title,Rect::new(b.x+12,b.y+8,b.width-24,20),0xFF173F67);
+        self.label(frame,prompt,Rect::new(b.x+16,b.y+52,b.width-32,22),0xFF111111);
+        if let Some(value) = value {
+            frame.fill_rect(b.x+16,b.y+82,b.width-32,28,0xFF7A9CBF);
+            frame.fill_rect(b.x+17,b.y+83,b.width-34,26,0xFFFFFFFF);
+            self.label(frame,value,Rect::new(b.x+22,b.y+88,b.width-44,20),0xFF111111);
+        }
+        self.label(frame,&self.model.desktop_error,Rect::new(b.x+16,b.y+122,b.width-32,48),0xFF9A1515);
+        for (offset,label) in [(232,button),(332,"Cancel")] {
+            let r=Rect::new(b.x+offset,b.y+178,88,26);
+            frame.fill_rect(r.x,r.y,r.width,r.height,0xFF7F9DB9);
+            frame.fill_rect(r.x+1,r.y+1,r.width-2,r.height-2,0xFFF7F7F7);
+            self.label(frame,label,Rect::new(r.x+18,r.y+5,68,20),0xFF111111);
+        }
     }
 
     fn current_cursor(&self) -> &CursorImage {
@@ -1088,7 +1223,7 @@ impl Shell {
             });
         }
         let mut windows: alloc::vec::Vec<_> = self.model.taskbar.windows.iter().collect();
-        windows.sort_by_key(|w| (Some(w.id) == self.model.selected_window, w.id));
+        windows.sort_by_key(|w| self.model.window_z_order(w.id));
         let foremost = windows.iter().rev().find(|w| !w.minimized).map(|w| w.id);
         for window in windows {
             if window.minimized || matches!(plan,Repaint::Window(id) if id!=window.id) {
@@ -1203,6 +1338,9 @@ impl Shell {
                     self.draw_shell_settings(frame, body, kind);
                 }
                 nt61_desktop::shell::WindowKind::ControlPanel
+                | nt61_desktop::shell::WindowKind::ControlCategory(_)
+                | nt61_desktop::shell::WindowKind::UserAccounts
+                | nt61_desktop::shell::WindowKind::SoundSettings
                 | nt61_desktop::shell::WindowKind::RecycleBin
                 | nt61_desktop::shell::WindowKind::System
                 | nt61_desktop::shell::WindowKind::ComputerManagement

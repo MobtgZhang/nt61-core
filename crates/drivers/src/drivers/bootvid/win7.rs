@@ -104,14 +104,16 @@ fn gpu_present(width: u32, height: u32, canvas_ptr: *mut u8) -> bool {
         // Allocate the CPU framebuffer before handing any backing memory to
         // the device. Allocation failure can then be retried without leaving
         // an active DMA resource owned by a discarded GPU session.
-        let software_framebuffer = if !super::is_lfb_active() {
+        let software_framebuffer = {
             let mut framebuffer = SOFTWARE_FRAMEBUFFER.lock();
             let Some((pointer, _)) = ensure_canvas(&mut framebuffer, width, height) else {
                 return false;
             };
-            Some(pointer)
-        } else {
-            None
+            // Reserve both stores and their system page tables before user
+            // address spaces exist. Even a firmware-backed boot needs this
+            // store for later mode switches; the runtime page-table allocator
+            // still depends on low identity aliases that a user image can own.
+            (!super::is_lfb_active()).then_some(pointer)
         };
         let Some(mut gpu) =
             (unsafe { crate::drivers::virtio::gpu::VirtioGpu::probe(0, &mut transport) })
@@ -325,21 +327,39 @@ fn ensure_canvas(
     height: u32,
 ) -> Option<(*mut u8, usize)> {
     let canvas_len = width as usize * height as usize * 4;
-    if canvas.ptr.is_null() || canvas.len != canvas_len {
-        let canvas_phys = crate::mm::allocate_pages(canvas_len.div_ceil(4096) as u64)?;
-        let map_start = canvas_phys & !0x1F_FFFF;
-        let map_len =
-            ((canvas_len as u64) + (canvas_phys - map_start)).div_ceil(0x20_0000) * 0x20_0000;
-        if !crate::arch::identity_map_region(map_start, map_len) {
-            return None;
-        }
+    if canvas.ptr.is_null() || canvas.len < canvas_len {
+        // Reserve the supported mode envelope once. DMA backing addresses stay
+        // stable across mode switches and repeated Apply/Revert never leaks pages.
+        let allocation_len = canvas_len.max(1920 * 1200 * 4);
+        let pages = allocation_len.div_ceil(4096) as u64;
+        let canvas_phys = crate::mm::allocate_pages(pages)?;
+        // Physical RAM may overlap a process's image virtual addresses. Keep
+        // x86 framebuffer mappings in the supervisor system-PTE range, so a
+        // runtime mode change never installs identity pages over Explorer.
+        #[cfg(target_arch = "x86_64")]
+        let pointer = {
+            let Some(mapped) = crate::mm::syspte::map_io_space(canvas_phys, pages) else {
+                crate::mm::free_pages(canvas_phys, pages);
+                return None;
+            };
+            crate::mm::vas::refresh_kernel_mappings(crate::arch::read_current_page_root());
+            mapped as *mut u8
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let pointer = {
+            if !crate::arch::identity_map_region(canvas_phys, pages * 4096) {
+                crate::mm::free_pages(canvas_phys, pages);
+                return None;
+            }
+            canvas_phys as *mut u8
+        };
         unsafe {
-            core::ptr::write_bytes(canvas_phys as *mut u8, 0, canvas_len);
+            core::ptr::write_bytes(pointer, 0, canvas_len);
         }
-        canvas.ptr = canvas_phys as *mut u8;
-        canvas.len = canvas_len;
+        canvas.ptr = pointer;
+        canvas.len = allocation_len;
     }
-    Some((canvas.ptr, canvas.len))
+    Some((canvas.ptr, canvas_len))
 }
 
 fn copy_canvas_to_lfb(canvas: *mut u8, width: u32, height: u32, pitch: u32) {
@@ -366,6 +386,46 @@ fn copy_canvas_to_lfb(canvas: *mut u8, width: u32, height: u32, pitch: u32) {
     }
 }
 
+/// VirtIO 2D accepts arbitrary scanout rectangles within the allocated envelope.
+/// Firmware-only displays expose their current mode until a modesetting driver owns them.
+pub fn display_modes() -> alloc::vec::Vec<(u32,u32)> {
+    if BOOT_GPU.lock().is_some() && !BOOT_GPU_UNAVAILABLE.load(Ordering::Acquire) {
+        alloc::vec![(800,600),(1024,768),(1152,864),(1280,720),(1280,800),(1280,960),
+            (1280,1024),(1360,768),(1366,768),(1440,900),(1600,900),(1600,1200),(1680,1050),(1920,1080),(1920,1200)]
+    } else { alloc::vec![(super::fb_width(),super::fb_height())] }
+}
+pub fn change_display_mode(width:u32,height:u32) -> bool {
+    if !display_modes().contains(&(width,height)) { return false; }
+    if (width,height)==(super::fb_width(),super::fb_height()) { return true; }
+    // Same lock order as the presentation path. Never publish geometry before
+    // the device accepts its new scanout and a CPU backing store is available.
+    let mut canvas=ANIMATION_CANVAS.lock();
+    let Some((pointer,_))=ensure_canvas(&mut canvas,width,height) else {return false;};
+    let mut software=SOFTWARE_FRAMEBUFFER.lock();
+    let Some((cpu,_))=ensure_canvas(&mut software,width,height) else {return false;};
+    let mut gpu=BOOT_GPU.lock();
+    let Some(session)=gpu.as_mut() else {return false;};
+    if !unsafe {session.gpu.change_display(&mut session.transport,pointer,width,height)} {return false;}
+    unsafe {core::ptr::write_bytes(cpu,0,width as usize*height as usize*4);}
+    let info=crate::hal::common::framebuffer_impl::FramebufferInfo {
+        address:cpu as u64,width,height,pitch:width*4,bpp:32,
+    };
+    crate::hal::common::framebuffer_impl::init(info);
+    #[cfg(target_arch="x86_64")]
+    crate::hal::framebuffer::init(Some(crate::hal::framebuffer::FramebufferInfo {
+        address:info.address,width,height,pitch:info.pitch,bpp:32,
+    }));
+    // Boot initialization deliberately ignores a second framebuffer. A live
+    // mode change must replace the mirror's geometry as well as HAL's, or
+    // presentation keeps copying the old dimensions and rejects the scanout.
+    super::FB_BASE.store(info.address, Ordering::Release);
+    super::FB_WIDTH.store(width, Ordering::Release);
+    super::FB_HEIGHT.store(height, Ordering::Release);
+    super::FB_PITCH.store(info.pitch, Ordering::Release);
+    crate::drivers::input::virtio_input::set_mouse_screen_bounds(width,height);
+    true
+}
+
 pub(super) fn present_desktop_frame() -> bool {
     if !super::MODE_LFB.load(Ordering::Acquire) {
         return false;
@@ -375,6 +435,9 @@ pub(super) fn present_desktop_frame() -> bool {
     if BOOT_GPU_UNAVAILABLE.load(Ordering::Acquire) || BOOT_GPU.lock().is_none() {
         return true;
     }
+    // Modesetting uses this same lock. Read geometry only after acquiring it,
+    // so a presenter cannot retain old dimensions across a scanout change.
+    let mut canvas_guard = ANIMATION_CANVAS.lock();
     let width = super::FB_WIDTH.load(Ordering::Acquire);
     let height = super::FB_HEIGHT.load(Ordering::Acquire);
     let pitch = super::FB_PITCH.load(Ordering::Acquire);
@@ -382,10 +445,13 @@ pub(super) fn present_desktop_frame() -> bool {
     if fb_base == 0 || width == 0 || height == 0 || pitch == 0 {
         return false;
     }
-    let Some(damage) = crate::hal::common::framebuffer_impl::take_damage() else {
+    let Some(mut damage) = crate::hal::common::framebuffer_impl::take_damage() else {
         return true; // An idle desktop never copies or submits a frame.
     };
-    let mut canvas_guard = ANIMATION_CANVAS.lock();
+    // A queued rectangle can belong to the previous, larger desktop.
+    damage.width = damage.width.min(width.saturating_sub(damage.x));
+    damage.height = damage.height.min(height.saturating_sub(damage.y));
+    if damage.width == 0 || damage.height == 0 { return true; }
     let Some((canvas_ptr, _)) = ensure_canvas(&mut canvas_guard, width, height) else {
         crate::hal::common::framebuffer_impl::mark_damage(damage.x, damage.y, damage.width, damage.height);
         return false;
