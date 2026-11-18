@@ -12,87 +12,24 @@
 //! 0x008: sequence2 (u32)   = secondary sequence number
 //! 0x00C: last_modified (i64) = Windows FILETIME
 //! 0x014: major_ver (u32)  = must be 1
-//! 0x018: minor_ver (u32)  = 1 or 3
-//! 0x01C: unknown5 (u32)
-//! 0x020: unknown6 (u32)    = 1
-//! 0x024: offset (u32)       = root key offset (HBIN-relative)
-//! 0x028: blocks (u32)      = offset of end of last hbin + 0x1000
-//! 0x02C: unknown7 (u32)    = 1
-//! 0x030: name[64]          = original hive filename (UTF-16LE)
-//! 0x1FC: csum (u32)        = xor of dwords 0x00..0x1F8
-//! 0x1000: (first hbin page)
-//
-//! ## HBIN Page (starts at 0x1000)
-//
-//! 0x00: magic[4]         = "hbin" (ASCII)
-//! 0x04: offset_first (u32) = offset from first hbin (i.e. 0 for first)
-//! 0x08: page_size (u32)  = size of this page (multiple of 4KB)
-//! 0x10: [blocks follow]
-//
-//! ## Block Header (8 bytes)
-//
-//! 0x00: seg_len (i32)    = negative for used block, positive for free
-//! 0x04: id[2]            = "nk", "vk", "lf", "lh", "ri", "sk"
-//! 0x06: pad[2]
-//
-//! ## nk (node key) block (offset 0x50 + name_len, aligned to 8 bytes)
-//
-//! 0x00: seg_len (i32, negative)
-//! 0x04: id[2] = "nk"
-//! 0x06: pad[2]
-//! 0x08: flags (u16)       bit1=HiveExit, bit2=HiveEntry(root)
-//! 0x0A: timestamp (i64)
-//! 0x12: unknown1 (u32)
-//! 0x16: parent (u32)        offset (HBIN-relative)
-//! 0x1A: nr_subkeys (u32)
-//! 0x1E: subkey_lf (u32)    offset to lf/lh block (HBIN-relative)
-//! 0x22: nr_subkeys_volatile (u32)
-//! 0x26: subkey_lf_volatile (u32)
-//! 0x2A: nr_values (u32)
-//! 0x2E: vallist (u32)      offset to value-list block (HBIN-relative)
-//! 0x32: sk (u32)            offset to sk block
-//! 0x36: classname (u32)     offset to classname data
-//! 0x3A: max_subkey_name_len (u16)
-//! 0x3C: unknown2 (u16)
-//! 0x3E: unknown3 (u32)
-//! 0x42: max_vk_name_len (u16)
-//! 0x44: max_vk_data_len (u32)
-//! 0x48: unknown6 (u32)
-//! 0x4C: name_len (u16)       in bytes (for short names: ASCII encoded)
-//! 0x4E: classname_len (u16)
-//! 0x50: name[?]             ASCII for short names (<=64 bytes) or UTF-16LE for long names
-//
-//! ## vk (value key) block
-//
-//! 0x00: seg_len (i32, negative)
-//! 0x04: id[2] = "vk"
-//! 0x06: pad[2]
-//! 0x08: name_len (u16)      0 = default value
-//! after name:
-//! 0x??: data_len (u32)       top bit set = inline (<=4 bytes)
-//! 0x??: data_offset (u32)    if not inline: offset (HBIN-relative)
-//! 0x??: data_type (u32)      1=string, 2=expand, 4=dword, 7=multi_sz, 11=qword
-//! 0x??: flags (u16)
-//! 0x??: unknown2 (u16)
-//! inline data: lower 4 bytes of data_offset
-//
-//! ## lf (leaf) block
-//
-//! 0x00: seg_len (i32)
-//! 0x04: id[2] = "lf" or "lh"
-//! 0x06: pad[2]
-//! 0x08: nr_keys (u16)
-//! 0x0A: [for each key: offset(4) + hash(4)]
-//
-//! ## ri (root index) block
-//
-//! 0x00: seg_len (i32)
-//! 0x04: id[2] = "ri"
-//! 0x06: pad[2]
-//! 0x08: nr_offsets (u16)
-//! 0x0A: [for each: offset(4) to lh/lf block]
+//! 0x018: minor_ver (u32) = format minor version (SP1 uses 5)
+//! 0x024: root key offset (u32, HBIN-relative)
+//! 0x028: total HBIN data length (u32, excludes REGF header)
+//! 0x1FC: checksum (u32, XOR over header dwords with reserved-value fixup)
+//! ```
+//!
+//! HBIN headers are 32 bytes. Cells start with a signed 4-byte allocated
+//! length; all cell offsets include that length. Key names start at cell
+//! offset 0x50; nk flags at 0x06 select compressed bytes or UTF-16LE.
+//! Value cells have name length at 0x06, data length at 0x08, data cell
+//! offset or inline bytes at 0x0C, type at 0x10, flags at 0x14 and name
+//! at 0x18. External value bytes start four bytes after the data cell offset.
+//! Subkey index cells have count at 0x06 and entries at 0x08: lf/lh use
+//! offset/hash pairs, li uses offsets, and ri references other index cells.
+//! This BCD reader supports inline and single-cell values. Segmented db
+//! values are handled by the general Configuration Manager hive reader.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// REGF header size (4096 bytes)
@@ -105,6 +42,7 @@ const NK_MAGIC: &[u8; 2] = b"nk";
 const VK_MAGIC: &[u8; 2] = b"vk";
 const LF_MAGIC: &[u8; 2] = b"lf";
 const LH_MAGIC: &[u8; 2] = b"lh";
+const LI_MAGIC: &[u8; 2] = b"li";
 const RI_MAGIC: &[u8; 2] = b"ri";
 
 /// Registry data types
@@ -162,43 +100,17 @@ fn compute_header_checksum(data: &[u8]) -> u32 {
     sum
 }
 
-/// Decode a registry value name. Short names (<=64 bytes) are ASCII encoded,
-/// while longer names are UTF-16LE encoded.
-fn decode_name(data: &[u8]) -> String {
-    if data.is_empty() {
-        return String::new();
-    }
-
-    // Check first byte - if it's printable ASCII, treat as ASCII
-    if data[0] >= 0x20 && data[0] < 0x7F {
-        // ASCII encoding - find null terminator
-        let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-        String::from_utf8_lossy(&data[..end])
-            .trim_end_matches('\0')
-            .to_string()
-    } else {
-        // UTF-16LE encoding
-        decode_utf16le(data)
-    }
-}
-
 /// Decode a UTF-16LE byte sequence into a String.
 fn decode_utf16le(data: &[u8]) -> String {
     if data.len() % 2 != 0 {
         return String::new();
     }
-    let mut out = String::new();
-    for i in (0..data.len()).step_by(2) {
-        let cu = u16::from_le_bytes([data[i], data[i + 1]]);
-        if cu == 0 {
-            break;
-        }
-        match char::from_u32(cu as u32) {
-            Some(c) => out.push(c),
-            None => out.push('\u{FFFD}'), // Replacement character
-        }
-    }
-    out
+    let units: Vec<_> = data
+        .chunks_exact(2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .take_while(|&unit| unit != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 #[derive(Debug, Clone)]
@@ -219,18 +131,12 @@ impl Value {
         if bytes.len() % 2 != 0 {
             return None;
         }
-        let mut out = String::new();
-        for i in (0..bytes.len()).step_by(2) {
-            let cu = u16::from_le_bytes([bytes[i], bytes[i + 1]]);
-            if cu == 0 {
-                break;
-            }
-            {
-                let c = char::from_u32(cu as u32)?;
-                out.push(c)
-            }
-        }
-        Some(out)
+        let units: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        String::from_utf16(&units).ok()
     }
 
     pub fn as_u32(&self) -> Option<u32> {
@@ -351,7 +257,7 @@ impl<'a> Hive<'a> {
         }
 
         // Offsets per the REGF spec (relative to cell start).
-        let _flags = read_u16(self.data, offset + 0x06).ok_or(HiveError::Truncated)?;
+        let flags = read_u16(self.data, offset + 0x06).ok_or(HiveError::Truncated)?;
         let _timestamp = read_u32(self.data, offset + 0x08).ok_or(HiveError::Truncated)?;
         let _timestamp_hi = read_u32(self.data, offset + 0x0C).ok_or(HiveError::Truncated)?;
         let _access_bits = read_u32(self.data, offset + 0x10).ok_or(HiveError::Truncated)?;
@@ -377,8 +283,13 @@ impl<'a> Hive<'a> {
             return Err(HiveError::Truncated);
         }
 
-        // Decode name (supports both ASCII and UTF-16LE)
-        let name = decode_name(&self.data[name_start..name_start + name_len]);
+        // Encoding is declared by the compressed-name flag, not guessed from
+        // the first byte (UTF-16 names can also start with printable ASCII).
+        let name = if flags & 0x20 != 0 {
+            String::from_utf8_lossy(&self.data[name_start..name_start + name_len]).into_owned()
+        } else {
+            decode_utf16le(&self.data[name_start..name_start + name_len])
+        };
 
         Ok(KeyNode {
             name,
@@ -405,18 +316,19 @@ impl<'a> Hive<'a> {
             return Err(HiveError::Truncated);
         }
         let id = &self.data[offset + 4..offset + 6];
-        if id != LF_MAGIC && id != LH_MAGIC {
+        if id != LF_MAGIC && id != LH_MAGIC && id != LI_MAGIC {
             return Err(HiveError::Truncated);
         }
+        let entry_size = if id == LI_MAGIC { 4 } else { 8 };
 
         let nr_keys = read_u16(self.data, offset + 6).ok_or(HiveError::Truncated)? as usize;
         let mut offsets = Vec::with_capacity(nr_keys);
 
         let entry_start = offset + 8;
         for i in 0..nr_keys {
-            let entry_off = entry_start + i * 8;
+            let entry_off = entry_start + i * entry_size;
             // Bounds check for each entry
-            if entry_off + 8 > self.data.len() {
+            if entry_off + entry_size > self.data.len() {
                 break;
             }
             let key_off = read_u32(self.data, entry_off).ok_or(HiveError::Truncated)?;
@@ -465,8 +377,8 @@ impl<'a> Hive<'a> {
         }
 
         let lf_offset = self.hbin_to_absolute(node.subkey_lf);
-        if lf_offset >= self.data.len() {
-            return Ok(Vec::new());
+        if lf_offset + 6 > self.data.len() {
+            return Err(HiveError::Truncated);
         }
 
         let id = &self.data[lf_offset + 4..lf_offset + 6];
@@ -574,17 +486,31 @@ impl<'a> Hive<'a> {
         let name = if flags & VK_FLAG_ASCII_NAME != 0 {
             String::from_utf8_lossy(&self.data[name_start..name_start + name_len]).into_owned()
         } else {
-            decode_name(&self.data[name_start..name_start + name_len])
+            decode_utf16le(&self.data[name_start..name_start + name_len])
         };
 
         let inline = (data_size_raw & VK_DATA_INLINE_FLAG) != 0;
         let data_len = (data_size_raw & !VK_DATA_INLINE_FLAG) as usize;
 
         let data = if inline {
-            data_offset_raw.to_le_bytes()[..data_len.min(4)].to_vec()
+            if data_len > 4 {
+                return Err(HiveError::Truncated);
+            }
+            data_offset_raw.to_le_bytes()[..data_len].to_vec()
+        } else if data_len == 0 {
+            Vec::new()
         } else {
-            let data_off = self.hbin_to_absolute(data_offset_raw);
-            if data_off + data_len > self.data.len() {
+            // Like SYSTEM hives, BCD vk offsets address the allocated cell
+            // header. The actual data starts four bytes after that header.
+            let cell = self.hbin_to_absolute(data_offset_raw);
+            let cell_size = read_i32(self.data, cell).ok_or(HiveError::Truncated)?;
+            if cell_size >= 0 || (cell_size.unsigned_abs() as usize) < data_len + 4 {
+                return Err(HiveError::Truncated);
+            }
+            let data_off = cell + 4;
+            if cell + cell_size.unsigned_abs() as usize > self.data.len()
+                || data_off + data_len > self.data.len()
+            {
                 return Err(HiveError::Truncated);
             }
             self.data[data_off..data_off + data_len].to_vec()
@@ -612,10 +538,7 @@ impl<'a> Hive<'a> {
     /// Supports both "/" and "\" as path separators.
     pub fn open(&self, path: &str) -> Result<KeyNode, HiveError> {
         let root = self.root()?;
-        let parts: Vec<&str> = path
-            .split(['/', '\\'])
-            .filter(|s| !s.is_empty())
-            .collect();
+        let parts: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
         let mut current = root;
         for part in parts {
             let subkeys = self.subkeys(&current)?;

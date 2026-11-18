@@ -65,6 +65,27 @@ pub mod ps {
             }
         }
         std::thread_local! { static TOKEN: core::cell::UnsafeCell<crate::token::Token> = core::cell::UnsafeCell::new(crate::token::Token::new_primary(crate::sid::sid::well_known(crate::sid::WellKnownSid::LocalSystem))); }
+
+        pub fn with_user_token<T>(run: impl FnOnce() -> T) -> T {
+            struct Restore(crate::token::Token);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    TOKEN.with(|slot| unsafe {
+                        core::ptr::swap(slot.get(), &mut self.0);
+                    });
+                }
+            }
+            // The harness token is thread-local; no registry call retains it.
+            // Restore it even if an assertion unwinds.
+            let previous = TOKEN.with(|slot| unsafe {
+                core::ptr::replace(
+                    slot.get(),
+                    crate::token::Token::new_primary(crate::sid::SID_USERS),
+                )
+            });
+            let _restore = Restore(previous);
+            run()
+        }
     }
 }
 pub mod arch {
@@ -264,6 +285,45 @@ mod mutation_cases {
             STATUS_SUCCESS
         );
         handle
+    }
+    #[test]
+    fn bootstrap_user_cannot_create_in_read_only_root_but_can_read_system_created_key() {
+        let _serial = REGISTRY_TEST_LOCK.lock();
+        init();
+        let name = Name::new("BootstrapUserAccess");
+        let mut attributes = ObjectAttributes::new();
+        attributes.object_name = name.address() as _;
+        let attr = pointer(&attributes, false) as *mut ObjectAttributes;
+        let mut handle: HANDLE = core::ptr::null_mut();
+        let out = pointer(&mut handle, true) as *mut HANDLE;
+        let mut disposition = 0xccccccccu32;
+        let action = pointer(&mut disposition, true) as *mut u32;
+        // Match the native-registry fixture's access and root-directory inputs,
+        // with the exact token identity used by create_user_process.
+        crate::ps::process::with_user_token(|| unsafe {
+            assert_eq!(
+                nt_create_key(out, 0x1000f, attr, 0, core::ptr::null_mut(), 0, action),
+                STATUS_ACCESS_DENIED
+            );
+            assert!(handle.is_null());
+            assert_eq!(disposition, 0xcccccccc);
+            assert_eq!(nt_open_key(out, 1, attr), STATUS_OBJECT_NAME_NOT_FOUND);
+        });
+        assert_eq!(
+            unsafe { nt_create_key(out, 0x1000f, attr, 0, core::ptr::null_mut(), 0, action) },
+            STATUS_SUCCESS
+        );
+        assert_eq!(disposition, 1, "denied create must not insert a key");
+        let system_handle = handle;
+        crate::ps::process::with_user_token(|| unsafe {
+            assert_eq!(nt_open_key(out, 1, attr), STATUS_SUCCESS);
+            assert_eq!(query(handle).1, name.units);
+            assert_eq!(nt_reg_close_key(handle), STATUS_SUCCESS);
+            handle = core::ptr::null_mut();
+            assert_eq!(nt_open_key(out, 0x1000f, attr), STATUS_ACCESS_DENIED);
+            assert!(handle.is_null());
+        });
+        assert_eq!(unsafe { nt_delete_key(system_handle) }, STATUS_SUCCESS);
     }
     fn query(handle: HANDLE) -> (i64, Vec<u16>) {
         let mut bytes = [0u64; 80];

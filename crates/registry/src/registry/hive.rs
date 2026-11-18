@@ -63,6 +63,8 @@ const VK_NAME: usize = 0x18;
 const VK_FLAG_ASCII_NAME: u32 = 0x0000_0001;
 const VK_DATA_INLINE_FLAG: u32 = 0x8000_0000;
 const VK_INLINE_MAX: usize = 4;
+// SP1 REGF 1.5 splits large values into db segments of this payload size.
+const BIG_DATA_SEGMENT_SIZE: usize = 0x3fd8;
 const NO_OFFSET: u32 = 0xFFFF_FFFF;
 
 #[derive(Debug)]
@@ -412,24 +414,24 @@ impl<'a> Hive<'a> {
             read_u32(self.data, node.offset as usize + NK_NR_VALUES).ok_or(HiveError::Truncated)?;
         let vallist_rel =
             read_u32(self.data, node.offset as usize + NK_VALLIST).ok_or(HiveError::Truncated)?;
-        if nr_values == 0 || vallist_rel == NO_OFFSET || vallist_rel == 0 {
+        if nr_values == 0 {
             return Ok(Vec::new());
         }
-
-        let vallist_abs = HBIN_BASE + vallist_rel as usize;
-        let list_start = vallist_abs + 4;
-        if list_start + (nr_values as usize) * 4 > self.data.len() {
-            return Err(HiveError::Truncated);
-        }
+        let list = self.allocated_payload(vallist_rel)?;
+        let list_size = (nr_values as usize)
+            .checked_mul(4)
+            .ok_or(HiveError::InvalidPointer)?;
+        let entries = list.get(..list_size).ok_or(HiveError::Truncated)?;
 
         let mut result = Vec::with_capacity(nr_values as usize);
-        for i in 0..nr_values as usize {
-            let entry = list_start + i * 4;
-            let vk_rel = read_u32(self.data, entry).ok_or(HiveError::Truncated)?;
-            let vk_abs = HBIN_BASE + vk_rel as usize;
-            if let Ok(v) = self.read_vk(vk_abs) {
-                result.push(v);
-            }
+        for entry in entries.chunks_exact(4) {
+            let vk_rel = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            let vk_abs = HBIN_BASE
+                .checked_add(vk_rel as usize)
+                .ok_or(HiveError::InvalidPointer)?;
+            // A corrupt value must not silently disappear from enumeration.
+            self.allocated_payload(vk_rel)?;
+            result.push(self.read_vk(vk_abs)?);
         }
         Ok(result)
     }
@@ -440,7 +442,7 @@ impl<'a> Hive<'a> {
         }
 
         let seg_len = read_i32(self.data, offset).ok_or(HiveError::Truncated)?;
-        if seg_len >= 0 {
+        if seg_len >= 0 || (seg_len.unsigned_abs() as usize) < VK_NAME {
             return Err(HiveError::Truncated);
         }
 
@@ -456,10 +458,12 @@ impl<'a> Hive<'a> {
             read_u32(self.data, offset + VK_DATA_OFFSET).ok_or(HiveError::Truncated)?;
         let data_type_raw =
             read_u32(self.data, offset + VK_DATA_TYPE).ok_or(HiveError::Truncated)?;
-        let flags = read_u32(self.data, offset + VK_FLAGS).ok_or(HiveError::Truncated)?;
+        let flags = read_u16(self.data, offset + VK_FLAGS).ok_or(HiveError::Truncated)? as u32;
 
         let name_start = offset + VK_NAME;
-        if name_start + name_len > self.data.len() {
+        if name_start + name_len > self.data.len()
+            || VK_NAME + name_len > seg_len.unsigned_abs() as usize
+        {
             return Err(HiveError::Truncated);
         }
 
@@ -473,14 +477,16 @@ impl<'a> Hive<'a> {
         let data_len = (data_size_raw & !VK_DATA_INLINE_FLAG) as usize;
 
         let data = if inline {
-            let le = data_offset_raw.to_le_bytes();
-            le[..data_len.min(VK_INLINE_MAX)].to_vec()
-        } else {
-            let data_abs = HBIN_BASE + data_offset_raw as usize;
-            if data_abs + data_len > self.data.len() {
-                return Err(HiveError::Truncated);
+            if data_len > VK_INLINE_MAX {
+                return Err(HiveError::InvalidPointer);
             }
-            self.data[data_abs..data_abs + data_len].to_vec()
+            let le = data_offset_raw.to_le_bytes();
+            le[..data_len].to_vec()
+        } else if data_len == 0 {
+            // An empty value has no allocated data cell; its offset is unused.
+            Vec::new()
+        } else {
+            self.read_external_data(data_offset_raw, data_len)?
         };
 
         Ok(Value {
@@ -488,6 +494,66 @@ impl<'a> Hive<'a> {
             value_type: ValueType::from_u32(data_type_raw),
             data,
         })
+    }
+
+    /// Return the payload of an allocated cell, excluding its length header.
+    fn allocated_payload(&self, relative: u32) -> Result<&'a [u8], HiveError> {
+        let cell = HBIN_BASE
+            .checked_add(relative as usize)
+            .ok_or(HiveError::InvalidPointer)?;
+        let signed = read_i32(self.data, cell).ok_or(HiveError::Truncated)?;
+        let size = signed.unsigned_abs() as usize;
+        if signed >= 0 || size < 8 || !size.is_multiple_of(8) || !cell.is_multiple_of(8) {
+            return Err(HiveError::InvalidPointer);
+        }
+        let end = cell.checked_add(size).ok_or(HiveError::InvalidPointer)?;
+        self.data.get(cell + 4..end).ok_or(HiveError::Truncated)
+    }
+
+    fn read_external_data(&self, relative: u32, length: usize) -> Result<Vec<u8>, HiveError> {
+        // Reject impossible lengths before reserving memory for an untrusted
+        // value. The segmented path never recurses through another db record.
+        if length > self.data.len() {
+            return Err(HiveError::InvalidPointer);
+        }
+        let payload = self.allocated_payload(relative)?;
+        if let Some(data) = payload.get(..length) {
+            return Ok(data.to_vec());
+        }
+        if length <= BIG_DATA_SEGMENT_SIZE
+            || read_u32(self.data, 0x18).unwrap_or(0) < 5
+            || payload.get(..2) != Some(b"db")
+        {
+            return Err(HiveError::InvalidPointer);
+        }
+        let count = read_u16(payload, 2).ok_or(HiveError::Truncated)? as usize;
+        if count != length.div_ceil(BIG_DATA_SEGMENT_SIZE) {
+            return Err(HiveError::InvalidPointer);
+        }
+        let list_relative = read_u32(payload, 4).ok_or(HiveError::Truncated)?;
+        let list = self.allocated_payload(list_relative)?;
+        let offsets = list.get(..count * 4).ok_or(HiveError::Truncated)?;
+        // Validate every segment before allocating the result, including the
+        // last segment whose allocated cell may contain unused padding.
+        for (index, offset) in offsets.chunks_exact(4).enumerate() {
+            let segment_relative = u32::from_le_bytes([offset[0], offset[1], offset[2], offset[3]]);
+            if segment_relative == relative || segment_relative == list_relative {
+                return Err(HiveError::InvalidPointer);
+            }
+            let segment = self.allocated_payload(segment_relative)?;
+            let needed = (length - index * BIG_DATA_SEGMENT_SIZE).min(BIG_DATA_SEGMENT_SIZE);
+            if segment.len() < needed {
+                return Err(HiveError::Truncated);
+            }
+        }
+        let mut result = Vec::with_capacity(length);
+        for offset in offsets.chunks_exact(4) {
+            let segment_relative = u32::from_le_bytes([offset[0], offset[1], offset[2], offset[3]]);
+            let segment = self.allocated_payload(segment_relative)?;
+            let needed = (length - result.len()).min(BIG_DATA_SEGMENT_SIZE);
+            result.extend_from_slice(&segment[..needed]);
+        }
+        Ok(result)
     }
 
     pub fn find_subkey(&self, node: &KeyNode, name: &str) -> Result<Option<KeyNode>, HiveError> {
@@ -780,5 +846,98 @@ mod tests {
         let value = hive.find_value(&node, "tESTvALUE").unwrap().unwrap();
         assert_eq!(value.name, "TestValue");
         assert_eq!(value.as_u32(), Some(0x42));
+    }
+
+    fn segmented_fixture() -> (Vec<u8>, u32, usize, usize, Vec<u8>) {
+        let mut bytes = build_test_hive();
+        bytes[0x18..0x1c].copy_from_slice(&5u32.to_le_bytes());
+        let checksum = compute_header_checksum(&bytes);
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&checksum.to_le_bytes());
+        let db = bytes.len();
+        bytes.resize(db + 16, 0);
+        bytes[db..db + 4].copy_from_slice(&(-16i32).to_le_bytes());
+        bytes[db + 4..db + 6].copy_from_slice(b"db");
+        bytes[db + 6..db + 8].copy_from_slice(&2u16.to_le_bytes());
+        let list = bytes.len();
+        bytes.resize(list + 16, 0);
+        bytes[list..list + 4].copy_from_slice(&(-16i32).to_le_bytes());
+        bytes[db + 8..db + 12].copy_from_slice(&((list - HBIN_BASE) as u32).to_le_bytes());
+        let expected = (0..BIG_DATA_SEGMENT_SIZE + 9)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        for (index, chunk) in expected.chunks(BIG_DATA_SEGMENT_SIZE).enumerate() {
+            let cell = bytes.len();
+            let size = (chunk.len() + 4).next_multiple_of(8);
+            bytes.resize(cell + size, 0xcc);
+            bytes[cell..cell + 4].copy_from_slice(&(-(size as i32)).to_le_bytes());
+            bytes[cell + 4..cell + 4 + chunk.len()].copy_from_slice(chunk);
+            bytes[list + 4 + 4 * index..list + 8 + 4 * index]
+                .copy_from_slice(&((cell - HBIN_BASE) as u32).to_le_bytes());
+        }
+        (bytes, (db - HBIN_BASE) as u32, db, list, expected)
+    }
+
+    #[test]
+    fn segmented_data_joins_full_chunks_and_excludes_last_cell_padding() {
+        let (bytes, relative, _, _, expected) = segmented_fixture();
+        let hive = Hive::parse(&bytes).unwrap();
+        assert_eq!(
+            hive.read_external_data(relative, expected.len()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn segmented_data_rejects_bad_counts_pointers_and_free_or_short_cells() {
+        let (bytes, relative, db, list, expected) = segmented_fixture();
+        let segment = HBIN_BASE + read_u32(&bytes, list + 4).unwrap() as usize;
+        for (offset, replacement) in [
+            (db + 6, 1u16.to_le_bytes().to_vec()),
+            (db + 8, u32::MAX.to_le_bytes().to_vec()),
+            (list + 4, relative.to_le_bytes().to_vec()),
+            (list + 4, u32::MAX.to_le_bytes().to_vec()),
+            (segment, 16352i32.to_le_bytes().to_vec()),
+            (segment, (-8i32).to_le_bytes().to_vec()),
+        ] {
+            let mut corrupt = bytes.clone();
+            corrupt[offset..offset + replacement.len()].copy_from_slice(&replacement);
+            let hive = Hive::parse(&corrupt).unwrap();
+            assert!(
+                hive.read_external_data(relative, expected.len()).is_err(),
+                "offset {offset}"
+            );
+        }
+        let hive = Hive::parse(&bytes).unwrap();
+        assert!(hive.read_external_data(relative, bytes.len() + 1).is_err());
+        assert!(hive
+            .read_external_data(relative, BIG_DATA_SEGMENT_SIZE)
+            .is_err());
+    }
+
+    #[test]
+    fn external_data_beginning_with_db_is_not_treated_as_a_segment_record() {
+        let (mut bytes, relative, db, _, _) = segmented_fixture();
+        bytes[db + 4..db + 12].copy_from_slice(b"db bytes");
+        let hive = Hive::parse(&bytes).unwrap();
+        assert_eq!(hive.read_external_data(relative, 8).unwrap(), b"db bytes");
+    }
+
+    #[test]
+    fn malformed_value_is_an_error_instead_of_silently_missing() {
+        let mut bytes = build_test_hive();
+        let hive = Hive::parse(&bytes).unwrap();
+        let node = hive.open_path(&["SUBKEY"]).unwrap().unwrap();
+        let list =
+            HBIN_BASE + read_u32(&bytes, node.offset as usize + NK_VALLIST).unwrap() as usize;
+        let vk = HBIN_BASE + read_u32(&bytes, list + 4).unwrap() as usize;
+        bytes[vk + VK_DATA_SIZE..vk + VK_DATA_SIZE + 4]
+            .copy_from_slice(&(VK_DATA_INLINE_FLAG | 5).to_le_bytes());
+        let hive = Hive::parse(&bytes).unwrap();
+        assert!(hive.values(&node).is_err());
+        // Empty non-inline values do not dereference their unused pointer.
+        bytes[vk + VK_DATA_SIZE..vk + VK_DATA_SIZE + 4].fill(0);
+        bytes[vk + VK_DATA_OFFSET..vk + VK_DATA_OFFSET + 4].fill(0xff);
+        let hive = Hive::parse(&bytes).unwrap();
+        assert!(hive.values(&node).unwrap()[0].data.is_empty());
     }
 }

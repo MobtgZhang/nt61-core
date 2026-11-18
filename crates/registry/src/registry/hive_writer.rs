@@ -180,16 +180,13 @@ impl HiveWriter {
         }
     }
 
-    /// FOUR-CC style hash over the first four name characters, the
-    /// convention Windows lh cells use. The local parser ignores the
-    /// field, but real hive consumers (regf tools) use it for lookups,
-    /// so a deterministic non-zero value is written instead of 0.
+    /// ASCII lh hash, as observed in the original SP1 hive. Non-ASCII
+    /// children use an un-hashed li index until an NT upcase table is available.
     fn entry_hash(name: &str) -> u32 {
-        let mut hash: u32 = 0;
-        for (i, c) in name.chars().take(4).enumerate() {
-            hash |= (c.to_ascii_lowercase() as u32) << (8 * i);
-        }
-        hash
+        name.bytes().fold(0u32, |hash, c| {
+            hash.wrapping_mul(37)
+                .wrapping_add(c.to_ascii_uppercase() as u32)
+        })
     }
 
     fn write_key(&mut self, key: &HiveKey, parent_off: u32) -> Result<u32, &'static str> {
@@ -234,7 +231,9 @@ impl HiveWriter {
 
             let lh_size = Self::align_up(8 + child_offsets.len() * LH_ENTRY_SIZE, 8);
             let lh_payload_len = lh_size - 8;
-            let lh_off = self.append_cell(ID_LH, &alloc::vec![0u8; lh_payload_len])?;
+            let hashed = child_names.iter().all(|name| name.is_ascii());
+            let id = if hashed { ID_LH } else { b"li" };
+            let lh_off = self.append_cell(id, &alloc::vec![0u8; lh_payload_len])?;
 
             // Write nr at +6 (in the pad field)
             let nr_pos = (lh_off + 6) as usize;
@@ -244,15 +243,15 @@ impl HiveWriter {
             // Fill in child offsets at +8 (payload start)
             let lh_body_start = (lh_off + 8) as usize;
             for (i, &child_abs) in child_offsets.iter().enumerate() {
-                let entry = lh_body_start + i * LH_ENTRY_SIZE;
+                let entry = lh_body_start + i * if hashed { LH_ENTRY_SIZE } else { 4 };
                 let rel = Self::to_hbin_rel(child_abs);
                 self.body[entry - HBIN_BASE..entry - HBIN_BASE + 4]
                     .copy_from_slice(&rel.to_le_bytes());
-                // hash (4 bytes): FOUR-CC over the child name so real
-                // hive consumers can use their lookup path.
-                let hash_pos = entry - HBIN_BASE + 4;
-                self.body[hash_pos..hash_pos + 4]
-                    .copy_from_slice(&Self::entry_hash(child_names[i]).to_le_bytes());
+                if hashed {
+                    let hash_pos = entry - HBIN_BASE + 4;
+                    self.body[hash_pos..hash_pos + 4]
+                        .copy_from_slice(&Self::entry_hash(child_names[i]).to_le_bytes());
+                }
             }
             lh_off
         } else {
@@ -360,7 +359,7 @@ impl HiveWriter {
                 self.body[ds_body - HBIN_BASE + j] = b;
             }
 
-            (v.data.len() as u32, Self::to_hbin_rel(ds_off + 4))
+            (v.data.len() as u32, Self::to_hbin_rel(ds_off))
         };
 
         // Patch the vk cell fields
@@ -402,7 +401,7 @@ impl HiveWriter {
         self.body.resize(data_len, 0);
         for &pos in &self.hbin_headers {
             self.body[pos..pos + 4].copy_from_slice(HBIN_MAGIC);
-            self.body[pos + 4..pos + 8].copy_from_slice(&((HBIN_BASE + pos) as u32).to_le_bytes());
+            self.body[pos + 4..pos + 8].copy_from_slice(&(pos as u32).to_le_bytes());
             self.body[pos + 8..pos + 12].copy_from_slice(&(HBIN_SIZE as u32).to_le_bytes());
         }
 
@@ -423,8 +422,8 @@ impl HiveWriter {
         // Root offset is HBIN-relative
         let root_rel = Self::to_hbin_rel(root_abs);
         header[0x24..0x28].copy_from_slice(&root_rel.to_le_bytes());
-        // Cluster size / hive data length: header plus every HBIN.
-        header[0x28..0x2C].copy_from_slice(&((REGF_HEADER_SIZE + data_len) as u32).to_le_bytes());
+        // Data length is every HBIN, excluding the REGF header.
+        header[0x28..0x2C].copy_from_slice(&(data_len as u32).to_le_bytes());
         header[0x2C..0x30].copy_from_slice(&1u32.to_le_bytes());
 
         // Compute checksum (XOR of all dwords [0, 0x1FC))

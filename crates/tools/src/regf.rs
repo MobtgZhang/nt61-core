@@ -442,7 +442,7 @@ impl NodePlan {
         out[nk_file + 4..nk_file + 6].copy_from_slice(ID_NK);
 
         // flags (offset 0x06)
-        let mut flags: u16 = if node.is_root { 0x0004 } else { 0x0024 };
+        let mut flags: u16 = if node.is_root { 0x0004 } else { 0 };
         if !name_bytes.is_empty() && name_bytes.len() < 64 && is_ascii_str(&node.name) {
             flags |= 0x0020; // CompressedName (Latin-1)
         }
@@ -537,14 +537,22 @@ impl NodePlan {
             let lf_file = lh_off;
             // seg_len (negative)
             out[lf_file..lf_file + 4].copy_from_slice(&(-(self.lh_size as i32)).to_le_bytes());
-            out[lf_file + 4..lf_file + 6].copy_from_slice(ID_LH);
+            let hashed = node.subkeys.iter().all(|child| child.name.is_ascii());
+            out[lf_file + 4..lf_file + 6].copy_from_slice(if hashed { ID_LH } else { b"li" });
             out[lf_file + 6..lf_file + 8]
                 .copy_from_slice(&(node.subkeys.len() as u16).to_le_bytes());
-            // entries: child nk offset (HBIN-relative) + hash (u32, always 0)
+            // lh uses NT's uppercase polynomial hash; li requires no Unicode
+            // upcase table and is used for any non-ASCII child identities.
             for (i, &child_abs) in self.lh_entries.iter().enumerate() {
-                let e_off = lf_file + 8 + i * LH_ENTRY_SIZE;
+                let e_off = lf_file + 8 + i * if hashed { LH_ENTRY_SIZE } else { 4 };
                 out[e_off..e_off + 4].copy_from_slice(&to_hbin_rel(child_abs as u32).to_le_bytes());
-                out[e_off + 4..e_off + 8].copy_from_slice(&0u32.to_le_bytes());
+                if hashed {
+                    let hash = node.subkeys[i].name.bytes().fold(0u32, |hash, c| {
+                        hash.wrapping_mul(37)
+                            .wrapping_add(c.to_ascii_uppercase() as u32)
+                    });
+                    out[e_off + 4..e_off + 8].copy_from_slice(&hash.to_le_bytes());
+                }
             }
         }
 
@@ -590,7 +598,8 @@ impl NodePlan {
 
             // data offset at fixed offset 0x0C
             let data_off_val: u32 = if let Some(d_off) = vk_plan.data_offset {
-                to_hbin_rel((d_off + 4) as u32)
+                // REGF offsets point at the cell header, not its payload.
+                to_hbin_rel(d_off as u32)
             } else {
                 let mut buf = [0u8; 4];
                 for (j, &b) in v.data.iter().enumerate() {
@@ -606,7 +615,8 @@ impl NodePlan {
             out[vk_file + 0x10..vk_file + 0x14].copy_from_slice(&v.data_type.to_le_bytes());
 
             // flags at fixed offset 0x14: bit 0 = 1 for ASCII name
-            let vk_flags: u16 = if v.name.is_empty() || is_ascii_str(&v.name) {
+            let vk_flags: u16 = if v.name.is_empty() || (is_ascii_str(&v.name) && v.name.len() < 64)
+            {
                 1
             } else {
                 0

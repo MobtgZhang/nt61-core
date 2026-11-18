@@ -1,4 +1,4 @@
-//! BCD hive parser (REGF format) - Compatible with Windows 7 SP2 Standard BCD
+//! BCD hive parser (REGF format) for the Windows 7 SP1 boot path.
 //
 //! Parses the BCD file as a Windows-style registry hive (REGF format).
 //! Standard Windows 7 BCD structure:
