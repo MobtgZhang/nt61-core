@@ -14,6 +14,48 @@ pub struct Api {
     pub cdecl: bool,
 }
 pub const APIS: &[Api] = &[
+    // Process/thread token gateway used by the SP1 Kernel32 API-set
+    // processthreads contract. These entries define ABI only: token handling
+    // remains explicitly unsupported until a guest-owned token backend exists.
+    Api { id: 3940, dll:"advapi32.dll", name:"OpenProcessToken", arguments:3, x86_arguments:3, cdecl:false },
+    Api { id: 3941, dll:"advapi32.dll", name:"OpenThreadToken", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id: 3942, dll:"advapi32.dll", name:"SetThreadToken", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3934, dll:"ole32.dll", name:"CoInitializeEx", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3935, dll:"ole32.dll", name:"CoUninitialize", arguments:0, x86_arguments:0, cdecl:false },
+    Api { id:3936, dll:"ole32.dll", name:"CoGetContextToken", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3930, dll:"shell32.dll", name:"SHGetKnownFolderPath", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3931, dll:"ole32.dll", name:"CoTaskMemAlloc", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3932, dll:"ole32.dll", name:"CoTaskMemFree", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3933, dll:"ole32.dll", name:"CoTaskMemRealloc", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id:3920, dll:"ntdll.dll", name:"memchr", arguments:3, x86_arguments:3, cdecl:true },
+    Api { id:3921, dll:"ntdll.dll", name:"strstr", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3922, dll:"ntdll.dll", name:"wcsstr", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3923, dll:"ntdll.dll", name:"strpbrk", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3924, dll:"ntdll.dll", name:"wcspbrk", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3925, dll:"ntdll.dll", name:"strspn", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3926, dll:"ntdll.dll", name:"wcsspn", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3927, dll:"ntdll.dll", name:"strcspn", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3928, dll:"ntdll.dll", name:"wcscspn", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3900, dll:"ntdll.dll", name:"strlen", arguments:1, x86_arguments:1, cdecl:true },
+    Api { id:3901, dll:"ntdll.dll", name:"strnlen", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3902, dll:"ntdll.dll", name:"strcmp", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3903, dll:"ntdll.dll", name:"strncmp", arguments:3, x86_arguments:3, cdecl:true },
+    Api { id:3904, dll:"ntdll.dll", name:"strchr", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3905, dll:"ntdll.dll", name:"strrchr", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3906, dll:"ntdll.dll", name:"wcslen", arguments:1, x86_arguments:1, cdecl:true },
+    Api { id:3907, dll:"ntdll.dll", name:"wcsnlen", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3908, dll:"ntdll.dll", name:"wcscmp", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3909, dll:"ntdll.dll", name:"wcsncmp", arguments:3, x86_arguments:3, cdecl:true },
+    Api { id:3910, dll:"ntdll.dll", name:"wcschr", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3911, dll:"ntdll.dll", name:"wcsrchr", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3912, dll:"ntdll.dll", name:"strcpy", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3913, dll:"ntdll.dll", name:"strncpy", arguments:3, x86_arguments:3, cdecl:true },
+    Api { id:3914, dll:"ntdll.dll", name:"strcat", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3915, dll:"ntdll.dll", name:"strncat", arguments:3, x86_arguments:3, cdecl:true },
+    Api { id:3916, dll:"ntdll.dll", name:"wcscpy", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3917, dll:"ntdll.dll", name:"wcsncpy", arguments:3, x86_arguments:3, cdecl:true },
+    Api { id:3918, dll:"ntdll.dll", name:"wcscat", arguments:2, x86_arguments:2, cdecl:true },
+    Api { id:3919, dll:"ntdll.dll", name:"wcsncat", arguments:3, x86_arguments:3, cdecl:true },
     Api { id:3802, dll:"advapi32.dll", name:"RegisterEventSourceW", arguments:2, x86_arguments:2, cdecl:false },
     Api { id:3803, dll:"advapi32.dll", name:"RegisterEventSourceA", arguments:2, x86_arguments:2, cdecl:false },
     Api { id:3804, dll:"advapi32.dll", name:"DeregisterEventSource", arguments:1, x86_arguments:1, cdecl:false },
@@ -51,6 +93,11 @@ pub const APIS: &[Api] = &[
     Api { id:3726, dll:"user32.dll", name:"SetWindowPos", arguments:7, x86_arguments:7, cdecl:false },
     Api { id:3727, dll:"user32.dll", name:"GetParent", arguments:1, x86_arguments:1, cdecl:false },
     Api { id:3728, dll:"user32.dll", name:"IsWindow", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3731, dll:"user32.dll", name:"GetSysColor", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3730, dll:"user32.dll", name:"GetSystemMetrics", arguments:1, x86_arguments:1, cdecl:false },
+    Api { id:3732, dll:"user32.dll", name:"LoadStringW", arguments:4, x86_arguments:4, cdecl:false },
+    Api { id:3733, dll:"user32.dll", name:"SetProcessDPIAware", arguments:0, x86_arguments:0, cdecl:false },
+    Api { id:3734, dll:"user32.dll", name:"IsProcessDPIAware", arguments:0, x86_arguments:0, cdecl:false },
     Api { id:3729, dll:"user32.dll", name:"UpdateWindow", arguments:1, x86_arguments:1, cdecl:false },
 
     Api { id:3600, dll:"gdi32.dll", name:"CreateDCW", arguments:4, x86_arguments:4, cdecl:false },
@@ -2230,6 +2277,11 @@ pub const APIS: &[Api] = &[
         x86_arguments: 4,
         cdecl: false,
     },
+    Api { id: 1062, dll: "ntdll.dll", name: "RtlRunOnceBeginInitialize", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 1063, dll: "ntdll.dll", name: "RtlRunOnceComplete", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 324, dll: "kernel32.dll", name: "InitOnceInitialize", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 325, dll: "kernel32.dll", name: "InitOnceBeginInitialize", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 326, dll: "kernel32.dll", name: "InitOnceComplete", arguments: 3, x86_arguments: 3, cdecl: false },
     Api {
         id: 1050,
         dll: "ntdll.dll",
@@ -4209,6 +4261,38 @@ pub const APIS: &[Api] = &[
         cdecl: false,
     },
     Api {
+        id: 3146,
+        dll: "advapi32.dll",
+        name: "AddAccessAllowedObjectAce",
+        arguments: 7,
+        x86_arguments: 7,
+        cdecl: false,
+    },
+    Api {
+        id: 3147,
+        dll: "advapi32.dll",
+        name: "AddAccessDeniedObjectAce",
+        arguments: 7,
+        x86_arguments: 7,
+        cdecl: false,
+    },
+    Api {
+        id: 3148,
+        dll: "advapi32.dll",
+        name: "AddAuditAccessObjectAce",
+        arguments: 9,
+        x86_arguments: 9,
+        cdecl: false,
+    },
+    Api {
+        id: 3149,
+        dll: "advapi32.dll",
+        name: "AddMandatoryAce",
+        arguments: 5,
+        x86_arguments: 5,
+        cdecl: false,
+    },
+    Api {
         id: 3300,
         dll: "kernel32.dll",
         name: "LocalSize",
@@ -4293,7 +4377,7 @@ pub struct RuntimeSupport {
     pub scope: &'static str,
 }
 
-pub const RUNTIME_LIMITATIONS: &str = "Linkability is not Windows compatibility. Limited implementations operate in one isolated GuestImage with bounded buffers and allocations; ANSI strings accept ASCII only. Host services depend on the selected GuestServices backend and may return NOT_IMPLEMENTED. Dynamic DLLs requiring DllMain or static TLS initialization are rejected. No certificate validation, exception unwinding, thread creation or threadpool implementation is provided.";
+pub const RUNTIME_LIMITATIONS: &str = "Linkability is not Windows compatibility. Limited implementations operate in one isolated GuestImage with bounded buffers and allocations; Win32 ANSI text accepts ASCII only, while CRT byte strings preserve arbitrary bytes. API-set facades use the audited default host and do not implement importer-specific routing; x86 schema hosts come from the same ISO's AMD64 schema. Host services depend on the selected GuestServices backend and may return NOT_IMPLEMENTED. Dynamic DLLs requiring DllMain or static TLS initialization are rejected. Guest threads have bounded stacks and cooperative host scheduling; APCs, threadpools and cross-thread window callbacks are unsupported. No certificate validation or exception unwinding is provided.";
 
 /// Explicit allowlist of the shipping runtime handlers. Unknown DLLs, exports
 /// and subsequently added catalog entries default to unsupported.
@@ -4301,12 +4385,40 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
     use SupportStatus::{HostService as H, ImplementedLimited as L, Unsupported as U};
     let (status, scope) = if find(dll, name).is_none() {
         (U, "No catalog entry or runtime implementation")
+    } else if dll.eq_ignore_ascii_case("shell32.dll") {
+        (H, "SHGetKnownFolderPath for current process RoamingAppData, LocalAppData and Profile from the provisioned environment; default flags verify through mounted-volume directories, DONT_VERIFY supported; other tokens, flags and registry folder redirection unsupported; HRESULT and task-allocator ownership")
+    } else if dll.eq_ignore_ascii_case("ole32.dll") {
+        match name {
+            "CoInitializeEx" | "CoUninitialize" | "CoGetContextToken" =>
+                (L, "SP1 apartment initialization flags, per-thread mode/refcount and balanced cleanup; checked opaque context token shared by MTA participants and private to STA; preserves Win32 LastError; context interfaces, COM activation, RPC, marshalling and message pumping unsupported"),
+            _ => (L, "Checked process-owned COM task allocator, including zero-length allocation and reallocation ownership/copy semantics; 1 MiB per allocation bound; preserves Win32 LastError; COM activation and interfaces unsupported"),
+        }
     } else if dll.eq_ignore_ascii_case("bcrypt.dll") {
         (H, "BCryptGenRandom with null algorithm and BCRYPT_USE_SYSTEM_PREFERRED_RNG only; bounded output from GuestServices entropy backend; unavailable entropy fails, no provider handles")
     } else if dll.eq_ignore_ascii_case("ntdll.dll") {
         match name {
+            "RtlLookupFunctionEntry" => (L, "AMD64 static PE exception-table binary search over loader-owned image identity and directory bounds; half-open ranges, indirect entries, image-base output and LastError match SP1; null history only; dynamic tables, callbacks, history caching, x86 unwind and unwind execution unsupported"),
+            "RtlVirtualUnwind" => (L, "AMD64 version-1 virtual unwind: checked metadata/stack, partial prolog, nonvolatile integer/XMM saves, allocation, frame register, machine frames, chained records, handler location, add/lea/pop/ret epilogs and context pointers; bounded traversal and atomic output validation; tail jumps, other versions, x86 and exception dispatch unsupported"),
+            "RtlCaptureContext" => (L, "Dedicated guest entry preserves original registers; SP1 x64 integer/control/segments and FXSAVE64, x86 caller-frame integer/control/segments with untouched floating state; Intel-compatible cleared FOP/FDP, MXCSR_MASK ffff; faults stop explicitly, exception dispatch unsupported"),
+            "NtQueryVirtualMemory" => (L, "Current-process MemoryBasicInformation over actual loader and allocator mappings; SP1 x64/WOW64 layout, region splitting, protections, errors and address bounds; other classes and cross-process queries unsupported"),
+            "RtlRunOnceInitialize" | "RtlRunOnceBeginInitialize" | "RtlRunOnceComplete" | "RtlRunOnceExecuteOnce" =>
+                (L, "Checked guest-width SP1 states, flags and context alignment; real three-argument callbacks, failure retry and same-process guest-thread waits; foreign keyed-event queues and completion exceptions unsupported"),
+            "RtlAllocateHeap" | "RtlReAllocateHeap" | "RtlFreeHeap" => (L, "Checked process-owned heap allocation/reallocation/free shared with Kernel32; copies old data, zeroes requested growth, preserves Win32 LastError; exception/in-place-only flags unsupported"),
+            "RtlSizeHeap" => (L, "Size of an exact owned process-heap block; pointer-width failure sentinel and Win32 LastError preserved; HEAP_NO_SERIALIZE accepted, unsupported flags stop explicitly"),
+            "RtlQueryPerformanceCounter" => (H, "Performance counter copied from GuestServices with checked guest output; backend failures remain explicit"),
+            "memchr" | "strstr" | "wcsstr" | "strpbrk" | "wcspbrk"
+            | "strspn" | "wcsspn" | "strcspn" | "wcscspn" =>
+                (L, "Checked raw-byte/UTF-16 search and set spans; linear scans with a 1 MiB input bound, no locale or LastError mutation; invalid memory faults, unsupported sizes stop explicitly"),
+            "RtlGetLastWin32Error" | "RtlSetLastWin32Error" =>
+                (L, "Last-error DWORD in the current guest TEB, shared with Kernel32/KernelBase without process-global state"),
+            "strcpy" | "strncpy" | "strcat" | "strncat"
+            | "wcscpy" | "wcsncpy" | "wcscat" | "wcsncat" =>
+                (L, "Checked C byte/UTF-16 copy and concatenation with bounded padding/termination; at most 1 MiB, caller owns destination capacity, overlapping strings outside contract; invalid memory faults, LastError preserved"),
+            "strlen" | "strnlen" | "strcmp" | "strncmp" | "strchr" | "strrchr"
+            | "wcslen" | "wcsnlen" | "wcscmp" | "wcsncmp" | "wcschr" | "wcsrchr" =>
+                (L, "Checked C byte and UTF-16 length/comparison/search primitives, including non-ASCII bytes; 1 MiB scan bound, no locale folding, no Win32 LastError mutation; invalid guest memory faults"),
             "RtlAcquireSRWLockExclusive" | "RtlAcquireSRWLockShared" | "RtlReleaseSRWLockExclusive" | "RtlReleaseSRWLockShared" =>
-                (L, "Guest-width Win7 uncontended SRW state; blocking acquisition, foreign wait queues and invalid release stop explicitly until guest scheduling exists"),
+                (L, "Guest-width Win7 uncontended SRW state; contended same-process acquisition yields to the guest scheduler; foreign wait queues and invalid releases stop explicitly"),
             "VerSetConditionMask" => (L, "NT three-bit version condition encoding with highest supported type priority, cumulative OR and a full 64-bit return in both guest ABIs"),
             "RtlPcToFileHeader" => (L, "Current loader's immutable image ranges, including dynamically mapped DLLs; exact pointer-width output and no LastError mutation"),
             "NtClose" | "NtTerminateProcess" | "NtTerminateThread"
@@ -4316,7 +4428,6 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             | "NtOpenProcess" | "NtWaitForSingleObject" =>
                 (H, "Guest ABI arguments forwarded to GuestServices; backend determines operation support and NTSTATUS"),
             "RtlInitUnicodeString" => (L, "Guest UNICODE_STRING initialization with checked UTF-16 source and 16-bit lengths"),
-            "RtlAllocateHeap" | "RtlFreeHeap" => (L, "Isolated process heap handle only; bounded allocations and restricted flags"),
             "memcpy" | "memmove" | "memset" | "memcmp" => (L, "Checked guest buffers up to 1 MiB; invalid pointers fault and larger operations are unsupported"),
             _ => (U, "No runtime handler; dispatch stops with UnsupportedApi"),
         }
@@ -4338,7 +4449,14 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             _ => (U, "No runtime handler; dispatch stops with UnsupportedApi"),
         }
     } else if dll.eq_ignore_ascii_case("user32.dll") {
-        if (3700..=3729).contains(&find(dll,name).unwrap().id) {(H,"Process-owned HWNDs, direct child controls and copied desktop messages; bounded queues and x86/x64 guest window procedures; unsupported messages fail explicitly")}else{(U,"No runtime handler")}
+        match name {
+            "SetProcessDPIAware" | "IsProcessDPIAware" => (L, "Process-owned DPI awareness for the current fixed 96-DPI session; initial aware state, repeated calls, cross-thread visibility and preserved LastError observed on native unmanifested SP1 EXEs; manifest activation, other DPI settings and coordinate virtualization unsupported"),
+            "LoadStringW" => (L, "Checked mapped-image RT_STRING blocks; UTF-16 copy/truncation and guest-width resource pointer; neutral or single-language resources only; MUI satellites and multilingual selection unsupported"),
+            "GetSysColor" => (H, "Captured SP1 Basic default COLORREFs only; invalid indices return zero; guest theme changes and per-user color overrides are not connected"),
+            "GetSystemMetrics" => (H, "Captured SP1 Basic 96 DPI metrics for the current single display and 40-pixel bottom taskbar; max-track limits retain session mode-change state; other DPI/themes and configurable work areas are not connected"),
+            _ if (3700..=3729).contains(&find(dll,name).unwrap().id) => (H,"Process-owned HWNDs, direct child controls and copied desktop messages; bounded queues and x86/x64 guest window procedures; unsupported messages fail explicitly"),
+            _ => (U,"No runtime handler"),
+        }
     } else if dll.eq_ignore_ascii_case("gdi32.dll") {
         if (3600..=3615).contains(&find(dll,name).unwrap().id) {(H,"PostScript printer DC, document/page lifecycle and basic text/vector drawing; no display DC, bitmap driver or physical printer")}else{(U,"No runtime handler")}
     } else if dll.eq_ignore_ascii_case("advapi32.dll") {
@@ -4347,7 +4465,7 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
                 (H, "Local Application log only, bounded per-process source handles, full DWORD event IDs, checked ABI-width insertion pointers, UTF-16/CP1252 strings, SID and raw data; success requires backend commit; remote servers unsupported"),
             "SystemFunction036" => (H, "RtlGenRandom BOOLEAN API using the host cryptographic entropy backend, bounded transactional guest output and no LastError mutation; unavailable entropy fails without generated fallback bytes"),
             "RegCopyTreeA" | "RegCopyTreeW" | "RegDeleteKeyValueA" | "RegDeleteKeyValueW" | "RegSetKeyValueA" | "RegSetKeyValueW" | "RegEnumKeyA" | "RegEnumKeyW" | "RegQueryValueA" | "RegQueryValueW" | "RegSetValueA" | "RegSetValueW" | "RegQueryMultipleValuesA" | "RegQueryMultipleValuesW" | "RegCloseKey" | "RegCreateKeyA" | "RegCreateKeyExA" | "RegCreateKeyExW" | "RegCreateKeyW" | "RegDeleteKeyA" | "RegDeleteKeyExA" | "RegDeleteKeyExW" | "RegDeleteKeyW" | "RegDeleteTreeA" | "RegDeleteTreeW" | "RegDeleteValueA" | "RegDeleteValueW" | "RegEnumKeyExA" | "RegEnumKeyExW" | "RegEnumValueA" | "RegEnumValueW" | "RegFlushKey" | "RegGetValueA" | "RegGetValueW" | "RegOpenKeyA" | "RegOpenKeyExA" | "RegOpenKeyExW" | "RegOpenKeyW" | "RegQueryInfoKeyA" | "RegQueryInfoKeyW" | "RegQueryValueExA" | "RegQueryValueExW" | "RegSetValueExA" | "RegSetValueExW" => (L, "Checked process-private registry keys, values, access masks and WOW64 views; no persistent hives, notifications, ACL enforcement, merged HKCR or environment expansion; RegFlushKey returns CALL_NOT_IMPLEMENTED; ANSI ASCII only"),
-            "MakeAbsoluteSD" | "AddAccessAllowedAce" | "AddAccessAllowedAceEx" | "AddAccessDeniedAce" | "AddAccessDeniedAceEx" | "AddAce" | "AddAuditAccessAce" | "AddAuditAccessAceEx" | "AllocateAndInitializeSid" | "ConvertSidToStringSidA" | "ConvertSidToStringSidW" | "ConvertStringSidToSidA" | "ConvertStringSidToSidW" | "CopySid" | "DeleteAce" | "EqualPrefixSid" | "EqualSid" | "FreeSid" | "GetAce" | "GetAclInformation" | "GetLengthSid" | "GetSecurityDescriptorControl" | "GetSecurityDescriptorDacl" | "GetSecurityDescriptorGroup" | "GetSecurityDescriptorLength" | "GetSecurityDescriptorOwner" | "GetSecurityDescriptorSacl" | "GetSidIdentifierAuthority" | "GetSidLengthRequired" | "GetSidSubAuthority" | "GetSidSubAuthorityCount" | "InitializeAcl" | "InitializeSecurityDescriptor" | "InitializeSid" | "IsValidAcl" | "IsValidSecurityDescriptor" | "IsValidSid" | "MakeSelfRelativeSD" | "SetAclInformation" | "SetSecurityDescriptorControl" | "SetSecurityDescriptorDacl" | "SetSecurityDescriptorGroup" | "SetSecurityDescriptorOwner" | "SetSecurityDescriptorSacl" | "CreateWellKnownSid" | "IsWellKnownSid" | "GetWindowsAccountDomainSid" | "EqualDomainSid" | "GetSecurityDescriptorRMControl" | "SetSecurityDescriptorRMControl" => (L, "Checked guest SID, ACL and security descriptor binary operations; bounded buffers and heap ownership; no account lookup, tokens, access decisions or host authorization"),
+            "AddMandatoryAce" | "AddAccessAllowedObjectAce" | "AddAccessDeniedObjectAce" | "AddAuditAccessObjectAce" | "MakeAbsoluteSD" | "AddAccessAllowedAce" | "AddAccessAllowedAceEx" | "AddAccessDeniedAce" | "AddAccessDeniedAceEx" | "AddAce" | "AddAuditAccessAce" | "AddAuditAccessAceEx" | "AllocateAndInitializeSid" | "ConvertSidToStringSidA" | "ConvertSidToStringSidW" | "ConvertStringSidToSidA" | "ConvertStringSidToSidW" | "CopySid" | "DeleteAce" | "EqualPrefixSid" | "EqualSid" | "FreeSid" | "GetAce" | "GetAclInformation" | "GetLengthSid" | "GetSecurityDescriptorControl" | "GetSecurityDescriptorDacl" | "GetSecurityDescriptorGroup" | "GetSecurityDescriptorLength" | "GetSecurityDescriptorOwner" | "GetSecurityDescriptorSacl" | "GetSidIdentifierAuthority" | "GetSidLengthRequired" | "GetSidSubAuthority" | "GetSidSubAuthorityCount" | "InitializeAcl" | "InitializeSecurityDescriptor" | "InitializeSid" | "IsValidAcl" | "IsValidSecurityDescriptor" | "IsValidSid" | "MakeSelfRelativeSD" | "SetAclInformation" | "SetSecurityDescriptorControl" | "SetSecurityDescriptorDacl" | "SetSecurityDescriptorGroup" | "SetSecurityDescriptorOwner" | "SetSecurityDescriptorSacl" | "CreateWellKnownSid" | "IsWellKnownSid" | "GetWindowsAccountDomainSid" | "EqualDomainSid" | "GetSecurityDescriptorRMControl" | "SetSecurityDescriptorRMControl" => (L, "Checked guest SID, ACL and security descriptor binary operations; bounded buffers and heap ownership; no account lookup, tokens, access decisions or host authorization"),
             "CryptAcquireContextA" | "CryptAcquireContextW" | "CryptContextAddRef" | "CryptCreateHash" | "CryptDestroyHash" | "CryptDuplicateHash" | "CryptGenRandom" | "CryptGetHashParam" | "CryptGetProvParam" | "CryptHashData" | "CryptReleaseContext" | "CryptSetHashParam" => (L, "Isolated VERIFYCONTEXT hash provider only: MD5/SHA1 and AES-provider SHA256/384/512, bounded inputs and typed handles; no key containers, encryption or signatures; CryptGenRandom returns NTE_FAIL without entropy backend"),
             "ChangeServiceConfigA" | "ChangeServiceConfigW" | "CloseServiceHandle" | "ControlService" | "CreateServiceA" | "CreateServiceW" | "DeleteService" | "EnumServicesStatusA" | "EnumServicesStatusExA" | "EnumServicesStatusExW" | "EnumServicesStatusW" | "GetServiceDisplayNameA" | "GetServiceDisplayNameW" | "GetServiceKeyNameA" | "GetServiceKeyNameW" | "OpenSCManagerA" | "OpenSCManagerW" | "OpenServiceA" | "OpenServiceW" | "QueryServiceConfigA" | "QueryServiceConfigW" | "QueryServiceStatus" | "QueryServiceStatusEx" | "StartServiceA" | "StartServiceCtrlDispatcherA" | "StartServiceCtrlDispatcherW" | "StartServiceW" | "RegisterServiceCtrlHandlerA" | "RegisterServiceCtrlHandlerW" | "RegisterServiceCtrlHandlerExA" | "RegisterServiceCtrlHandlerExW" | "SetServiceStatus" => (L, "Isolated SCM configuration, handle access and stopped-service status; no host database, service execution or dispatcher; start/control/dispatcher calls return explicit backend-unavailable errors"),
             "MapGenericMask" | "AreAllAccessesGranted" | "AreAnyAccessesGranted" => (L, "Checked access-mask arithmetic only; does not evaluate tokens or grant permissions"),
@@ -4357,6 +4475,11 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
         }
     } else if dll.eq_ignore_ascii_case("kernel32.dll") {
         match name {
+            "VirtualQuery" | "VirtualQueryEx" => (L, "Current-process MemoryBasicInformation using the same checked mapping metadata as NtQueryVirtualMemory; cross-process queries unsupported"),
+            "InitOnceInitialize" | "InitOnceBeginInitialize" | "InitOnceComplete" | "InitOnceExecuteOnce" =>
+                (L, "SP1 run-once state machine shared with NTDLL; real guest callbacks and contended guest-thread waits; BOOL, pending output and LastError follow original wrappers; foreign keyed-event queues and completion exceptions unsupported"),
+            "WerRegisterRuntimeExceptionModule" | "WerUnregisterRuntimeExceptionModule" =>
+                (U, "Explicit E_NOTIMPL HRESULT preserving LastError; no WER service, callback host or registration is implemented"),
             "CreateDirectoryW" =>
                 (H, "Creates one directory through the mounted-volume backend with WoW64 path redirection and preserved NTSTATUS errors; null security attributes only; ordinary drive-absolute or current-directory-relative paths; no UNC, drive-relative paths, dot components, trailing-dot/space normalization or explicit ACLs"),
             "FindFirstFileW" | "FindFirstFileExW" | "FindNextFileW" | "FindClose" =>
@@ -4385,14 +4508,20 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "InitializeConditionVariable" | "WakeConditionVariable" | "WakeAllConditionVariable" => (L, "Pointer-sized condition initialization and empty wait queues only; nonempty queues and guest wait scheduling remain unsupported"),
             "CreateFileA" | "CreateFileW" => (H, "Synchronous read-only OPEN_EXISTING subset forwarded to GuestServices; security, templates and unsupported flags rejected"),
             "ReadFile" | "WriteFile" => (H, "Synchronous GuestServices I/O up to 64 KiB; OVERLAPPED rejected"),
-            "CreateEventW" | "SetEvent" | "ResetEvent" | "WaitForSingleObject" | "WaitForSingleObjectEx" => (H, "Owned unnamed non-inheritable kernel events with manual/auto-reset signal state, checked private handle translation, non-alertable waits and millisecond/NT timeout conversion; named/security/alertable requests rejected; other waitable object types and guest thread scheduling unsupported"),
-            "CloseHandle" => (H, "GuestServices Close operation for owned file/event handles with NTSTATUS-to-Win32 error translation; remaining events closed when the service context exits"),
+            "CreateEventW" | "SetEvent" | "ResetEvent" | "WaitForSingleObject" | "WaitForSingleObjectEx" => (H, "Owned unnamed non-inheritable kernel events with manual/auto-reset signal state, checked private handle translation, non-alertable waits and millisecond/NT timeout conversion; named/security/alertable requests rejected; guest thread joins poll cooperatively; other waitable object types unsupported"),
+            "CloseHandle" => (H, "Process-owned thread handles and GuestServices Close operation for owned file/event handles with NTSTATUS-to-Win32 error translation; remaining events closed when the service context exits"),
+            "DuplicateHandle" => (L, "Same-process thread handles and current-thread pseudo-handle only; independent handle lifetime and restricted access, SAME_ACCESS and CLOSE_SOURCE options; rights escalation, generic mapping, cross-process and file/event duplication remain unsupported"),
+            "SetHandleInformation" => (L, "Owned guest thread handles only; inheritance and protect-from-close flags; other object types unsupported"),
             "LoadLibraryA" | "LoadLibraryW" | "LoadLibraryExA" | "LoadLibraryExW" => (H, "GuestServices reads same-ISA DLLs; transactional mapping, identity reuse and explicit reference acquisition; no new DllMain/static TLS; Ex accepts zero flags only"),
-            "FreeLibrary" => (L, "Releases acquired LoadLibrary references while executable imports or further explicit references retain the module; invalid handles fail; final dynamic unload, detach and releasing borrowed GetModuleHandle handles remain unsupported"),
-            "ExitProcess" | "ExitThread" => (L, "Stops the isolated interpreter execution with the supplied exit code; no independent guest thread scheduler"),
+            "FreeLibrary" => (L, "Releases explicit references, unmaps unreachable callback-free DLLs and dependencies, preserves imports and pins, invalidates all decode caches; invalid handles report SP1 error 126; DllMain/TLS detach and releasing borrowed handles remain unsupported"),
+            "ExitProcess" => (L, "Stops the isolated guest process with the supplied exit code"),
+            "ExitThread" => (L, "Runs thread detach callbacks and exits only the calling guest thread; the last exiting thread supplies process status"),
+            "CreateThread" => (L, "Bounded preemptible same-process guest threads with independent CPU, stack, TEB, static and dynamic TLS, and initial DLL thread callbacks; security/inheritance and dynamic DLL initialization remain unsupported"),
+            "ResumeThread" | "SuspendThread" | "GetThreadId" | "GetExitCodeThread" => (L, "Owned guest thread handles, suspend counts, identity and STILL_ACTIVE/exit status; cross-process handles unsupported"),
             "GetLastError" | "SetLastError" => (L, "Last-error DWORD stored in the current guest TEB"),
             "GetCurrentProcess" | "GetCurrentThread" => (L, "Guest-bitness pseudo-handle only"),
-            "GetCurrentProcessId" | "GetCurrentThreadId" => (L, "Single isolated process and thread identity fixed at 1"),
+            "GetCurrentProcessId" => (L, "Single isolated process identity fixed at 1"),
+            "GetCurrentThreadId" => (L, "Active guest thread identity, distinct for each CreateThread"),
             "IsProcessorFeaturePresent" => (L, "Isolated interpreter capabilities only: NX execution-permission enforcement; incomplete instruction families and unknown DWORD feature IDs report absent; LastError preserved"),
             "IsDebuggerPresent" => (L, "Reports no debugger for the isolated guest; no debugger attachment support"),
             "GetVersion" => (L, "Fixed Windows 6.1 build 7601 compatibility value"),
@@ -4405,21 +4534,22 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "GetEnvironmentStringsW" | "FreeEnvironmentStringsW" => (L, "Owned UTF-16 snapshots of the current guest process environment, bounded to 1 MiB; exact pointer ownership on release; no host environment or mutation APIs"),
             "GetEnvironmentVariableA" | "GetEnvironmentVariableW" => (L, "Reads current guest UTF-16 environment with required-size queries, empty/missing value distinction and checked outputs; A uses installed CP1252, unsupported best-fit tables stop explicitly; case folding uses installed NLS repertoire; no host environment or mutation APIs"),
             "GetTempPathW" => (L, "Selects current guest TMP, TEMP, USERPROFILE, then the installed Windows directory; returns a trailing backslash with UTF-16 required-size queries and checked output; no host environment or directory existence check"),
-            "InitializeSRWLock" => (L, "Zero-initialize one guest pointer-sized SRWLOCK; uncontended acquire/release supported; contended scheduling remains unsupported"),
+            "InitializeSRWLock" => (L, "Zero-initialize one guest pointer-sized SRWLOCK; uncontended acquire/release supported; contended acquisition yields to the bounded guest scheduler"),
             "AcquireSRWLockExclusive" | "AcquireSRWLockShared" | "ReleaseSRWLockExclusive" | "ReleaseSRWLockShared"
             | "TryAcquireSRWLockExclusive" | "TryAcquireSRWLockShared" =>
-                (L, "Guest-width Win7 uncontended exclusive/shared SRW state and nonblocking TryAcquire; blocking acquisition, foreign wait queues and invalid release stop explicitly until guest scheduling exists"),
+                (L, "Guest-width Win7 uncontended exclusive/shared SRW state and nonblocking TryAcquire; contended same-process acquisition yields to the guest scheduler; foreign wait queues and invalid releases stop explicitly"),
             "InitializeSListHead" => (L, "Aligned x86 8-byte or x64 16-byte empty Win7 SLIST_HEADER initialization only; concurrent push/pop/flush remain unsupported"),
             "GetModuleHandleA" | "GetModuleHandleW" => (L, "Current executable or already mapped guest module identity only"),
             "GetModuleHandleExW" => (L, "Checked guest-width output and loader-owned module range/name lookup; optional reference acquisition or process-lifetime pin; unchanged-reference flag preserves borrowed ownership"),
-            "DisableThreadLibraryCalls" => (L, "Records thread notification policy on validated guest modules, rejects active static TLS and invalid handles; subsequent guest thread creation remains unsupported"),
+            "DisableThreadLibraryCalls" => (L, "Records thread notification policy on validated guest modules, rejects active static TLS and invalid handles; policy applied to subsequent thread attach/detach notifications"),
             "GetModuleFileNameA" | "GetModuleFileNameW" => (L, "Executable path from guest RTL parameters, Win7 NUL-terminated truncation and ERROR_INSUFFICIENT_BUFFER; A requires ASCII; resolved DLL full paths remain unsupported"),
             "GetProcAddress" => (L, "Checked readable guest PE code/data exports by name or ordinal; forward targets loaded through GuestServices with bounded depth"),
             "VirtualAlloc" | "VirtualFree" | "VirtualProtect" => (L, "Bounded guest private mappings, reserve/commit/decommit/release and page permissions; zero allocation sizes and mapped-view copy-on-write protections rejected; restricted flags and no host virtual-memory allocation"),
+            "FlushInstructionCache" => (L, "Current-process guest decoded-code cache invalidation on all guest threads; SP1 empty non-null range bypass and LastError behavior; no cross-process cache backend"),
             "GlobalAlloc" | "GlobalFree" | "GlobalLock" | "GlobalUnlock" => (L,"Process-private stable heap-backed global handles with checked ownership"),
             "LocalAlloc" | "LocalFree" | "LocalSize" => (L, "Fixed private-heap local memory and size queries only; movable handles and LocalLock are unsupported"),
             "HeapAlloc" | "HeapReAlloc" | "HeapFree" | "HeapSize" => (L, "Private guest heap allocations with checked ownership and restricted flags"),
-            "TlsAlloc" | "TlsFree" | "TlsSetValue" | "TlsGetValue" => (L, "Up to 1088 slots on the one current guest thread"),
+            "TlsAlloc" | "TlsFree" | "TlsSetValue" | "TlsGetValue" => (L, "Process-wide allocation of up to 1088 slots with per-thread values; direct TEB dynamic TLS slot access remains unsupported"),
             "EncodePointer" | "DecodePointer" => (L, "Identity mapping; no pointer obfuscation"),
             "lstrlenA" | "lstrlenW" | "lstrcmpA" | "lstrcmpW" | "lstrcmpiA" | "lstrcmpiW" => (L, "Bounded checked strings; ordinal or ASCII case-insensitive comparison rather than locale collation"),
             _ => (U, "No runtime handler; dispatch stops with UnsupportedApi"),

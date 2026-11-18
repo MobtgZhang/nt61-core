@@ -17,12 +17,32 @@ mod printing;
 mod user;
 #[path = "win32/sync.rs"]
 mod sync;
+#[path = "win32/runonce.rs"]
+mod runonce;
+#[path = "win32/virtual_memory.rs"]
+mod virtual_memory;
+#[path = "win32/context.rs"]
+mod context;
+#[path = "win32/function_table.rs"]
+mod function_table;
+#[path = "win32/unwind.rs"]
+mod unwind;
 #[path = "win32/nls.rs"]
 mod nls;
 #[path = "win32/environment.rs"]
 mod environment;
+#[path = "win32/com.rs"]
+mod com;
+#[path = "win32/shell.rs"]
+mod shell;
+#[path = "win32/resources.rs"]
+mod resources;
 #[path = "win32/version.rs"]
 mod version;
+#[path = "win32/crt.rs"]
+mod crt;
+#[path = "win32/library.rs"]
+mod library;
 #[path = "win32/catalog.rs"]
 pub mod catalog;
 use crate::arch::common::btl::{
@@ -50,6 +70,8 @@ pub struct Runtime {
     pub modules: Vec<(String, u64)>,
     /// Dependencies retained by the executable's initial import graph.
     pub(super) process_dependencies: Vec<u64>,
+    /// Import and resolved forward-export edges owned by mapped DLLs.
+    pub(super) module_dependencies: Vec<(u64, u64)>,
     /// References acquired by successful Win32 LoadLibrary calls. Module
     /// lookup and GetModuleHandle do not acquire a reference.
     library_loads: Vec<(u64, u32)>,
@@ -58,7 +80,8 @@ pub struct Runtime {
     allocations: Vec<(u64, usize)>,
     heap_allocations: Vec<(u64, usize)>,
     virtual_allocations: Vec<VirtualAllocation>,
-    tls: Vec<Option<u64>>,
+    tls: Vec<bool>,
+    pub(super) local: ThreadLocal,
     next_address: u64,
     pub last_api: Option<u32>,
     pub last_arguments: Vec<u64>,
@@ -66,6 +89,7 @@ pub struct Runtime {
     pub failures: Vec<(u32, u32, String)>,
     pub last_library_error: Option<String>,
     advapi: advapi::State,
+    com: com::State,
     eventlog: eventlog::State,
     directory: directory::State,
     gui: gui::State,
@@ -73,6 +97,7 @@ pub struct Runtime {
     user: user::State,
     sync: sync::State,
     environment: environment::State,
+    shell: shell::State,
     /// Process-local top-level filter registration. Exception dispatch remains
     /// unsupported; a registered callback is never called as a host pointer.
     exception_filter: u64,
@@ -82,18 +107,21 @@ impl Runtime {
         Self {
             modules: vec![(String::new(), base)],
             process_dependencies: Vec::new(),
+            module_dependencies: Vec::new(),
             library_loads: Vec::new(),
             pinned_modules: Vec::new(),
             allocations: Vec::new(),
             heap_allocations: Vec::new(),
             virtual_allocations: Vec::new(),
             tls: Vec::new(),
+            local: ThreadLocal::default(),
             next_address: 0x2000_0000,
             last_api: None,
             last_arguments: Vec::new(),
             failures: Vec::new(),
             last_library_error: None,
             advapi: advapi::State::new(),
+            com: com::State::default(),
             eventlog: eventlog::State::default(),
             directory: directory::State::default(),
             gui: gui::State::new(),
@@ -101,13 +129,29 @@ impl Runtime {
             user: user::State::new(),
             sync: sync::State::default(),
             environment: environment::State::default(),
+            shell: shell::State::default(),
             exception_filter: 0,
         }
     }
 }
+#[derive(Default)]
+pub(super) struct ThreadLocal {
+    pub(super) tls: Vec<u64>,
+    user: user::ThreadState,
+    com: com::ThreadState,
+}
+
+pub(super) fn cleanup_thread(image: &mut GuestImage) {
+    com::cleanup_thread(image);
+}
+
 pub enum Outcome {
     Return(u64),
     Exit(u32),
+    ExitThread(u32),
+    Park(super::threads::Wait),
+    ParkRetry(super::threads::Wait),
+    Retry,
     Continue,
 }
 
@@ -194,8 +238,8 @@ fn protection(p: u32) -> Result<u8, u32> {
         _ => return Err(INVALID_PARAMETER),
     })
 }
-fn win_protection(p: u8) -> u32 {
-    match p {
+pub(super) fn win_protection(p: u8) -> u32 {
+    match p & (READ | WRITE | EXECUTE) {
         0 => 1,
         1 => 2,
         3 => 4,
@@ -212,7 +256,7 @@ fn aligned_size(n: u64) -> Result<usize, u32> {
     }
     n.checked_add(PAGE - 1).map(|v| v & !(PAGE - 1)).ok_or(8)
 }
-fn allocate(image: &mut GuestImage, requested: u64, n: u64, permissions: u8) -> Result<u64, u32> {
+pub(super) fn allocate(image: &mut GuestImage, requested: u64, n: u64, permissions: u8) -> Result<u64, u32> {
     let requested_base = requested & !0xffff;
     let len = aligned_size(n.checked_add(requested - requested_base).ok_or(8u32)?)?;
     let mut base = if requested == 0 {
@@ -236,12 +280,7 @@ fn allocate(image: &mut GuestImage, requested: u64, n: u64, permissions: u8) -> 
     }
     let end = base.checked_add(len as u64).ok_or(8u32)?;
     if base < 0x10000
-        || end
-            > if image.thread.context.mode == DecodeMode::X86 {
-                0x7f000000
-            } else {
-                0x0000_8000_0000_0000
-            }
+        || end > image.user_address_end
         || image.win32.allocations.len() >= 4096
         || image
             .memory
@@ -270,7 +309,7 @@ fn allocate(image: &mut GuestImage, requested: u64, n: u64, permissions: u8) -> 
     image.win32.next_address = (end + 0xffff) & !0xffff;
     Ok(base)
 }
-fn free(image: &mut GuestImage, p: u64) -> Result<(), u32> {
+pub(super) fn free(image: &mut GuestImage, p: u64) -> Result<(), u32> {
     let i = image
         .win32
         .allocations
@@ -325,8 +364,11 @@ fn change_commit(
             let end = ((page + 1) * PAGE).min(region.bytes.len());
             region.bytes[page * PAGE..end].fill(0);
         }
-        allocation.committed[page] = commit;
+        // SP1 preserves contents on duplicate commit but applies the requested
+        // protection even to pages that were already committed.
         region.permissions[page] = if commit { bits } else { 0 };
+        region.protections[page] = if commit { win_protection(bits) } else { 0 };
+        allocation.committed[page] = commit;
     }
     image.thread.invalidate_code();
     Ok(())
@@ -353,8 +395,9 @@ fn protect(image: &mut GuestImage, p: u64, n: u64, flags: u32) -> Result<u32, u3
         .ok_or(487u32)?;
     let first = ((p - r.base) as usize) / PAGE;
     let last = ((end - 1 - r.base) as usize) / PAGE;
-    let old = win_protection(r.permissions[first]);
+    let old = r.protections[first];
     r.permissions[first..=last].fill(bits);
+    r.protections[first..=last].fill(flags);
     Ok(old)
 }
 fn heap_allocate(image: &mut GuestImage, n: u64) -> Result<u64, u32> {
@@ -396,14 +439,34 @@ fn load_library(
     name: &str,
     services: &mut dyn GuestServices,
 ) -> Result<u64, u32> {
-    struct Resolver<'a>(&'a mut dyn GuestServices);
+    // Import descriptors remain restricted to basenames. LoadLibrary accepts
+    // paths, however: keep the module identity separate from the path used for
+    // its first read, and resolve its dependencies normally.
+    let identity = name.rsplit(['\\', '/']).next().ok_or(INVALID_PARAMETER)?;
+    struct Resolver<'a> {
+        services: &'a mut dyn GuestServices,
+        requested: &'a str,
+        first: bool,
+    }
     impl super::ImportResolver for Resolver<'_> {
         fn read_library(&mut self, name: &str, mode: DecodeMode) -> Result<Vec<u8>, u32> {
-            self.0.read_library(name, mode)
+            if self.first {
+                self.first = false;
+                if self.requested.contains(['\\', '/']) {
+                    let path = if self.requested.rsplit(['\\', '/']).next().is_some_and(|s| !s.contains('.')) {
+                        alloc::format!("{}.dll", self.requested)
+                    } else { self.requested.into() };
+                    self.services.read_library(&path, mode)
+                } else {
+                    self.services.read_library(name, mode)
+                }
+            } else {
+                self.services.read_library(name, mode)
+            }
         }
     }
     image
-        .load_library(name, &mut Resolver(services))
+        .load_library(identity, &mut Resolver { services, requested: name, first: true })
         .map_err(|e| {
             image.win32.last_library_error = Some(alloc::format!("{}: {}", name, e));
             match e.ntstatus() {
@@ -415,7 +478,33 @@ fn load_library(
             }
         })
 }
+// A failed lazy forward lookup must roll back newly mapped targets and
+// dependency edges. Keep pre-existing explicit references and memory intact.
 fn proc_address(
+    image: &mut GuestImage,
+    base: u64,
+    name: Option<&str>,
+    ordinal: u16,
+    depth: usize,
+    services: &mut dyn GuestServices,
+) -> Result<u64, u32> {
+    let mut previous = Vec::new();
+    previous.try_reserve_exact(image.module_metadata.len()).map_err(|_| 8u32)?;
+    previous.extend(image.module_metadata.iter().map(|m| m.base));
+    let edge_count = image.win32.module_dependencies.len();
+    let result = proc_address_inner(image, base, name, ordinal, depth, services);
+    if result.is_err() {
+        image.memory.regions.retain(|r|
+            previous.contains(&r.base) || !image.module_metadata.iter().any(|m| m.base == r.base));
+        image.module_metadata.retain(|m| previous.contains(&m.base));
+        image.win32.modules.retain(|m| previous.contains(&m.1));
+        image.win32.module_dependencies.truncate(edge_count);
+        image.thread.invalidate_code();
+        image.threads.invalidate_code();
+    }
+    result
+}
+fn proc_address_inner(
     image: &mut GuestImage,
     base: u64,
     name: Option<&str>,
@@ -473,17 +562,19 @@ fn proc_address(
         } else {
             load_library(image, dll, services)?
         };
-        if let Some(n) = symbol.strip_prefix('#') {
-            return proc_address(
-                image,
-                b,
-                None,
-                n.parse().map_err(|_| 127u32)?,
-                depth + 1,
-                services,
-            );
+        let result = if let Some(n) = symbol.strip_prefix('#') {
+            proc_address_inner(image, b, None, n.parse().map_err(|_| 127u32)?, depth + 1, services)
+        } else {
+            proc_address_inner(image, b, Some(symbol), 0, depth + 1, services)
+        };
+        if result.is_ok() && b != base {
+            let edge = (base, b);
+            if !image.win32.module_dependencies.contains(&edge) {
+                image.win32.module_dependencies.try_reserve(1).map_err(|_| 8u32)?;
+                image.win32.module_dependencies.push(edge);
+            }
         }
-        return proc_address(image, b, Some(symbol), 0, depth + 1, services);
+        return result;
     }
     let mut byte = [0];
     // A PE export may name readable data as well as code. Returning that
@@ -543,19 +634,17 @@ pub fn dispatch(
             return Ok(
                 match services.call(abi, service, &a[..count], &mut image.memory) {
                     ServiceResult::Return(v) => Outcome::Return(v as u64),
-                    ServiceResult::ExitProcess(c) | ServiceResult::ExitThread(c) => {
-                        Outcome::Exit(c)
-                    }
+                    ServiceResult::ExitProcess(c) => Outcome::Exit(c),
+                    ServiceResult::ExitThread(c) => Outcome::ExitThread(c),
                 },
             );
         }
     }
-    if api.name == "ExitProcess" || api.name == "ExitThread" {
-        return Ok(Outcome::Exit(a[0] as u32));
-    }
+    if api.name == "ExitProcess" { return Ok(Outcome::Exit(a[0] as u32)); }
+    if api.name == "ExitThread" { return Ok(Outcome::ExitThread(a[0] as u32)); }
     match invoke(image, api, &a, services) {
         Ok(v) => {
-            if let Some((procedure,args))=image.win32.user.callback.take(){
+            if let Some((procedure,args))=image.win32.local.user.callback.take(){
                 user::enter_callback(image,procedure,args).map_err(|_|StopReason::DataFault{pc:image.thread.context.rip})?;
                 return Ok(Outcome::Continue);
             }
@@ -593,7 +682,7 @@ pub fn dispatch(
             image.win32.failures.push((id, e, detail));
             error(image, e);
             Ok(Outcome::Return(match api.name {
-                "TlsAlloc" | "WaitForSingleObject" | "WaitForSingleObjectEx" => u32::MAX as u64,
+                "TlsAlloc" | "ResumeThread" | "SuspendThread" | "WaitForSingleObject" | "WaitForSingleObjectEx" => u32::MAX as u64,
                 "GlobalFree" | "LocalFree" | "FreeSid" => a[0],
                 "CreateFileA" | "CreateFileW" | "HeapSize" | "FindFirstFileW" | "FindFirstFileExW" => {
                     if abi == GuestAbi::X86_32 {
@@ -605,14 +694,28 @@ pub fn dispatch(
                 _ => 0,
             }))
         }
+        Err(ApiError::Pending(wait)) => Ok(Outcome::Park(wait)),
+        Err(ApiError::Hresult(code, detail)) => {
+            // HRESULT failures are returned to the caller without touching
+            // Win32 LastError. They are not successful backend operations.
+            if image.win32.failures.len() == 16 { image.win32.failures.remove(0); }
+            image.win32.failures.push((id, code, String::from(detail)));
+            Ok(Outcome::Return(u64::from(code)))
+        }
+        Err(ApiError::Retry) => Ok(Outcome::Retry),
+        Err(ApiError::PendingRetry(wait)) => Ok(Outcome::ParkRetry(wait)),
         Err(ApiError::Unsupported) => Err(StopReason::UnsupportedApi { id }),
         Err(ApiError::MemoryFault) => Err(StopReason::DataFault {
             pc: image.thread.context.rip,
         }),
     }
 }
-enum ApiError {
+pub(super) enum ApiError {
+    Retry,
+    PendingRetry(super::threads::Wait),
+    Pending(super::threads::Wait),
     Windows(u32),
+    Hresult(u32, &'static str),
     Unsupported,
     MemoryFault,
 }
@@ -627,6 +730,60 @@ fn invoke(
     a: &[u64],
     services: &mut dyn GuestServices,
 ) -> Result<u64, ApiError> {
+    if api.dll == "ntdll.dll" && api.name == "RtlCaptureContext" {
+        return context::capture(image, a[0]);
+    }
+    if api.dll == "ntdll.dll" && api.name == "RtlLookupFunctionEntry" {
+        return function_table::lookup(image, a);
+    }
+    if api.dll == "ntdll.dll" && api.name == "RtlVirtualUnwind" {
+        return unwind::unwind(image, a);
+    }
+    if (api.dll == "ntdll.dll" && api.name == "NtQueryVirtualMemory")
+        || (api.dll == "kernel32.dll" && matches!(api.name, "VirtualQuery" | "VirtualQueryEx")) {
+        return virtual_memory::invoke(image, api.name, a);
+    }
+    if api.dll == "kernel32.dll" && matches!(api.name,
+        "WerRegisterRuntimeExceptionModule" | "WerUnregisterRuntimeExceptionModule") {
+        // The Win7 contract returns HRESULT. No out-of-process WER service,
+        // registry allow-list or crash callback host is implemented yet.
+        return Err(ApiError::Hresult(0x80004001, "WER out-of-process backend unavailable"));
+    }
+    if api.dll == "ole32.dll" && matches!(api.name,
+        "CoInitializeEx" | "CoUninitialize" | "CoGetContextToken") {
+        return com::invoke(image, api.name, a);
+    }
+    if matches!(api.dll, "shell32.dll" | "ole32.dll") {
+        return shell::invoke(image, api.name, a, services);
+    }
+    if api.dll == "ntdll.dll" && matches!(api.name, "RtlAllocateHeap" | "RtlReAllocateHeap" | "RtlFreeHeap") {
+        let allowed = if api.name == "RtlFreeHeap" { 1 } else { 9 };
+        if a[1] & !allowed != 0 { return Err(ApiError::Unsupported); }
+        let name = match api.name {
+            "RtlAllocateHeap" => "HeapAlloc", "RtlReAllocateHeap" => "HeapReAlloc", _ => "HeapFree",
+        };
+        let target = catalog::find("kernel32.dll", name).ok_or(ApiError::Unsupported)?;
+        let mut args = a.to_vec();
+        args[1] &= !1; // serialization belongs to the process's guest scheduler
+        return match invoke(image, target, &args, services) {
+            Err(ApiError::Windows(_)) => Ok(0),
+            result => result,
+        };
+    }
+    if api.dll == "ntdll.dll" && api.name == "RtlSizeHeap" {
+        // Native heap queries preserve Win32 LastError, including failures.
+        // Only the process-owned heap and documented HEAP_NO_SERIALIZE flag
+        // are accepted; there is no host-pointer dereference.
+        let failure = if image.thread.context.mode == DecodeMode::X86 { u32::MAX as u64 } else { u64::MAX };
+        if a[1] & !1 != 0 { return Err(ApiError::Unsupported); }
+        return Ok(if a[0] != HEAP { failure } else {
+            image.win32.heap_allocations.iter().find(|p| p.0 == a[2])
+                .map_or(failure, |p| p.1 as u64)
+        });
+    }
+    if api.dll == "ntdll.dll" && crt::handles(api.name) {
+        return crt::invoke(image, api.name, a);
+    }
     if api.dll == "bcrypt.dll" && api.name == "BCryptGenRandom" {
         // CNG reports NTSTATUS directly and never sets Win32 LastError.
         if a[0] != 0 || a[3] as u32 & !2 != 0 { return Ok(0xc000000d); }
@@ -670,6 +827,9 @@ fn invoke(
         GuestAbi::X86_64
     };
     let name = api.name;
+    if runonce::handles(name) {
+        return runonce::invoke(image, api, a);
+    }
     if api.dll == "kernel32.dll" && matches!(name, "CreateDirectoryW" | "FindFirstFileW" | "FindFirstFileExW" | "FindNextFileW" | "FindClose") {
         return directory::invoke(image, name, a, services);
     }
@@ -739,6 +899,14 @@ fn invoke(
                 if !image.memory.write_virt(a[0], &bytes) { return Err(ApiError::MemoryFault); }
                 (units.len() - 1) as u64
             }
+        }
+        "CreateThread" => return super::threads::create(image, a).map_err(ApiError::Windows),
+        "ResumeThread" | "SuspendThread" | "GetThreadId" | "GetExitCodeThread" =>
+            return super::threads::invoke(image, name, a).map_err(ApiError::Windows),
+        "Sleep" | "SleepEx" if image.has_other_threads() => {
+            if name == "SleepEx" && a[1] as u32 != 0 { return Err(ApiError::Unsupported); }
+            let wait = super::threads::sleep(image, a[0] as u32, services)?;
+            return Err(ApiError::Pending(wait));
         }
         "Sleep" | "SleepEx" => {
             let milliseconds = a[0] as u32;
@@ -817,7 +985,7 @@ fn invoke(
             .find(|entry| entry.0 == a[0])
             .map(|entry| entry.1 as u64)
             .ok_or(INVALID_PARAMETER)?,
-        "QueryPerformanceCounter"
+        "QueryPerformanceCounter" | "RtlQueryPerformanceCounter"
         | "QueryPerformanceFrequency"
         | "GetTickCount"
         | "GetTickCount64"
@@ -920,12 +1088,12 @@ fn invoke(
             free(image, scratch)?;
             result?
         }
-        "GetLastError" => word(
+        "GetLastError" | "RtlGetLastWin32Error" => word(
             &mut image.memory,
             image.teb + if x86 { 0x34 } else { 0x68 },
             4,
         )?,
-        "SetLastError" => {
+        "SetLastError" | "RtlSetLastWin32Error" => {
             error(image, a[0] as u32);
             0
         }
@@ -943,7 +1111,8 @@ fn invoke(
                 u64::MAX - 1
             }
         }
-        "GetCurrentProcessId" | "GetCurrentThreadId" => 1,
+        "GetCurrentProcessId" => 1,
+        "GetCurrentThreadId" => u64::from(image.thread_id()),
         "IsProcessorFeaturePresent" => {
             // Report the isolated interpreter's guarantees, never host CPUID.
             // Instruction fetch checks EXECUTE permissions (PF_NX_ENABLED=12).
@@ -1238,10 +1407,11 @@ fn invoke(
             let mut bytes = alloc::vec![0u8; size];
             bytes[..2].copy_from_slice(&processor.architecture.to_le_bytes());
             bytes[4..8].copy_from_slice(&4096u32.to_le_bytes());
-            // These are the portable loader's VirtualAlloc address bounds;
-            // physical allocation capacity is reported separately by memory
-            // status. CPU family/revision match the virtual CPUID model.
-            for (index, value) in [0x10000u64, if x86 {0x7eff_ffff} else {0x7fff_ffff_ffff}, mask].into_iter().enumerate() {
+            // Use the executable's SP1 application address model, including
+            // WOW64 LARGEADDRESSAWARE. Backing capacity is reported separately.
+            let maximum = if x86 && name == "GetNativeSystemInfo" { 0xfffe_ffff }
+                else { image.user_address_end - 1 };
+            for (index, value) in [0x10000u64, maximum, mask].into_iter().enumerate() {
                 bytes[8+index*width..8+(index+1)*width].copy_from_slice(&value.to_le_bytes()[..width]);
             }
             let tail = 8 + width * 3;
@@ -1295,33 +1465,38 @@ fn invoke(
             module.thread_notifications_disabled = true;
             1
         }
-        "FreeLibrary" => {
-            if !image.win32.modules.iter().any(|m| m.1 == a[0]) {
-                return Err(6.into());
-            }
-            let pinned = image.win32.pinned_modules.contains(&a[0]);
-            let retained = a[0] == image.image_base || pinned || image.win32.process_dependencies.contains(&a[0]);
-            let Some((_, count)) = image.win32.library_loads.iter_mut().find(|m| m.0 == a[0]) else {
-                if pinned { return Ok(1); }
-                return Err(ApiError::Unsupported);
-            };
-            // Releasing a surplus reference cannot unload code. Releasing
-            // the last dynamic reference requires dependency, TLS, DllMain
-            // detach and unmapping support; leave that reference intact.
-            if *count == 0 || (*count == 1 && !retained) {
-                if pinned { return Ok(1); }
-                return Err(ApiError::Unsupported);
-            }
-            *count -= 1;
-            1
-        }
+        "FreeLibrary" => return library::free(image, a[0]),
         "GetProcAddress" => {
-            if a[1] <= 0xffff {
-                proc_address(image, a[0], None, a[1] as u16, 0, services)?
+            let by_ordinal = a[1] <= 0xffff;
+            let ordinal_failure = by_ordinal && image.win32.modules.iter().any(|m| m.1 == a[0]);
+            let result = if by_ordinal {
+                proc_address(image, a[0], None, a[1] as u16, 0, services)
             } else {
                 let n = string(&mut image.memory, a[1], false)?;
-                proc_address(image, a[0], Some(&n), 0, 0, services)?
-            }
+                proc_address(image, a[0], Some(&n), 0, 0, services)
+            };
+            // SP1 reports lookup failure according to the original request,
+            // including unavailable forwarded modules/symbols and ordinal
+            // holes. Preserve other backend/resource failures as such.
+            result.map_err(|code| match code {
+                126 | 127 | 182 => if ordinal_failure { 182 } else { 127 },
+                code => code,
+            })?
+        }
+        "FlushInstructionCache" => {
+            // SP1 skips handle validation for an empty, non-null range. A
+            // null base requests the whole cache even when length is zero.
+            if a[1] != 0 && a[2] == 0 { return Ok(1); }
+            let pseudo = if image.thread.context.mode == DecodeMode::X86 {
+                u32::MAX as u64
+            } else { u64::MAX };
+            if a[0] != pseudo { return Err(6u32.into()); }
+            // Guest code is interpreted, not executed from a host I-cache.
+            // Invalidate every thread's decoded instructions; no host pointer
+            // is derived from the caller's optional address/length range.
+            image.thread.invalidate_code();
+            image.threads.invalidate_code();
+            1
         }
         "VirtualAlloc" => {
             let kind = a[2] as u32;
@@ -1348,6 +1523,10 @@ fn invoke(
                     length,
                     committed: vec![kind & 0x1000 != 0; length / PAGE],
                 });
+                let region = image.memory.regions.iter_mut().find(|r| r.base == p)
+                    .ok_or(INVALID_PARAMETER)?;
+                region.allocation_protection = a[3] as u32;
+                if kind & 0x1000 == 0 { region.protections.fill(0); }
                 p
             }
         }
@@ -1387,16 +1566,17 @@ fn invoke(
             }
             // lpflOldProtect may alias the changed pages. If publishing it
             // fails after permissions change, restore permissions atomically.
-            let snapshot: Vec<Vec<u8>> = image
+            let snapshot: Vec<(Vec<u8>, Vec<u32>)> = image
                 .memory
                 .regions
                 .iter()
-                .map(|r| r.permissions.clone())
+                .map(|r| (r.permissions.clone(), r.protections.clone()))
                 .collect();
             let old = protect(image, a[0], a[1], a[2] as u32)?;
             if let Err(e) = put(&mut image.memory, a[3], old as u64, 4) {
-                for (region, permissions) in image.memory.regions.iter_mut().zip(snapshot) {
+                for (region, (permissions, protections)) in image.memory.regions.iter_mut().zip(snapshot) {
                     region.permissions = permissions;
+                    region.protections = protections;
                 }
                 return Err(e.into());
             }
@@ -1465,46 +1645,28 @@ fn invoke(
                 .1 as u64
         }
         "TlsAlloc" => {
-            if let Some(i) = image.win32.tls.iter().position(Option::is_none) {
-                image.win32.tls[i] = Some(0);
-                i as u64
-            } else {
-                if image.win32.tls.len() >= 1088 {
-                    return Err(259.into());
-                }
-                image.win32.tls.push(Some(0));
-                image.win32.tls.len() as u64 - 1
-            }
+            let slot = if let Some(i) = image.win32.tls.iter().position(|used| !used) { i }
+                else {
+                    if image.win32.tls.len() >= 1088 { return Err(259.into()); }
+                    image.win32.tls.push(false);
+                    image.win32.tls.len() - 1
+                };
+            image.clear_tls_slot(slot);
+            image.win32.tls[slot] = true;
+            slot as u64
         }
         "TlsFree" => {
-            let slot = image
-                .win32
-                .tls
-                .get_mut(a[0] as usize)
-                .filter(|s| s.is_some())
-                .ok_or(INVALID_PARAMETER)?;
-            *slot = None;
+            let slot = image.win32.tls.get_mut(a[0] as usize).filter(|s| **s).ok_or(INVALID_PARAMETER)?;
+            *slot = false;
+            image.clear_tls_slot(a[0] as usize);
             1
         }
-        "TlsSetValue" => {
-            let slot = image
-                .win32
-                .tls
-                .get_mut(a[0] as usize)
-                .and_then(Option::as_mut)
-                .ok_or(INVALID_PARAMETER)?;
-            *slot = a[1];
-            1
-        }
-        "TlsGetValue" => {
-            let v = image
-                .win32
-                .tls
-                .get(a[0] as usize)
-                .and_then(|s| *s)
-                .ok_or(INVALID_PARAMETER)?;
-            error(image, 0);
-            v
+        "TlsSetValue" | "TlsGetValue" => {
+            let slot = a[0] as u32 as usize;
+            if !image.win32.tls.get(slot).copied().unwrap_or(false) { return Err(INVALID_PARAMETER.into()); }
+            image.win32.local.tls.resize(image.win32.tls.len(), 0);
+            if name == "TlsSetValue" { image.win32.local.tls[slot] = a[1]; 1 }
+            else { let value = image.win32.local.tls[slot]; error(image, 0); value }
         }
         "EncodePointer" | "DecodePointer" => a[0],
         "lstrlenA" | "lstrlenW" => {
@@ -1557,19 +1719,6 @@ fn invoke(
             )?;
             put(&mut image.memory, a[0] + width as u64, p, width)?;
             0
-        }
-        "RtlAllocateHeap" => {
-            if a[0] != HEAP || a[1] & !8 != 0 {
-                return Err(INVALID_PARAMETER.into());
-            }
-            heap_allocate(image, a[2])?
-        }
-        "RtlFreeHeap" => {
-            if a[0] != HEAP || a[1] != 0 {
-                return Err(INVALID_PARAMETER.into());
-            }
-            heap_free(image, a[2])?;
-            1
         }
         "CreateFileA" | "CreateFileW" => {
             if a[3] != 0 || a[4] != 3 || a[6] != 0 {
@@ -1696,7 +1845,15 @@ fn invoke(
             x.iter()
                 .zip(y.iter())
                 .find(|(x, y)| x != y)
-                .map_or(0, |(x, y)| (*x as i32 - *y as i32) as u32 as u64)
+                // Both SP1 NTDLL and MSVCRT return a sign for memcmp,
+                // independently of the magnitude of the byte difference.
+                .map_or(0, |(x, y)| (i32::from(*x) - i32::from(*y)).signum() as u32 as u64)
+        }
+        "DuplicateHandle" => super::threads::duplicate(image, a)?,
+        "SetHandleInformation" if super::threads::is_handle(a[0]) => super::threads::set_handle_information(image, a)?,
+        "CloseHandle" if super::threads::is_handle(a[0]) => {
+            super::threads::close(image, a[0])?;
+            1
         }
         "CloseHandle" => match services.call(abi, Service::Close, &a[..1], &mut image.memory) {
             ServiceResult::Return(0) => 1,
@@ -1713,7 +1870,7 @@ fn invoke(
     })
 }
 
-fn sleep_counter(
+pub(super) fn sleep_counter(
     abi: GuestAbi,
     services: &mut dyn GuestServices,
     memory: &mut dyn GuestMemory,
@@ -1730,7 +1887,7 @@ fn sleep_counter(
     }
     Ok((counter, frequency))
 }
-fn status_error(s: u32) -> u32 {
+pub(super) fn status_error(s: u32) -> u32 {
     match s {
         0xc0000005 => NOACCESS,
         0xc0000008 => 6,

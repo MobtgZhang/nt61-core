@@ -2,10 +2,9 @@
 //! Event signal/reset/wait state belongs to the kernel dispatcher, with
 //! process-owned guest handles. Named events and alertable waits need guest
 //! namespaces/APC delivery before they can be exposed here.
-//! The executor currently runs
-//! one guest thread (ID 1). Recursive ownership is real guest state; a foreign
-//! owner is never silently acquired or released. Blocking requires a future
-//! guest-thread scheduler and is explicitly unsupported here.
+//! Recursive ownership uses the active guest thread ID. Contended critical
+//! sections and SRW locks yield to the guest scheduler; unsupported foreign
+//! wait queues are never silently acquired or released.
 use super::*;
 
 #[derive(Default)]
@@ -46,6 +45,11 @@ pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64], services: &m
         "WaitForSingleObject" | "WaitForSingleObjectEx" => {
             if name.ends_with("Ex") && a[2] as u32 != 0 { return Err(120u32.into()); }
             let milliseconds = a[1] as u32;
+            if image.has_other_threads() || super::super::threads::is_handle(a[0]) {
+                return match super::super::threads::wait(image, a[0], milliseconds, services)? {
+                    Ok(value) => Ok(value), Err(wait) => Err(ApiError::Pending(wait)),
+                };
+            }
             let timeout = if milliseconds == u32::MAX { None } else { Some(-i64::from(milliseconds) * 10_000) };
             let status = services.wait_event(a[0], timeout).map_err(status_error)?;
             return if matches!(status, 0 | 0x102) { Ok(u64::from(status)) } else { Err(120u32.into()) };
@@ -130,12 +134,14 @@ pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64], services: &m
     owner_bytes[..width].copy_from_slice(&data[owner_at..owner_at + width]);
     let owner = u64::from_le_bytes(owner_bytes);
     let recursion = i32::from_le_bytes(data[recursion_at..recursion_at + 4].try_into().map_err(|_| ApiError::MemoryFault)?);
-    let current_thread = 1;
+    let current_thread = u64::from(image.thread_id());
     let result;
     match name {
         "EnterCriticalSection" | "TryEnterCriticalSection" => {
             if owner != 0 && owner != current_thread {
-                return if name == "TryEnterCriticalSection" { Ok(0) } else { Err(ApiError::Unsupported) };
+                return if name == "TryEnterCriticalSection" { Ok(0) }
+                    else if image.has_other_threads() { Err(ApiError::Pending(super::super::threads::Wait::lock(super::super::threads::Target::Critical(address)))) }
+                    else { Err(ApiError::Unsupported) };
             }
             if recursion < 0 || (owner == 0 && recursion != 0) || (owner != 0 && recursion == 0) {
                 return Err(ApiError::MemoryFault);
@@ -144,7 +150,7 @@ pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64], services: &m
             // Win7 uncontended LockCount encodes the locked bit, not recursion.
             data[width..width + 4].copy_from_slice(&(-2i32).to_le_bytes());
             data[recursion_at..recursion_at + 4].copy_from_slice(&next.to_le_bytes());
-            data[owner_at..owner_at + width].copy_from_slice(&1u64.to_le_bytes()[..width]);
+            data[owner_at..owner_at + width].copy_from_slice(&current_thread.to_le_bytes()[..width]);
             result = u64::from(name == "TryEnterCriticalSection");
         }
         "LeaveCriticalSection" => {
@@ -197,7 +203,9 @@ fn srw(image: &mut GuestImage, name: &str, address: u64, width: usize) -> Result
         let maximum = if width == 4 { u64::from(u32::MAX) } else { u64::MAX };
         value.checked_add(16).filter(|next| *next <= maximum).ok_or(ApiError::Unsupported)?
     } else {
-        return if trying { Ok(0) } else { Err(ApiError::Unsupported) };
+        return if trying { Ok(0) }
+            else if image.has_other_threads() { Err(ApiError::Pending(super::super::threads::Wait::lock(super::super::threads::Target::Srw(address,shared)))) }
+            else { Err(ApiError::Unsupported) };
     };
     put(&mut image.memory, address, next, width).map_err(|_| ApiError::MemoryFault)?;
     Ok(u64::from(trying))

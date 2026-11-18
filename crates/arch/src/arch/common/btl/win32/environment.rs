@@ -72,7 +72,7 @@ pub(super) fn variable(image: &mut GuestImage, a: &[u64], wide: bool) -> Result<
     Err(203u32.into()) // ERROR_ENVVAR_NOT_FOUND
 }
 
-fn lookup(image: &mut GuestImage, name: &[u16]) -> Result<Option<Vec<u16>>, ApiError> {
+pub(super) fn lookup(image: &mut GuestImage, name: &[u16]) -> Result<Option<Vec<u16>>, ApiError> {
     let bytes = snapshot(image)?;
     let units: Vec<u16> = bytes.chunks_exact(2)
         .map(|b| u16::from_le_bytes([b[0], b[1]])).collect();

@@ -8,6 +8,7 @@ struct Class {
 }
 #[derive(Clone)]
 struct Window {
+    thread_id: u32,
     hwnd: u32,
     parent: u32,
     id: u32,
@@ -25,34 +26,39 @@ struct Message {
     wp: u64,
     lp: u64,
 }
-pub(super) enum Completion { Value, FreeValue(u64), Fixed(u64), Create{hwnd:u32,data:u64,procedure:u64,phase:u8} }
-struct Frame { pc:u64,sp:u64,completion:Completion }
+pub(super) enum Completion { Value, FreeValue(u64), Fixed(u64), Create{hwnd:u32,data:u64,procedure:u64,phase:u8}, RunOnce{address:u64,output:u64,native:bool} }
+struct Frame { pc:u64,sp:u64,result_sp:u64,completion:Completion }
 pub(super) const CALLBACK_RETURN:u32=0xfffe;
 pub(super) struct State {
     pub common_classes: u32,
+    dpi_aware: bool,
     classes: Vec<Class>,
     windows: Vec<Window>,
     next: u32,
-    messages: Vec<Message>,
-    pub callback: Option<(u64, [u64; 4])>,
+    messages: Vec<(u32, Message)>,
     trampoline: Option<u64>,
-    frames:Vec<Frame>,
     notifications:Vec<u64>,
-    pub completion:Option<Completion>,
+}
+#[derive(Default)]
+pub(super) struct ThreadState {
+    pub callback: Option<(u64, [u64; 4])>,
+    frames: Vec<Frame>,
+    pub completion: Option<Completion>,
 }
 impl State {
     pub fn new() -> Self {
         Self {
             common_classes: 0,
+            // Native unmanifested EXEs on the SP1 96-DPI reference start
+            // aware, including WOW64. A scalable session must initialize
+            // this from its actual policy instead of inheriting this default.
+            dpi_aware: true,
             classes: Vec::new(),
             windows: Vec::new(),
             next: 0x10000,
             messages: Vec::new(),
-            callback: None,
             trampoline: None,
-            frames:Vec::new(),
             notifications:Vec::new(),
-            completion:None,
         }
     }
 }
@@ -136,7 +142,7 @@ fn message_write(image: &mut GuestImage, p: u64, message: Message) -> Result<(),
     Ok(())
 }
 pub(super) fn enter_callback(image:&mut GuestImage,procedure:u64,args:[u64;4])->Result<(),u32>{
-    if image.win32.user.frames.len()>=64{return Err(1816);}
+    if image.win32.local.user.frames.len()>=64{return Err(1816);}
     let x86=image.thread.context.mode==DecodeMode::X86;
     let width=if x86{4}else{8};
     let old=image.thread.context.reg(X86Reg::Rsp);let pc=image.thread.context.rip;
@@ -147,26 +153,36 @@ pub(super) fn enter_callback(image:&mut GuestImage,procedure:u64,args:[u64;4])->
         let p=allocate(image,0,16,READ|WRITE|EXECUTE)?;
         if !image.memory.write_virt(p,&code){return Err(87);}image.win32.user.trampoline=Some(p);p
     };
-    let sp=old.checked_sub(if x86{20}else{48}).ok_or(87u32)?;
-    if !image.memory.probe_write(sp,if x86{20}else{48}){return Err(87);}
+    let completion=image.win32.local.user.completion.take().unwrap_or(Completion::Value);
+    let count=if matches!(completion,Completion::RunOnce{..}){3}else{4};
+    // x86 callbacks clean exactly their argument count. x64 entry RSP must
+    // be 8 modulo 16, with all 32 bytes of shadow space below the old frame.
+    let sp=if x86{old.checked_sub(4+count as u64*4).ok_or(87u32)?}
+        else{(old.checked_sub(40).ok_or(87u32)?&!15).checked_sub(8).ok_or(87u32)?};
+    if !image.memory.probe_write(sp,(old-sp)as usize){return Err(87);}
     put(&mut image.memory,sp,trampoline,width)?;
-    if x86{for(i,arg)in args.iter().enumerate(){put(&mut image.memory,sp+4+i as u64*4,*arg,4)?;}}
+    if x86{for(i,arg)in args.iter().take(count).enumerate(){put(&mut image.memory,sp+4+i as u64*4,*arg,4)?;}}
     else{for(reg,arg)in [X86Reg::Rcx,X86Reg::Rdx,X86Reg::R8,X86Reg::R9].into_iter().zip(args){image.thread.context.set_reg(reg,arg);}}
-    let completion=image.win32.user.completion.take().unwrap_or(Completion::Value);
-    image.win32.user.frames.push(Frame{pc,sp:old,completion});
+    let result_sp=if x86{sp+count as u64*4}else{sp};
+    image.win32.local.user.frames.push(Frame{pc,sp:old,result_sp,completion});
     image.thread.context.set_reg(X86Reg::Rsp,sp);image.thread.context.rip=procedure;Ok(())
 }
 pub(super) fn callback_return(image:&mut GuestImage,services:&mut dyn GuestServices)->Result<Outcome,StopReason>{
     let failure=||StopReason::DataFault{pc:0};
     let sp=image.thread.context.reg(X86Reg::Rsp);
     let result=word(&mut image.memory,sp,if image.thread.context.mode==DecodeMode::X86{4}else{8}).map_err(|_|failure())?;
-    let frame=image.win32.user.frames.pop().ok_or_else(failure)?;
+    let frame=image.win32.local.user.frames.pop().ok_or_else(failure)?;
+    if sp!=frame.result_sp{return Err(failure());}
     image.thread.context.rip=frame.pc;image.thread.context.set_reg(X86Reg::Rsp,frame.sp);
     let result=match frame.completion{
         Completion::Value=>result,Completion::FreeValue(pointer)=>{heap_free(image,pointer).map_err(|_|failure())?;result},Completion::Fixed(value)=>value,
+        Completion::RunOnce{address,output,native}=>super::runonce::callback_complete(image,address,output,native,result).map_err(|error| match error {
+            super::ApiError::Unsupported => StopReason::UnsupportedApi { id: if native { 1048 } else { 139 } },
+            _ => failure(),
+        })?,
         Completion::Create{hwnd,data,procedure,phase}=>{
             if phase==0&&result!=0 {
-                image.win32.user.completion=Some(Completion::Create{hwnd,data,procedure,phase:1});
+                image.win32.local.user.completion=Some(Completion::Create{hwnd,data,procedure,phase:1});
                 enter_callback(image,procedure,[hwnd as u64,1,0,data]).map_err(|_|failure())?;
                 return Ok(Outcome::Continue);
             }
@@ -179,11 +195,16 @@ pub(super) fn callback_return(image:&mut GuestImage,services:&mut dyn GuestServi
     };
     Ok(Outcome::Return(result))
 }
-fn queue(state: &mut State, message: Message) -> Result<(), ApiError> {
+fn queue(image: &mut GuestImage, message: Message) -> Result<(), ApiError> {
+    let owner = if message.hwnd == 0 { image.thread_id() } else {
+        image.win32.user.windows.iter().find(|w| u64::from(w.hwnd) == message.hwnd)
+            .map(|w| w.thread_id).ok_or(ApiError::Windows(1400))?
+    };
+    let state = &mut image.win32.user;
     if state.messages.len() >= 256 {
         return Err(1816u32.into());
     }
-    state.messages.push(message);
+    state.messages.push((owner, message));
     Ok(())
 }
 pub(super) fn invoke(
@@ -196,6 +217,19 @@ pub(super) fn invoke(
     let width = if x86 { 4 } else { 8 };
     let wide = name.ends_with('W');
     match name {
+        "SetProcessDPIAware" => {
+            image.win32.user.dpi_aware = true;
+            Ok(1)
+        }
+        "IsProcessDPIAware" => Ok(u64::from(image.win32.user.dpi_aware)),
+        "LoadStringW" => resources::load_string_w(image, a),
+        "GetSystemMetrics" | "GetSysColor" => {
+            let action = if name == "GetSysColor" { w::SYSTEM_COLOR } else { w::SYSTEM_METRICS };
+            let mut request = packet(action, 0);
+            request.values[6] = a[0] as u32;
+            let reply = send(services, request)?;
+            Ok(reply.values[20] as u64)
+        }
         "RegisterClassExW" | "RegisterClassExA" => {
             let p = a[0];
             if word(&mut image.memory, p, 4)? != if x86 { 48 } else { 80 } {
@@ -312,7 +346,9 @@ pub(super) fn invoke(
             copied_text(&mut p, &title)?;
             send(services, p)?;
             image.win32.user.next += 1;
+            let thread_id = image.thread_id();
             image.win32.user.windows.push(Window {
+                thread_id,
                 hwnd,
                 parent,
                 id: a[9] as u32,
@@ -331,14 +367,14 @@ pub(super) fn invoke(
                     vec![(0,a[11],8),(8,a[10],8),(16,a[9],8),(24,a[8],8),(32,p.values[16]as u64,4),(36,p.values[15]as u64,4),(40,a[5],4),(44,a[4],4),(48,a[3],4),(56,a[2],8),(64,a[1],8),(72,a[0],4)]
                 };
                 for(offset,value,size)in fields{put(&mut image.memory,data+offset,value,size)?;}
-                image.win32.user.completion=Some(Completion::Create{hwnd,data,procedure,phase:0});
-                image.win32.user.callback=Some((procedure,[hwnd as u64,0x81,0,data]));
+                image.win32.local.user.completion=Some(Completion::Create{hwnd,data,procedure,phase:0});
+                image.win32.local.user.callback=Some((procedure,[hwnd as u64,0x81,0,data]));
             }
             Ok(hwnd as u64)
         }
         "PostQuitMessage" => {
             queue(
-                &mut image.win32.user,
+                image,
                 Message {
                     hwnd: 0,
                     message: 0x12,
@@ -360,7 +396,7 @@ pub(super) fn invoke(
                 return Err(1400u32.into());
             }
             queue(
-                &mut image.win32.user,
+                image,
                 Message {
                     hwnd: a[0],
                     message: a[1] as u32,
@@ -382,15 +418,16 @@ pub(super) fn invoke(
             if !image.memory.probe_write(a[0], if x86 { 28 } else { 48 }) {
                 return Err(87u32.into());
             }
+            let mut polled = false;
             loop {
                 if let Some(index) = image
                     .win32
                     .user
                     .messages
                     .iter()
-                    .position(|m| m.message == 0x12 || a[1] == 0 || m.hwnd == a[1])
+                    .position(|(owner,m)| *owner == image.thread_id() && (m.message == 0x12 || a[1] == 0 || m.hwnd == a[1]))
                 {
-                    let message = image.win32.user.messages[index];
+                    let message = image.win32.user.messages[index].1;
                     if !peek || a[4] & 1 != 0 {
                         image.win32.user.messages.remove(index);
                     }
@@ -401,12 +438,14 @@ pub(super) fn invoke(
                         1
                     });
                 }
+                if polled { return if peek { Ok(0) } else { Err(ApiError::Retry) }; }
+                polled = true;
                 let roots: Vec<u32> = image
                     .win32
                     .user
                     .windows
                     .iter()
-                    .filter(|w| w.parent == 0)
+                    .filter(|w| w.parent == 0 && w.thread_id == image.thread_id())
                     .map(|w| w.hwnd)
                     .collect();
                 for root in roots {
@@ -457,7 +496,7 @@ pub(super) fn invoke(
                         lp = notification;
                     }
                     queue(
-                        &mut image.win32.user,
+                        image,
                         Message {
                             hwnd: r.values[5] as u64,
                             message,
@@ -465,12 +504,6 @@ pub(super) fn invoke(
                             lp,
                         },
                     )?;
-                }
-                if peek && image.win32.user.messages.is_empty() {
-                    return Ok(0);
-                }
-                if image.win32.user.windows.is_empty() && image.win32.user.messages.is_empty() {
-                    return Err(1400u32.into());
                 }
             }
         }
@@ -485,10 +518,10 @@ pub(super) fn invoke(
                 .map_or(0, |w| w.procedure);
             if let Some(index)=image.win32.user.notifications.iter().position(|p|*p==message.lp){
                 let pointer=image.win32.user.notifications.remove(index);
-                if procedure!=0{image.win32.user.completion=Some(Completion::FreeValue(pointer));}else{heap_free(image,pointer)?;}
+                if procedure!=0{image.win32.local.user.completion=Some(Completion::FreeValue(pointer));}else{heap_free(image,pointer)?;}
             }
             if procedure != 0 {
-                image.win32.user.callback = Some((procedure,[message.hwnd,message.message as u64,message.wp,message.lp]));
+                image.win32.local.user.callback = Some((procedure,[message.hwnd,message.message as u64,message.wp,message.lp]));
             }
             Ok(0)
         }
@@ -525,8 +558,8 @@ pub(super) fn invoke(
                         .windows
                         .retain(|w| w.hwnd != window.hwnd && w.parent != window.hwnd);
                     if window.procedure != 0 {
-                        image.win32.user.completion=Some(Completion::Fixed(1));
-                        image.win32.user.callback = Some((window.procedure, [a[0], 2, 0, 0]));
+                        image.win32.local.user.completion=Some(Completion::Fixed(1));
+                        image.win32.local.user.callback = Some((window.procedure, [a[0], 2, 0, 0]));
                     }
                     Ok(1)
                 }
@@ -607,8 +640,11 @@ pub(super) fn invoke(
                     Ok(1)
                 }
                 "SendMessageW" | "SendMessageA" => {
+                    if window.procedure != 0 && window.thread_id != image.thread_id() {
+                        return Err(ApiError::Unsupported);
+                    }
                     if window.procedure != 0 {
-                        image.win32.user.callback =
+                        image.win32.local.user.callback =
                             Some((window.procedure, [a[0], a[1], a[2], a[3]]));
                         return Ok(0);
                     }
