@@ -1,12 +1,12 @@
-//! The Win32 DLL surface regression.
+//! Legacy PE scaffold and guest runtime DLL regression.
 //!
-//! The DLLs that ship in `C:\Windows\System32` are the Ring 3
-//! boundary of NT61. This test verifies that each emitted image
+//! Scaffold tests validate PE/loader mechanics, not executable Win32 behavior.
+//! Runtime tests below separately validate catalog-generated guest thunks.
+//! This test verifies that each emitted scaffold image
 //!
-//!   * is a PE32+ DLL with the **GUI subsystem** (2) — not the
-//!     EFI-application subsystem (0x0A) the driver images use;
+//!   * is a PE32+ DLL with the subsystem/version fields captured from SP1;
 //!   * exports exactly the symbols the specification lists, with
-//!     1-based ordinals;
+//!     original SP1 AMD64 ordinals;
 //!   * imports exactly the modules and symbols the specification
 //!     lists;
 //!   * does not fabricate relocations for position-independent code.
@@ -30,8 +30,56 @@ fn build(name: &str) -> Vec<u8> {
     win32_dlls::build_dll_image(spec)
 }
 
+fn assert_reference_header(name: &str, x64: bool, bytes: &[u8]) {
+    let reference: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../docs/desktop/baselines/win7-sp1-window-placement/pe-headers.json"
+    )).expect("captured original headers");
+    let expected = &reference["modules"][if x64 { "x64" } else { "x86" }][name];
+    assert!(expected.is_object(), "missing original header evidence: {name}");
+    let pe_offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let opt = pe_offset + 24;
+    let read = |offset| u16::from_le_bytes(bytes[opt + offset..opt + offset + 2].try_into().unwrap());
+    assert_eq!(read(68) as u64, expected["subsystem"].as_u64().unwrap(), "{name}: subsystem");
+    for (field, offset) in [("os_version", 40), ("subsystem_version", 48)] {
+        for i in 0..2 {
+            assert_eq!(read(offset + i * 2) as u64, expected[field][i].as_u64().unwrap(), "{name}: {field}[{i}]");
+        }
+    }
+}
+
 #[test]
-fn every_dll_is_a_gui_subsystem_pe32_plus_dll() {
+fn guest_facades_require_an_original_sp1_module_for_the_requested_bitness() {
+    for x64 in [false, true] {
+        let names: BTreeSet<_> = win32_dlls::runtime_library_names_for_arch(x64).collect();
+        for name in &names {
+            assert!(win32_dlls::sp1_reference::HEADERS.iter()
+                .any(|h| h.x64 == x64 && h.name.eq_ignore_ascii_case(name)),
+                "runtime DLL has no original SP1 identity: {name}");
+        }
+        for absent in ["api-ms-win-core-file-l1-2-0.dll", "api-ms-win-core-file-l2-1-0.dll",
+            "api-ms-win-core-localization-l1-2-0.dll", "api-ms-win-core-processthreads-l1-1-1.dll",
+            "api-ms-win-core-synch-l1-2-0.dll", "api-ms-win-core-timezone-l1-1-0.dll",
+            "api-ms-win-unknown-l1-1-0.dll"] {
+            assert!(!names.contains(absent));
+            assert!(win32_dlls::build_runtime_dll(absent, x64).is_none(), "{absent}");
+            assert!(!win32_dlls::runtime_manifest(x64).contains(absent));
+        }
+        assert!(names.contains("api-ms-win-core-localization-l1-1-0.dll"));
+    }
+}
+
+#[test]
+fn guest_runtime_headers_match_original_per_bitness() {
+    for x64 in [false, true] {
+        for name in win32_dlls::runtime_library_names_for_arch(x64) {
+            let bytes = win32_dlls::build_runtime_dll(name, x64).expect("runtime image");
+            assert_reference_header(name, x64, &bytes);
+        }
+    }
+}
+
+#[test]
+fn every_dll_preserves_original_sp1_subsystem_and_versions() {
     for spec in win32_dlls::ALL_DLLS {
         let bytes = win32_dlls::build_dll_image(spec);
         let image = pe_read::parse(&bytes)
@@ -45,13 +93,7 @@ fn every_dll_is_a_gui_subsystem_pe32_plus_dll() {
             "{}: must be marked as a DLL",
             spec.file_name
         );
-        assert_eq!(
-            image.subsystem,
-            pe::IMAGE_SUBSYSTEM_WINDOWS_GUI,
-            "{}: the subsystem must be 2 (Windows GUI), not {}",
-            spec.file_name,
-            image.subsystem
-        );
+        assert_reference_header(spec.file_name, true, &bytes);
         assert_ne!(
             image.subsystem,
             pe::IMAGE_SUBSYSTEM_EFI_APPLICATION,
@@ -84,20 +126,25 @@ fn every_dll_exports_exactly_the_specified_symbols() {
 }
 
 #[test]
-fn every_dll_uses_one_based_ordinals_in_specification_order() {
+fn every_scaffold_export_preserves_original_sp1_ordinal() {
     for spec in win32_dlls::ALL_DLLS {
         let bytes = win32_dlls::build_dll_image(spec);
         let image = pe_read::parse(&bytes).expect("parse");
 
         assert_eq!(
-            image.exports_by_ordinal.len(),
+            image.exports_by_ordinal.values().filter(|rva| **rva != 0).count(),
             spec.exports.len(),
             "{}: the number of ordinal slots",
             spec.file_name
         );
 
-        for (index, (name, _)) in spec.exports.iter().enumerate() {
-            let ordinal = index as u16 + 1;
+        let reference: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/desktop/baselines/win7-sp1-window-placement/pe-scaffold-exports.json")).unwrap();
+        let selected = &reference["modules"][spec.file_name]["selected_exports"];
+        assert_eq!(selected.as_object().unwrap().len(), spec.exports.len());
+        for (index, (name, specified)) in spec.exports.iter().enumerate() {
+            let ordinal = selected[*name].as_u64().expect("original name") as u16;
+            assert_eq!(*specified, u32::from(ordinal));
             let rva = image
                 .exports_by_ordinal
                 .get(&ordinal)
@@ -230,9 +277,7 @@ fn the_gdi32_dll_exports_the_documented_win7_surface() {
         "BitBlt",
         "StretchBlt",
         "PatBlt",
-        "AlphaBlend",
-        "FillRect",
-        "DrawEdge",
+        "GdiAlphaBlend",
         "MoveToEx",
         "LineTo",
         "Rectangle",
@@ -241,7 +286,6 @@ fn the_gdi32_dll_exports_the_documented_win7_surface() {
         "Polygon",
         "TextOutW",
         "ExtTextOutW",
-        "DrawTextW",
         "GetTextExtentPoint32W",
         "GetTextMetricsW",
         "CreateSolidBrush",
@@ -276,8 +320,8 @@ fn the_uxtheme_dwmapi_shell32_ole32_and_comctl32_surfaces_are_present() {
                 "GetThemePartSize",
                 "GetThemeMargins",
                 "SetWindowTheme",
-                "GetThemeMetrics",
-                "EnableTheme",
+                "GetThemeMetric",
+                "EnableTheming",
                 "GetCurrentThemeName",
             ],
         ),
@@ -362,24 +406,27 @@ fn the_uxtheme_dwmapi_shell32_ole32_and_comctl32_surfaces_are_present() {
 }
 
 #[test]
-fn the_ntdll_dll_exports_the_win32k_syscall_stubs() {
-    let bytes = build("ntdll.dll");
-    let image = pe_read::parse(&bytes).expect("parse");
-
-    // The `NtUser*`/`NtGdi*` stubs are the Ring 3 → kernel boundary.
-    let user_stubs = image
-        .exports_by_name
-        .keys()
-        .filter(|name| name.starts_with("NtUser"))
-        .count();
-    let gdi_stubs = image
-        .exports_by_name
-        .keys()
-        .filter(|name| name.starts_with("NtGdi"))
-        .count();
-
-    assert!(user_stubs >= 20, "ntdll.dll must expose the NtUser* stubs");
-    assert!(gdi_stubs >= 10, "ntdll.dll must expose the NtGdi* stubs");
+fn sp1_surfaces_do_not_invent_named_win32k_exports_or_ntdll_imports() {
+    for dll in ["ntdll.dll", "user32.dll", "gdi32.dll"] {
+        let bytes = build(dll);
+        let image = pe_read::parse(&bytes).expect("parse");
+        for name in image.exports_by_name.keys() {
+            assert!(
+                !name.starts_with("NtUser") && !name.starts_with("NtGdi"),
+                "{dll}: SP1 has no named export {name}"
+            );
+        }
+    }
+    for imports in [win32_dlls::USER32_IMPORTS, win32_dlls::GDI32_IMPORTS] {
+        for (module, symbols) in imports {
+            for symbol in *symbols {
+                if let pe::ImportSymbol::ByName(name) = symbol {
+                    assert!(!name.starts_with("NtUser") && !name.starts_with("NtGdi"),
+                        "{module}: fabricated win32k import {name}");
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -434,11 +481,11 @@ fn the_loader_accepts_a_dll_once_its_imports_are_resolvable() {
     // The IAT of `user32.dll` must now hold the *resolved* addresses
     // of the ntdll stubs, not the hint/name RVAs.
     let address = db
-        .lookup("ntdll.dll", "NtUserCreateWindowEx")
-        .expect("ntdll must export NtUserCreateWindowEx");
+        .lookup("ntdll.dll", "RtlAllocateHeap")
+        .expect("ntdll must export the native heap helper");
     assert_eq!(
         address,
-        win32_dlls::NTDLL_BASE + u64::from(win32_dlls::stub_rva(15))
+        win32_dlls::NTDLL_BASE + u64::from(win32_dlls::stub_rva(9))
     );
 }
 
@@ -457,6 +504,8 @@ fn guest_runtime_catalog_preserves_bitness_calling_convention_and_stable_service
         assert!(api.arguments <= 16 && api.x86_arguments <= 16);
     }
     for x64 in [false, true] {
+        let user = pe_read::parse(&win32_dlls::build_runtime_dll("user32.dll", x64).unwrap()).unwrap();
+        assert!(user.exports_by_name.contains_key("LoadStringW"));
         for name in win32_dlls::RUNTIME_DLLS {
             let bytes = win32_dlls::build_runtime_dll(name, x64).unwrap();
             let image = pe_read::parse(&bytes).unwrap();
@@ -469,6 +518,16 @@ fn guest_runtime_catalog_preserves_bitness_calling_convention_and_stable_service
                 let rva = *image.exports_by_name.get(api.name).unwrap();
                 let offset = (rva - section.virtual_address + section.pointer_to_raw_data) as usize;
                 let code = &bytes[offset..offset + 16];
+                if api.name == "RtlCaptureContext" {
+                    assert_eq!(code[0],0xe9);
+                    let delta=i32::from_le_bytes(code[1..5].try_into().unwrap());
+                    let target=(offset as i64+5+i64::from(delta)) as usize;
+                    let prefix: &[u8]=if x64 {&[0x50,0x41,0x52,0x41,0x53,0xb8]} else {&[0x50,0x51,0x52,0xb8]};
+                    assert_eq!(&bytes[target..target+prefix.len()],prefix);
+                    assert_eq!(u32::from_le_bytes(bytes[target+prefix.len()..target+prefix.len()+4].try_into().unwrap()),
+                        win32_dlls::catalog::GATEWAY_BASE | api.id);
+                    continue;
+                }
                 assert_eq!(code[0], 0xb8);
                 assert_eq!(
                     u32::from_le_bytes(code[1..5].try_into().unwrap()),
@@ -542,5 +601,97 @@ fn common_dialog_and_control_runtime_dlls_export_both_guest_abis() {
             assert!(controls.exports_by_name.contains_key(*name), "missing {name}");
         }
         assert_eq!(dialog.machine, if x64 { 0x8664 } else { 0x14c });
+    }
+}
+
+#[test]
+fn runtime_packaging_uses_each_requested_host_layout_in_one_process() {
+    let temporary = tempfile::tempdir().unwrap();
+    for arch in ["aarch64", "x86_64", "riscv64", "loongarch64"] {
+        let root = temporary.path().join(arch);
+        let native = root.join("Windows/System32");
+        std::fs::create_dir_all(&native).unwrap();
+        let marker = native.join("native-marker.txt");
+        std::fs::write(&marker, b"preserve native files").unwrap();
+        nt61_tools::fs::build::stage_guest_runtime(arch, &root).unwrap();
+        assert_eq!(std::fs::read(marker).unwrap(), b"preserve native files");
+        for (x64, directory) in [(false, root.join("Windows/SysWOW64")),
+            (true, if arch == "x86_64" { native.clone() } else { root.join("Windows/SysX64") })] {
+            for name in win32_dlls::runtime_library_names_for_arch(x64) {
+                let bytes = std::fs::read(directory.join(name)).unwrap();
+                let image = pe_read::parse(&bytes).unwrap();
+                assert_eq!(image.machine, if x64 { 0x8664 } else { 0x14c });
+                assert_eq!(image.magic, if x64 { 0x20b } else { 0x10b });
+            }
+        }
+        if arch != "x86_64" { assert!(!native.join("ntdll.dll").exists()); }
+    }
+    let invalid = temporary.path().join("invalid");
+    assert!(nt61_tools::fs::build::stage_guest_runtime("invalid", &invalid).is_err());
+    assert!(!invalid.exists());
+}
+
+#[test]
+fn runtime_packaging_rejects_stale_facades_before_overwriting_either_abi() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let x64 = root.join("Windows/System32");
+    let x86 = root.join("Windows/SysWOW64");
+    std::fs::create_dir_all(&x64).unwrap();
+    std::fs::create_dir_all(&x86).unwrap();
+    // Put the stale facade in x64, which is written after x86. Even x86's
+    // existing runtime must survive this failed staging operation intact.
+    let existing = x86.join("ntdll.dll");
+    std::fs::write(&existing, b"preexisting runtime").unwrap();
+    for name in ["api-ms-win-core-ums-l1-1-0.dll",
+                 "api-ms-win-core-localization-l1-2-0.dll",
+                 "API-MS-WIN-UNKNOWN-L1-1-0.DLL"] {
+        let stale = x64.join(name);
+        std::fs::write(&stale, b"preexisting facade").unwrap();
+        let result = nt61_tools::fs::build::stage_guest_runtime("x86_64", root);
+        assert!(result.is_err(), "{name}");
+        assert_eq!(std::fs::read(&stale).unwrap(), b"preexisting facade");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"preexisting runtime");
+        assert!(!x86.join("nt61-runtime-exports.json").exists());
+        std::fs::remove_file(stale).unwrap();
+    }
+    nt61_tools::fs::build::stage_guest_runtime("x86_64", root).unwrap();
+    assert!(x86.join("nt61-runtime-exports.json").exists());
+}
+
+#[test]
+fn shell_runtime_preserves_resource_payloads_and_original_export_ordinals() {
+    for x64 in [false, true] {
+        // Three-level synthetic resource tree: type 3 / icon 1 / language 1033.
+        let mut resource = vec![0u8; 92];
+        for (header, id, child) in [(0usize,3u32,0x80000018u32),(24,1,0x80000030),(48,1033,72)] {
+            resource[header+14..header+16].copy_from_slice(&1u16.to_le_bytes());
+            resource[header+16..header+20].copy_from_slice(&id.to_le_bytes());
+            resource[header+20..header+24].copy_from_slice(&child.to_le_bytes());
+        }
+        // Put .rsrc at RVA 0x2000 to ensure composition actually relocates it.
+        resource[72..76].copy_from_slice(&0x2058u32.to_le_bytes());
+        resource[76..80].copy_from_slice(&4u32.to_le_bytes());
+        resource[88..92].copy_from_slice(b"ICON");
+        let mut spec = pe::PeImageSpec::new(0x400000, 2, true, if x64 {0x8664} else {0x14c});
+        spec.entry_point_rva = 0;
+        spec.sections = vec![pe::SectionSpec::code(vec![0xc3]), pe::SectionSpec { name:".rsrc".into(), characteristics:0x40000040, data:resource }];
+        let mut source = pe::emit(&spec).0;
+        let dd = 0x98 + if x64 {0x70} else {0x60};
+        source[dd+16..dd+20].copy_from_slice(&0x2000u32.to_le_bytes());
+        source[dd+20..dd+24].copy_from_slice(&92u32.to_le_bytes());
+        let bytes = win32_dlls::build_runtime_dll_with_resources("shell32.dll",x64,&source).unwrap();
+        let parsed = pe_read::parse(&bytes).unwrap();
+        let entry = parsed.exports_by_name["SHGetKnownFolderPath"];
+        assert_eq!(parsed.exports_by_ordinal[&382], entry);
+        let section = parsed.sections.iter().find(|s|s.name==".rsrc").unwrap();
+        assert_eq!(parsed.data_directories[2],(section.virtual_address,92));
+        let offset = section.pointer_to_raw_data as usize;
+        assert_eq!(&bytes[offset+88..offset+92], b"ICON");
+        assert_eq!(u32::from_le_bytes(bytes[offset+72..offset+76].try_into().unwrap()), section.virtual_address+88);
+        let ole = pe_read::parse(&win32_dlls::build_runtime_dll("ole32.dll",x64).unwrap()).unwrap();
+        for (name,ordinal) in [("CoTaskMemAlloc",if x64 {117}else{113}),("CoTaskMemFree",if x64 {118}else{114}),("CoTaskMemRealloc",if x64 {119}else{115})] {
+            assert_eq!(ole.exports_by_name[name],ole.exports_by_ordinal[&ordinal]);
+        }
     }
 }

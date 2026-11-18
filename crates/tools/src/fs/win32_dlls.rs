@@ -1,8 +1,10 @@
 //! Native surface metadata and NT61-owned x86/x64 guest runtime DLL factory.
 //!
 //! Guest exports enter a checked runtime gateway; name/ABI availability is
-//! distinct from handler support. ADVAPI32 named ordinals match the audited
-//! Windows 7 SP1 reference; other DLL ordinals are NT61 assignments. Product
+//! distinct from handler support. Guest runtime and foundation facade names
+//! present in the audited Windows 7 SP1 reference use its ordinals.
+//! Additional compatibility names use NT61 private assignments. Native
+//! placeholder metadata retains NT61 numbering. Product
 //! code and thunks are built from source; no Microsoft machine code is shipped.
 
 use super::pe::{ImportSymbol, PeImageSpec, SectionSpec};
@@ -11,6 +13,8 @@ use super::pe::{ImportSymbol, PeImageSpec, SectionSpec};
 pub mod catalog;
 #[path = "../../../arch/src/arch/common/btl/win32/advapi/ordinals.rs"]
 mod advapi_ordinals;
+#[path = "sp1_reference.rs"]
+pub mod sp1_reference;
 #[path = "../../../abi/src/syscall_metadata.rs"]
 pub mod syscall_metadata;
 
@@ -19,27 +23,27 @@ pub mod syscall_metadata;
 // =====================================================================
 
 /// `ntdll.dll` — the lowest DLL, mapped first.
-pub const NTDLL_BASE: u64 = 0x0000_1000_0000_0000;
+pub const NTDLL_BASE: u64 = 0x0000_0700_0000_0000;
 /// `kernel32.dll`.
-pub const KERNEL32_BASE: u64 = 0x0000_1000_1000_0000;
+pub const KERNEL32_BASE: u64 = 0x0000_0700_1000_0000;
 /// `user32.dll`.
-pub const USER32_BASE: u64 = 0x0000_1000_2000_0000;
+pub const USER32_BASE: u64 = 0x0000_0700_2000_0000;
 /// `gdi32.dll`.
-pub const GDI32_BASE: u64 = 0x0000_1000_3000_0000;
+pub const GDI32_BASE: u64 = 0x0000_0700_3000_0000;
 /// `uxtheme.dll`.
-pub const UXTHEME_BASE: u64 = 0x0000_1000_4000_0000;
+pub const UXTHEME_BASE: u64 = 0x0000_0700_4000_0000;
 /// `dwmapi.dll`.
-pub const DWMAPI_BASE: u64 = 0x0000_1000_5000_0000;
+pub const DWMAPI_BASE: u64 = 0x0000_0700_5000_0000;
 /// `shell32.dll`.
-pub const SHELL32_BASE: u64 = 0x0000_1000_6000_0000;
+pub const SHELL32_BASE: u64 = 0x0000_0700_6000_0000;
 /// `ole32.dll`.
-pub const OLE32_BASE: u64 = 0x0000_1000_7000_0000;
+pub const OLE32_BASE: u64 = 0x0000_0700_7000_0000;
 /// `oleaut32.dll`.
-pub const OLEAUT32_BASE: u64 = 0x0000_1000_8000_0000;
+pub const OLEAUT32_BASE: u64 = 0x0000_0700_8000_0000;
 /// `comctl32.dll`.
-pub const COMCTL32_BASE: u64 = 0x0000_1000_9000_0000;
+pub const COMCTL32_BASE: u64 = 0x0000_0700_9000_0000;
 /// `comdlg32.dll`.
-pub const COMDLG32_BASE: u64 = 0x0000_1000_c000_0000;
+pub const COMDLG32_BASE: u64 = 0x0000_0700_c000_0000;
 
 /// `IMAGE_FILE_MACHINE_AMD64`.
 pub const MACHINE_AMD64: u16 = 0x8664;
@@ -69,7 +73,7 @@ pub struct DllSpec {
     pub file_name: &'static str,
     /// The preferred load address.
     pub image_base: u64,
-    /// The exported symbols, in ordinal order.
+    /// Exported names and their original SP1 AMD64 ordinals; array order sets code RVAs.
     pub exports: &'static [(&'static str, u32)],
     /// The imported modules and symbols.
     pub imports: &'static [(&'static str, &'static [ImportSymbol])],
@@ -78,326 +82,241 @@ pub struct DllSpec {
 /// The `ntdll.dll` surface.
 ///
 /// `ntdll.dll` is the boundary between Ring 3 and the kernel. Every
-/// `Nt*` entry is a syscall stub; the `Rtl*` entries are the
-/// run-time library helpers that sit on top of the native calls.
+/// native service belongs here; win32k entry points belong inside user32/gdi32.
+/// This specification describes a legacy placeholder surface, not implementations
+/// of the native services or runtime helpers.
 pub const NTDLL_EXPORTS: &[(&str, u32)] = &[
     // --- Native system services -------------------------------------
-    ("NtAllocateVirtualMemory", 0),
-    ("NtClose", 1),
-    ("NtCreateFile", 2),
-    ("NtDeviceIoControlFile", 3),
-    ("NtFreeVirtualMemory", 4),
-    ("NtQuerySystemInformation", 5),
-    ("NtReadFile", 6),
-    ("NtWriteFile", 7),
-    ("NtWaitForSingleObject", 8),
+    ("NtAllocateVirtualMemory", 192),
+    ("NtClose", 223),
+    ("NtCreateFile", 239),
+    ("NtDeviceIoControlFile", 280),
+    ("NtFreeVirtualMemory", 304),
+    ("NtQuerySystemInformation", 435),
+    ("NtReadFile", 447),
+    ("NtWriteFile", 570),
+    ("NtWaitForSingleObject", 565),
     // --- Run-time library --------------------------------------------
-    ("RtlAllocateHeap", 9),
-    ("RtlFreeHeap", 10),
-    ("RtlUserThreadStart", 11),
-    ("RtlInitUnicodeString", 12),
-    ("LdrLoadDll", 13),
-    ("LdrGetProcedureAddress", 14),
-    // --- Win32k (USER) syscall stubs --------------------------------
-    ("NtUserCreateWindowEx", 15),
-    ("NtUserDestroyWindow", 16),
-    ("NtUserGetMessage", 17),
-    ("NtUserPeekMessage", 18),
-    ("NtUserTranslateMessage", 19),
-    ("NtUserDispatchMessage", 20),
-    ("NtUserSendMessage", 21),
-    ("NtUserPostMessage", 22),
-    ("NtUserSetWindowPos", 23),
-    ("NtUserShowWindow", 24),
-    ("NtUserMoveWindow", 25),
-    ("NtUserBeginPaint", 26),
-    ("NtUserEndPaint", 27),
-    ("NtUserGetDC", 28),
-    ("NtUserReleaseDC", 29),
-    ("NtUserInvalidateRect", 30),
-    ("NtUserSetWindowText", 31),
-    ("NtUserGetWindowText", 32),
-    ("NtUserGetSystemMetrics", 33),
-    ("NtUserGetCursorPos", 34),
-    ("NtUserSetCapture", 35),
-    ("NtUserGetCapture", 36),
-    ("NtUserRegisterClassEx", 37),
-    ("NtUserDefWindowProc", 38),
-    ("NtUserCallWindowProc", 39),
-    ("NtUserGetMessagePos", 40),
-    ("NtUserBlockInput", 41),
-    // --- Win32k (GDI) syscall stubs ---------------------------------
-    ("NtGdiGetDC", 42),
-    ("NtGdiCreateCompatibleDC", 43),
-    ("NtGdiDeleteDC", 44),
-    ("NtGdiSelectObject", 45),
-    ("NtGdiDeleteObject", 46),
-    ("NtGdiBitBlt", 47),
-    ("NtGdiStretchBlt", 48),
-    ("NtGdiPatBlt", 49),
-    ("NtGdiFillRect", 50),
-    ("NtGdiExtTextOutW", 51),
-    ("NtGdiSelectFont", 52),
-    ("NtGdiSetTextColor", 53),
-    ("NtGdiSetBkMode", 54),
-    ("NtGdiCreateRectRgn", 55),
-    ("NtGdiIntersectClipRect", 56),
-    ("NtGdiFlush", 57),
-    ("NtGdiGetTextExtentPoint32W", 58),
+    ("RtlAllocateHeap", 622),
+    ("RtlFreeHeap", 852),
+    ("RtlUserThreadStart", 1265),
+    ("RtlInitUnicodeString", 940),
+    ("LdrLoadDll", 132),
+    ("LdrGetProcedureAddress", 125),
+
 ];
 
 /// The `kernel32.dll` surface.
 pub const KERNEL32_EXPORTS: &[(&str, u32)] = &[
-    ("CloseHandle", 0),
-    ("CreateFileW", 1),
-    ("GetLastError", 2),
-    ("SetLastError", 3),
-    ("GetProcAddress", 4),
-    ("GetModuleHandleW", 5),
-    ("LoadLibraryW", 6),
-    ("ReadFile", 7),
-    ("Sleep", 8),
-    ("VirtualAlloc", 9),
-    ("VirtualFree", 10),
-    ("WriteFile", 11),
+    ("CloseHandle", 83),
+    ("CreateFileW", 144),
+    ("GetLastError", 519),
+    ("SetLastError", 1152),
+    ("GetProcAddress", 587),
+    ("GetModuleHandleW", 541),
+    ("LoadLibraryW", 835),
+    ("ReadFile", 964),
+    ("Sleep", 1218),
+    ("VirtualAlloc", 1274),
+    ("VirtualFree", 1277),
+    ("WriteFile", 1334),
 ];
 
 /// The `user32.dll` surface.
 pub const USER32_EXPORTS: &[(&str, u32)] = &[
-    ("BeginPaint", 0),
-    ("CreateWindowExW", 1),
-    ("DefWindowProcW", 2),
-    ("DestroyWindow", 3),
-    ("DispatchMessageW", 4),
-    ("DrawTextW", 5),
-    ("EndPaint", 6),
-    ("GetClientRect", 7),
-    ("GetDC", 8),
-    ("GetMessageW", 9),
-    ("GetSystemMetrics", 10),
-    ("GetWindowTextW", 11),
-    ("InvalidateRect", 12),
-    ("MessageBoxW", 13),
-    ("PeekMessageW", 14),
-    ("RegisterClassExW", 15),
-    ("ReleaseDC", 16),
-    ("SendMessageW", 17),
-    ("SetWindowPos", 18),
-    ("SetWindowTextW", 19),
-    ("ShowWindow", 20),
-    ("TranslateMessage", 21),
-    ("PostMessageW", 22),
-    ("PostQuitMessage", 23),
-    ("GetCursorPos", 24),
-    ("SetCapture", 25),
-    ("ReleaseCapture", 26),
-    ("GetForegroundWindow", 27),
-    ("SetForegroundWindow", 28),
-    ("OpenWindowStationW", 29),
-    ("CreateDesktopW", 30),
-    ("SwitchDesktop", 31),
-    ("GetWindowRect", 32),
+    ("BeginPaint", 1516),
+    ("CreateWindowExW", 1619),
+    ("DefWindowProcW", 1665),
+    ("DestroyWindow", 1675),
+    ("DispatchMessageW", 1684),
+    ("DrawTextW", 1717),
+    ("EndPaint", 1729),
+    ("GetClientRect", 1787),
+    ("GetDC", 1800),
+    ("GetMessageW", 1860),
+    ("GetSystemMetrics", 1893),
+    ("GetWindowTextW", 1932),
+    ("InvalidateRect", 1959),
+    ("MessageBoxW", 2050),
+    ("PeekMessageW", 2080),
+    ("RegisterClassExW", 2106),
+    ("ReleaseDC", 2130),
+    ("SendMessageW", 2153),
+    ("SetWindowPos", 2231),
+    ("SetWindowTextW", 2236),
+    ("ShowWindow", 2256),
+    ("TranslateMessage", 2285),
+    ("PostMessageW", 2083),
+    ("PostQuitMessage", 2084),
+    ("GetCursorPos", 1799),
+    ("SetCapture", 2157),
+    ("ReleaseCapture", 2129),
+    ("GetForegroundWindow", 1812),
+    ("SetForegroundWindow", 2178),
+    ("OpenWindowStationW", 2074),
+    ("CreateDesktopW", 1603),
+    ("SwitchDesktop", 2265),
+    ("GetWindowRect", 1925),
+    ("FillRect", 1755),
+    ("DrawEdge", 1704),
 ];
 
 /// The `gdi32.dll` surface.
 pub const GDI32_EXPORTS: &[(&str, u32)] = &[
-    ("BitBlt", 0),
-    ("CreateCompatibleDC", 1),
-    ("CreateDIBSection", 2),
-    ("CreateFontIndirectW", 3),
-    ("CreatePen", 4),
-    ("CreateSolidBrush", 5),
-    ("DeleteObject", 6),
-    ("Ellipse", 7),
-    ("ExtTextOutW", 8),
-    ("FillRect", 9),
-    ("GetStockObject", 10),
-    ("GetTextExtentPoint32W", 11),
-    ("GetTextMetricsW", 12),
-    ("IntersectClipRect", 13),
-    ("LineTo", 14),
-    ("MoveToEx", 15),
-    ("Polygon", 16),
-    ("Rectangle", 17),
-    ("RoundRect", 18),
-    ("SelectObject", 19),
-    ("SetBkMode", 20),
-    ("SetTextColor", 21),
-    ("StretchBlt", 22),
-    ("TextOutW", 23),
-    ("PatBlt", 24),
-    ("AlphaBlend", 25),
-    ("DrawEdge", 26),
-    ("GdiFlush", 27),
-    ("DrawTextW", 28),
-    ("CreateRectRgn", 29),
+    ("BitBlt", 1031),
+    ("CreateCompatibleDC", 1060),
+    ("CreateDIBSection", 1065),
+    ("CreateFontIndirectW", 1076),
+    ("CreatePen", 1087),
+    ("CreateSolidBrush", 1096),
+    ("DeleteObject", 1242),
+    ("Ellipse", 1249),
+    ("ExtTextOutW", 1324),
+    ("GetStockObject", 1537),
+    ("GetTextExtentPoint32W", 1554),
+    ("GetTextMetricsW", 1562),
+    ("IntersectClipRect", 1572),
+    ("LineTo", 1578),
+    ("MoveToEx", 1582),
+    ("Polygon", 1610),
+    ("Rectangle", 1619),
+    ("RoundRect", 1630),
+    ("SelectObject", 1643),
+    ("SetBkMode", 1651),
+    ("SetTextColor", 1690),
+    ("StretchBlt", 1703),
+    ("TextOutW", 1709),
+    ("PatBlt", 1594),
+    ("GdiAlphaBlend", 1343),
+    ("GdiFlush", 1385),
+    ("CreateRectRgn", 1091),
 ];
 
 /// The `uxtheme.dll` surface.
 pub const UXTHEME_EXPORTS: &[(&str, u32)] = &[
-    ("CloseThemeData", 0),
-    ("DrawThemeBackground", 1),
-    ("DrawThemeText", 2),
-    ("EnableTheme", 3),
-    ("GetCurrentThemeName", 4),
-    ("GetThemeColor", 5),
-    ("GetThemeMargins", 6),
-    ("GetThemeMetrics", 7),
-    ("GetThemePartSize", 8),
-    ("IsThemeActive", 9),
-    ("OpenThemeData", 10),
-    ("SetWindowTheme", 11),
+    ("CloseThemeData", 53),
+    ("DrawThemeBackground", 54),
+    ("DrawThemeText", 59),
+    ("EnableTheming", 87),
+    ("GetCurrentThemeName", 94),
+    ("GetThemeColor", 101),
+    ("GetThemeMargins", 108),
+    ("GetThemeMetric", 109),
+    ("GetThemePartSize", 110),
+    ("IsThemeActive", 130),
+    ("OpenThemeData", 134),
+    ("SetWindowTheme", 136),
 ];
 
 /// The `dwmapi.dll` surface.
 pub const DWMAPI_EXPORTS: &[(&str, u32)] = &[
-    ("DwmEnableComposition", 0),
-    ("DwmExtendFrameIntoClientArea", 1),
-    ("DwmFlush", 2),
-    ("DwmGetWindowAttribute", 3),
-    ("DwmIsCompositionEnabled", 4),
-    ("DwmRegisterThumbnail", 5),
-    ("DwmSetIconicLivePreviewBitmap", 6),
-    ("DwmSetIconicThumbnail", 7),
-    ("DwmSetWindowAttribute", 8),
-    ("DwmUnregisterThumbnail", 9),
-    ("DwmUpdateThumbnailProperties", 10),
+    ("DwmEnableComposition", 102),
+    ("DwmExtendFrameIntoClientArea", 135),
+    ("DwmFlush", 136),
+    ("DwmGetWindowAttribute", 142),
+    ("DwmIsCompositionEnabled", 144),
+    ("DwmRegisterThumbnail", 147),
+    ("DwmSetIconicLivePreviewBitmap", 149),
+    ("DwmSetIconicThumbnail", 150),
+    ("DwmSetWindowAttribute", 152),
+    ("DwmUnregisterThumbnail", 153),
+    ("DwmUpdateThumbnailProperties", 154),
 ];
 
 /// The `shell32.dll` surface.
 pub const SHELL32_EXPORTS: &[(&str, u32)] = &[
-    ("ExtractIconExW", 0),
-    ("SHChangeNotify", 1),
-    ("SHGetFileInfoW", 2),
-    ("SHGetFolderPathW", 3),
-    ("SHGetKnownFolderPath", 4),
-    ("SHParseDisplayName", 5),
-    ("ShellExecuteExW", 6),
-    ("Shell_NotifyIconW", 7),
+    ("ExtractIconExW", 293),
+    ("SHChangeNotify", 324),
+    ("SHGetFileInfoW", 367),
+    ("SHGetFolderPathW", 373),
+    ("SHGetKnownFolderPath", 382),
+    ("SHParseDisplayName", 408),
+    ("ShellExecuteExW", 436),
+    ("Shell_NotifyIconW", 444),
 ];
 
 /// The `ole32.dll` surface.
 pub const OLE32_EXPORTS: &[(&str, u32)] = &[
-    ("CLSIDFromString", 0),
-    ("CoCreateInstance", 1),
-    ("CoInitializeEx", 2),
-    ("CoTaskMemAlloc", 3),
-    ("CoTaskMemFree", 4),
-    ("CoUninitialize", 5),
-    ("StringFromCLSID", 6),
+    ("CLSIDFromString", 22),
+    ("CoCreateInstance", 30),
+    ("CoInitializeEx", 77),
+    ("CoTaskMemAlloc", 117),
+    ("CoTaskMemFree", 118),
+    ("CoUninitialize", 122),
+    ("StringFromCLSID", 437),
 ];
 
 /// The `oleaut32.dll` surface.
 pub const OLEAUT32_EXPORTS: &[(&str, u32)] = &[
-    ("SafeArrayCreate", 0),
-    ("SafeArrayDestroy", 1),
+    ("SafeArrayCreate", 15),
+    ("SafeArrayDestroy", 16),
     ("SysAllocString", 2),
-    ("SysFreeString", 3),
-    ("VariantClear", 4),
-    ("VariantInit", 5),
+    ("SysFreeString", 6),
+    ("VariantClear", 9),
+    ("VariantInit", 8),
 ];
 
 /// The Windows 7 common-dialog export surface.
 pub const COMDLG32_EXPORTS: &[(&str, u32)] = &[
-    ("CommDlgExtendedError", 0),
-    ("GetOpenFileNameA", 1),
-    ("GetOpenFileNameW", 2),
-    ("GetSaveFileNameA", 3),
-    ("GetSaveFileNameW", 4),
-    ("ChooseFontA", 5),
-    ("ChooseFontW", 6),
-    ("ChooseColorA", 7),
-    ("ChooseColorW", 8),
-    ("PrintDlgA", 9),
-    ("PrintDlgW", 10),
-    ("PageSetupDlgA", 11),
-    ("PageSetupDlgW", 12),
-    ("GetFileTitleA", 13),
-    ("GetFileTitleW", 14),
+    ("CommDlgExtendedError", 106),
+    ("GetOpenFileNameA", 113),
+    ("GetOpenFileNameW", 114),
+    ("GetSaveFileNameA", 115),
+    ("GetSaveFileNameW", 116),
+    ("ChooseFontA", 104),
+    ("ChooseFontW", 105),
+    ("ChooseColorA", 102),
+    ("ChooseColorW", 103),
+    ("PrintDlgA", 120),
+    ("PrintDlgW", 123),
+    ("PageSetupDlgA", 118),
+    ("PageSetupDlgW", 119),
+    ("GetFileTitleA", 111),
+    ("GetFileTitleW", 112),
 ];
 
 /// The `comctl32.dll` (v6) surface.
 pub const COMCTL32_EXPORTS: &[(&str, u32)] = &[
-    ("CreatePropertySheetPageW", 0),
-    ("CreateStatusWindowW", 1),
-    ("CreateToolbarEx", 2),
-    ("DestroyPropertySheetPage", 3),
-    ("ImageList_Add", 4),
-    ("ImageList_AddIcon", 5),
-    ("ImageList_Create", 6),
-    ("ImageList_Destroy", 7),
-    ("ImageList_GetIcon", 8),
-    ("ImageList_SetIconSize", 9),
-    ("InitCommonControlsEx", 10),
-    ("InitMUILanguage", 11),
-    ("PropertySheetW", 12),
-    ("InitCommonControls", 13),
-    ("GetMUILanguage", 14),
-    ("DllGetVersion", 15),
-    ("ImageList_GetImageCount", 16),
-    ("ImageList_GetIconSize", 17),
-    ("ImageList_SetImageCount", 18),
-    ("ImageList_Remove", 19),
+    ("CreatePropertySheetPageW", 19),
+    ("CreateStatusWindowW", 21),
+    ("CreateToolbarEx", 22),
+    ("DestroyPropertySheetPage", 23),
+    ("ImageList_Add", 39),
+    ("ImageList_AddIcon", 40),
+    ("ImageList_Create", 44),
+    ("ImageList_Destroy", 45),
+    ("ImageList_GetIcon", 58),
+    ("ImageList_SetIconSize", 79),
+    ("InitCommonControlsEx", 83),
+    ("InitMUILanguage", 84),
+    ("PropertySheetW", 88),
+    ("InitCommonControls", 17),
+    ("GetMUILanguage", 38),
+    ("DllGetVersion", 24),
+    ("ImageList_GetImageCount", 60),
+    ("ImageList_GetIconSize", 59),
+    ("ImageList_SetImageCount", 80),
+    ("ImageList_Remove", 68),
 ];
 
-/// The `user32.dll` imports.
+/// Limited native imports for the legacy PE/loader scaffold.
 ///
-/// `user32.dll` talks to the kernel exclusively through `ntdll.dll`'s
-/// `NtUser*` stubs, exactly as on Windows 7.
+/// All four names occur in the original SP1 user32/gdi32 import tables.
+/// SP1 keeps its win32k syscall entry points internal to user32/gdi32;
+/// neither DLL imports named NtUser/NtGdi entry points from ntdll.
+/// This scaffold does not implement those entry points or the complete imports.
 pub const USER32_IMPORTS: &[(&str, &[ImportSymbol])] = &[(
     "ntdll.dll",
     &[
-        ImportSymbol::ByName("NtUserCreateWindowEx"),
-        ImportSymbol::ByName("NtUserDestroyWindow"),
-        ImportSymbol::ByName("NtUserGetMessage"),
-        ImportSymbol::ByName("NtUserPeekMessage"),
-        ImportSymbol::ByName("NtUserTranslateMessage"),
-        ImportSymbol::ByName("NtUserDispatchMessage"),
-        ImportSymbol::ByName("NtUserSendMessage"),
-        ImportSymbol::ByName("NtUserPostMessage"),
-        ImportSymbol::ByName("NtUserSetWindowPos"),
-        ImportSymbol::ByName("NtUserShowWindow"),
-        ImportSymbol::ByName("NtUserMoveWindow"),
-        ImportSymbol::ByName("NtUserBeginPaint"),
-        ImportSymbol::ByName("NtUserEndPaint"),
-        ImportSymbol::ByName("NtUserGetDC"),
-        ImportSymbol::ByName("NtUserReleaseDC"),
-        ImportSymbol::ByName("NtUserInvalidateRect"),
-        ImportSymbol::ByName("NtUserSetWindowText"),
-        ImportSymbol::ByName("NtUserGetWindowText"),
-        ImportSymbol::ByName("NtUserGetSystemMetrics"),
-        ImportSymbol::ByName("NtUserGetCursorPos"),
-        ImportSymbol::ByName("NtUserSetCapture"),
-        ImportSymbol::ByName("NtUserGetCapture"),
-        ImportSymbol::ByName("NtUserRegisterClassEx"),
-        ImportSymbol::ByName("NtUserDefWindowProc"),
-        ImportSymbol::ByName("NtUserCallWindowProc"),
-        ImportSymbol::ByName("NtUserBlockInput"),
+        ImportSymbol::ByName("RtlAllocateHeap"),
+        ImportSymbol::ByName("RtlFreeHeap"),
+        ImportSymbol::ByName("RtlInitUnicodeString"),
+        ImportSymbol::ByName("NtClose"),
     ],
 )];
 
-/// The `gdi32.dll` imports.
-pub const GDI32_IMPORTS: &[(&str, &[ImportSymbol])] = &[(
-    "ntdll.dll",
-    &[
-        ImportSymbol::ByName("NtGdiCreateCompatibleDC"),
-        ImportSymbol::ByName("NtGdiDeleteDC"),
-        ImportSymbol::ByName("NtGdiSelectObject"),
-        ImportSymbol::ByName("NtGdiDeleteObject"),
-        ImportSymbol::ByName("NtGdiBitBlt"),
-        ImportSymbol::ByName("NtGdiStretchBlt"),
-        ImportSymbol::ByName("NtGdiPatBlt"),
-        ImportSymbol::ByName("NtGdiFillRect"),
-        ImportSymbol::ByName("NtGdiExtTextOutW"),
-        ImportSymbol::ByName("NtGdiSelectFont"),
-        ImportSymbol::ByName("NtGdiSetTextColor"),
-        ImportSymbol::ByName("NtGdiSetBkMode"),
-        ImportSymbol::ByName("NtGdiCreateRectRgn"),
-        ImportSymbol::ByName("NtGdiIntersectClipRect"),
-        ImportSymbol::ByName("NtGdiFlush"),
-        ImportSymbol::ByName("NtGdiGetTextExtentPoint32W"),
-    ],
-)];
+/// The same observed native subset for the legacy gdi32 scaffold.
+pub const GDI32_IMPORTS: &[(&str, &[ImportSymbol])] = USER32_IMPORTS;
 
 /// The `kernel32.dll` imports.
 pub const KERNEL32_IMPORTS: &[(&str, &[ImportSymbol])] = &[(
@@ -566,6 +485,7 @@ fn build_dll_image_native(spec: &DllSpec, machine: u16, return_code: &[u8]) -> V
         true,
         machine,
     );
+    apply_reference_header(&mut image, spec.file_name, machine != 0x014c);
     image.module_name = spec.file_name.to_string();
     image.entry_point_rva = 0; // No DllMain; export zero is not an initializer.
 
@@ -576,9 +496,9 @@ fn build_dll_image_native(spec: &DllSpec, machine: u16, return_code: &[u8]) -> V
         text[at..at + return_code.len()].copy_from_slice(return_code);
     }
 
-    // The exports. The ordinal is 1-based, matching Windows.
-    for (index, (name, _)) in spec.exports.iter().enumerate() {
-        image.export_named(name, index as u16 + 1, stub_rva(index as u32));
+    // Preserve original SP1 ordinals independently of the code array order.
+    for (index, (name, ordinal)) in spec.exports.iter().enumerate() {
+        image.export_named(name, u16::try_from(*ordinal).expect("SP1 export ordinal"), stub_rva(index as u32));
     }
 
     // The imports.
@@ -601,272 +521,137 @@ fn build_dll_image_native(spec: &DllSpec, machine: u16, return_code: &[u8]) -> V
 
 /// DLLs backed by the isolated x86/x64 runtime gateway. Keeping this set
 /// explicit avoids confusing native architecture placeholders with guest code.
-pub const RUNTIME_DLLS: &[&str] = &["kernel32.dll", "ntdll.dll", "crypt32.dll", "advapi32.dll", "comdlg32.dll", "comctl32.dll", "gdi32.dll", "user32.dll", "bcrypt.dll"];
+pub const RUNTIME_DLLS: &[&str] = &["kernel32.dll", "ntdll.dll", "crypt32.dll", "advapi32.dll", "comdlg32.dll", "comctl32.dll", "gdi32.dll", "user32.dll", "bcrypt.dll", "shell32.dll", "ole32.dll"];
 
-/// Exact API-set contracts imported by the supplied Firefox UCRT/VCRuntime
-/// packages (both bitnesses). This is a bounded compatibility map, not a prefix
-/// alias accepting arbitrary API-set names. Export names came from import
-/// metadata; implementations are separately checked NT61 runtime handlers.
-pub const APISET_CONTRACTS: &[(&str, &[&str])] = &[
-    (
-        "api-ms-win-core-console-l1-1-0.dll",
-        &[
-            "GetConsoleCP",
-            "GetConsoleMode",
-            "GetConsoleOutputCP",
-            "GetNumberOfConsoleInputEvents",
-            "PeekConsoleInputA",
-            "ReadConsoleInputW",
-            "ReadConsoleW",
-            "SetConsoleCtrlHandler",
-            "SetConsoleMode",
-            "WriteConsoleW",
-        ],
-    ),
-    (
-        "api-ms-win-core-datetime-l1-1-0.dll",
-        &["GetDateFormatW", "GetTimeFormatW"],
-    ),
-    (
-        "api-ms-win-core-debug-l1-1-0.dll",
-        &["IsDebuggerPresent", "OutputDebugStringW"],
-    ),
-    (
-        "api-ms-win-core-errorhandling-l1-1-0.dll",
-        &[
-            "GetLastError",
-            "RaiseException",
-            "SetErrorMode",
-            "SetLastError",
-            "SetUnhandledExceptionFilter",
-            "UnhandledExceptionFilter",
-        ],
-    ),
-    (
-        "api-ms-win-core-file-l1-1-0.dll",
-        &[
-            "CreateDirectoryW",
-            "CreateFileW",
-            "DeleteFileW",
-            "FindClose",
-            "FindFirstFileExW",
-            "FindNextFileW",
-            "FlushFileBuffers",
-            "GetDiskFreeSpaceW",
-            "GetDriveTypeW",
-            "GetFileAttributesExW",
-            "GetFileInformationByHandle",
-            "GetFileSizeEx",
-            "GetFileType",
-            "GetFullPathNameW",
-            "GetLogicalDrives",
-            "LockFileEx",
-            "ReadFile",
-            "RemoveDirectoryW",
-            "SetEndOfFile",
-            "SetFileAttributesW",
-            "SetFilePointerEx",
-            "SetFileTime",
-            "UnlockFileEx",
-            "WriteFile",
-        ],
-    ),
-    ("api-ms-win-core-file-l1-2-0.dll", &["GetTempPathW"]),
-    ("api-ms-win-core-file-l2-1-0.dll", &["MoveFileExW"]),
-    (
-        "api-ms-win-core-handle-l1-1-0.dll",
-        &["CloseHandle", "DuplicateHandle"],
-    ),
-    (
-        "api-ms-win-core-heap-l1-1-0.dll",
-        &[
-            "GetProcessHeap",
-            "HeapAlloc",
-            "HeapCompact",
-            "HeapFree",
-            "HeapQueryInformation",
-            "HeapReAlloc",
-            "HeapSize",
-            "HeapValidate",
-            "HeapWalk",
-        ],
-    ),
-    (
-        "api-ms-win-core-interlocked-l1-1-0.dll",
-        &["InterlockedFlushSList", "InterlockedPushEntrySList"],
-    ),
-    (
-        "api-ms-win-core-libraryloader-l1-1-0.dll",
-        &[
-            "FreeLibrary",
-            "FreeLibraryAndExitThread",
-            "GetModuleFileNameW",
-            "GetModuleHandleExW",
-            "GetModuleHandleW",
-            "GetProcAddress",
-            "LoadLibraryExW",
-        ],
-    ),
-    (
-        "api-ms-win-core-localization-l1-2-0.dll",
-        &[
-            "EnumSystemLocalesW",
-            "GetACP",
-            "GetCPInfo",
-            "GetLocaleInfoW",
-            "GetOEMCP",
-            "GetUserDefaultLCID",
-            "IsValidCodePage",
-            "IsValidLocale",
-            "LCMapStringW",
-        ],
-    ),
-    (
-        "api-ms-win-core-memory-l1-1-0.dll",
-        &["VirtualAlloc", "VirtualProtect", "VirtualQuery"],
-    ),
-    (
-        "api-ms-win-core-namedpipe-l1-1-0.dll",
-        &["CreatePipe", "PeekNamedPipe"],
-    ),
-    (
-        "api-ms-win-core-processenvironment-l1-1-0.dll",
-        &[
-            "FreeEnvironmentStringsW",
-            "GetCommandLineA",
-            "GetCommandLineW",
-            "GetCurrentDirectoryW",
-            "GetEnvironmentStringsW",
-            "GetStdHandle",
-            "SetCurrentDirectoryW",
-            "SetEnvironmentVariableW",
-            "SetStdHandle",
-        ],
-    ),
-    (
-        "api-ms-win-core-processthreads-l1-1-0.dll",
-        &[
-            "CreateProcessW",
-            "CreateThread",
-            "ExitProcess",
-            "ExitThread",
-            "GetCurrentProcess",
-            "GetCurrentProcessId",
-            "GetCurrentThread",
-            "GetCurrentThreadId",
-            "GetExitCodeProcess",
-            "GetStartupInfoW",
-            "ResumeThread",
-            "TerminateProcess",
-            "TlsAlloc",
-            "TlsFree",
-            "TlsGetValue",
-            "TlsSetValue",
-        ],
-    ),
-    (
-        "api-ms-win-core-processthreads-l1-1-1.dll",
-        &["IsProcessorFeaturePresent"],
-    ),
-    (
-        "api-ms-win-core-profile-l1-1-0.dll",
-        &["QueryPerformanceCounter", "QueryPerformanceFrequency"],
-    ),
-    (
-        "api-ms-win-core-rtlsupport-l1-1-0.dll",
-        &[
-            "RtlCaptureContext",
-            "RtlLookupFunctionEntry",
-            "RtlPcToFileHeader",
-            "RtlUnwind",
-            "RtlUnwindEx",
-            "RtlVirtualUnwind",
-        ],
-    ),
-    (
-        "api-ms-win-core-string-l1-1-0.dll",
-        &[
-            "CompareStringW",
-            "GetStringTypeW",
-            "MultiByteToWideChar",
-            "WideCharToMultiByte",
-        ],
-    ),
-    (
-        "api-ms-win-core-synch-l1-1-0.dll",
-        &[
-            "DeleteCriticalSection",
-            "EnterCriticalSection",
-            "InitializeCriticalSectionAndSpinCount",
-            "LeaveCriticalSection",
-            "WaitForSingleObject",
-        ],
-    ),
-    ("api-ms-win-core-synch-l1-2-0.dll", &["Sleep"]),
-    (
-        "api-ms-win-core-sysinfo-l1-1-0.dll",
-        &[
-            "GetLocalTime",
-            "GetSystemInfo",
-            "GetSystemTimeAsFileTime",
-            "SetLocalTime",
-        ],
-    ),
-    (
-        "api-ms-win-core-timezone-l1-1-0.dll",
-        &[
-            "FileTimeToSystemTime",
-            "GetTimeZoneInformation",
-            "SystemTimeToFileTime",
-            "SystemTimeToTzSpecificLocalTime",
-            "TzSpecificLocalTimeToSystemTime",
-        ],
-    ),
-    (
-        "api-ms-win-core-util-l1-1-0.dll",
-        &["Beep", "DecodePointer", "EncodePointer"],
-    ),
-];
+/// A source-owned facade export backed by an existing checked runtime handler.
+/// The ordinal belongs to the original image, independently for each bitness.
+#[derive(Clone, Debug)]
+pub struct FoundationExport {
+    pub name: &'static str,
+    pub ordinal: u16,
+    pub target: &'static catalog::Api,
+}
+
+// Non-x86 scaffold ports use the AMD64 semantic reference only; no original
+// ARM64/RISC-V/LoongArch SP1 binary or ABI equivalence is implied.
+fn apply_reference_header(image: &mut PeImageSpec, name: &str, x64: bool) {
+    if let Some(header) = sp1_reference::HEADERS.iter()
+        .find(|header| header.x64 == x64 && header.name.eq_ignore_ascii_case(name)) {
+        image.subsystem = header.subsystem;
+        image.os_version = header.os_version;
+        image.subsystem_version = header.subsystem_version;
+    }
+}
+
+fn reference_module(name: &str, x64: bool) -> Option<&'static sp1_reference::Module> {
+    sp1_reference::MODULES.iter().find(|m| m.x64 == x64 && m.name.eq_ignore_ascii_case(name))
+}
+
+fn foundation_target(dll: &str, name: &str, x64: bool, depth: usize, importer: Option<&str>) -> Option<&'static catalog::Api> {
+    if depth > 8 { return None; }
+    if let Some(api) = catalog::find(dll, name) { return Some(api); }
+    let module = reference_module(dll, x64)?;
+    let export = module.exports.iter().find(|e| e.name == name)?;
+    // A forwarded Kernel32 import uses the ISO's importer-specific host,
+    // commonly KernelBase, rather than the contract's default Kernel32 host.
+    // Otherwise valid SP1 forwarding chains loop back into their importer.
+    if let Some(host) = module.host_for_importer(importer) {
+        return foundation_target(host, name, x64, depth + 1, None);
+    }
+    if let Some(forwarder) = export.forwarder {
+        let (host, symbol) = forwarder.rsplit_once('.')?;
+        // Ordinal-only forwarders require separate ABI evidence; do not guess.
+        if symbol.starts_with('#') { return None; }
+        let host = format!("{}.dll", host.trim_end_matches(".dll").to_ascii_lowercase());
+        // Some SP1 kernelbase entries forward to an ntdll identity for which
+        // NT61 has no gateway yet. Preserve the explicit composition below
+        // when the same checked Win32 ABI is already implemented in kernel32.
+        if let Some(target) = foundation_target(&host, symbol, x64, depth + 1, Some(module.name)) {
+            return Some(target);
+        }
+    }
+    // Implementation composition is NT61-owned. These are deliberate module
+    // boundaries, not a global same-name lookup or an arbitrary API-set alias.
+    let targets: &[&str] = match module.name {
+        "kernelbase.dll" => &["kernel32.dll", "advapi32.dll"],
+        "sechost.dll" => &["advapi32.dll"],
+        "kernel32.dll" if name.starts_with("Reg") => &["advapi32.dll"],
+        "msvcrt.dll" if matches!(name, "memcmp" | "memcpy" | "memmove" | "memset"
+            | "memchr" | "strstr" | "wcsstr" | "strpbrk" | "wcspbrk"
+            | "strspn" | "wcsspn" | "strcspn" | "wcscspn"
+            | "strlen" | "strnlen" | "strcmp" | "strncmp" | "strchr" | "strrchr"
+            | "wcslen" | "wcsnlen" | "wcscmp" | "wcsncmp" | "wcschr" | "wcsrchr"
+            | "strcpy" | "strncpy" | "strcat" | "strncat"
+            | "wcscpy" | "wcsncpy" | "wcscat" | "wcsncat") => &["ntdll.dll"],
+        _ => &[],
+    };
+    targets.iter().find_map(|target| catalog::find(target, name))
+}
+
+/// Original SP1 names for which NT61 has an explicit checked gateway identity.
+/// Unsupported handlers retain their unsupported status; unknown ABI entries
+/// are omitted, never replaced with zero-return stubs.
+pub fn foundation_exports(name: &str, x64: bool) -> Vec<FoundationExport> {
+    let Some(module) = reference_module(name, x64) else { return Vec::new(); };
+    module.exports.iter().filter_map(|export| {
+        foundation_target(module.name, export.name, x64, 0, None).map(|target| FoundationExport {
+            name: export.name, ordinal: export.ordinal, target,
+        })
+    }).collect()
+}
+
+pub fn runtime_library_names_for_arch(x64: bool) -> impl Iterator<Item = &'static str> {
+    let mut names = RUNTIME_DLLS.to_vec();
+    for module in sp1_reference::MODULES.iter().filter(|module| module.x64 == x64) {
+        if !names.contains(&module.name) && !foundation_exports(module.name, x64).is_empty() {
+            names.push(module.name);
+        }
+    }
+    names.into_iter()
+}
 
 pub fn runtime_library_names() -> impl Iterator<Item = &'static str> {
-    RUNTIME_DLLS
-        .iter()
-        .copied()
-        .chain(APISET_CONTRACTS.iter().map(|entry| entry.0))
+    runtime_library_names_for_arch(true)
+}
+
+fn kernel32_extra_forwarders(x64: bool) -> Vec<FoundationExport> {
+    foundation_exports("kernel32.dll", x64).into_iter().filter(|e|
+        catalog::find("kernel32.dll", e.name).is_none()
+        && !KERNEL32_FORWARDERS.contains(&e.name)).collect()
+}
+
+fn kernel32_ordinal(name: &str, x64: bool, private_index: usize) -> u16 {
+    runtime_ordinal("kernel32.dll", name, x64, private_index)
+}
+
+fn runtime_ordinal(dll: &str, name: &str, x64: bool, private_index: usize) -> u16 {
+    reference_module(dll, x64)
+        .and_then(|m| m.exports.iter().find(|e| e.name == name))
+        .map(|e| e.ordinal)
+        .unwrap_or(0x1000 + private_index as u16)
 }
 
 fn build_runtime_facade(file_name: &str, x64: bool) -> Option<Vec<u8>> {
-    let (index, &(name, exports)) = APISET_CONTRACTS
-        .iter()
-        .enumerate()
-        .find(|(_, entry)| entry.0.eq_ignore_ascii_case(file_name))?;
-    let base = if x64 {
-        0x0000_1100_0000_0000 + index as u64 * 0x0010_0000
-    } else {
-        0x5000_0000 + index as u64 * 0x0010_0000
-    };
-    let mut image = PeImageSpec::new(
-        base,
-        super::pe::IMAGE_SUBSYSTEM_WINDOWS_GUI,
-        true,
-        if x64 { MACHINE_AMD64 } else { 0x014c },
-    );
-    image.module_name = name.to_string();
-    image.entry_point_rva = 0;
-    for (index, name) in exports.iter().enumerate() {
-        let target = if name.starts_with("Rtl") {
-            "ntdll"
-        } else {
-            "kernel32"
-        };
-        assert!(
-            catalog::find(&format!("{target}.dll"), name).is_some(),
-            "unknown facade target"
-        );
-        image.export_forwarder(name, index as u16 + 1, &format!("{target}.{name}"));
+    if let Some(module) = reference_module(file_name, x64) {
+        let exports = foundation_exports(module.name, x64);
+        if exports.is_empty() { return None; }
+        let index = sp1_reference::MODULES.iter().position(|m| core::ptr::eq(m, module))?;
+        let base = if x64 { 0x0000_0720_0000_0000 } else { 0x4000_0000 }
+            + index as u64 * 0x0010_0000;
+        let mut image = PeImageSpec::new(base, super::pe::IMAGE_SUBSYSTEM_WINDOWS_GUI,
+            true, if x64 { MACHINE_AMD64 } else { 0x014c });
+        apply_reference_header(&mut image, module.name, x64);
+        image.module_name = module.name.to_string();
+        image.entry_point_rva = 0;
+        for export in exports {
+            let host = export.target.dll.trim_end_matches(".dll");
+            image.export_forwarder(export.name, export.ordinal, &format!("{host}.{}", export.target.name));
+        }
+        image.sections = vec![SectionSpec::rdata(Vec::new())];
+        return Some(super::pe::emit(&image).0);
     }
-    image.sections = vec![SectionSpec::rdata(Vec::new())];
-    Some(super::pe::emit(&image).0)
+    // No fallback table: a missing SP1 module is not an implicit contract alias.
+    None
 }
 
 /// Kernel32 compatibility names whose implementation belongs to ntdll.
@@ -880,13 +665,6 @@ pub const KERNEL32_FORWARDERS: &[&str] = &[
     "RtlLookupFunctionEntry",
     "RtlPcToFileHeader",
 ];
-
-fn ntdll_ordinal(name: &str, x64: bool, index: usize) -> u16 {
-    syscall_metadata::NTDLL_CATALOG_ORDINALS.iter()
-        .find(|entry| entry.0 == name)
-        .map(|entry| if x64 { entry.1 } else { entry.2 })
-        .unwrap_or(0x1000 + index as u16)
-}
 
 fn service_thunk(number: u32, arguments: u8, x64: bool) -> Vec<u8> {
     let mut code = vec![0xb8];
@@ -904,6 +682,16 @@ fn service_thunk(number: u32, arguments: u8, x64: bool) -> Vec<u8> {
 /// enter the checked guest runtime and preserve each API's guest calling ABI.
 /// Unsupported catalog entries terminate explicitly in the runtime handler.
 pub fn build_runtime_dll(file_name: &str, x64: bool) -> Option<Vec<u8>> {
+    build_runtime_image(file_name, x64, None)
+}
+
+/// Compose source-generated desktop resources with runtime exports. The input
+/// is an NT61 resource PE, never a DLL copied from the Windows reference ISO.
+pub fn build_runtime_dll_with_resources(file_name: &str, x64: bool, resources: &[u8]) -> Option<Vec<u8>> {
+    build_runtime_image(file_name, x64, Some(resources))
+}
+
+fn build_runtime_image(file_name: &str, x64: bool, resources: Option<&[u8]>) -> Option<Vec<u8>> {
     let Some(index) = RUNTIME_DLLS
         .iter()
         .position(|name| name.eq_ignore_ascii_case(file_name))
@@ -912,9 +700,9 @@ pub fn build_runtime_dll(file_name: &str, x64: bool) -> Option<Vec<u8>> {
     };
     // Preserve native System32's address plan. crypt32 has its own slot after
     // comctl32, avoiding collisions with user32/gdi32.
-    let slot = [1u64, 0, 10, 11, 12, 9, 3, 2, 13][index];
+    let slot = [1u64, 0, 10, 11, 12, 9, 3, 2, 13, 4, 5][index];
     let base = if x64 {
-        0x0000_1000_0000_0000 + slot * 0x1000_0000
+        0x0000_0700_0000_0000 + slot * 0x1000_0000
     } else {
         0x6000_0000 + slot * 0x0100_0000
     };
@@ -924,6 +712,7 @@ pub fn build_runtime_dll(file_name: &str, x64: bool) -> Option<Vec<u8>> {
         true,
         if x64 { MACHINE_AMD64 } else { 0x014c },
     );
+    apply_reference_header(&mut image, RUNTIME_DLLS[index], x64);
     image.module_name = RUNTIME_DLLS[index].to_string();
     image.entry_point_rva = 0;
     let apis: Vec<_> = catalog::APIS
@@ -933,30 +722,62 @@ pub fn build_runtime_dll(file_name: &str, x64: bool) -> Option<Vec<u8>> {
     let mut text = vec![0xcc; apis.len() * STUB_STRIDE as usize];
     for (index, api) in apis.iter().enumerate() {
         let offset = index * STUB_STRIDE as usize;
-        let mut code = vec![0xb8]; // mov eax, gateway service
-        code.extend_from_slice(&(catalog::GATEWAY_BASE | api.id).to_le_bytes());
-        if x64 {
-            code.extend_from_slice(&[0x4c, 0x8b, 0xd1, 0x0f, 0x05, 0xc3]); // r10=rcx; syscall; ret
-        } else {
-            code.extend_from_slice(&[0x8d, 0x54, 0x24, 0x04, 0xcd, 0x2e]); // edx=&args; int 2e
-            if api.cdecl {
-                code.push(0xc3);
+        let mut code = if api.name == "RtlCaptureContext" {
+            // Save entry registers before the gateway overwrites EAX/EDX or
+            // RAX/RCX/R10/R11. Keep the stable export slot, jumping to our
+            // source-generated longer thunk; no Windows instructions copied.
+            let target = text.len();
+            let mut thunk = if x64 {
+                vec![0x50, 0x41, 0x52, 0x41, 0x53]
             } else {
-                code.push(0xc2);
-                code.extend_from_slice(&(u16::from(api.x86_arguments) * 4).to_le_bytes());
+                vec![0x50, 0x51, 0x52]
+            };
+            thunk.push(0xb8);
+            thunk.extend_from_slice(&(catalog::GATEWAY_BASE | api.id).to_le_bytes());
+            if x64 {
+                thunk.extend_from_slice(&[
+                    0x4c, 0x8b, 0xd1, 0x0f, 0x05, // r10=rcx; syscall
+                    0x49, 0x8b, 0xca, 0x41, 0x5b, 0x41, 0x5a, // restore rcx,r11,r10
+                    0x48, 0x8d, 0x64, 0x24, 0x08, 0xc3, // discard saved rax; ret
+                ]);
+            } else {
+                thunk.extend_from_slice(&[
+                    0x8d, 0x54, 0x24, 0x10, 0xcd, 0x2e,
+                    0x5a, 0x59, 0x8d, 0x64, 0x24, 0x04, 0xc2, 0x04, 0x00,
+                ]);
+            }
+            text.extend_from_slice(&thunk);
+            let mut jump = vec![0xe9];
+            let displacement = i32::try_from(target as i64 - offset as i64 - 5)
+                .expect("context thunk must fit in a rel32 jump");
+            jump.extend_from_slice(&displacement.to_le_bytes());
+            jump
+        } else {
+            vec![0xb8] // mov eax, gateway service
+        };
+        if api.name != "RtlCaptureContext" {
+            code.extend_from_slice(&(catalog::GATEWAY_BASE | api.id).to_le_bytes());
+            if x64 {
+                code.extend_from_slice(&[0x4c, 0x8b, 0xd1, 0x0f, 0x05, 0xc3]); // r10=rcx; syscall; ret
+            } else {
+                code.extend_from_slice(&[0x8d, 0x54, 0x24, 0x04, 0xcd, 0x2e]); // edx=&args; int 2e
+                if api.cdecl {
+                    code.push(0xc3);
+                } else {
+                    code.push(0xc2);
+                    code.extend_from_slice(&(u16::from(api.x86_arguments) * 4).to_le_bytes());
+                }
             }
         }
         assert!(code.len() <= STUB_STRIDE as usize);
         text[offset..offset + code.len()].copy_from_slice(&code);
-        // ADVAPI32 keeps the audited named ordinals for ordinal imports.
-        // Other DLLs retain their existing NT61 private ordinal numbering.
+        // Audited modules keep their SP1 ordinals. Extra compatibility names
+        // use a distinct private range; other DLLs retain NT61 numbering.
         let ordinal = if file_name.eq_ignore_ascii_case("advapi32.dll") {
             advapi_ordinals::ordinal(api.name, x64)
                 .expect("ADVAPI32 export absent from the audited Windows 7 SP1 binary")
-        } else if file_name.eq_ignore_ascii_case("ntdll.dll") {
-            ntdll_ordinal(api.name, x64, index)
         } else {
-            index as u16 + 1
+            runtime_ordinal(file_name, api.name, x64, index)
         };
         image.export_named(api.name, ordinal, stub_rva(index as u32));
     }
@@ -992,13 +813,63 @@ pub fn build_runtime_dll(file_name: &str, x64: bool) -> Option<Vec<u8>> {
             );
             image.export_forwarder(
                 name,
-                (apis.len() + index + 1) as u16,
+                kernel32_ordinal(name, x64, apis.len() + index),
                 &format!("ntdll.{name}"),
             );
         }
+        for export in kernel32_extra_forwarders(x64) {
+            image.export_forwarder(export.name, export.ordinal,
+                &format!("{}.{}", export.target.dll.trim_end_matches(".dll"), export.target.name));
+        }
     }
     image.sections = vec![SectionSpec::code(text), SectionSpec::rdata(Vec::new())];
-    Some(super::pe::emit(&image).0)
+    let mut bytes = super::pe::emit(&image).0;
+    if let Some(resources) = resources {
+        let source = super::pe_read::parse(resources)?;
+        if source.machine != image.machine { return None; }
+        let (old_rva, size) = *source.data_directories.get(2)?;
+        let section = source.sections.iter().find(|s| s.virtual_address == old_rva && size <= s.virtual_size)?;
+        let start = section.pointer_to_raw_data as usize;
+        let mut data = resources.get(start..start.checked_add(size as usize)?)?.to_vec();
+        let new_rva = super::pe_read::parse(&bytes)?.size_of_image;
+        // Directory offsets are relative to the resource root; only each
+        // IMAGE_RESOURCE_DATA_ENTRY payload RVA changes when moving .rsrc.
+        fn collect(data: &[u8], at: usize, depth: u8, leaves: &mut Vec<usize>) -> Option<()> {
+            if depth > 2 { return None; }
+            let header = data.get(at..at.checked_add(16)?)?;
+            let count = usize::from(u16::from_le_bytes(header[12..14].try_into().ok()?))
+                + usize::from(u16::from_le_bytes(header[14..16].try_into().ok()?));
+            let entries = data.get(at+16..(at+16).checked_add(count.checked_mul(8)?)?)?;
+            for entry in entries.chunks_exact(8) {
+                let child = u32::from_le_bytes(entry[4..8].try_into().ok()?);
+                if child & 0x80000000 != 0 {
+                    collect(data, (child & 0x7fffffff) as usize, depth+1, leaves)?;
+                } else {
+                    if depth != 2 { return None; }
+                    if !leaves.contains(&(child as usize)) { leaves.push(child as usize); }
+                }
+            }
+            Some(())
+        }
+        let mut leaves = Vec::new();
+        collect(&data, 0, 0, &mut leaves)?;
+        for at in leaves {
+            let entry = data.get(at..at.checked_add(16)?)?;
+            let offset = u32::from_le_bytes(entry[..4].try_into().ok()?).checked_sub(old_rva)?;
+            let length = u32::from_le_bytes(entry[4..8].try_into().ok()?);
+            data.get(offset as usize..offset.checked_add(length)? as usize)?;
+            data[at..at+4].copy_from_slice(&new_rva.checked_add(offset)?.to_le_bytes());
+        }
+        image.sections.push(SectionSpec { name: ".rsrc".into(), characteristics: 0x40000040, data });
+        bytes = super::pe::emit(&image).0;
+        let placed = super::pe_read::parse(&bytes)?;
+        if placed.sections.last()?.virtual_address != new_rva { return None; }
+        let pe = u32::from_le_bytes(bytes.get(0x3c..0x40)?.try_into().ok()?) as usize;
+        let directory = pe + 24 + if x64 { 0x70 } else { 0x60 };
+        bytes[directory+16..directory+20].copy_from_slice(&new_rva.to_le_bytes());
+        bytes[directory+20..directory+24].copy_from_slice(&size.to_le_bytes());
+    }
+    Some(bytes)
 }
 
 /// Machine-readable ABI and support inventory. Forwarders inherit the target's
@@ -1035,16 +906,13 @@ pub fn runtime_manifest(x64: bool) -> String {
         }
         let ordinal = if api.dll == "advapi32.dll" {
             advapi_ordinals::ordinal(api.name, x64).expect("audited ADVAPI32 ordinal")
-        } else if api.dll == "ntdll.dll" {
+        } else {
             let index = catalog::APIS.iter().filter(|a| a.dll == api.dll)
                 .position(|a| a.id == api.id).expect("catalog member");
-            ntdll_ordinal(api.name, x64, index)
-        } else {
-            catalog::APIS.iter().filter(|a| a.dll == api.dll)
-                .position(|a| a.id == api.id).expect("catalog member") as u16 + 1
+            runtime_ordinal(api.dll, api.name, x64, index)
         };
         text.push_str(&format!("{{\"dll\":\"{}\",\"name\":\"{}\",\"ordinal\":{},\"ordinal_provenance\":\"{}\",\"service\":{},\"arguments\":{},\"x86_stack_words\":{},\"cdecl\":{}, {}}}",
-            api.dll, api.name, ordinal, if api.dll == "advapi32.dll" || (api.dll == "ntdll.dll" && ordinal < 0x1000) { "Windows 7 SP1 reference" } else { "NT61 private" }, catalog::GATEWAY_BASE | api.id, api.arguments, api.x86_arguments, api.cdecl, fields(api.dll, api.name)));
+            api.dll, api.name, ordinal, if ordinal < 0x1000 { "Windows 7 SP1 reference" } else { "NT61 private" }, catalog::GATEWAY_BASE | api.id, api.arguments, api.x86_arguments, api.cdecl, fields(api.dll, api.name)));
     }
     text.push_str("],\"native_services\":[");
     for (index, service) in syscall_metadata::NATIVE_SERVICE_METADATA.iter().enumerate() {
@@ -1057,32 +925,46 @@ pub fn runtime_manifest(x64: bool) -> String {
         if i != 0 {
             text.push(',');
         }
+        let index = catalog::APIS.iter().filter(|api| api.dll == "kernel32.dll").count() + i;
+        let ordinal = kernel32_ordinal(name, x64, index);
         text.push_str(&format!(
-            "{{\"dll\":\"kernel32.dll\",\"name\":\"{name}\",\"target\":\"ntdll.{name}\",{}}}",
+            "{{\"dll\":\"kernel32.dll\",\"name\":\"{name}\",\"ordinal\":{ordinal},\"ordinal_provenance\":\"{}\",\"target\":\"ntdll.{name}\",{}}}",
+            if ordinal < 0x1000 { "Windows 7 SP1 reference" } else { "NT61 private" },
             fields("ntdll.dll", name)
         ));
     }
+    for export in kernel32_extra_forwarders(x64) {
+        text.push_str(&format!(",{{\"dll\":\"kernel32.dll\",\"name\":\"{}\",\"ordinal\":{},\"target\":\"{}.{}\",{}}}",
+            export.name, export.ordinal, export.target.dll.trim_end_matches(".dll"), export.target.name,
+            fields(export.target.dll, export.target.name)));
+    }
     text.push_str("],\"contracts\":[");
-    for (i, (contract, names)) in APISET_CONTRACTS.iter().enumerate() {
+    let contracts: Vec<_> = sp1_reference::MODULES.iter()
+        .filter(|m| m.x64 == x64 && !RUNTIME_DLLS.contains(&m.name)).map(|m| m.name).collect();
+    for (i, contract) in contracts.iter().enumerate() {
         if i != 0 {
             text.push(',');
         }
-        text.push_str(&format!("{{\"dll\":\"{contract}\",\"forwarders\":["));
-        for (j, name) in names.iter().enumerate() {
-            if j != 0 {
-                text.push(',');
+        if let Some(module) = reference_module(contract, x64) {
+            let exports = foundation_exports(contract, x64);
+            text.push_str(&format!("{{\"dll\":\"{contract}\",\"baseline\":\"Windows 7 SP1 reference\",\"delivered\":{},\"original_export_count\":{},\"schema_default_host\":{},\"forwarders\":[",
+                !exports.is_empty(), module.exports.len(), module.host.map(quoted).unwrap_or_else(|| "null".into())));
+            for (j, export) in exports.iter().enumerate() {
+                if j != 0 { text.push(','); }
+                text.push_str(&format!("{{\"name\":\"{}\",\"ordinal\":{},\"target\":\"{}.{}\",{}}}",
+                    export.name, export.ordinal, export.target.dll.trim_end_matches(".dll"), export.target.name,
+                    fields(export.target.dll, export.target.name)));
             }
-            let target = if name.starts_with("Rtl") {
-                "ntdll"
-            } else {
-                "kernel32"
-            };
-            text.push_str(&format!(
-                "{{\"name\":\"{name}\",\"target\":\"{target}.{name}\",{}}}",
-                fields(&format!("{target}.dll"), name)
-            ));
+            text.push_str("],\"unavailable_exports\":[");
+            let mut separator = "";
+            for export in module.exports.iter().filter(|e| !exports.iter().any(|a| a.name == e.name)) {
+                text.push_str(&format!("{separator}{{\"name\":\"{}\",\"ordinal\":{},\"reason\":\"No checked runtime ABI target\"}}", export.name, export.ordinal));
+                separator = ",";
+            }
+            text.push_str("]}");
+            continue;
         }
-        text.push_str("]}");
+
     }
     text.push_str("]}\n");
     text
@@ -1155,5 +1037,16 @@ mod architecture_tests {
             }
         }
         assert!(build_dll_image_for_arch(&ALL_DLLS[0], "=riscv64").is_err());
+    }
+
+    #[test]
+    fn profile_api_set_keeps_win7_performance_exports() {
+        for x64 in [false, true] {
+            let exports = foundation_exports("api-ms-win-core-profile-l1-1-0.dll", x64);
+            assert!(exports.iter().any(|e| e.name == "QueryPerformanceFrequency"), "x64={x64}");
+            let image = build_runtime_dll("api-ms-win-core-profile-l1-1-0.dll", x64).expect("profile facade");
+            let parsed = super::super::pe_read::parse(&image).expect("valid profile PE");
+            assert!(parsed.exports_by_name.contains_key("QueryPerformanceFrequency"));
+        }
     }
 }

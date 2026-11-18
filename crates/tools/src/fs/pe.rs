@@ -10,11 +10,10 @@
 //! table. That is enough for a bare driver but not for a Win32 DLL:
 //! a real `user32.dll` needs
 //!
-//!   * an **import table** so the loader can bind `ntdll!NtUser*`;
+//!   * an **import table** so the loader can bind native runtime dependencies;
 //!   * **ordinal exports** and **forwarders**;
 //!   * a **`.reloc` section** so the image can be rebased;
-//!   * the **GUI subsystem** (`IMAGE_SUBSYSTEM_WINDOWS_GUI` = 2), not
-//!     the EFI-application subsystem the driver images use;
+//!   * the module-specific **subsystem** and version fields observed in SP1;
 //!   * multiple sections so code and read-only data get the right
 //!     permissions.
 //!
@@ -218,6 +217,10 @@ pub struct PeImageSpec {
     pub entry_point_rva: u32,
     /// `IMAGE_SUBSYSTEM_*`.
     pub subsystem: u16,
+    /// Optional-header operating system version; defaults to NT 6.1.
+    pub os_version: [u16; 2],
+    /// Optional-header subsystem version; individual SP1 modules differ.
+    pub subsystem_version: [u16; 2],
     /// Whether the image is a DLL.
     pub is_dll: bool,
     /// The PE machine identifier.
@@ -241,6 +244,8 @@ impl PeImageSpec {
             image_base,
             entry_point_rva: 0,
             subsystem,
+            os_version: [6, 1],
+            subsystem_version: [6, 1],
             is_dll,
             machine,
             module_name: String::new(),
@@ -548,11 +553,11 @@ pub fn emit(spec: &PeImageSpec) -> (Vec<u8>, PeEmitReport) {
     }
     image[opt + 32..opt + 36].copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
     image[opt + 36..opt + 40].copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
-    // Windows 7 SP1 version numbers.
-    image[opt + 40..opt + 42].copy_from_slice(&6u16.to_le_bytes()); // OS major
-    image[opt + 42..opt + 44].copy_from_slice(&1u16.to_le_bytes()); // OS minor
-    image[opt + 48..opt + 50].copy_from_slice(&6u16.to_le_bytes()); // subsystem major
-    image[opt + 50..opt + 52].copy_from_slice(&1u16.to_le_bytes()); // subsystem minor
+    // Module-specific versions; SP1 DLLs do not all use subsystem version 6.1.
+    image[opt + 40..opt + 42].copy_from_slice(&spec.os_version[0].to_le_bytes()); // OS major
+    image[opt + 42..opt + 44].copy_from_slice(&spec.os_version[1].to_le_bytes()); // OS minor
+    image[opt + 48..opt + 50].copy_from_slice(&spec.subsystem_version[0].to_le_bytes()); // subsystem major
+    image[opt + 50..opt + 52].copy_from_slice(&spec.subsystem_version[1].to_le_bytes()); // subsystem minor
     image[opt + 56..opt + 60].copy_from_slice(&size_of_image.to_le_bytes());
     image[opt + 60..opt + 64].copy_from_slice(&headers_size.to_le_bytes());
     image[opt + 68..opt + 70].copy_from_slice(&spec.subsystem.to_le_bytes());

@@ -56,7 +56,7 @@ fn sample_dll() -> PeImageSpec {
     spec.imports = vec![ImportModule {
         dll_name: "ntdll.dll".into(),
         symbols: vec![
-            ImportSymbol::ByName("NtUserWaitMessage".into()),
+            ImportSymbol::ByName("NtWaitForSingleObject".into()),
             ImportSymbol::ByOrdinal(7),
         ],
     }];
@@ -193,7 +193,7 @@ fn import_directory_lists_modules_and_symbols() {
     assert_eq!(import.dll_name, "ntdll.dll");
     assert_eq!(
         import.symbols,
-        vec![Some("NtUserWaitMessage".to_string()), None]
+        vec![Some("NtWaitForSingleObject".to_string()), None]
     );
     assert_eq!(import.ordinals, vec![7]);
 }
@@ -303,7 +303,7 @@ fn import_entries_use_the_pe32_plus_ordinal_flag_convention() {
     let import = &image.imports[0];
     assert_eq!(
         import.symbols,
-        vec![Some("NtUserWaitMessage".to_string()), None],
+        vec![Some("NtWaitForSingleObject".to_string()), None],
         "the name import must be by name and the ordinal import by ordinal"
     );
     assert_eq!(import.ordinals, vec![7]);
@@ -474,7 +474,7 @@ fn pe32_uses_i386_headers_four_byte_imports_and_highlow_relocations() {
     assert_eq!(image.imports.len(), 1);
     assert_eq!(
         image.imports[0].symbols[0].as_deref(),
-        Some("NtUserWaitMessage")
+        Some("NtWaitForSingleObject")
     );
     assert_eq!(image.imports[0].ordinals, vec![7]);
     assert_eq!(image.relocations, vec![0x1018, 0x1028, 0x1038]);
