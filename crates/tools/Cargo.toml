@@ -9,6 +9,10 @@ publish = false
 name = "build-tool"
 path = "src/main.rs"
 
+[[bin]]
+name = "driver-package-plan"
+path = "src/bin/driver_package_plan.rs"
+
 # build-esp 通过 fs::build 产物管线生成 PE，不再依赖 nt61 门面
 [[bin]]
 name = "build-esp"
@@ -48,13 +52,15 @@ name = "nt61_tools"
 path = "src/lib.rs"
 
 [dependencies]
+nt61-driver-package = { path = "../driver-package", features = ["serde"] }
+serde_json = "1.0"
 nt61-boot-types = { path = "../boot-types" }
 nt61-loader = { path = "../loader" }
 # hive_gen is always available
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 uuid = { version = "1.12", default-features = false }
-tempfile = { version = "3.8", optional = true }
+tempfile = "3.8"
 
 [dev-dependencies]
 nt61-bootfs = { path = "../bootfs" }
@@ -64,5 +70,5 @@ toml = "0.8"
 
 [features]
 default = []
-testing = ["tempfile"]
-with-nt61 = ["tempfile"]
+testing = []
+with-nt61 = []

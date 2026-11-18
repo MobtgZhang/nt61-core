@@ -8,6 +8,7 @@ pub mod fs;
 pub mod hive_gen;
 pub mod logger;
 pub mod regf;
+pub mod registry_hive;
 
 // Re-export commonly used types
 pub use error::{BuildError, Result};
