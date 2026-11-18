@@ -1,0 +1,8 @@
+[package]
+name = "nt61-win32-metrics"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+serde_json = "1.0"
