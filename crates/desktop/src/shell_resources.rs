@@ -98,6 +98,23 @@ fn draw(image:&png::Image,frame:&mut Surface,b:Rect){
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn reads_rust_generated_pe_resources_with_bounded_io(){
+        for arch in ["x86_64", "i686"] {
+            let shell = crate::resource_generator::shell_reader_fixture("shell32.dll", arch);
+            let image = crate::resource_generator::shell_reader_fixture("imageres.dll", arch);
+            let mut total = 0;
+            let icons = ShellIcons::load(|path, offset, length| {
+                assert!(length <= 65536); total += length;
+                let bytes = if path.ends_with("shell32.dll") { &shell } else { &image };
+                bytes.get(offset as usize..offset as usize + length).map(|b| b.to_vec()).ok_or(INVALID)
+            }).unwrap();
+            assert_eq!((icons.folder.width,icons.document.width,icons.computer.width),(16,16,16));
+            assert!(total < 256 * 1024);
+            for icon in [&icons.folder, &icons.document, &icons.computer] {
+                assert!(icon.pixels.chunks_exact(4).all(|p| p == [0x12, 0x34, 0x56, 0xff]));
+            }
+        }
+    }
     #[test]fn reads_actual_generated_dlls_with_bounded_io(){
         use std::{fs,io::{Read,Seek,SeekFrom}};
         // Generate the same DLLs as the image builder. Staged build files may

@@ -545,16 +545,19 @@ fn resource_pe(arch: &str, image_name: &str, entries: &[ResourceEntry]) -> Vec<u
     }
     put_u32(&mut out, optional + 0x20, SECTION_ALIGNMENT);
     put_u32(&mut out, optional + 0x24, FILE_ALIGNMENT);
-    put_u16(&mut out, optional + 0x28, 10);
-    put_u16(&mut out, optional + 0x2A, 0);
+    put_u16(&mut out, optional + 0x28, 6);
+    put_u16(&mut out, optional + 0x2A, 1);
     put_u16(&mut out, optional + 0x2C, 0);
     put_u16(&mut out, optional + 0x2E, 0);
-    put_u16(&mut out, optional + 0x30, 10);
-    put_u16(&mut out, optional + 0x32, 0);
+    put_u16(&mut out, optional + 0x30, 6);
+    put_u16(&mut out, optional + 0x32, 1);
     put_u32(&mut out, optional + 0x38,
         align_up_u32(RSRC_RVA + rsrc_raw_size, SECTION_ALIGNMENT));
     put_u32(&mut out, optional + 0x3C, headers_size);
-    put_u16(&mut out, optional + 0x44, 0x0002);
+    // Original SP1 x86/x64: SHELL32 is GUI, IMAGERES is CUI.
+    // Other architectures reuse these metadata facts only.
+    put_u16(&mut out, optional + 0x44,
+        if image_name.eq_ignore_ascii_case("imageres.dll") { 3 } else { 2 });
     put_u16(&mut out, optional + 0x46, 0x0160);
     if x86 {
         put_u32(&mut out, optional + 0x48, 0x0010_0000);
@@ -573,8 +576,8 @@ fn resource_pe(arch: &str, image_name: &str, entries: &[ResourceEntry]) -> Vec<u
     }
 
     let data_directory = optional + if x86 { 0x60 } else { 0x70 };
-    put_u32(&mut out, data_directory, RDATA_RVA);
-    put_u32(&mut out, data_directory + 4, rdata.len() as u32);
+    // Resource-only libraries have no export directory. Do not point the
+    // loader at an empty, uninitialized IMAGE_EXPORT_DIRECTORY in .rdata.
     put_u32(&mut out, data_directory + 16, RSRC_RVA);
     put_u32(&mut out, data_directory + 20, rsrc.len() as u32);
     put_u32(&mut out, data_directory + 5 * 8, RDATA_RVA + relocation_offset as u32);
@@ -644,9 +647,43 @@ pub fn generate_desktop_resources(output_directory: &Path, arch: &str) -> io::Re
     Ok(written)
 }
 
+/// Synthetic DIBs exercise the actual PE encoder/reader without original pixels.
+/// This fixture is test-only and is never installed as desktop artwork.
+#[cfg(test)]
+pub(crate) fn shell_reader_fixture(name: &str, arch: &str) -> Vec<u8> {
+    let mut dib = vec![0; 40 + 16 * 16 * 4 + 16 * 4];
+    put_u32(&mut dib, 0, 40);
+    put_u32(&mut dib, 4, 16);
+    put_u32(&mut dib, 8, 32);
+    put_u16(&mut dib, 12, 1);
+    put_u16(&mut dib, 14, 32);
+    for pixel in dib[40..40 + 16 * 16 * 4].chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[0x56, 0x34, 0x12, 0xff]);
+    }
+    let groups: Vec<_> = [2, 4, 109].into_iter().enumerate().map(|(i, id)| IconGroup {
+        id, first_icon_id: i as u16 + 1,
+        images: vec![IconImage { width: 16, height: 16, color_count: 0,
+            planes: 1, bit_count: 32, bytes: dib.clone() }],
+    }).collect();
+    resource_pe(arch, name, &icon_resources(&groups))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_subsystems_match_the_original_modules() {
+        // Captured separately from both original SP1 System32/SysWOW64 PE headers.
+        // Hashes are pinned in docs/desktop/baselines/.../pe-headers.json.
+        for arch in ["x86_64", "i686"] {
+            for (name, expected) in [("shell32.dll", 2), ("imageres.dll", 3)] {
+                let image = resource_pe(arch, name, &[]);
+                let subsystem = u16::from_le_bytes(image[0x98 + 0x44..0x98 + 0x46].try_into().unwrap());
+                assert_eq!(subsystem, expected, "{arch}/{name}");
+            }
+        }
+    }
 
     #[test]
     fn resource_images_allow_rebasing_without_changing_resource_rvas() {
@@ -655,6 +692,13 @@ mod tests {
             let read32 = |at| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
             let x86 = arch == "i686";
             let directory = 0x98 + if x86 { 0x60 } else { 0x70 };
+            let read16 = |at| u16::from_le_bytes(image[at..at + 2].try_into().unwrap());
+            assert_eq!(read16(0x98 + 0x28), 6, "SP1 operating system major version");
+            assert_eq!(read16(0x98 + 0x2a), 1, "SP1 operating system minor version");
+            assert_eq!(read16(0x98 + 0x30), 6, "SP1 subsystem major version");
+            assert_eq!(read16(0x98 + 0x32), 1, "SP1 subsystem minor version");
+            assert_eq!(read32(directory), 0, "resource-only DLL has no exports");
+            assert_eq!(read32(directory + 4), 0, "no empty export directory");
             let sections = 0x98 + if x86 { 224 } else { 240 };
             let rva = read32(directory + 5 * 8);
             let size = read32(directory + 5 * 8 + 4);

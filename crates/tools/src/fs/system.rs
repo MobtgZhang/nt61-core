@@ -77,6 +77,7 @@ const SYSTEM_STRUCTURE: &[(&str, bool)] = &[
     ("Users/Administrator/Videos", true),
     ("Users/Administrator/AppData", true),
     ("Users/Administrator/AppData/Local", true),
+    ("Users/Administrator/AppData/Local/Temp", true),
     ("Users/Administrator/AppData/Roaming", true),
 ];
 
@@ -259,17 +260,29 @@ impl SystemBuilder {
         Ok(())
     }
 
-    /// Install the default Windows 7 scheme from the repository's reference assets.
-    pub fn copy_system_sounds(&self) -> Result<()> {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../references/windows-ui-assets/Sounds/Windows 7");
-        let destination = self.output_dir.join("Windows/Media");
-        std::fs::create_dir_all(&destination)?;
-        for entry in std::fs::read_dir(source)? {
+    /// Install the repository's existing desktop media at their Windows paths.
+    /// PE icon libraries and application resources are built separately in Rust.
+    pub fn prepare_system_media(&self) -> Result<()> {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../desktop/assets/windows7");
+        for (source, destination) in [
+            ("sounds", "Windows/Media"),
+            ("cursors", "Windows/Cursors"),
+            ("wallpapers/Desktop", "Windows/Web/Wallpaper"),
+            ("User Account Pictures", "ProgramData/Microsoft/User Account Pictures"),
+        ] {
+            crate::fs::copy::copy_dir_recursive(&assets.join(source), &self.output_dir.join(destination))?;
+        }
+        // Regional theme wallpapers retain the SP1 MCT-<country>/Wallpaper layout.
+        for entry in std::fs::read_dir(assets.join("wallpapers/Desktop Regional"))? {
             let entry = entry?;
-            if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|e| e.eq_ignore_ascii_case("wav")) {
-                std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
-            }
+            let first = std::fs::read_dir(entry.path())?.next()
+                .ok_or_else(|| crate::error::BuildError::InvalidFormat("empty regional wallpaper set".into()))??;
+            let name = first.file_name();
+            let code = name.to_str().and_then(|s| s.split('-').next())
+                .ok_or_else(|| crate::error::BuildError::InvalidFormat("invalid regional wallpaper name".into()))?;
+            crate::fs::copy::copy_dir_recursive(&entry.path(),
+                &self.output_dir.join(format!("Windows/Globalization/MCT/MCT-{code}/Wallpaper")))?;
         }
         Ok(())
     }
@@ -293,7 +306,7 @@ impl SystemBuilder {
         self.copy_kernel_artifacts()?;
         self.copy_drivers()?;
         self.copy_extra_files()?;
-        self.copy_system_sounds()?;
+        self.prepare_system_media()?;
         self.write_registry_hives()?;
         log::success(&format!(
             "System partition built: {}",

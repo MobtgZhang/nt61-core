@@ -4,6 +4,9 @@
 pub mod catalog;
 use super::{build::SystemImage, elf_to_pe};
 use std::path::Path;
+#[allow(dead_code)]
+#[path = "../../../desktop/src/applications/media_player/icon.rs"]
+mod media_icon;
 const IDENTITY: &[u8] = b"NT61APP_ID_V1___";
 fn u16_at(bytes: &[u8], offset: usize) -> usize {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap()) as usize
@@ -223,14 +226,10 @@ pub fn package(root: &Path, arch: &str, target: &str) -> Vec<SystemImage> {
         put32(&mut image, pos, app.id as u32);
         let header = u32_at(&image, 0x3C);
         put16(&mut image, header + 24 + 68, app.pe_subsystem()); // Windows GUI or console, never EFI.
-        let mut entries = ico_resources(
-            &std::fs::read(
-                root.join("crates/desktop/src/applications")
-                    .join(app.icon)
-                    .join("resources/icon.ico"),
-            )
-            .expect("application-owned multi-resolution icon"),
-        );
+        let icon = if app.id==catalog::AppId::MediaPlayer {media_icon::ico()}else{
+            std::fs::read(root.join("crates/desktop/src/applications").join(app.icon).join("resources/icon.ico")).expect("application-owned multi-resolution icon")
+        };
+        let mut entries=ico_resources(&icon);
         entries.extend([(16, 1, version(app)), (24, 1, manifest(app))]);
         image = append_resources(image, &entries);
         images.push(SystemImage {
