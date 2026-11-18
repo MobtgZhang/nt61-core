@@ -207,6 +207,9 @@ pub enum AluOp {
     Test,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitAction { Test, Set, Reset, Complement }
+
 /// Conditional branch predicate mapping x86 condition codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BranchCond {
@@ -327,6 +330,7 @@ pub enum IROp {
     PopFlags,
     AccumulatorMemory { address: u64, store: bool },
     ByteAlu { op: AluOp, dst: ByteOperand, src: ByteOperand },
+    ByteAluImmediate { op: AluOp, dst: ByteOperand, immediate: u8 },
     ByteMove { dst: ByteOperand, src: ByteOperand },
     ByteImmediate { dst: ByteOperand, value: u8 },
     DoubleShift { dst: Result<X86Reg, MemOperand>, src: X86Reg, right: bool, count: Option<u8> },
@@ -343,11 +347,11 @@ pub enum IROp {
     UnsignedDivide { src: Result<X86Reg, MemOperand>, high_byte: bool },
     FullMultiply { src: Result<X86Reg, MemOperand>, high_byte: bool, signed: bool },
     SignedMultiply { dst: X86Reg, src: Result<X86Reg, MemOperand>, immediate: Option<i64> },
-    /// Immediate BT selects a bit modulo the operand width and updates CF.
-    BitTestImmediate { src: Result<X86Reg, MemOperand>, bit: u8 },
+    /// Immediate bit operations select a bit modulo the operand width.
+    BitTestImmediate { src: Result<X86Reg, MemOperand>, bit: u8, action: BitAction },
     /// Legacy BSF/BSR; the virtual CPU does not advertise BMI1 or ABM.
     BitScan { dst: X86Reg, src: Result<X86Reg, MemOperand>, reverse: bool },
-    BitRegister { dst: Result<X86Reg, MemOperand>, index: X86Reg, complement: bool },
+    BitRegister { dst: Result<X86Reg, MemOperand>, index: X86Reg, action: BitAction },
     TestImmediate { src: Result<X86Reg, MemOperand>, high_byte: bool, immediate: i64 },
     AdcReg {
         dst: X86Reg,

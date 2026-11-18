@@ -7,7 +7,7 @@
 //! handles by trapping back to the kernel.
 
 use super::ir::{
-    AluOp, BranchCond, ByteOperand, DecodeMode, IROp, IrInst, MemOperand, Segment, SimdOp, SimdSrc, SimdWidth,
+    AluOp, BitAction, BranchCond, ByteOperand, DecodeMode, IROp, IrInst, MemOperand, Segment, SimdOp, SimdSrc, SimdWidth,
     X86Reg, X86Xmm,
 };
 
@@ -559,9 +559,13 @@ impl<'a> Decoder<'a> {
                     let (dst, src, _) = self.decode_modrm()?;
                     Some(IROp::BitScan { dst, src, reverse: op2 == 0xbd })
                 }
-                0xa3 | 0xbb if !self.has_f2 && !self.has_f3 => {
+                0xa3 | 0xab | 0xb3 | 0xbb if !self.has_f2 && !self.has_f3 => {
                     let (index, dst, _) = self.decode_modrm()?;
-                    Some(IROp::BitRegister { dst, index, complement: op2 == 0xbb })
+                    let action = match op2 {
+                        0xa3 => BitAction::Test, 0xab => BitAction::Set,
+                        0xb3 => BitAction::Reset, _ => BitAction::Complement,
+                    };
+                    Some(IROp::BitRegister { dst, index, action })
                 }
                 0x40..=0x4f if !self.has_f2 && !self.has_f3 => {
                     let (dst, src, _) = self.decode_modrm()?;
@@ -580,10 +584,14 @@ impl<'a> Decoder<'a> {
                 }
                 0xba if !self.has_f2 && !self.has_f3 => {
                     let raw = self.peek()?;
-                    if (raw >> 3) & 7 != 4 { return Some(IROp::Unsupported); }
+                    let action = match (raw >> 3) & 7 {
+                        4 => BitAction::Test, 5 => BitAction::Set,
+                        6 => BitAction::Reset, 7 => BitAction::Complement,
+                        _ => return Some(IROp::Unsupported),
+                    };
                     let (_, src, _) = self.decode_modrm()?;
                     let bit = self.fetch()?;
-                    Some(IROp::BitTestImmediate { src, bit })
+                    Some(IROp::BitTestImmediate { src, bit, action })
                 }
                 0xb6 | 0xb7 | 0xbe | 0xbf => {
                     let source_width = if op2 & 1 == 0 {1} else {2};
@@ -1092,9 +1100,13 @@ impl<'a> Decoder<'a> {
                 // from the reg field before decode_modrm consumes it.
                 let modrm_byte = self.bytes.get(self.offset).copied().unwrap_or(0);
                 self.byte_operand = op == OPCODE_ALU_IMM_BASE;
-                if self.byte_operand && !self.has_rex && modrm_byte >> 6 == 3 && modrm_byte & 7 >= 4
-                {
-                    return Some(IROp::Unsupported);
+                if self.byte_operand && !self.has_lock {
+                    let (_, dst) = self.decode_byte_operands()?;
+                    let operation = match (modrm_byte >> 3) & 7 {
+                        0 => AluOp::Add, 1 => AluOp::Or, 2 => AluOp::Adc, 3 => AluOp::Sbb,
+                        4 => AluOp::And, 5 => AluOp::Sub, 6 => AluOp::Xor, _ => AluOp::Cmp,
+                    };
+                    return Some(IROp::ByteAluImmediate { op: operation, dst, immediate: self.fetch()? });
                 }
                 let (_, dst, _) = self.decode_modrm()?;
                 // The ALU sub-operation is encoded in the ModR/M reg field.

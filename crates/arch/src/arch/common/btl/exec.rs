@@ -5,7 +5,7 @@
 //! it can preserve the same semantics; unsupported instructions stop precisely.
 
 use super::ir::{
-    AluOp, BranchCond, ByteOperand, DecodeMode, IROp, IrInst, MemOperand, Segment, SimdOp, SimdSrc, SimdWidth,
+    AluOp, BitAction, BranchCond, ByteOperand, DecodeMode, IROp, IrInst, MemOperand, Segment, SimdOp, SimdSrc, SimdWidth,
     X86Reg,
 };
 use super::memory::GuestMemory;
@@ -72,6 +72,9 @@ pub struct GuestState {
     pub x87_registers: [Extended; 8],
     /// One bit per physical register, set when the register is empty.
     pub x87_empty: u8,
+    /// Last completed x87 data instruction for the virtual CPU's FXSAVE64.
+    /// FOP/FDP use the cleared-field model of the native SP1 reference CPU.
+    pub x87_instruction_pointer: u64,
     /// SSE reset state: exceptions masked, round to nearest, gradual underflow.
     pub mxcsr: u32,
 }
@@ -89,6 +92,7 @@ impl GuestState {
             x87_control: 0x037f,
             x87_registers: [Extended::ZERO; 8],
             x87_empty: 0xff,
+            x87_instruction_pointer: 0,
             mxcsr: 0x1f80,
         }
     }
@@ -462,6 +466,7 @@ fn execute_one(
             x87::wait(s, i.guest_va)?;
             let value = mem_read(m, effective_address(s, &source, i, true), if double {8} else {4}).ok_or(fault)?;
             x87::load(s, value, double);
+            s.x87_instruction_pointer = i.guest_va;
         }
         IROp::StoreX87Integer { destination, width, pop } => {
             if !matches!(width, 2 | 4 | 8) { return Err(unsupported); }
@@ -472,12 +477,14 @@ fn execute_one(
             if let Some(value) = x87::store_integer(s, width, pop) {
                 if !mem_write(m, address, value, width) { return Err(fault); }
             }
+            s.x87_instruction_pointer = i.guest_va;
         }
         IROp::LoadX87Integer { source, width } => {
             if !matches!(width, 2 | 4 | 8) { return Err(unsupported); }
             x87::wait(s, i.guest_va)?;
             let bits = mem_read(m, effective_address(s, &source, i, true), width).ok_or(fault)?;
             x87::load_integer(s, bits, width);
+            s.x87_instruction_pointer = i.guest_va;
         }
         IROp::StoreX87Float { destination, double, pop } => {
             x87::wait(s, i.guest_va)?;
@@ -487,6 +494,7 @@ fn execute_one(
             if let Some(value) = x87::store_float(s, double, pop) {
                 if !mem_write(m, address, value, width) { return Err(fault); }
             }
+            s.x87_instruction_pointer = i.guest_va;
         }
         IROp::MoveString { repeat } => {
             let aw = i.address_width;
@@ -569,13 +577,17 @@ fn execute_one(
                 ByteOperand::Memory(mem) => if !mem_write(m, effective_address(s, &mem, i, true), value, 1) { return Err(fault); },
             }
         }
-        IROp::ByteAlu { op, dst, src } => {
+        IROp::ByteAlu { op, dst, .. } | IROp::ByteAluImmediate { op, dst, .. } => {
             let value = |m: &mut dyn GuestMemory, operand| match operand {
                 ByteOperand::Register { reg, high_byte } => Some((s.reg(reg) >> if high_byte {8} else {0}) & 255),
                 ByteOperand::Memory(mem) => mem_read(m, effective_address(s, &mem, i, true), 1),
             };
             let left = value(m, dst).ok_or(fault)?;
-            let right = value(m, src).ok_or(fault)?;
+            let right = match i.op {
+                IROp::ByteAlu { src, .. } => value(m, src).ok_or(fault)?,
+                IROp::ByteAluImmediate { immediate, .. } => u64::from(immediate),
+                _ => return Err(unsupported),
+            };
             let result = alu(s, op, left, right, 1);
             if !matches!(op, AluOp::Cmp | AluOp::Test) {
                 match dst {
@@ -820,12 +832,26 @@ fn execute_one(
             };
             alu(s, AluOp::Test, value, immediate as u64, w);
         }
-        IROp::BitTestImmediate { src, bit } => {
+        IROp::BitTestImmediate { src, bit, action } => {
             let value = match src {
                 Ok(reg) => s.reg(reg),
                 Err(mem) => mem_read(m, effective_address(s, &mem, i, true), w).ok_or(fault)?,
             };
-            s.set_flag(FLAG_CF, value & (1u64 << (bit % (w * 8))) != 0);
+            let bit = 1u64 << (bit % (w * 8));
+            let result = match action {
+                BitAction::Test => None, BitAction::Set => Some(value | bit),
+                BitAction::Reset => Some(value & !bit), BitAction::Complement => Some(value ^ bit),
+            };
+            if let Some(result) = result {
+                match src {
+                    Ok(reg) => s.write_reg(reg, result, w),
+                    Err(mem) => {
+                        let address = effective_address(s, &mem, i, true);
+                        if !m.probe_write(address, usize::from(w)) || !mem_write(m,address,result,w) {return Err(fault);}
+                    }
+                }
+            }
+            s.set_flag(FLAG_CF, value & bit != 0);
         }
         IROp::BitScan { dst, src, reverse } => {
             let value = match src {
@@ -840,13 +866,17 @@ fn execute_one(
                 s.write_reg(dst, u64::from(index), w);
             }
         }
-        IROp::BitRegister { dst, index, complement } => {
+        IROp::BitRegister { dst, index, action } => {
             let index = s.reg(index) & mask(w);
             let bit = 1u64 << (index % u64::from(w * 8));
             let old = match dst {
                 Ok(reg) => {
                     let old = s.reg(reg);
-                    if complement { s.write_reg(reg, old ^ bit, w); }
+                    let result = match action {
+                        BitAction::Test => None, BitAction::Set => Some(old | bit),
+                        BitAction::Reset => Some(old & !bit), BitAction::Complement => Some(old ^ bit),
+                    };
+                    if let Some(result) = result { s.write_reg(reg, result, w); }
                     old
                 }
                 Err(mem) => {
@@ -861,7 +891,13 @@ fn execute_one(
                     let address = base.wrapping_add(offset);
                     let address = if s.mode == DecodeMode::X86 { u64::from(address as u32) } else { address };
                     let old = mem_read(m, address, w).ok_or(fault)?;
-                    if complement && !mem_write(m, address, old ^ bit, w) { return Err(fault); }
+                    let result = match action {
+                        BitAction::Test => None, BitAction::Set => Some(old | bit),
+                        BitAction::Reset => Some(old & !bit), BitAction::Complement => Some(old ^ bit),
+                    };
+                    if let Some(result) = result {
+                        if !m.probe_write(address, usize::from(w)) || !mem_write(m,address,result,w) { return Err(fault); }
+                    }
                     old
                 }
             };
