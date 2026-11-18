@@ -56,19 +56,17 @@ impl Shell {
     fn program_icon(&self, frame: &mut Surface, program: StartProgram, b: Rect) {
         match program {
             StartProgram::Folder(_) => image(frame,&self.folder,b),
-            StartProgram::Application(id) => nt61_desktop::applications::icons::draw(frame,id,b),            StartProgram::Notepad => nt61_desktop::applications::icons::draw(frame,nt61_desktop::applications::AppId::Notepad,b),
+            StartProgram::Application(id) => nt61_desktop::applications::icons::draw(frame,id,b),
+            StartProgram::Notepad => nt61_desktop::applications::icons::draw(frame,nt61_desktop::applications::AppId::Notepad,b),
             StartProgram::Computer => image(frame, &self.computer, b),
             StartProgram::Explorer => image(frame, &self.folder, b),
-            StartProgram::CommandPrompt => {
-                aero::blend_rounded_rect(frame, b, 2, 0xFF536373);
-                frame.fill_rect(b.x + 2, b.y + 3, b.width - 4, b.height - 5, 0xFF0B0C0F);
-                frame.fill_rect(b.x + 2, b.y + 2, b.width - 4, 3, 0xFFDAE5F1);
-                self.fonts
-                    .draw_color(frame, ">_", b.x + 4, b.y + 10, 0xFFF5F5F5);
-            }
+            StartProgram::CommandPrompt => nt61_desktop::applications::icons::draw(
+                frame, nt61_desktop::applications::AppId::CommandPrompt, b,
+            ),
         }
     }
     pub(super) fn draw_namespace_window(&self, frame: &mut Surface, body: Rect, kind: WindowKind) {
+        if kind==WindowKind::Personalization {nt61_desktop::personalization::draw(&self.model.personalization,frame,body,|f,t,b,c|self.label(f,t,b,c));return;}
         if kind==WindowKind::SoundSettings {nt61_desktop::sound_settings::draw(&self.model.sound_settings,frame,body,|f,t,b,c|self.label(f,t,b,c));return;}
         if kind==WindowKind::UserAccounts {nt61_desktop::control_panel::draw(&self.model.account_settings,frame,body,|f,t,b,c|self.label(f,t,b,c));return;}
         if kind == WindowKind::System {
@@ -178,8 +176,8 @@ impl Shell {
             aero::superbar_button(frame, b, false);
         }
         image(frame, &self.folder, Rect::new(b.x + 10, b.y + 3, 32, 32));
-        for (i, w) in self.model.taskbar.windows.iter().enumerate() {
-            let b = l.window_button(i, self.model.taskbar.windows.len());
+        for (display, (i, w)) in self.model.taskbar_windows().enumerate() {
+            let b = l.window_button(display, self.model.taskbar_windows().count());
             let active = self.model.selected_window == Some(w.id) && !w.minimized;
             aero::superbar_button(frame, b, active);
             if self.model.controls.hot() == CONTROL_TASKBAR_BASE + i as u32 {
@@ -683,7 +681,12 @@ impl Shell {
                 );
             }
             Flyout::Overflow => {
-                self.centered(
+                if self.model.task_manager_tray().is_some() {
+                    self.program_icon(frame, StartProgram::Application(nt61_desktop::applications::AppId::TaskManager),
+                        Rect::new(b.x + 18, b.y + 48, 32, 32));
+                    self.label(frame, "Windows Task Manager",
+                        Rect::new(b.x + 58, b.y + 55, b.width.saturating_sub(66), 24), TEXT);
+                } else { self.centered(
                     frame,
                     if self.model.taskbar.notifications.is_empty() {
                         "No hidden notification icons"
@@ -692,7 +695,7 @@ impl Shell {
                     },
                     Rect::new(b.x + 12, b.y + 64, b.width - 24, 18),
                     0xFF617484,
-                );
+                ); }
                 self.centered(
                     frame,
                     "Customize...",

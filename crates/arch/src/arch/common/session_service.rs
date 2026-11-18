@@ -27,6 +27,33 @@ pub fn session(action:&str, input:&[u8])->Result<Vec<u8>,u32>{
     if !logonui {desktop()?;} else if !matches!(action,"shutdown"|"restart"|"sleep"){return Err(STATUS_ACCESS_DENIED);}
     match action {
         "user"=>Ok(user()?.into_bytes()),
+        "wallpaper-get" | "wallpaper-set" => {
+            if LOCKED.load(Ordering::Acquire) || SECURE.load(Ordering::Acquire) { return Err(STATUS_ACCESS_DENIED); }
+            let profile=alloc::format!("C:\\Users\\{}\\NTUSER.DAT",user()?);
+            let previous=match crate::fs::system_volume::read(&profile) {
+                Ok(bytes)=>Some(bytes), Err(STATUS_NOT_FOUND)=>None, Err(code)=>return Err(code),
+            };
+            const POSITIONS: &[(&str,&str)]=&[("10","0"),("6","0"),("2","0"),("0","1"),("0","0")];
+            if action=="wallpaper-get" {
+                let (path,style,tile)=match previous.as_deref() {
+                    Some(bytes)=>crate::registry::desktop_profile::read(bytes).ok_or(STATUS_INVALID_PARAMETER)?,
+                    None=>("C:\\Windows\\Web\\Wallpaper\\Windows\\img0.jpg".into(),"10".into(),"0".into()),
+                };
+                let position=POSITIONS.iter().position(|&(s,t)|s==style&&t==tile).unwrap_or(0);
+                let mut response=alloc::vec![position as u8];response.extend_from_slice(path.as_bytes());return Ok(response);
+            }
+            let (&position,path)=input.split_first().ok_or(STATUS_INVALID_PARAMETER)?;
+            let &(style,tile)=POSITIONS.get(position as usize).ok_or(STATUS_INVALID_PARAMETER)?;
+            let path=core::str::from_utf8(path).map_err(|_|STATUS_INVALID_PARAMETER)?;
+            if path.len()>260 || !path.get(..3).is_some_and(|p|p.eq_ignore_ascii_case("C:\\")) {return Err(STATUS_INVALID_PARAMETER);}
+            let path=crate::fs::system_volume::normalize(path)?;
+            // Validate the target before changing the user's durable setting.
+            crate::fs::system_volume::read(&path)?;
+            let bytes=crate::registry::desktop_profile::update(previous.as_deref(),&path,style,tile).ok_or(STATUS_INVALID_PARAMETER)?;
+            if previous.is_some(){crate::fs::system_volume::write(&profile,&bytes)?;}
+            else {crate::fs::system_volume::create(&profile,&bytes)?;}
+            crate::fs::system_volume::flush()?;Ok(Vec::new())
+        },
         "secure"=>{SECURE.store(true,Ordering::Release);Ok(Vec::new())},
         "unsecure"=>{if LOCKED.load(Ordering::Acquire){return Err(STATUS_ACCESS_DENIED);}SECURE.store(false,Ordering::Release);Ok(Vec::new())},
         "lock"=>{LOCKED.store(true,Ordering::Release);Ok(Vec::new())},
@@ -88,6 +115,9 @@ pub fn monitor()->Result<Vec<u8>,u32>{
     for n in interfaces {
         for v in [u64::from(n.interface_index),u64::from(n.up),n.link_speed,n.bytes_sent,n.bytes_received] {bytes.extend_from_slice(&v.to_le_bytes());}
     }
+    let cpus=crate::ke::scheduler::cpu_activity();
+    bytes.extend(b"CPU1");bytes.extend((cpus.len() as u32).to_le_bytes());
+    for (total,idle,kernel) in cpus {for value in [total,idle,kernel]{bytes.extend(value.to_le_bytes());}}
     Ok(bytes)
 }
 pub fn services()->Result<Vec<u8>,u32>{
@@ -306,4 +336,12 @@ pub fn network(action:&str)->Result<Vec<u8>,u32>{
         bytes.extend_from_slice(&adapter.mac);bytes.extend_from_slice(&adapter.name);
     }
     Ok(bytes)
+}
+
+pub fn media(action:&str,input:&[u8])->Result<Vec<u8>,u32>{
+    desktop()?;
+    if LOCKED.load(Ordering::Acquire)||SECURE.load(Ordering::Acquire){return Err(STATUS_ACCESS_DENIED);}
+    let length=u32::from_le_bytes(input.get(..4).ok_or(STATUS_INVALID_PARAMETER)?.try_into().map_err(|_|STATUS_INVALID_PARAMETER)?) as usize;
+    let input=input.get(4..4usize.checked_add(length).ok_or(STATUS_INVALID_PARAMETER)?).ok_or(STATUS_INVALID_PARAMETER)?;
+    Ok(crate::drivers::audio::hda_pcm::media(action,input)?.into_iter().flat_map(u32::to_le_bytes).collect())
 }

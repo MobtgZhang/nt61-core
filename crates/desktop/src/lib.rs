@@ -21,6 +21,9 @@ pub mod fs;
 pub mod graphics;
 pub mod login;
 pub mod platform;
+#[path = "bin/explorer/png.rs"]
+pub mod png;
+pub mod personalization;
 // Filesystem-based resource generation belongs to the host tool. Keep std out
 // of the desktop library even when Cargo unifies the tool's feature flags.
 #[cfg(test)]
@@ -52,3 +55,6 @@ pub mod control_panel;
 
 pub mod sound_settings;
 pub mod network_settings;
+
+#[path = "../../boot-types/src/memory_diagnostic.rs"]
+pub mod memory_result;

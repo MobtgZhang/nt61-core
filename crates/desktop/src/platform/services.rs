@@ -49,8 +49,10 @@ fn exchange_with(
         16
     } else if operation == nt61_abi::session_bridge::DISPLAY_MODES {256
     } else if operation == nt61_abi::session_bridge::HOTKEYS {4
+    } else if operation == nt61_abi::session_bridge::MEDIA {input.len().max(16)
     } else if operation == nt61_abi::session_bridge::SOUND {16
     } else if operation == nt61_abi::session_bridge::SESSION && path=="user" {128
+    } else if operation == nt61_abi::session_bridge::SESSION && path=="wallpaper-get" {512
     } else if matches!(operation,nt61_abi::session_bridge::MONITOR|nt61_abi::session_bridge::SERVICES|nt61_abi::session_bridge::ACCOUNTS|nt61_abi::session_bridge::NETWORK) {65536
     } else if matches!(operation, COMMAND | nt61_abi::dialog_bridge::COMMAND_POLL) {
         CWD_BYTES + 65536
@@ -226,7 +228,7 @@ pub fn command_poll(id:u64)->Result<Option<CommandOutput>,u32>{
 
 pub fn session(action:&str,input:&[u8])->Result<Vec<u8>,u32>{
     // Passwords borrow caller storage. Never clone them into exchange's buffer.
-    if action=="user" {return transfer(nt61_abi::session_bridge::SESSION,action,input);}
+    if matches!(action,"user"|"wallpaper-get") {return transfer(nt61_abi::session_bridge::SESSION,action,input);}
     submit(&mut Request{version:VERSION,operation:nt61_abi::session_bridge::SESSION,path:action.as_ptr()as u64,path_length:action.len()as u64,data:input.as_ptr()as u64,capacity:input.len()as u64,..Request::default()})?;
     Ok(Vec::new())
 }
@@ -262,3 +264,10 @@ pub fn account_control(name:&str,command:&str,value:&[u8])->Result<(),u32>{
 pub fn play_sound(event:&str)->Result<(),u32>{transfer(nt61_abi::session_bridge::SOUND,event,&[]).map(|_|())}
 
 pub fn sound_settings()->Result<alloc::vec::Vec<u8>,u32>{transfer(nt61_abi::session_bridge::SOUND,"settings",&[])}
+
+pub fn media(action:&str,input:&[u8])->Result<[u32;4],u32>{
+    let mut packet=(input.len() as u32).to_le_bytes().to_vec();packet.extend_from_slice(input);
+    let (bytes,_)=exchange(nt61_abi::session_bridge::MEDIA,action,&packet)?;
+    if bytes.len()!=16 {return Err(STATUS_INVALID_PARAMETER);}
+    Ok(core::array::from_fn(|i|u32::from_le_bytes(bytes[i*4..i*4+4].try_into().unwrap())))
+}

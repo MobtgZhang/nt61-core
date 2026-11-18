@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use crate::registry::path::PathError;
 
 pub mod cm;
+pub mod desktop_profile;
 pub mod hive;
 pub mod path;
 pub mod reg;

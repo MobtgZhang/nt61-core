@@ -7,7 +7,7 @@ mod chrome;
 #[path = "../../font_view.rs"]
 mod font_view;
 mod ico;
-mod png;
+use nt61_desktop::png;
 mod resources_data;
 
 const CURSOR_CUR: &[u8] = include_bytes!("../../../assets/windows7/cursors/aero_arrow_l.cur");
@@ -85,6 +85,8 @@ struct Shell {
     start_button_hover: png::Image,
     start_button_pressed: png::Image,
     wallpaper_asset: png::Image,
+    wallpaper_preference: nt61_desktop::personalization::Preference,
+    wallpaper_revision: u64,
     session_background: nt61_desktop::graphics::Surface,
     fonts: font_view::FontPack,
     model: ShellModel,
@@ -97,6 +99,7 @@ struct Shell {
     window_dirty: core::cell::Cell<Option<u32>>,
     scene_dirty: core::cell::Cell<bool>,
     hover_damage: core::cell::Cell<Option<nt61_desktop::graphics::Rect>>,
+    task_menu_overlay: core::cell::Cell<bool>,
 }
 
 fn desktop_main() -> ! {
@@ -143,9 +146,11 @@ fn desktop_main() -> ! {
         arch::desktop_info(&mut framebuffer);
     }
     let mut frame = nt61_desktop::graphics::Surface::new(framebuffer.width, framebuffer.height);
+    shell.update_wallpaper();
     shell.prepare_aero(framebuffer.width, framebuffer.height);
     shell.model.refresh_controls(framebuffer.width, framebuffer.height);
     shell.model.refresh_desktop_files();
+    if shell.model.show_boot_memory_result() { arch::debug_str("[MEMORY-RESULT] desktop notification shown\r\n"); }
     shell.model.update_clock(arch::shell_time());
     let devices = arch::shell_devices();
     shell.model.network_adapters = (devices >> 8) as u32;
@@ -431,6 +436,7 @@ fn desktop_main() -> ! {
                             let safe_hover = mouse.buttons & 1 == 0
                                 && shell.model.application(id).is_some_and(|app| {
                                     !app.menu
+                                        && app.manager.menu.is_none()
                                         && app.dialog.is_none()
                                         && !app.confirm
                                         && app.search.is_none()
@@ -465,6 +471,7 @@ fn desktop_main() -> ! {
                     pointer_full = true;
                 }
                 if action == PointerAction::Up {
+                    let was_dragging = shell.model.drag_window.is_some();
                     if shell.model.drag_window.is_none() {
                         if let Some(id) = shell
                             .model
@@ -480,6 +487,10 @@ fn desktop_main() -> ! {
                         }
                     }
                     shell.model.release_window_drag();
+                    if was_dragging {
+                        shell.scene_dirty.set(true);
+                        pointer_full = true;
+                    }
                 }
                 let previous_hot = shell.model.controls.hot();
                 let changed = match shell.model.controls.route_pointer(
@@ -684,9 +695,13 @@ fn desktop_main() -> ! {
                 shell.scene_dirty.set(true);redraw=true;
             }
         }
+        if shell.model.personalization.work(&mut shell.model.files) {shell.scene_dirty.set(true);redraw=true;}
+        if shell.update_wallpaper() {shell.prepare_aero(framebuffer.width,framebuffer.height);redraw=true;}
+        let old_identity=shell.model.session.identity.clone();
         let old_session=shell.model.session.screen;
         let closing=shell.model.session.pending_close.is_some() || shell.model.power_action.is_some();
         if let Some(action)=shell.model.advance_session(){committed_power=Some((action,ticks.saturating_add(250)));}
+        if old_identity!=shell.model.session.identity {shell.model.personalization.load();}
         if closing || old_session!=shell.model.session.screen {shell.scene_dirty.set(true);redraw=true;shell.model.refresh_controls(framebuffer.width,framebuffer.height);}
         let mut updated = arch::DesktopFramebufferInfo::default();
         arch::desktop_info(&mut updated);
@@ -739,7 +754,7 @@ fn desktop_main() -> ! {
                         .taskbar
                         .windows
                         .iter()
-                        .any(|w| w.id == app.window_id && !w.minimized)
+                        .any(|w| w.id == app.window_id && (!w.minimized || (app.id == nt61_desktop::applications::AppId::TaskManager && app.manager.network_active)))
                 })
                 .map(|app| app.window_id)
                 .collect();
@@ -867,6 +882,7 @@ impl Shell {
         if user.is_empty(){return None;}
         model.session.user=user.clone();
         model.session.identity=user;
+        model.personalization.load();
         model.refresh_audio();
         model.files = match nt61_desktop::file::FileSystem::mounted(nt61_desktop::file::Backend(
             nt61_desktop::platform::services::transfer,
@@ -917,6 +933,7 @@ impl Shell {
             window_dirty: core::cell::Cell::new(None),
             scene_dirty: core::cell::Cell::new(true),
             hover_damage: core::cell::Cell::new(None),
+            task_menu_overlay: core::cell::Cell::new(false),
             computer: scaled_icon(resources_data::COMPUTER)?,
             network: scaled_icon(resources_data::NETWORK)?,
             recycle_bin: scaled_icon(resources_data::RECYCLE_BIN)?,
@@ -951,6 +968,8 @@ impl Shell {
             start_button_hover: png::decode_png(START_BUTTON_HOVER_PNG).ok()?,
             start_button_pressed: png::decode_png(START_BUTTON_PRESSED_PNG).ok()?,
             wallpaper_asset: decoded_wallpaper()?,
+            wallpaper_preference: Default::default(),
+            wallpaper_revision: u64::MAX,
             session_background: {let asset=png::decode_png(include_bytes!("../../../assets/windows7/wallpapers/login-1024.png")).ok()?;let mut surface=nt61_desktop::graphics::Surface::new(1024,768);cover_image(&asset,&mut surface);surface},
             fonts: font_view::FontPack::with_library(
                 nt61_desktop::shell::layout::UI_FONT_SIZE,
@@ -960,6 +979,24 @@ impl Shell {
             wallpaper: nt61_desktop::graphics::Surface::new(1, 1),
             glass: nt61_desktop::graphics::Surface::new(1, 1),
         })
+    }
+
+    fn update_wallpaper(&mut self) -> bool {
+        if self.wallpaper_revision==self.model.personalization.revision {return false;}
+        let initial=self.wallpaper_revision==u64::MAX;
+        self.wallpaper_revision=self.model.personalization.revision;
+        let preference=self.model.personalization.current.clone();
+        if initial || preference.path!=self.wallpaper_preference.path {
+            let asset=self.model.files.read_bytes(&preference.path).ok().and_then(|b|nt61_desktop::personalization::decode_jpeg(&b));
+            let Some(asset)=asset else {
+                self.model.personalization.message="This picture could not be loaded.".into();
+                self.model.personalization.current=self.wallpaper_preference.clone();
+                return false;
+            };
+            self.wallpaper_asset=asset;
+        }
+        self.wallpaper_preference=preference;
+        true
     }
 
     fn prepare_aero(&mut self, width: u32, height: u32) {
@@ -972,7 +1009,9 @@ impl Shell {
         let Some(mut glass) = nt61_desktop::graphics::Surface::try_new(width, height) else {
             return;
         };
-        if !cover_image(&self.wallpaper_asset, &mut wallpaper) {
+        let rendered=if self.wallpaper_preference.position==0 {cover_image(&self.wallpaper_asset,&mut wallpaper)}
+            else {nt61_desktop::personalization::render(&self.wallpaper_asset,&mut wallpaper,self.wallpaper_preference.position)};
+        if !rendered {
             draw_wallpaper_into(&mut wallpaper, width, height);
         }
         glass.copy_from(&wallpaper);
@@ -1028,7 +1067,8 @@ impl Shell {
         let damage = self.scene.borrow().damage();
         let has_overlay = self.model.session.screen!=nt61_desktop::session::Screen::Desktop || self.model.start_menu.open
             || self.model.context_menu.is_some()
-            || self.model.flyout.is_some();
+            || self.model.flyout.is_some()
+            || self.task_menu_overlay.get();
         if let Some(region) = damage.filter(|_| !has_overlay) {
             use nt61_desktop::graphics::{present::update_rgba_region, Rect};
             let changed = update_rgba_region(frame, output_pixels, region);
@@ -1056,7 +1096,10 @@ impl Shell {
         let damage = self.hover_damage.take();
         let dirty = self.window_dirty.take();
         let selected = self.model.selected_window;
-        let all = self.scene_dirty.replace(false)
+        let task_menu = self.model.applications.iter().any(|a| a.manager.menu.is_some()
+            && self.model.taskbar.windows.iter().any(|w|w.id==a.window_id && !w.minimized));
+        let previous_task_menu = self.task_menu_overlay.replace(task_menu);
+        let all = self.scene_dirty.replace(false) || task_menu || previous_task_menu
             || damage.zip(dirty).is_some_and(|(rect, dirty)| {
                 let dirty_order = (Some(dirty) == selected, dirty);
                 self.window_glass
@@ -1349,6 +1392,20 @@ impl Shell {
                 | nt61_desktop::shell::WindowKind::DisplaySettings
                 | nt61_desktop::shell::WindowKind::Personalization => {
                     self.draw_namespace_window(frame, body, window.kind);
+                }
+                nt61_desktop::shell::WindowKind::MemoryDiagnostic => {
+                    if let Some(result) = self.model.memory_result {
+                        let mut y = body.y + 22;
+                        for line in [
+                            alloc::string::String::from(result.summary()),
+                            alloc::format!("Completed passes: {}", result.passes),
+                            alloc::format!("Memory tested: {} MiB   Errors: {}", result.tested / 1048576, result.errors),
+                            alloc::string::String::from("A detailed report is saved in C:\\Windows\\MemoryDiagnosticResults.txt"),
+                        ] {
+                            self.draw_wrapped_line(frame, &line, body, y);
+                            y += 46;
+                        }
+                    }
                 }
                 nt61_desktop::shell::WindowKind::Generic => {
                     let client = nt61_desktop::graphics::Rect::new(

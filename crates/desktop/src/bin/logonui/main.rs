@@ -152,6 +152,11 @@ fn logonui_main() -> ! {
     picker.switching=true;picker.logged_off=true;picker.select_users();
     let mut selected_user=picker.accounts.first().map(|a|a.name.clone()).unwrap_or_else(||USER_NAME.into());
     if picker.accounts.len()==1 {if let Some(screen)=assets.as_mut(){screen.set_account(&picker.accounts[0],framebuffer.width,framebuffer.height);}picker.screen=nt61_desktop::session::Screen::Credentials;}
+    if picker.screen == nt61_desktop::session::Screen::Users {
+        arch::debug_str("[LOGONUI] user selection ready\r\n");
+    } else {
+        arch::debug_str("[LOGONUI] credentials ready\r\n");
+    }
     let mut credentials = Credentials::new();
     let layout = Layout::new(framebuffer.width, framebuffer.height);
     let mut controls = build_login_controls(framebuffer.width, framebuffer.height, &layout);
@@ -214,6 +219,7 @@ fn logonui_main() -> ! {
             if let nt61_desktop::session::Intent::Action(action)=intent {power_action=Some(action);}
             if picker.screen==nt61_desktop::session::Screen::Credentials {
                 selected_user=picker.user.clone();credentials.clear();authentication_failed=false;notice=None;
+                arch::debug_str("[LOGONUI] credentials ready\r\n");
                 if let Some(account)=picker.accounts.iter().find(|a|a.name==selected_user){if let Some(screen)=assets.as_mut(){screen.set_account(account,framebuffer.width,framebuffer.height);}}
             }
             if let Some(screen)=assets.as_ref(){if picker.screen==nt61_desktop::session::Screen::Users{draw_account_picker(screen,&picker,&mut frame);}else{screen.draw(&framebuffer,&mut frame,&credentials,false,&controls,false);}cursor_frame.copy_from(&frame);draw_login_cursor(screen,&mut cursor_frame,cursor_x,cursor_y);present_surface_with(&cursor_frame,&mut frame_rgba);}
