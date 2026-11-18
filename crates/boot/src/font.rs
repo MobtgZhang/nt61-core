@@ -4,6 +4,8 @@ extern crate alloc;
 
 use crate::renderer::{Color, Framebuffer};
 use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
+use core::cell::{Ref, RefCell};
 use nt61_fonts::{FontFace, TERMINAL_FONT};
 
 /// A rasterized glyph with antialiased coverage data.
@@ -55,6 +57,7 @@ impl BitmapGlyph {
 pub struct BitmapFont {
     face: FontFace,
     size: u32,
+    glyphs: RefCell<BTreeMap<char, BitmapGlyph>>,
 }
 
 impl BitmapFont {
@@ -68,11 +71,18 @@ impl BitmapFont {
         Self {
             face,
             size: DEFAULT_FONT_SIZE,
+            glyphs: RefCell::new(BTreeMap::new()),
         }
     }
 
+    pub fn size(&self) -> u32 { self.size }
+
     pub fn set_size(&mut self, size: u32) {
-        self.size = size.max(1);
+        let size = size.max(1);
+        if self.size != size {
+            self.size = size;
+            self.glyphs.get_mut().clear();
+        }
     }
 
     pub fn char_width(&self) -> u32 {
@@ -95,20 +105,26 @@ impl BitmapFont {
         measure_string(self, text)
     }
 
-    fn get_char(&self, ch: char) -> Option<BitmapGlyph> {
+    fn get_char(&self, ch: char) -> Option<Ref<'_, BitmapGlyph>> {
+        // Progress updates reuse a small alphabet. Rasterizing every character
+        // on every repaint stalls firmware input and exposes half-painted frames.
+        if self.glyphs.borrow().contains_key(&ch) {
+            return Ref::filter_map(self.glyphs.borrow(), |cache| cache.get(&ch)).ok();
+        }
         let glyph = self.face.rasterize(ch, self.size)?;
         let baseline_offset = self
             .face
             .line_metrics(self.size)
             .map_or(self.size as i32, |metrics| metrics.ascent);
-        Some(BitmapGlyph {
+        self.glyphs.borrow_mut().insert(ch, BitmapGlyph {
             width: glyph.metrics.width,
             height: glyph.metrics.height,
             xmin: glyph.metrics.xmin,
             ymin: glyph.metrics.ymin,
             baseline_offset,
             coverage: glyph.coverage,
-        })
+        });
+        Ref::filter_map(self.glyphs.borrow(), |cache| cache.get(&ch)).ok()
     }
 
     pub fn draw_text(

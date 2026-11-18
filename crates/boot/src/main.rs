@@ -119,6 +119,10 @@ mod graphics;
 mod input;
 mod loader;
 mod memory_test;
+mod memory_diagnostic;
+#[path = "../../boot-types/src/memory_diagnostic.rs"]
+#[allow(dead_code)]
+mod memory_result;
 mod menu;
 #[path = "../../winload/src/refs_boot.rs"]
 mod refs_boot;
@@ -2641,186 +2645,15 @@ fn show_advanced_notice(
     wait_for_any_key(con_in);
 }
 
-/// Test only pages successfully reserved with AllocatePages(Address).
-/// Firmware/loader/runtime regions are excluded. Pages allocated after the
-/// snapshot are skipped if they can no longer be reserved, never overwritten.
+/// Run the boot-time diagnostic before any operating-system pages are loaded.
 fn run_memory_diagnostic(
     fb: &mut Framebuffer,
     font: &mut BitmapFont,
-    mut con_in: Option<&mut crate::input::Keyboard>,
+    con_in: Option<&mut crate::input::Keyboard>,
 ) {
-    use memory_test::{OwnedRegion, TestError, TestMix};
-    use uefi::boot::{AllocateType, MemoryType};
-    use uefi::mem::memory_map::MemoryMap;
-    let mut mix = TestMix::Standard;
-    let mut passes = 2u32;
-    let mut field = 0usize;
-    let mut redraw = true;
-    crate::arch::current::write_com1_marker(b"[MEMORY] configure\r\n");
-    loop {
-        if redraw {
-            let lines = alloc::format!(
-                "{}Test mix: {}    {}Passes: {}",
-                if field == 0 { "> " } else { "" },
-                mix.name(),
-                if field == 1 { "> " } else { "" },
-                passes
-            );
-            diagnostic_screen(
-                fb,
-                font,
-                "Windows Memory Diagnostic",
-                &lines,
-                "TAB: select field  UP/DOWN: change  ENTER: run  ESC: return",
-            );
-            redraw = false;
-        }
-        match con_in.as_mut().and_then(|input| input.read_key()) {
-            Some(Key::Special(ScanCode::ESCAPE)) => return,
-            Some(Key::Special(code)) if code == ScanCode::UP || code == ScanCode::DOWN => {
-                if field == 0 {
-                    mix = if code == ScanCode::UP {
-                        mix.next().next()
-                    } else {
-                        mix.next()
-                    };
-                } else {
-                    passes = if code == ScanCode::UP {
-                        (passes + 8) % 10 + 1
-                    } else {
-                        passes % 10 + 1
-                    };
-                }
-                redraw = true;
-            }
-            Some(Key::Printable(c)) if u16::from(c) == 9 => {
-                field ^= 1;
-                redraw = true;
-            }
-            Some(Key::Printable(c)) if u16::from(c) == 13 => break,
-            _ => uefi::boot::stall(core::time::Duration::from_millis(10)),
-        }
-        if con_in.is_none() {
-            break;
-        }
-    }
-    crate::arch::current::write_com1_marker(
-        alloc::format!("[MEMORY] begin mix={} passes={}\r\n", mix.name(), passes).as_bytes(),
-    );
-    let ranges: Vec<(u64, u64)> = match uefi::boot::memory_map(MemoryType::LOADER_DATA) {
-        Ok(map) => map
-            .entries()
-            .filter(|d| d.ty == MemoryType::CONVENTIONAL && d.page_count > 0)
-            .map(|d| (d.phys_start, d.page_count))
-            .collect(),
-        Err(_) => {
-            show_advanced_notice(fb, font, con_in, "Could not read the UEFI memory map.");
-            return;
-        }
-    };
-    let available: u64 = ranges.iter().map(|(_, pages)| pages * 4096).sum();
-    let mut total_tested = 0u64;
-    for pass in 0..passes {
-        let mut tested = 0u64;
-        let mut skipped = 0u64;
-        let mut last_percent = 101u64;
-        for &(base, pages) in &ranges {
-            let mut page = 0;
-            while page < pages {
-                let count = (pages - page).min(256) as usize;
-                let address = base + page * 4096;
-                page += count as u64;
-                // The live memory map, not the stale snapshot, decides ownership.
-                let pointer = match uefi::boot::allocate_pages(
-                    AllocateType::Address(address),
-                    MemoryType::LOADER_DATA,
-                    count,
-                ) {
-                    Ok(pointer) => pointer,
-                    Err(_) => {
-                        skipped += count as u64 * 4096;
-                        continue;
-                    }
-                };
-                let mut region =
-                    unsafe { OwnedRegion::new(pointer.as_ptr() as *mut u64, count * 512) };
-                let result = memory_test::test(&mut region, mix, || {
-                    !matches!(
-                        con_in.as_mut().and_then(|input| input.read_key()),
-                        Some(Key::Special(ScanCode::ESCAPE))
-                    )
-                });
-                // This allocation is no longer accessed, including failure/cancel paths.
-                let _ = unsafe { uefi::boot::free_pages(pointer, count) };
-                match result {
-                    Ok(bytes) => tested += bytes,
-                    Err(TestError::Cancelled) => {
-                        crate::arch::current::write_com1_marker(b"[MEMORY] cancelled\r\n");
-                        show_advanced_notice(
-                            fb,
-                            font,
-                            con_in,
-                            &alloc::format!("Cancelled: {} bytes fully verified this pass", tested),
-                        );
-                        return;
-                    }
-                    Err(TestError::Fault(fault)) => {
-                        crate::arch::current::write_com1_marker(b"[MEMORY] fault\r\n");
-                        show_advanced_notice(
-                            fb,
-                            font,
-                            con_in,
-                            &alloc::format!(
-                                "Fault at {:x}: expected {:x}, read {:x}",
-                                fault.address,
-                                fault.expected,
-                                fault.actual
-                            ),
-                        );
-                        return;
-                    }
-                }
-                let percent = (tested + skipped) * 100 / available.max(1);
-                if percent != last_percent {
-                    last_percent = percent;
-                    let status = alloc::format!(
-                        "Pass {}/{}: {}%  verified {} MiB  skipped {} MiB",
-                        pass + 1,
-                        passes,
-                        percent,
-                        tested / 1048576,
-                        skipped / 1048576
-                    );
-                    diagnostic_screen(
-                        fb,
-                        font,
-                        "Windows Memory Diagnostic",
-                        &status,
-                        "ESC: cancel. Firmware/loader pages excluded; CPU cache remains enabled.",
-                    );
-                }
-            }
-        }
-        total_tested += tested;
-    }
-    let summary = if total_tested == 0 {
-        String::from("No reservable memory was tested; result is inconclusive.")
-    } else {
-        alloc::format!(
-            "No errors in {} byte-passes ({} passes).",
-            total_tested,
-            passes
-        )
-    };
-    crate::arch::current::write_com1_marker(
-        alloc::format!(
-            "[MEMORY] completed bytes={} passes={}\r\n",
-            total_tested,
-            passes
-        )
-        .as_bytes(),
-    );
-    show_advanced_notice(fb, font, con_in, &summary);
+    let size = font.size();
+    memory_diagnostic::run(fb, font, con_in);
+    font.set_size(size);
 }
 
 fn diagnostic_screen(

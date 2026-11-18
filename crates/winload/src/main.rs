@@ -457,8 +457,7 @@ struct PersistentBootData {
     /// `collect_memory_map` runs.
     map_key: usize,
     /// Physical address of the ESP mirror (set by `capture_esp_partition`).
-    /// The buffer is allocated as `EfiBootServicesData` so it
-    /// survives `ExitBootServices`.
+    /// Runtime data excludes the live snapshot from kernel page reclamation.
     esp_image_base: u64,
     /// Total size of the ESP mirror in bytes.
     esp_image_size: u64,
@@ -2265,15 +2264,14 @@ static mut ESP_CAPTURE_HANDLE: usize = 0;
 const ESP_BLOCKS_PER_CHUNK: usize = 64; // 64 * 512 = 32 KiB per read
 
 /// Snapshot the ESP partition into a contiguous physical buffer.
-/// The buffer is allocated as `EfiBootServicesData` so it
-/// survives `ExitBootServices` and the kernel can map it during
+/// The buffer uses `EfiRuntimeServicesData` so the kernel excludes it
+/// from reclaimed boot-services pages and can map it during
 /// phase 1 of its own bootstrap.
 ///
 /// On success the PERSISTENT struct's `esp_image_*` fields hold
 /// the physical address, byte size, and block size of the
 /// snapshot. On failure (no BlockIO, allocation failed, I/O
-/// error) the fields stay zero and the kernel falls back to the
-/// built-in stub listing.
+/// error) the fields stay zero; there is no synthetic filesystem fallback.
 fn capture_esp_partition() {
     use uefi::boot::OpenProtocolAttributes;
     use uefi::boot::OpenProtocolParams;
@@ -2356,8 +2354,8 @@ fn capture_esp_partition() {
         blocks_to_read,
     );
 
-    // Allocate the mirror buffer in EfiBootServicesData so it
-    // survives ExitBootServices.
+    // This volume stays live after ExitBootServices. Runtime data keeps
+    // it out of the kernel's reclaimed boot-services allocation bank.
     let pages = (mirror_bytes + 0xFFF) / 0x1000;
     debug_println!(
         "[LOADER] ESP capture: allocating {} pages ({} MiB)",
@@ -2366,7 +2364,7 @@ fn capture_esp_partition() {
     );
     let buffer = match uefi::boot::allocate_pages(
         uefi::boot::AllocateType::AnyPages,
-        uefi::boot::MemoryType::BOOT_SERVICES_DATA,
+        uefi::boot::MemoryType::RUNTIME_SERVICES_DATA,
         pages,
     ) {
         Ok(p) => p,
@@ -2618,7 +2616,7 @@ fn capture_system_partition() {
     let pages = (mirror_bytes + 0xFFF) / 0x1000;
     let buffer = match uefi::boot::allocate_pages(
         uefi::boot::AllocateType::AnyPages,
-        uefi::boot::MemoryType::BOOT_SERVICES_DATA,
+        uefi::boot::MemoryType::RUNTIME_SERVICES_DATA,
         pages,
     ) {
         Ok(p) => p,
@@ -2922,6 +2920,33 @@ fn read_fb_mailbox_from_config_table() -> Option<FramebufferInfo> {
 // Phase 6 — Build BootInfo
 // =====================================================================
 
+/// Copy a validated, persistent boot diagnostic result into runtime-owned RAM.
+/// The kernel never dereferences firmware variable storage after ExitBootServices.
+fn read_memory_diagnostic_result() -> (u64, u64, u32, u32) {
+    use nt61_boot_types::memory_diagnostic as md;
+    let name = uefi::cstr16!("NT61MemoryDiagnostic");
+    let vendor = VariableVendor(uefi::guid!("9d0f7e8a-8d21-4f7f-987f-3c9d0c5f4b61"));
+    let mut bytes = [0u8; md::SIZE];
+    let Ok((value, _)) = uefi::runtime::get_variable(name, &vendor, &mut bytes) else { return (0, 0, 0, 0); };
+    let Some(record) = md::ResultRecord::decode(value) else {
+        uefi::println!("[MEMORY-RESULT] invalid result ignored");
+        return (0, 0, 0, 0);
+    };
+    // Retain NVRAM until a previous kernel has actually published this exact
+    // run. A loader crash must not consume the only persistent copy.
+    if open_system_file_data("\\Windows\\MemoryDiagnosticResults.ack")
+        .is_some_and(|ack| record.acknowledged_by(&ack)) {
+        let _ = uefi::runtime::delete_variable(name, &vendor);
+        uefi::println!("[MEMORY-RESULT] acknowledged run={}", record.run_id);
+        return (0, 0, 0, 0);
+    }
+    let Ok(pointer) = uefi::boot::allocate_pages(uefi::boot::AllocateType::AnyPages, uefi::boot::MemoryType::RUNTIME_SERVICES_DATA, 1) else { return (0, 0, 0, 0); };
+    // SAFETY: one runtime page is exclusively ours and holds this fixed-size payload.
+    unsafe { core::ptr::copy_nonoverlapping(value.as_ptr(), pointer.as_ptr(), md::SIZE); }
+    uefi::println!("[MEMORY-RESULT] status={} bytes={} errors={}", record.status, record.tested, record.errors);
+    (pointer.as_ptr() as u64, md::SIZE as u64, md::SIGNATURE, record.status)
+}
+
 fn build_boot_info(kernel_pa: u64, kernel_size: u64) -> BootInfo {
     let pd = unsafe { &*core::ptr::addr_of!(PERSISTENT) };
     uefi::println!(
@@ -2933,6 +2958,8 @@ fn build_boot_info(kernel_pa: u64, kernel_size: u64) -> BootInfo {
 
     // Count loaded boot drivers
     let boot_driver_count = pd.boot_drivers.iter().filter(|r| r.loaded).count() as u32;
+
+    let memory_result = read_memory_diagnostic_result();
 
     BootInfo {
         magic: BootInfo::MAGIC,
@@ -2980,10 +3007,10 @@ fn build_boot_info(kernel_pa: u64, kernel_size: u64) -> BootInfo {
         framebuffer_format: 0,
         _reserved_gfx: 0,
         // Memory diagnostic fields
-        memtest_base: 0,
-        memtest_size: 0,
-        memtest_signature: 0,
-        memtest_status: 0,
+        memtest_base: memory_result.0,
+        memtest_size: memory_result.1,
+        memtest_signature: memory_result.2,
+        memtest_status: memory_result.3,
         // NTFS-loaded kernel images
         ntoskrnl_image_base: 0,
         ntoskrnl_image_size: 0,
@@ -3383,13 +3410,10 @@ fn os_loader_run() -> ! {
     // =================================================================
     // Phase L01 — Capture partition snapshots
     //
-    // Windows 7 winload snapshots the ESP and the System partition
-    // (NTFS or FAT32, depending on disk layout) into
-    // `EfiBootServicesData` buffers so the kernel can mount them as
-    // RAM disks without ever touching the raw disk. This decouples
-    // the kernel's storage stack from the boot-time driver stack
-    // and is exactly what the FAT32 / NTFS drivers in
-    // `fs::init()` expect to find populated in `BootInfo`.
+    // Project bootstrap: preserve complete volumes until native storage
+    // drivers can serve their files. This is not the Windows 7 disk boot
+    // architecture. Runtime data prevents the kernel from reclaiming these
+    // live buffers as boot-services pages; fs::init consumes their BootInfo.
     //
     // Optical boot uses the FAT El Torito volume for both EFI and Windows;
     // capture_system_partition reuses its snapshot as the system RAM disk.
@@ -3412,6 +3436,10 @@ fn os_loader_run() -> ! {
     uefi::println!("[WINLOAD] capture SYS begin");
     capture_system_partition();
     uefi::println!("[WINLOAD] capture SYS end");
+    let captured = unsafe { &*core::ptr::addr_of!(PERSISTENT) };
+    uefi::println!("[WINLOAD] live volumes ESP=0x{:x}/{} SYS=0x{:x}/{}",
+        captured.esp_image_base, captured.esp_image_size,
+        captured.sys_image_base, captured.sys_image_size);
     debug_println!(
         "[LOADER] capture: SYS done (sys_image_base=0x{:x}, size={})",
         unsafe { (*core::ptr::addr_of!(PERSISTENT)).sys_image_base },

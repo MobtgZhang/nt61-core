@@ -60,6 +60,12 @@ impl InputEx {
 }
 
 fn raw_key_to_key((unicode_char, scan_code): (uefi::Char16, u16)) -> Option<Key> {
+    // Some firmware HID consoles put digit characters in ScanCode.
+    // 0x30..0x39 are not UEFI special keys. Normalize this observed
+    // encoding so numeric fields work with those consoles as well.
+    if (0x30..=0x39).contains(&scan_code) {
+        return uefi::Char16::try_from(scan_code).ok().map(Key::Printable);
+    }
     if scan_code != 0 {
         return Some(Key::Special(ScanCode(scan_code)));
     }
@@ -173,10 +179,12 @@ impl Keyboard {
                 .extended
                 .get_mut(index)
                 .and_then(|input| input.read_key()),
-            ActiveKeyboard::Basic(index) => self
-                .basic
-                .get_mut(index)
-                .and_then(|input| input.read_key().ok().flatten()),
+            ActiveKeyboard::Basic(index) => self.basic.get_mut(index).and_then(|input| {
+                input.read_key().ok().flatten().and_then(|key| match key {
+                    Key::Special(code) => raw_key_to_key((uefi::Char16::try_from(0u16).ok()?, code.0)),
+                    key => Some(key),
+                })
+            }),
         }
     }
 }

@@ -544,6 +544,7 @@ pub extern "C" fn kernel_main(boot_info: &BootInfo) -> ! {
             crate::hal::serial::write_string_always(if result.is_ok() { "[BOOTLOG] ntbtlog.txt written\r\n" } else { "[BOOTLOG] ntbtlog.txt write failed\r\n" });
         }
     }
+    crate::ke::memdiag::publish_boot_result(boot_info);
     crate::rtl::klog::phase_trace_marker(14);
     boot_header!("NT6.1.7601 - System Ready");
     boot_debug_println!("NT6.1.7601 reached IDLE");

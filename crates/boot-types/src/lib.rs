@@ -12,3 +12,5 @@ pub mod boot_driver;
 
 /// ABI-reviewed native PE exports shared with the image builder.
 pub mod native_exports;
+
+pub mod memory_diagnostic;

@@ -4,7 +4,7 @@
 
 use crate::graphics::FramebufferInfo;
 
-/// 32-bit BGRA color (in memory: BB GG RR AA)
+/// Packed 0xAARRGGBB colour, stored as BB GG RR AA in a BGRA framebuffer.
 #[derive(Debug, Clone, Copy)]
 pub struct Color(pub u32);
 
@@ -112,9 +112,9 @@ impl Framebuffer {
         unsafe {
             let ptr = self.ptr.add(offset);
             // BGRA format
-            *ptr = ((color.0 >> 16) & 0xFF) as u8; // B
+            *ptr = (color.0 & 0xFF) as u8; // B
             *ptr.add(1) = ((color.0 >> 8) & 0xFF) as u8; // G
-            *ptr.add(2) = (color.0 & 0xFF) as u8; // R
+            *ptr.add(2) = ((color.0 >> 16) & 0xFF) as u8; // R
             *ptr.add(3) = ((color.0 >> 24) & 0xFF) as u8; // A
         }
     }
@@ -134,7 +134,7 @@ impl Framebuffer {
             let green = u32::from(*ptr.add(1));
             let red = u32::from(*ptr.add(2));
             let alpha = u32::from(*ptr.add(3));
-            Some(Color((blue << 16) | (green << 8) | red | (alpha << 24)))
+            Some(Color((red << 16) | (green << 8) | blue | (alpha << 24)))
         }
     }
 
