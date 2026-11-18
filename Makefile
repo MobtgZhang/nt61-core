@@ -216,7 +216,7 @@ VERIFY_DIR ?= build/verify-strict
 # ============================================================
 # Main targets
 # ============================================================
-SYSTEM_SIZE_MB ?= 512
+SYSTEM_SIZE_MB ?= 1024
 
 all: build
 
@@ -1270,6 +1270,30 @@ test-host:
 test-desktop:
 	@echo "Running desktop shell and resource tests..."
 	cargo test -p nt61-desktop --features resource-gen -- --nocapture
+
+# These use an existing x64 NTFS image. Set a new output directory per run;
+# placement refuses to overwrite evidence from an earlier run.
+DESKTOP_TEST_IMAGES ?= $(IMAGES_DIR)
+DESKTOP_TEST_OUTPUT ?= build/desktop-regression
+.PHONY: test-desktop test-desktop-win32 test-desktop-boot test-desktop-placement test-desktop-aero
+
+test-desktop-win32:
+	cargo test -p nt61-abi --test abi_layout --test syscall_metadata
+	cargo test -p nt61-tools --test win32_dll_tests --test win7_metrics_tests
+	cargo test -p nt61-hal --test desktop_hotkeys
+
+test-desktop-boot:
+	python3 scripts/test-desktop-boot.py x86_64 --format ntfs --gpu virtio \
+		--images-dir "$(DESKTOP_TEST_IMAGES)" --output "$(DESKTOP_TEST_OUTPUT)"
+
+test-desktop-placement:
+	python3 scripts/test-window-snap.py --images-dir "$(DESKTOP_TEST_IMAGES)" \
+		--output "$(DESKTOP_TEST_OUTPUT)" --resize
+
+# Software composition regression; does not certify original Aero pixels or DWM ABI.
+test-desktop-aero:
+	python3 scripts/test-window-snap.py --images-dir "$(DESKTOP_TEST_IMAGES)" \
+		--output "$(DESKTOP_TEST_OUTPUT)" --resize --aero
 
 test-pe:
 	@echo "Running PE validation tests..."

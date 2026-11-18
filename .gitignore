@@ -13,6 +13,18 @@ Thumbs.db
 push.sh
 *.local
 
+# Local reports and generated evidence; keep the directory guide and active plan.
+/reports/*
+!/reports/README.md
+!/reports/issues-files.md
+
+# Python caches and optional local experiments/results
+__pycache__/
+*.py[cod]
+/scripts/local/
+/scripts/results/
+/.openssh-staging/
+
 # Build artifacts
 target/
 build/
@@ -27,7 +39,6 @@ isodir/
 *.profraw
 
 # Rust
-Cargo.lock
 *.rs.bk
 *.pdb
 
