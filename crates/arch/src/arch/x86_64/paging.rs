@@ -137,30 +137,30 @@ pub fn page_is_mapped_in_root(root_pfn: u64, va: u64) -> bool {
 
 /// # Safety
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Install an intermediate page-table page. `level` is 1 (PDPT),
-/// 2 (PD), or 3 (PT). The intermediate page's PTE is written in
-/// the parent table with `P=1, R/W=1, U=1, A=1, D=1`.
-/// Map a page-table page by physical address, read one entry, and
-/// immediately release the hyperspace mapping. `None` means the
-/// temporary map could not be established.
+/// Caller must keep the physical table allocated and serialize modifications.
+/// Managed tables use their permanent supervisor alias: a process's low VA
+/// with the same numeric address can contain its image instead of this table.
+/// Before bank publication, and for firmware tables outside it, the bootstrap
+/// identity mapping must still be valid. Do not use hyperspace here: its own
+/// mapper needs to walk these same physical tables.
 unsafe fn read_table_entry(table_phys: u64, idx: usize) -> Option<u64> {
-    if table_phys == 0 {
+    if table_phys == 0 || table_phys & 0xfff != 0 || idx >= 512 {
         return None;
     }
-    Some(ptr::read_volatile((table_phys as *const u64).add(idx)))
+    let table = crate::mm::kernel_physical_alias(table_phys, 4096).unwrap_or(table_phys);
+    Some(ptr::read_volatile((table as *const u64).add(idx)))
 }
 
 /// # Safety
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Map a page-table page by physical address, write one entry, and
-/// immediately release the hyperspace mapping.
+/// Same allocation, synchronization and bootstrap requirements as
+/// `read_table_entry`; the table's kernel mapping must also be writable.
 unsafe fn write_table_entry(table_phys: u64, idx: usize, value: u64) -> bool {
-    if table_phys == 0 {
+    if table_phys == 0 || table_phys & 0xfff != 0 || idx >= 512 {
         return false;
     }
-    ptr::write_volatile((table_phys as *mut u64).add(idx), value);
+    let table = crate::mm::kernel_physical_alias(table_phys, 4096).unwrap_or(table_phys);
+    ptr::write_volatile((table as *mut u64).add(idx), value);
     true
 }
 
@@ -174,14 +174,17 @@ unsafe fn install_intermediate(parent_table_phys: u64, parent_idx: usize, level:
         None => return false,
     };
     let new_pa = pfn_to_phys(pfn);
-    // The fresh table page must be identity-mapped before it can be
-    // zeroed; on failure fail closed and return the page to the free
-    // list (free_pfn only relinks the page, its contents do not matter).
-    if !crate::mm::vas::ensure_low_identity_map(new_pa & !0x1F_FFFF, 0x20_0000) {
-        crate::mm::pfn::free_pfn(pfn);
-        return false;
-    }
-    ptr::write_bytes(new_pa as *mut u8, 0, PAGE_SIZE as usize);
+    let table = match crate::mm::kernel_physical_alias(new_pa, PAGE_SIZE) {
+        Some(alias) => alias,
+        None => {
+            if !crate::mm::vas::ensure_low_identity_map(new_pa & !0x1F_FFFF, 0x20_0000) {
+                crate::mm::pfn::free_pfn(pfn);
+                return false;
+            }
+            new_pa
+        }
+    };
+    ptr::write_bytes(table as *mut u8, 0, PAGE_SIZE as usize);
 
     if !write_table_entry(
         parent_table_phys,
@@ -336,8 +339,8 @@ pub fn unmap_page(va: u64) -> Option<u64> {
         return None;
     }
     let pa = pte_val & 0x000F_FFFF_FFFF_F000;
-    unsafe {
-        ptr::write_volatile((pt_pa as *mut u64).add(pt_idx), 0);
+    if !unsafe { write_table_entry(pt_pa, pt_idx, 0) } {
+        return None;
     }
     invalidate_tlb(va);
     Some(pa)

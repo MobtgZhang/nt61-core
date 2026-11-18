@@ -924,9 +924,9 @@ pub fn init(base_pfn: PfnNumber, pfn_count: PfnNumber) {
                     core::mem::size_of::<MMPFN>() as u64,
                 );
             }
-            // The PFN DB storage lives in kernel-VA space via the
-            // recursive self-map, so we can access it through its
-            // physical address directly.
+            // Bootstrap through the identity mapping only. Before creating
+            // user roots, protect_database switches to the permanent kernel
+            // alias: a user image may replace this low virtual address.
             PFN_STORAGE_PTR = phys as *mut u8;
             PFN_STORAGE_PHYS = phys;
             PFN_STORAGE_USED = pages * 4096;
@@ -1055,12 +1055,14 @@ pub fn allocate_pfn() -> Option<PfnNumber> {
         db.allocate_pfn(pfn);
         return Some(pfn);
     }
-    // NT bugchecks PFN_LIST_CORRUPT (0x4E) when the free list is
-    // internally inconsistent. Self-healing masks corruption and can
-    // rebuild the list over live pages. Pass the free-list head and
-    // count as bugcheck parameters 1/2 for diagnosis.
+    // Empty lists are ordinary memory pressure. A nonzero count with no
+    // head is corruption; do not silently rebuild over live allocations.
     let head = db.lists[PFNL_FREE].head;
     let count = db.lists[PFNL_FREE].count;
+    let zeroed_count = db.lists[PFNL_ZEROED].count;
+    if count == 0 && zeroed_count == 0 {
+        return None;
+    }
     drop(db);
     crate::ke::bugcheck::bugcheck_with(
         crate::ke::bugcheck::BugCheckCode::PfnListCorrupt,
@@ -1135,6 +1137,32 @@ pub fn free_pfn(pfn: PfnNumber) {
 #[doc(hidden)]
 pub fn frame_sync_is_initialized() -> bool {
     is_initialized()
+}
+
+/// Atomically acquire a buddy extent only if every tracked PFN is free or
+/// zeroed. An existing Active reservation is ownership, not permission for
+/// another allocator to reuse the page. Preflight before unlinking anything.
+/// Called with the buddy lock held; this function must never call back into it.
+#[doc(hidden)]
+pub fn frame_sync_claim(base: PfnNumber, count: PfnNumber) -> bool {
+    let Some(end) = base.checked_add(count) else { return false; };
+    if count == 0 { return false; }
+    let mut db = PFN_DB.lock();
+    if !db.initialized { return true; }
+    let start = base.max(db.lowest_pfn);
+    let end = end.min(db.highest_pfn);
+    for pfn in start..end {
+        let entry = db.entry(pfn).unwrap();
+        if !matches!(unsafe { (*entry).state() }, MMPFNSTATE::Free | MMPFNSTATE::Zeroed) {
+            return false;
+        }
+    }
+    for pfn in start..end {
+        let entry = db.entry(pfn).unwrap();
+        unsafe { db.unlink_entry(entry, pfn); }
+        db.allocate_pfn(pfn);
+    }
+    true
 }
 
 /// Shim for `frame::allocate_pages`: reserves a frame the buddy
@@ -1311,6 +1339,34 @@ pub fn get_database_phys() -> u64 {
     unsafe { PFN_STORAGE_PHYS }
 }
 
+/// Stop using the bootstrap identity mapping before any user root exists.
+/// List links contain PFN numbers, so changing the base preserves all records,
+/// ownership and counters without rebuilding the database.
+///
+/// # Safety
+/// Call once during MM initialization, before SMP/process creation, with no
+/// outstanding pointers to PFN entries. The shared bank mapping must already
+/// be installed and must remain mapped in every subsequent kernel root.
+pub(super) unsafe fn protect_database() -> bool {
+    let mut db = PFN_DB.lock();
+    if !db.initialized {
+        return false;
+    }
+    if PFN_STORAGE_PHYS == 0 {
+        // Static fallback is part of the protected kernel image.
+        return true;
+    }
+    let Some(alias) = crate::mm::kernel_heap_map::address(
+        PFN_STORAGE_PHYS,
+        PFN_STORAGE_USED as u64,
+    ) else {
+        return false;
+    };
+    db.pfn_array = alias as *mut MMPFN;
+    PFN_STORAGE_PTR = alias as *mut u8;
+    true
+}
+
 pub fn get_database_bytes() -> usize {
     unsafe { PFN_STORAGE_USED }
 }
@@ -1479,9 +1535,9 @@ mod tests {
         db.add_to_free(pfn);
         assert_eq!(db.free_count(), 1500);
 
-        // Pop and mark as zeroed
-        db.unlink(pfn);
+        // insert_zeroed removes a Free page from its current list itself.
         db.insert_zeroed(pfn);
+        assert_eq!(db.free_count(), 1499);
         assert_eq!(db.zeroed_count(), 1);
 
         // Pop zeroed

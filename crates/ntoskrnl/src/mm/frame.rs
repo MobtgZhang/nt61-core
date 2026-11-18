@@ -260,25 +260,27 @@ impl BuddyAllocator {
         }
 
         for current_order in order..MAX_BUDDY_ORDER {
-            // Take the first block whose pages are all allocatable.
-            // Blocks kept alive by reserve_range() carry the
-            // FRAME_RESERVED flag but stay on the free lists, so a
-            // plain pop_head could hand out the kernel stack / PFN
-            // database region. Walk the list and remove the first
-            // block that contains no reserved pages.
-            let frame = {
+            // Claim the requested extent in the PFN database before publishing
+            // it. PFN-owned page tables may still appear free in buddy metadata.
+            let candidate = {
                 let mut lock = self.free_lists[current_order].lock();
-                self.take_allocatable(&mut lock, current_order)
+                self.take_allocatable(&mut lock, current_order, order)
             };
-            if frame == FREE_LIST_END {
+            let Some((frame, selected)) = candidate else {
                 continue;
-            }
-            // Split the block down to the requested order.
-            let cur_frame = frame;
+            };
+            // Split toward the selected sub-block; either half can contain the
+            // first free extent when the other half belongs to the PFN allocator.
+            let mut cur_frame = frame;
             let mut cur_order = current_order;
             while cur_order > order {
                 cur_order -= 1;
-                let buddy = cur_frame ^ (1u32 << cur_order);
+                let upper = cur_frame + (1u32 << cur_order);
+                let buddy = if selected < upper { upper } else {
+                    let lower = cur_frame;
+                    cur_frame = upper;
+                    lower
+                };
                 let mut sub_lock = self.free_lists[cur_order].lock();
                 unsafe { (*self.frame_infos.add(buddy as usize)).order = cur_order as u8; }
                 push_head(&mut sub_lock, buddy, self.buddy_nodes);
@@ -300,22 +302,27 @@ impl BuddyAllocator {
         None
     }
 
-    /// Remove and return the first block on the order-`order` free
-    /// list that contains no FRAME_RESERVED pages. Returns
-    /// `FREE_LIST_END` when the list is exhausted. Reserved blocks
-    /// stay on the list untouched.
-    fn take_allocatable(&self, list: &mut FreeListHead, order: usize) -> u32 {
+    /// Find a requested-order extent within a free block and atomically claim
+    /// its PFNs. Keep the rest available, including around live PFN allocations.
+    /// Lock order is buddy -> PFN; the PFN allocator never takes the buddy lock.
+    fn take_allocatable(&self, list: &mut FreeListHead, order: usize, requested: usize) -> Option<(u32, u32)> {
         let mut cur = list.head;
         while cur != FREE_LIST_END {
-            if !self.block_contains_reserved(cur, order) {
-                remove_node(list, cur, self.buddy_nodes);
-                return cur;
+            let pages = 1u64 << requested;
+            for offset in (0..1u64 << order).step_by(pages as usize) {
+                let selected = cur + offset as u32;
+                if !self.block_contains_reserved(selected, requested)
+                    && crate::mm::pfn::frame_sync_claim(self.base_address / 4096 + selected as u64, pages)
+                {
+                    remove_node(list, cur, self.buddy_nodes);
+                    return Some((cur, selected));
+                }
             }
             unsafe {
                 cur = (*self.buddy_nodes.add(cur as usize)).next;
             }
         }
-        FREE_LIST_END
+        None
     }
 
     /// True if any 4 KiB page inside the order-`order` block that
@@ -642,17 +649,8 @@ pub fn allocate_pages(count: u64) -> Option<u64> {
             allocation_pages.min(FREE_PAGES.load(Ordering::SeqCst)),
             Ordering::SeqCst,
         );
-        // Keep the PFN allocator in sync: every frame this buddy hands
-        // out is a live page the PFN database must never treat as free.
-        // Without this reservation the PFN allocator can later hand the
-        // same frame to a different consumer, letting it overwrite live
-        // page tables or the PFN database itself (PFN_LIST_CORRUPT).
-        if crate::mm::pfn::frame_sync_is_initialized() {
-            let pfn_base = addr / 4096;
-            for offset in 0..allocation_pages {
-                crate::mm::pfn::frame_sync_reserve(pfn_base + offset);
-            }
-        }
+        // BuddyAllocator::allocate already claimed the entire rounded PFN
+        // extent under the same ownership check that selected this block.
         Some(addr)
     } else {
         None
@@ -671,7 +669,7 @@ pub fn free_pages(phys_addr: u64, count: u64) {
     // again instead of leaking as permanently Active.
     if crate::mm::pfn::frame_sync_is_initialized() {
         let pfn_base = phys_addr / 4096;
-        for offset in 0..count {
+        for offset in 0..allocation_pages {
             crate::mm::pfn::frame_sync_release(pfn_base + offset);
         }
     }

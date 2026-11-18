@@ -3,9 +3,9 @@
 //! One contiguous allocation holds the descriptor table, the available
 //! ring and the used ring, laid out with the alignment the legacy
 //! transport requires. All buffers are described to the device by
-//! physical address; the kernel identity-maps its pool memory on every
-//! supported target, so virtual-to-physical translation is performed
-//! through mm::virt_to_phys.
+//! physical address. On x86_64 CPU accesses use a persistent system-PTE
+//! mapping: a user image can replace low identity mappings. Device ring
+//! addresses and allocation ownership retain the original physical extent.
 
 use crate::mm::virt_to_phys;
 use alloc::vec::Vec;
@@ -63,6 +63,7 @@ impl QueueBuffer {
 pub struct QueueLayout {
     num: u16,
     mem: *mut u8,
+    mem_phys: u64,
     mem_len: usize,
     desc: *mut Descriptor,
     avail_base: *mut u8,
@@ -94,13 +95,27 @@ impl QueueLayout {
         crate::hal::serial::write_string_always("[QUEUE] layout ok\r\n");
         let page_count = mem_len.div_ceil(0x1000) as u64;
         let mem_phys = crate::mm::allocate_pages(page_count)?;
-        let map_base = mem_phys & !0x1F_FFFF;
-        let map_len = ((mem_len as u64) + (mem_phys - map_base)).div_ceil(0x20_0000) * 0x20_0000;
-        if !crate::arch::identity_map_region(map_base, map_len) {
-            crate::mm::free_pages(mem_phys, page_count);
-            return None;
-        }
-        let mem = mem_phys as *mut u8;
+        #[cfg(target_arch = "x86_64")]
+        let mem = {
+            let Some(mapped) = crate::mm::syspte::map_io_space(mem_phys, page_count) else {
+                crate::mm::free_pages(mem_phys, page_count);
+                return None;
+            };
+            crate::mm::vas::refresh_kernel_mappings(crate::arch::read_current_page_root());
+            mapped as *mut u8
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let mem = {
+            let map_base = mem_phys & !0x1F_FFFF;
+            let map_len = ((mem_len as u64) + (mem_phys - map_base)).div_ceil(0x20_0000) * 0x20_0000;
+            if !crate::arch::identity_map_region(map_base, map_len) {
+                crate::mm::free_pages(mem_phys, page_count);
+                return None;
+            }
+            mem_phys as *mut u8
+        };
+        // SAFETY: the owned allocation is mapped for mem_len bytes and
+        // has not been exposed to the device or any other queue yet.
         unsafe {
             core::ptr::write_bytes(mem, 0, mem_len);
             let desc = mem as *mut Descriptor;
@@ -129,6 +144,7 @@ impl QueueLayout {
             Some(QueueLayout {
                 num,
                 mem,
+                mem_phys,
                 mem_len,
                 desc,
                 avail_base,
@@ -151,15 +167,15 @@ impl QueueLayout {
 
     /// Physical address of the descriptor table (for the transport).
     pub fn desc_physical(&self) -> Option<u64> {
-        virt_to_phys(self.desc as u64)
+        Some(self.mem_phys)
     }
 
     pub fn avail_physical(&self) -> Option<u64> {
-        virt_to_phys(self.avail_base as u64)
+        self.mem_phys.checked_add(self.avail_base as u64 - self.mem as u64)
     }
 
     pub fn used_physical(&self) -> Option<u64> {
-        virt_to_phys(self.used_base as u64)
+        self.mem_phys.checked_add(self.used_base as u64 - self.mem as u64)
     }
 
     pub fn debug_descriptor(&self, head: u16) -> (u64, u32, u16, u16) {
@@ -275,7 +291,10 @@ impl QueueLayout {
 impl Drop for QueueLayout {
     fn drop(&mut self) {
         if !self.mem.is_null() {
-            crate::mm::free_pages(self.mem as u64, self.mem_len.div_ceil(0x1000) as u64);
+            let pages = self.mem_len.div_ceil(0x1000) as u64;
+            #[cfg(target_arch = "x86_64")]
+            crate::mm::syspte::release_system_ptes(self.mem as u64, pages);
+            crate::mm::free_pages(self.mem_phys, pages);
             self.mem = core::ptr::null_mut();
         }
     }

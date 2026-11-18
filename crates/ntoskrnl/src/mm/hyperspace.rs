@@ -3,13 +3,13 @@
 //! Hyperspace is a per-process temporary mapping window used to map
 //! page tables (and other kernel data structures) of *another*
 //! address space into the current one. NT 6.1 implements this as a
-//! single 4-KiB mapping per CPU (modern Windows uses multiple).
+//! temporary window; our bootstrap mapper reserves slots until released.
 //
 //! In our layout hyperspace lives at `0xFFFFF700_0000_0000`. The
 //! underlying PTE is the index `[0]` in the corresponding PDE/PPE
 //! chain. To map a physical page there, we set the PTE at
-//! `HYPERSPACE_BASE + ((cpu_id & 0x1FF) * 4096)` and then access the
-//! address.
+//! `HYPERSPACE_BASE + (reserved_slot * 4096)` and then access the
+//! address. Nested mappings must retain distinct slots until unmapping.
 
 #[cfg(target_arch = "x86_64")]
 use crate::ke::sync::Spinlock;
@@ -22,7 +22,7 @@ use crate::mm::pte::MMPTE;
 
 pub use crate::mm::constants::{HYPERSPACE_BASE, HYPERSPACE_END, HYPERSPACE_ENTRIES};
 
-/// Physical address of the leaf PTE for hyperspace slot `slot` in
+/// Kernel address of the leaf PTE for hyperspace slot `slot` in
 /// the current address space, obtained by walking the page tables
 /// from the current root by physical address.
 ///
@@ -38,85 +38,100 @@ fn hyperspace_pte(slot: u64) -> *mut MMPTE {
     const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
     const PTE_P: u64 = 0x1;
     const PTE_PS: u64 = 1 << 7;
-    let root = crate::mm::vas::current_root();
-    if root == 0 {
+    // The window belongs to the address space executing this mapping.
+    // Bootstrap attach/detach bookkeeping is global and can name a different
+    // root after direct user entry or an assembly context switch.
+    let root = crate::arch::read_current_page_root();
+    if root == 0 || slot >= HYPERSPACE_ENTRIES {
         return core::ptr::null_mut();
     }
-    let pml4e = unsafe { *((root as *const u64).add(MI_HYPERSPACE_INDEX)) };
+    // The permanent bank map is inherited by every process. Low identity
+    // pointers cease to name physical tables once a user image replaces them.
+    let table_address = |physical| {
+        crate::mm::kernel_physical_alias(physical, 4096).unwrap_or(physical)
+    };
+    // SAFETY: the current root and its present non-large descendants remain
+    // allocated while the caller holds the hyperspace slot lock.
+    let pml4e = unsafe { core::ptr::read_volatile((table_address(root) as *const u64).add(MI_HYPERSPACE_INDEX)) };
     if pml4e & PTE_P == 0 {
         return core::ptr::null_mut();
     }
-    let pdpte = unsafe { *((pml4e & PTE_ADDR_MASK) as *const u64) };
+    let pdpte = unsafe { core::ptr::read_volatile(table_address(pml4e & PTE_ADDR_MASK) as *const u64) };
     if pdpte & PTE_P == 0 || pdpte & PTE_PS != 0 {
         return core::ptr::null_mut();
     }
-    let pde = unsafe { *((pdpte & PTE_ADDR_MASK) as *const u64) };
+    let pde = unsafe { core::ptr::read_volatile(table_address(pdpte & PTE_ADDR_MASK) as *const u64) };
     if pde & PTE_P == 0 || pde & PTE_PS != 0 {
         return core::ptr::null_mut();
     }
-    let pt = (pde & PTE_ADDR_MASK) as *mut MMPTE;
+    let pt = table_address(pde & PTE_ADDR_MASK) as *mut MMPTE;
     unsafe { pt.add(slot as usize) }
 }
 
-/// Per-CPU hyperspace slot. NT gives every processor its own temporary
-/// mapping; this prevents concurrent mappers on different CPUs from
-/// aliasing the same PTE.
+// CPUs executing one process share its temporary-mapping chain. Reserve a slot for
+// the complete lifetime of each mapping, including nested guards on one CPU.
+// Global bookkeeping conservatively prevents reuse across different roots too.
+// A CPU-indexed single slot lets the second guard silently replace the first
+// (notably the system/process page tables in refresh_kernel_mappings).
 #[cfg(target_arch = "x86_64")]
-static HYPERSPACE_LOCK: Spinlock<()> = Spinlock::new(());
+static HYPERSPACE_SLOTS: Spinlock<[bool; HYPERSPACE_ENTRIES as usize]> =
+    Spinlock::new([false; HYPERSPACE_ENTRIES as usize]);
 
-/// Map `pfn` at the next hyperspace slot and return the VA.
+/// Reserve and map a contiguous physical span in the temporary window.
+/// Exhaustion or a missing window fails without replacing an active mapping.
 #[cfg(target_arch = "x86_64")]
-pub fn map_hyperspace(pfn: u64) -> u64 {
-    let slot = this_hyperspace_slot();
-    let va = HYPERSPACE_BASE + slot * 4096;
-    let pte_ptr = hyperspace_pte(slot);
-    if pte_ptr.is_null() {
+pub fn map_hyperspace_pages(pfn: u64, pages: u64) -> u64 {
+    if pages == 0 || pages > HYPERSPACE_ENTRIES ||
+        pfn.checked_add(pages - 1).filter(|&last| last <= (0x000f_ffff_ffff_f000 >> 12)).is_none() {
         return 0;
     }
-    unsafe {
-        let pte = pte_ptr;
-        (*pte).set_hardware(pfn << 12, 0x1 | 0x2 | 0x4 | 0x20 | 0x40);
+    let mut slots = HYPERSPACE_SLOTS.lock();
+    let count = pages as usize;
+    let Some(start) = slots.windows(count).position(|span| span.iter().all(|&used| !used)) else {
+        return 0;
+    };
+    // Preflight the whole range before changing the shared page tables.
+    for offset in 0..count {
+        if hyperspace_pte((start + offset) as u64).is_null() { return 0; }
     }
-    crate::mm::vas::invalidate_tlb(va);
-    va
+    for offset in 0..count {
+        let slot = start + offset;
+        let va = HYPERSPACE_BASE + slot as u64 * 4096;
+        unsafe { (*hyperspace_pte(slot as u64)).set_hardware((pfn + offset as u64) << 12, 0x63); }
+        crate::mm::vas::invalidate_tlb(va);
+        slots[slot] = true;
+    }
+    HYPERSPACE_BASE + start as u64 * 4096
 }
 
-#[cfg(target_arch = "x86_64")]
-fn this_hyperspace_slot() -> u64 {
-    let cpu = crate::ke::scheduler::get_current_cpu() as u64;
-    let _guard = HYPERSPACE_LOCK.lock();
-    cpu % HYPERSPACE_ENTRIES
+pub fn map_hyperspace(pfn: u64) -> u64 {
+    map_hyperspace_pages(pfn, 1)
 }
 
-/// Non-x86 targets expose RAM through a boot-time physical identity
-/// map, so page-table pages can be reached directly. This is the
-/// architecture's temporary-mapping implementation.
+/// Non-x86 targets expose RAM through a boot-time physical identity map.
 #[cfg(not(target_arch = "x86_64"))]
-pub fn map_hyperspace(pfn: u64) -> u64 {
-    let pa = crate::mm::pte::pfn_to_phys(pfn);
-    if !crate::arch::map_page(pa, pa, crate::mm::pte::PTE_RW) {
-        return 0;
+pub fn map_hyperspace_pages(pfn: u64, pages: u64) -> u64 {
+    if pages == 0 || pages > HYPERSPACE_ENTRIES { return 0; }
+    let Some(end) = pfn.checked_add(pages) else { return 0; };
+    for frame in pfn..end {
+        let pa = crate::mm::pte::pfn_to_phys(frame);
+        if !crate::arch::map_page(pa, pa, crate::mm::pte::PTE_RW) { return 0; }
     }
-    pa
+    crate::mm::pte::pfn_to_phys(pfn)
 }
 
-/// Invalidate the most recent hyperspace mapping. After calling
-/// this the slot can be reused.
 #[cfg(target_arch = "x86_64")]
 pub fn unmap_hyperspace(va: u64) {
-    if !(HYPERSPACE_BASE..HYPERSPACE_END).contains(&va) {
+    if !(HYPERSPACE_BASE..HYPERSPACE_END).contains(&va) || va & 0xfff != 0 {
         return;
     }
     let slot = (va - HYPERSPACE_BASE) / 4096;
+    let mut slots = HYPERSPACE_SLOTS.lock();
     let pte_ptr = hyperspace_pte(slot);
-    if pte_ptr.is_null() {
-        return;
-    }
-    unsafe {
-        let pte = pte_ptr;
-        (*pte).clear();
-        crate::mm::vas::invalidate_tlb(va);
-    }
+    if pte_ptr.is_null() || !slots[slot as usize] { return; }
+    unsafe { (*pte_ptr).clear(); }
+    crate::mm::vas::invalidate_tlb(va);
+    slots[slot as usize] = false;
 }
 
 #[cfg(not(target_arch = "x86_64"))]

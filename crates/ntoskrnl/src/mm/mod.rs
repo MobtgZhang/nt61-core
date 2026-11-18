@@ -54,6 +54,7 @@ pub(crate) fn write_decimal_u64(mut x: u64) {
 }
 
 pub mod access_fault;
+mod bootstrap_region;
 pub mod constants;
 pub mod cow;
 pub mod dynamic_paging;
@@ -75,6 +76,12 @@ pub mod frame;
 pub mod heap;
 mod large_heap;
 mod kernel_heap_map;
+
+/// Stable supervisor address for a complete extent of the managed RAM bank.
+/// Bootstrap/firmware memory outside this bank has no alias here.
+pub fn kernel_physical_alias(physical: u64, bytes: u64) -> Option<u64> {
+    kernel_heap_map::address(physical, bytes)
+}
 pub mod logging;
 pub mod mdl;
 pub mod perf;
@@ -450,6 +457,35 @@ pub fn init(boot_info: &BootInfo) {
     }
     if chosen_size > MAX_RAM_BYTES {
         chosen_size = MAX_RAM_BYTES;
+    }
+
+    // A single firmware descriptor can be much smaller than available RAM
+    // after the loader has allocated images and volume snapshots. Select a
+    // bounded bank covering multiple usable islands. The reservation passes
+    // below exclude every non-usable descriptor and unlisted hole again.
+    #[cfg(target_arch = "x86_64")]
+    if boot_info.memory_map != 0 && boot_info.memory_map_entries != 0 {
+        let stride = if boot_info.memory_descriptor_size != 0 {
+            boot_info.memory_descriptor_size as usize
+        } else {
+            core::mem::size_of::<MemoryDescriptor>()
+        };
+        let descriptors = boot_info.memory_map as *const u8;
+        let count = boot_info.memory_map_entries as usize;
+        if let Some(region) = bootstrap_region::select(count, |index| {
+            let entry = unsafe {
+                core::ptr::read_unaligned(descriptors.add(index * stride) as *const MemoryDescriptor)
+            };
+            (entry.base_address, entry.length, entry.memory_type)
+        }, FRAME_COVERAGE_BYTES) {
+            if region.usable > chosen_size {
+                chosen_base = region.base;
+                chosen_size = region.size;
+                crate::hal::serial::write_string_always("[mm] multi-descriptor usable bytes=");
+                write_decimal_u64(region.usable);
+                crate::hal::serial::write_string_always("\r\n");
+            }
+        }
     }
 
     // Firmware page tables outside the managed bank remain reserved firmware
@@ -860,6 +896,20 @@ pub fn init(boot_info: &BootInfo) {
     } else {
         crate::hal::serial::write_string_always("[mm] shared kernel heap aliases unavailable\r\n");
     }
+
+    // No PFN entry pointers escape this boot phase. User image mappings may
+    // replace the low identity addresses, including the database's storage.
+    if !unsafe { pfn::protect_database() } {
+        crate::hal::serial::write_string_always("[FATAL] PFN kernel alias unavailable\r\n");
+        crate::ke::bugcheck::bugcheck_with(
+            crate::ke::bugcheck::BugCheckCode::PfnListCorrupt,
+            pfn::get_database_phys(),
+            pfn::get_database_bytes() as u64,
+            chosen_base,
+            chosen_size,
+        );
+    }
+    crate::hal::serial::write_string_always("[mm] PFN storage protected by kernel mapping\r\n");
 
     // ------------------------------------------------------------------
     // 8. Mark MM as fully initialized.  After this point the

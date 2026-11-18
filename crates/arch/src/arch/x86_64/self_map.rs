@@ -650,81 +650,8 @@ pub unsafe fn force_writable_identity_map(pfn: PfnNumber) {
         in(reg) saved_cr0,
         options(nostack, preserves_flags),
     );
-    unsafe {
-        force_user_accessible(pfn);
-    }
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Walk user PML4 entries and force user-accessible bits.
-pub unsafe fn force_user_accessible(pfn: PfnNumber) {
-    let pml4_phys = pfn << 12;
-    let pml4 = pml4_phys as *mut MMPTE;
-    crate::boot_println!("[VAS] force_user_accessible: pml4_phys=0x{:x}", pml4_phys);
-    let saved_cr0: u64;
-    core::arch::asm!(
-        "mov {}, cr0",
-        out(reg) saved_cr0,
-        options(nostack, preserves_flags),
-    );
-    core::arch::asm!(
-        "mov cr0, {}",
-        in(reg) saved_cr0 & !0x0001_0000u64,
-        options(nostack, preserves_flags),
-    );
-    let mut flipped = 0u64;
-    // Iterate user-half PML4 entries only (0..256). The kernel-half
-    // (256..512) keeps U=0.
-    for pml4_idx in 0..256 {
-        let mut pml4e = (*pml4.add(pml4_idx)).raw();
-        if pml4e & 0x1 == 0 {
-            continue;
-        }
-        if pml4e & 0x4u64 == 0 {
-            pml4e |= 0x4u64;
-            core::ptr::write_volatile(pml4.add(pml4_idx) as *mut u64, pml4e);
-            flipped += 1;
-        }
-        let pdpt_phys = pml4e & !0xFFF_u64;
-        let pdpt = pdpt_phys as *mut MMPTE;
-        // Skip 1GB large pages.
-        if pml4e & (1u64 << 7) != 0 {
-            continue;
-        }
-        for pdpt_idx in 0..PT_ENTRIES {
-            let mut pdpte = (*pdpt.add(pdpt_idx)).raw();
-            if pdpte & 0x1 == 0 {
-                continue;
-            }
-            if pdpte & 0x4u64 == 0 {
-                pdpte |= 0x4u64;
-                core::ptr::write_volatile(pdpt.add(pdpt_idx) as *mut u64, pdpte);
-                flipped += 1;
-            }
-            let next_phys = pdpte & !0xFFF_u64;
-            if pdpte & (1u64 << 7) != 0 {
-                continue;
-            }
-            let pd = next_phys as *const MMPTE;
-            for pd_idx in 0..PT_ENTRIES {
-                let mut pde = (*pd.add(pd_idx)).raw();
-                if pde & 0x1 == 0 {
-                    continue;
-                }
-                if pde & 0x4u64 == 0 {
-                    pde |= 0x4u64;
-                    core::ptr::write_volatile(pd.add(pd_idx) as *mut u64, pde);
-                    flipped += 1;
-                }
-            }
-        }
-    }
-    crate::boot_println!("[VAS] force_user_accessible: flipped={}", flipped);
-    core::arch::asm!(
-        "mov cr0, {}",
-        in(reg) saved_cr0,
-        options(nostack, preserves_flags),
-    );
+    // Preserve supervisor identity leaves. User mappings enable U on their
+    // own intermediate path in map_page_in_pml4; promoting inherited large
+    // leaves here exposes kernel memory and makes BSS reservations collide
+    // with what now appears to be an existing user-owned mapping.
 }

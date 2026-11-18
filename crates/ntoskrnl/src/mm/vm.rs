@@ -328,23 +328,8 @@ pub fn direct_map_phys(phys: u64, size: u64) -> Result<u64, NTSTATUS> {
     if page_count == 0 || page_count > crate::mm::hyperspace::HYPERSPACE_ENTRIES {
         return Err(STATUS_UNSUCCESSFUL);
     }
-    let mut va = None;
-    for offset in 0..page_count {
-        let pfn = (phys + offset * PAGE_SIZE) >> PAGE_SHIFT;
-        let mapped = crate::mm::hyperspace::map_hyperspace(pfn);
-        if mapped == 0 {
-            if let Some(start) = va {
-                for rollback in 0..offset {
-                    crate::mm::hyperspace::unmap_hyperspace(start + rollback * PAGE_SIZE);
-                }
-            }
-            return Err(STATUS_UNSUCCESSFUL);
-        }
-        if va.is_none() {
-            va = Some(mapped);
-        }
-    }
-    va.ok_or(STATUS_UNSUCCESSFUL)
+    let mapped = crate::mm::hyperspace::map_hyperspace_pages(phys >> PAGE_SHIFT, page_count);
+    if mapped == 0 { Err(STATUS_UNSUCCESSFUL) } else { Ok(mapped) }
 }
 
 /// Release a direct mapping created by `direct_map_phys`.
