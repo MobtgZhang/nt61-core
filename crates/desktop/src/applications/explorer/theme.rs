@@ -77,6 +77,10 @@ pub fn large_icon(frame: &mut Surface, name: &str, at: Rect) {
     draw(frame, pixels, (48, 48), at);
 }
 
+pub fn system_logo(frame: &mut Surface, at: Rect) {
+    draw(frame, asset!("system-logo"), (157, 151), at);
+}
+
 pub fn brand(frame: &mut Surface, at: Rect) {
     draw(frame, asset!("windows-brand"), (275, 174), at);
 }

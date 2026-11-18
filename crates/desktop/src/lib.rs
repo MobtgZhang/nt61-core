@@ -52,6 +52,7 @@ pub mod logon_power;
 pub mod accounts;
 
 pub mod control_panel;
+pub mod control_browser;
 
 pub mod sound_settings;
 pub mod network_settings;
