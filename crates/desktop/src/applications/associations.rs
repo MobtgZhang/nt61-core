@@ -12,7 +12,17 @@ pub const ASSOCIATIONS: &[(&str, AppId)] = &[
     ("rtf", AppId::WordPad),
     ("doc", AppId::WordPad),
     ("docx", AppId::WordPad),
-    ("bmp", AppId::Paint),
+    ("bmp", AppId::PhotoViewer),
+    ("dib", AppId::PhotoViewer),
+    ("jpg", AppId::PhotoViewer),
+    ("jpeg", AppId::PhotoViewer),
+    ("jpe", AppId::PhotoViewer),
+    ("jfif", AppId::PhotoViewer),
+    ("png", AppId::PhotoViewer),
+    ("gif", AppId::PhotoViewer),
+    ("tif", AppId::PhotoViewer),
+    ("tiff", AppId::PhotoViewer),
+    ("ico", AppId::PhotoViewer),
 ];
 
 pub fn resolve(name: &str) -> Option<AppId> {
@@ -29,7 +39,7 @@ mod tests {
     #[test]
     fn document_associations_do_not_treat_executables_as_text() {
         assert_eq!(resolve("Read Me.RTF"), Some(AppId::WordPad));
-        assert_eq!(resolve("sample.BMP"), Some(AppId::Paint));
+        assert_eq!(resolve("sample.BMP"), Some(AppId::PhotoViewer));
         assert_eq!(resolve("boot.ini"), Some(AppId::Notepad));
         assert_eq!(resolve("ntdll.dll"), None);
         assert_eq!(resolve("cmd.exe"), None);

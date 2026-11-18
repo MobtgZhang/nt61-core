@@ -80,21 +80,32 @@ pub fn document(app: &ApplicationSession, options: &PrintDialog) -> Result<Vec<u
                 pages.push(content);
             }
         }
-        AppState::Paint(p) => {
-            if p.canvas.pixels().len() * 6 > LIMIT - 4096 {
-                return Err("Image exceeds the file printer's 1 MiB job limit.".into());
+        AppState::Paint(_) | AppState::PhotoViewer(_) => {
+            let image = match &app.state {
+                AppState::Paint(p) => &p.canvas,
+                AppState::PhotoViewer(v) => v.image.as_ref().ok_or("No picture is loaded.")?,
+                _ => unreachable!(),
+            };
+            let available = (width - margins[0] - margins[1], height - margins[2] - margins[3]);
+            if available.0 <= 0.0 || available.1 <= 0.0 {return Err("Margins leave no printable area.".into());}
+            // Resample the print raster to fit the bounded spool protocol. Keep the
+            // original aspect ratio and retain the full in-memory source picture.
+            let mut rw=image.width();let mut rh=image.height();
+            while rw as usize * rh as usize * 6 > (LIMIT-8192)/copies.max(1) {
+                rw=(rw*9/10).max(1);rh=(rh*9/10).max(1);
             }
-            let scale = ((width - margins[0] - margins[1]) / p.canvas.width() as f32)
-                .min((height - margins[2] - margins[3]) / p.canvas.height() as f32);
-            let mut content=format!("gsave {:.2} {:.2} translate {:.2} {:.2} scale\n{} {} 8 [{} 0 0 -{} 0 {}]\n{{currentfile /ASCIIHexDecode filter}} false 3 colorimage\n",margins[0],height-margins[2]-p.canvas.height()as f32*scale,p.canvas.width()as f32*scale,p.canvas.height()as f32*scale,p.canvas.width(),p.canvas.height(),p.canvas.width(),p.canvas.height(),p.canvas.height());
-            for (i, pixel) in p.canvas.pixels().iter().enumerate() {
-                let _ = write!(content, "{:06x}", pixel & 0xffffff);
-                if i % 24 == 23 {
-                    content.push('\n');
-                }
-            }
-            content.push_str(">\ngrestore\n");
-            pages.push(content);
+            let scale=(available.0 / image.width() as f32).min(available.1 / image.height() as f32);
+            let dw=image.width() as f32*scale;let dh=image.height()as f32*scale;
+            let x=margins[0]+(available.0-dw)/2.0;let y=margins[3]+(available.1-dh)/2.0;
+            let mut content=format!("gsave {x:.2} {y:.2} translate {dw:.2} {dh:.2} scale\n{rw} {rh} 8 [{rw} 0 0 -{rh} 0 {rh}]\n{{currentfile /ASCIIHexDecode filter}} false 3 colorimage\n");
+            for y in 0..rh { for x in 0..rw {
+                let p=image.pixel((x as u64*image.width() as u64/rw as u64)as u32,(y as u64*image.height()as u64/rh as u64)as u32).unwrap_or(0);
+                let alpha=p>>24;
+                let channel=|shift:u32| (((p>>shift)&255u32)*alpha+255*(255-alpha)+127)/255;
+                let _=write!(content,"{:02x}{:02x}{:02x}",channel(16),channel(8),channel(0));
+                if x%24==23 {content.push('\n');}
+            }}
+            content.push_str(">\ngrestore\n");pages.push(content);
         }
         _ => return Err("This application has no printable document.".into()),
     }
@@ -153,6 +164,20 @@ mod tests {
         common_dialogs::{self, Dialog},
         AppId,
     };
+    #[test]
+    fn photo_print_raster_flattens_alpha_on_paper_and_rejects_empty_images() {
+        let mut app=ApplicationSession::new(1,AppId::PhotoViewer,0);
+        common_dialogs::open_print(&mut app);
+        let Some(Dialog::Print(d))=app.common_dialog.clone()else{panic!()};
+        assert!(document(&app,&d).is_err());
+        let AppState::PhotoViewer(v)=&mut app.state else{panic!()};
+        let mut image=crate::graphics::Surface::new(2,1);
+        image.set_pixel(0,0,0x00ff0000);image.set_pixel(1,0,0xff123456);v.image=Some(image);
+        let ps=String::from_utf8(document(&app,&d).unwrap()).unwrap();
+        assert!(ps.contains("2 1 8 [2 0 0 -1 0 1]"));
+        assert!(ps.contains("ffffff123456>"));
+        assert!(ps.contains("%%Pages: 1"));
+    }
     #[test]
     fn real_postscript_pages_ranges_and_copies() {
         let mut app = ApplicationSession::new(1, AppId::Notepad, 0);
