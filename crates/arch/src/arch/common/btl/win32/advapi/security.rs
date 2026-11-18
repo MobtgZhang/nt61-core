@@ -435,6 +435,120 @@ fn add_aces(
     Ok(1)
 }
 
+#[derive(Clone, Copy)]
+enum ObjectAceKind { Allowed, Denied, Audit, Mandatory }
+
+/// Append the SP1 object ACE, or its ordinary ACE fallback.
+/// Native references: scripts/fixtures/sp1-{object,denied-object,audit-object,mandatory}-ace.tsv.
+/// This only edits ACL bytes; it does not authorize the caller or emit audits.
+fn add_object_ace(m: &mut dyn GuestMemory, a: &[u64], kind: ObjectAceKind) -> Result<u64, u32> {
+    let s = sid(m, a[6])?;
+    let mandatory = matches!(kind, ObjectAceKind::Mandatory);
+    // SP1 checks SID validity and the complete authority before ACL revision.
+    // It accepts any valid subauthority count and RID for authority 16.
+    if mandatory && s[2..8] != [0, 0, 0, 0, 0, 16] { return Err(PARAM); }
+    let mut h = read(m, a[0], 8)?;
+    let object = a[4] != 0 || a[5] != 0;
+    if h[0] > 4 || a[1] > 4 || (object && a[1] != 4) {
+        return Err(1306); // ERROR_REVISION_MISMATCH, not UNKNOWN_REVISION.
+    }
+    let valid_flags = if matches!(kind, ObjectAceKind::Audit) { 0xdf } else { 0x1f };
+    if a[2] & !valid_flags != 0 || (mandatory && a[3] & !7 != 0) {
+        return Err(if mandatory { PARAM } else { 1004 });
+    }
+    if h[0] < 2 || u16le(&h, 2) < 8 || a[0] & 1 != 0 {
+        return Err(ACL);
+    }
+    let capacity = usize::from(u16le(&h, 2));
+    let count = u16le(&h, 4);
+    let mut at = 8usize;
+    // Original NTDLL RtlValidAcl (RVA 0x29600, 0x6317b, 0x63237):
+    // capacity need not be aligned; ordinary/object ACEs allow trailing bytes;
+    // types >=9 only need a bounded header. The generic ace_list parser has a
+    // different contract and must not reject those SP1 append inputs.
+    for _ in 0..count {
+        if at + 4 >= capacity || addr(a[0], at)? & 1 != 0 {
+            return Err(ACL);
+        }
+        let ace = read(m, addr(a[0], at)?, 4)?;
+        let size = usize::from(u16le(&ace, 2));
+        if size < 4 || size > capacity - at {
+            return Err(ACL);
+        }
+        if ace[0] <= 8 {
+            let bytes = read(m, addr(a[0], at)?, size)?;
+            let sid_at = match ace[0] {
+                0..=3 => 8,
+                4 => 12,
+                _ => {
+                    if h[0] < 4 || size < 12 { return Err(ACL); }
+                    let flags = u32le(&bytes, 8);
+                    12 + if flags & 1 != 0 { 16 } else { 0 }
+                        + if flags & 2 != 0 { 16 } else { 0 }
+                }
+            };
+            let minimum = match ace[0] { 0..=3 => 16, 4 => 24, _ => sid_at + 12 };
+            if size % 4 != 0 || size < minimum || (ace[0] == 4 &&
+                (h[0] < 3 || u16le(&bytes, 8) != 1)) {
+                return Err(ACL);
+            }
+            let s = &bytes[sid_at..];
+            if s[0] != 1 || s[1] > 15 || 8 + usize::from(s[1]) * 4 > s.len() {
+                return Err(ACL);
+            }
+            if ace[0] == 4 {
+                let next = sid_at + 8 + usize::from(s[1]) * 4;
+                if next + 12 > size { return Err(ACL); }
+                let s = &bytes[next..];
+                if s[0] != 1 || s[1] > 15 || 8 + usize::from(s[1]) * 4 > s.len() {
+                    return Err(ACL);
+                }
+            }
+        }
+        at += size;
+    }
+    let (ordinary, object_type) = match kind {
+        ObjectAceKind::Allowed => (0, 5),
+        ObjectAceKind::Denied => (1, 6),
+        ObjectAceKind::Audit => (2, 7),
+        ObjectAceKind::Mandatory => (17, 17),
+    };
+    let mut flags = a[2] as u8;
+    if matches!(kind, ObjectAceKind::Audit) {
+        // SP1 KernelBase narrows the BOOLs to RTL BOOLEAN before the call:
+        // 2 enables auditing while 256 does not (native fixtures, all ABIs).
+        if a[7] as u8 != 0 { flags |= 0x40; }
+        if a[8] as u8 != 0 { flags |= 0x80; }
+    }
+    let mut b = vec![if object { object_type } else { ordinary }, flags, 0, 0];
+    b.extend_from_slice(&(a[3] as u32).to_le_bytes());
+    if object {
+        let flags = u32::from(a[4] != 0) | (u32::from(a[5] != 0) << 1);
+        b.extend_from_slice(&flags.to_le_bytes());
+        for p in [a[4], a[5]] {
+            if p != 0 {
+                b.extend_from_slice(&read(m, p, 16)?);
+            }
+        }
+    }
+    b.extend_from_slice(&s);
+    let size = b.len() as u16; // bounded by two GUIDs and a validated SID.
+    b[2..4].copy_from_slice(&size.to_le_bytes());
+    if b.len() > capacity - at || count == u16::MAX {
+        return Err(1344); // ERROR_ALLOTTED_SPACE_EXCEEDED.
+    }
+    // Read the complete destination before any mutation. GuestMemory checks
+    // page protections for the single final write; untouched bytes survive.
+    let mut bytes = read(m, a[0], at + b.len())?;
+    h[0] = h[0].max(a[1] as u8);
+    h[4..6].copy_from_slice(&(count + 1).to_le_bytes());
+    bytes[..8].copy_from_slice(&h);
+    bytes[at..].copy_from_slice(&b);
+    if !m.probe_write(a[0], bytes.len()) { return Err(998); }
+    write(m, a[0], &bytes)?;
+    Ok(1)
+}
+
 pub(super) struct Descriptor {
     pub(super) control: u16,
     pub(super) rm: u8,
@@ -582,6 +696,10 @@ pub fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Option<Result<u6
         "DeleteAce",
         "AddAccessAllowedAce",
         "AddAccessAllowedAceEx",
+        "AddAccessAllowedObjectAce",
+        "AddAccessDeniedObjectAce",
+        "AddAuditAccessObjectAce",
+        "AddMandatoryAce",
         "AddAccessDeniedAce",
         "AddAccessDeniedAceEx",
         "AddAuditAccessAce",
@@ -645,7 +763,9 @@ pub fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Option<Result<u6
         | "AddAccessDeniedAce" => 4,
         "AddAce" | "AddAccessAllowedAceEx" | "AddAccessDeniedAceEx" => 5,
         "AddAuditAccessAce" => 6,
-        "AddAuditAccessAceEx" => 7,
+        "AddAuditAccessObjectAce" => 9,
+        "AddMandatoryAce" => 5,
+        "AddAuditAccessAceEx" | "AddAccessAllowedObjectAce" | "AddAccessDeniedObjectAce" => 7,
         _ => 3,
     };
     let rm_control = matches!(
@@ -964,6 +1084,11 @@ pub fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Option<Result<u6
                 let b = read(&mut image.memory, a[3], n)?;
                 add_aces(&mut image.memory, a[0], a[1], a[2], &b)
             }
+            "AddAccessAllowedObjectAce" => add_object_ace(&mut image.memory, a, ObjectAceKind::Allowed),
+            "AddAccessDeniedObjectAce" => add_object_ace(&mut image.memory, a, ObjectAceKind::Denied),
+            "AddAuditAccessObjectAce" => add_object_ace(&mut image.memory, a, ObjectAceKind::Audit),
+            "AddMandatoryAce" => add_object_ace(&mut image.memory,
+                &[a[0], a[1], a[2], a[3], 0, 0, a[4]], ObjectAceKind::Mandatory),
             "AddAccessAllowedAce"
             | "AddAccessAllowedAceEx"
             | "AddAccessDeniedAce"
