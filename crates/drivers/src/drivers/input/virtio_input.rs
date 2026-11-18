@@ -354,7 +354,7 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         return;
     }
     if value != KEY_VALUE_RELEASE {
-        let usage = match code { 111 => 0x4c, 62 => 0x3d, 1 => 0x29, 38=>0x0f, _ => 0 };
+        let usage = match code { 111 => 0x4c, 62 => 0x3d, 1 => 0x29, 38=>0x0f, 105=>0x50, 106=>0x4f, 103=>0x52, 108=>0x51, _ => 0 };
         let modifiers = u8::from(CONTROL_KEYS.load(Ordering::Relaxed) != 0)
             | (u8::from(ALT_KEYS.load(Ordering::Relaxed) != 0) << 2)
             | (u8::from(shift_state()) << 1)

@@ -11,6 +11,10 @@ pub const SECURITY: u32 = 1;
 pub const CLOSE: u32 = 2;
 pub const TASK_MANAGER: u32 = 4;
 pub const LOCK: u32 = 8;
+pub const WINDOW_LEFT: u32 = 16;
+pub const WINDOW_RIGHT: u32 = 32;
+pub const WINDOW_UP: u32 = 64;
+pub const WINDOW_DOWN: u32 = 128;
 /// Fixed monitor header, little endian u64 values: uptime ms, physical total,
 /// physical available, thread count, pool bytes, CPU total ticks, CPU idle ticks.
 pub const MONITOR_BYTES: usize = 56;
@@ -24,3 +28,9 @@ pub const SOUND: u32 = 74;
 /// Each record: index, flags, MTU, IPv4, mask, gateway, DNS (u32 LE),
 /// MAC (6 bytes), kernel interface name (16 bytes, zero padded).
 pub const NETWORK: u32 = 75;
+
+/// Independent desktop media stream: stereo PCM16 at 48 kHz. Status is four
+/// LE u32 values: queued samples, available, paused, media volume (0..100).
+pub const MEDIA: u32 = 76;
+pub const MEDIA_STATUS_BYTES: usize = 16;
+pub const MEDIA_MAX_SAMPLES: usize = 9600;

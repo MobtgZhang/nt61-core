@@ -32,6 +32,7 @@ pub const ALT_EDIT:u8=0xA1;
 pub const ALT_FORMAT:u8=0xA2;
 pub const ALT_VIEW:u8=0xA3;
 pub const ALT_HELP:u8=0xA4;
+pub const ALT_WINDOWS:u8=0xA5;
 impl Decoder {
     pub fn feed(&mut self, key: u8, now: u64) -> Option<u8> {
         if self.length == 0 {
@@ -45,7 +46,7 @@ impl Decoder {
         }
         if self.length == 1 && !matches!(key, b'[' | b'O') {
             self.length = 0;
-            return match key.to_ascii_lowercase(){b'f'=>Some(ALT_FILE),b'e'=>Some(ALT_EDIT),b'o'=>Some(ALT_FORMAT),b'v'=>Some(ALT_VIEW),b'h'=>Some(ALT_HELP),_=>self.feed(key,now)};
+            return match key.to_ascii_lowercase(){b'f'=>Some(ALT_FILE),b'e'=>Some(ALT_EDIT),b'o'=>Some(ALT_FORMAT),b'v'=>Some(ALT_VIEW),b'h'=>Some(ALT_HELP),b'w'=>Some(ALT_WINDOWS),_=>self.feed(key,now)};
         }
         if self.length >= self.bytes.len() {
             self.length = 0;

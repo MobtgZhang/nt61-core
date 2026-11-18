@@ -271,7 +271,7 @@ pub fn process_scancode(sc: u8) {
     let code = sc & 0x7F;
     let extended = EXTENDED_PREFIX.swap(false, Ordering::Relaxed);
     if !release {
-        let usage = match (code, extended) { (0x53, true) => 0x4c, (0x3e, false) => 0x3d, (0x01, false) => 0x29, (0x26,false)=>0x0f, _ => 0 };
+        let usage = match (code, extended) { (0x53, true) => 0x4c, (0x3e, false) => 0x3d, (0x01, false) => 0x29, (0x26,false)=>0x0f, (0x4b,true)=>0x50, (0x4d,true)=>0x4f, (0x48,true)=>0x52, (0x50,true)=>0x51, _ => 0 };
         let modifiers = u8::from(CTRL_DOWN.load(Ordering::Relaxed))
             | (u8::from(ALT_DOWN.load(Ordering::Relaxed)) << 2)
             | (u8::from(SHIFT_DOWN.load(Ordering::Relaxed)) << 1)

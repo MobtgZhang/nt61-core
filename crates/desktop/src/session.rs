@@ -245,6 +245,14 @@ impl crate::shell::ShellModel {
         else if keys&w::CLOSE!=0 {
             if let Some(id)=self.selected_window {self.request_application_close(id);}else{self.start_menu.close();self.flyout=None;self.session.show(Screen::ShutDown);}
         }
+        else {
+            use crate::shell::WindowShortcut;
+            for (mask, action) in [(w::WINDOW_LEFT, WindowShortcut::Left),
+                (w::WINDOW_RIGHT, WindowShortcut::Right), (w::WINDOW_UP, WindowShortcut::Up),
+                (w::WINDOW_DOWN, WindowShortcut::Down)] {
+                if keys & mask != 0 { self.window_shortcut(action); }
+            }
+        }
     }
     pub fn session_intent(&mut self,intent:Intent){
         use crate::platform::services;

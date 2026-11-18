@@ -7,6 +7,10 @@ use crate::widgets::textbox::TextBox;
 
 pub mod layout;
 pub mod chrome;
+mod placement;
+pub use placement::WindowShortcut;
+#[cfg(test)]
+mod aero_tests;
 pub use chrome::WindowCursor;
 use chrome::{ResizeDrag, CAPTION_HEIGHT};
 use layout::ShellLayout;
@@ -30,6 +34,7 @@ pub enum Flyout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WindowKind {
     Generic,
+    MemoryDiagnostic,
     Application(AppId),
     ShellSettings(Flyout),
     Notepad,
@@ -285,6 +290,7 @@ pub struct WindowState {
     pub group_id: u32,
     pub kind: WindowKind,
     pub restore_geometry: Option<(i32, i32, i32, i32)>,
+    pub snapped: Option<SnapSide>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -334,6 +340,7 @@ impl TaskbarState {
             group_id: id,
             kind,
             restore_geometry: None,
+            snapped: None,
         });
     }
 
@@ -370,6 +377,7 @@ impl TaskbarState {
                 group_id: id,
                 kind: WindowKind::Generic,
                 restore_geometry: None,
+                snapped: None,
             });
         }
     }
@@ -726,9 +734,15 @@ pub struct ShellModel {
     desktop_restore: Vec<u32>,
     pub controls: ControlTree,
     pub(crate) viewport: (u32, u32),
+    pub(crate) metrics: nt61_win32_metrics::SessionMetrics,
     pub textboxes: Vec<TextBox>,
+    pub memory_result: Option<crate::memory_result::ResultRecord>,
     pub drag_window: Option<u32>,
     pub drag_offset: (i32, i32),
+    drag_origin: (i32, i32),
+    drag_moved: bool,
+    drag_snap: Option<placement::DragSnap>,
+    drag_normal_geometry: Option<(i32, i32, i32, i32)>,
     resize_drag: Option<ResizeDrag>,
     pub context_menu: Option<ContextMenuState>,
     pub context_submenu: Option<SubmenuState>,
@@ -741,6 +755,7 @@ pub struct ShellModel {
     pub power_action: Option<PowerAction>,
     pub session: crate::session::Session,
     pub account_settings: crate::control_panel::Accounts,
+    pub personalization: crate::personalization::Settings,
     pub sound_settings:crate::sound_settings::Settings,
     pub network_settings:crate::network_settings::Settings,
     pub saved_desktops: Vec<crate::session::SavedDesktop>,
@@ -750,6 +765,17 @@ pub struct ShellModel {
 }
 
 impl ShellModel {
+    /// Keep original window indices for control IDs while hiding opted-in minimized Task Manager.
+    pub fn taskbar_windows(&self) -> impl Iterator<Item = (usize, &WindowState)> {
+        self.taskbar.windows.iter().enumerate().filter(|(_, w)| {
+            !(w.minimized && self.applications.iter().any(|app|
+                app.window_id == w.id && app.id == AppId::TaskManager && app.manager.hide_minimized))
+        })
+    }
+    pub fn task_manager_tray(&self) -> Option<u32> {
+        self.applications.iter().find(|app| app.id == AppId::TaskManager).map(|app| app.window_id)
+    }
+
     pub fn window_z_order(&self, id: u32) -> (bool, bool, u32) {
         (
             self.application(id).is_some_and(|application| {
@@ -779,9 +805,15 @@ impl ShellModel {
             desktop_restore: Vec::new(),
             controls: ControlTree::new(),
             viewport: (1024, 768),
+            metrics: Default::default(),
             textboxes: Vec::new(),
+            memory_result: None,
             drag_window: None,
             drag_offset: (0, 0),
+            drag_origin: (0, 0),
+            drag_moved: false,
+            drag_snap: None,
+            drag_normal_geometry: None,
             resize_drag: None,
             context_menu: None,
             context_submenu: None,
@@ -794,6 +826,7 @@ impl ShellModel {
             power_action: None,
             session: crate::session::Session::default(),
             account_settings: Default::default(),
+            personalization: Default::default(),
             sound_settings:Default::default(),
             network_settings:Default::default(),
             saved_desktops: Vec::new(),
@@ -818,6 +851,7 @@ impl ShellModel {
     }
 
     pub fn refresh_controls(&mut self, width: u32, height: u32) {
+        self.metrics.observe_display(width, height);
         self.viewport = (width, height);
         let new_start = self.start_menu.open && self.controls.control(CONTROL_SEARCH).is_none();
         let next = self.build_controls(width, height);
@@ -834,7 +868,7 @@ impl ShellModel {
         }
         if self.flyout.is_some() {
             let id = self.controls.focus();
-            if !((CONTROL_FLYOUT_LINK..=CONTROL_CALENDAR_NEXT).contains(&id)
+            if !((CONTROL_FLYOUT_LINK..=CONTROL_TASK_MANAGER_TRAY).contains(&id)
                 || (CONTROL_POWER_BASE..CONTROL_POWER_BASE + 6).contains(&id))
             {
                 self.controls
@@ -864,12 +898,10 @@ impl ShellModel {
             Rect::new(0, top, START_BUTTON_WIDTH, TASKBAR_HEIGHT),
         );
         c.add(CONTROL_PIN_EXPLORER, ControlKind::Button, l.pinned());
-        for (index, _) in self.taskbar.windows.iter().enumerate() {
-            c.add(
-                CONTROL_TASKBAR_BASE + index as u32,
-                ControlKind::Button,
-                l.window_button(index, self.taskbar.windows.len()),
-            );
+        let visible_count = self.taskbar_windows().count();
+        for (display, (index, _)) in self.taskbar_windows().enumerate() {
+            c.add(CONTROL_TASKBAR_BASE + index as u32, ControlKind::Button,
+                l.window_button(display, visible_count));
         }
         for (index, id) in [
             CONTROL_OVERFLOW,
@@ -947,6 +979,10 @@ impl ShellModel {
                 );
             }
             match kind {
+                Flyout::Overflow if self.task_manager_tray().is_some() => {
+                    c.add(CONTROL_TASK_MANAGER_TRAY, ControlKind::Button,
+                        Rect::new(b.x + 12, b.y + 40, b.width - 24, 48));
+                }
                 Flyout::Volume => {
                     c.add(
                         CONTROL_VOLUME_TRACK,
@@ -1030,6 +1066,14 @@ impl ShellModel {
             CONTROL_PIN_EXPLORER => {
                 self.start_menu.selected = Some(StartProgram::Explorer);
                 self.launch_selected_start_program();
+                true
+            }
+            CONTROL_TASK_MANAGER_TRAY => {
+                if let Some(id) = self.task_manager_tray() {
+                    if let Some(w) = self.taskbar.windows.iter_mut().find(|w| w.id == id) { w.minimized = false; }
+                    self.select_window(id);
+                }
+                self.flyout = None;
                 true
             }
             CONTROL_OVERFLOW => self.toggle_flyout(Flyout::Overflow),
@@ -1296,10 +1340,9 @@ impl ShellModel {
         let target = if y >= top {
             if self.controls.hit_test(x, y) == CONTROL_START {
                 ContextMenuTarget::StartButton
-            } else if let Some(index) = (0..self.taskbar.windows.len()).find(|index| {
-                ShellLayout::new(width, height)
-                    .window_button(*index, self.taskbar.windows.len())
-                    .contains(x, y)
+            } else if let Some(index) = self.taskbar_windows().enumerate().find_map(|(display, (index, _))| {
+                ShellLayout::new(width, height).window_button(display, self.taskbar_windows().count())
+                    .contains(x, y).then_some(index)
             }) {
                 ContextMenuTarget::TaskbarTask(index)
             } else if x >= notification_area_left(width) as i32 {
@@ -1811,7 +1854,7 @@ impl ShellModel {
                 true
             }
             ContextMenuCommand::Personalize => {
-                self.open_window_with_kind("Personalization", 180, 110, 560, 390, WindowKind::Personalization);
+                self.open_window_with_kind("Personalization", 140, 80, 660, 520, WindowKind::Personalization);
                 true
             }
             ContextMenuCommand::Refresh => { self.refresh_desktop_files(); true },
@@ -1948,6 +1991,20 @@ impl ShellModel {
         true
     }
 
+    /// Display the boot diagnostic result once, after the desktop has logged on.
+    /// The text report remains on disk after this pending notification is consumed.
+    pub fn show_boot_memory_result(&mut self) -> bool {
+        if self.memory_result.is_some() { return false; }
+        let Some(id) = self.files.resolve("C:\\Windows\\MemoryDiagnosticResults.bin") else { return false; };
+        if self.files.load_file(id).is_err() { return false; }
+        let Some(record) = self.files.node(id).and_then(|n| crate::memory_result::ResultRecord::decode(&n.contents)) else { return false; };
+        self.memory_result = Some(record);
+        self.open_window_with_kind("Windows Memory Diagnostic", 180, 140, 620, 300, WindowKind::MemoryDiagnostic);
+        self.taskbar.add_notification(0x4d544553, "Windows Memory Diagnostic results");
+        if self.files.remove(id).is_ok() { let _ = self.files.flush(); }
+        true
+    }
+
     pub fn open_window(&mut self, title: &str, x: i32, y: i32, width: i32, height: i32) -> u32 {
         self.open_window_with_kind(title, x, y, width, height, WindowKind::Generic)
     }
@@ -1961,6 +2018,14 @@ impl ShellModel {
         height: i32,
         kind: WindowKind,
     ) -> u32 {
+        if kind == WindowKind::Personalization {
+            if let Some(id) = self.taskbar.windows.iter().find(|w| w.kind == kind).map(|w| w.id) {
+                self.select_window(id);
+                return id;
+            }
+        }
+        let (width,height)=if kind==WindowKind::Personalization {(width.max(660),height.max(520))}else{(width,height)};
+        if kind==WindowKind::Personalization {self.personalization.open(&mut self.files);}
         if kind==WindowKind::ShellSettings(Flyout::Network){self.network_settings.refresh();}
         let id = self.next_window_id;
         self.next_window_id += 1;
@@ -1985,6 +2050,10 @@ impl ShellModel {
     }
 
     pub fn close_window(&mut self, id: u32) {
+        if self.taskbar.windows.iter().any(|w|w.id==id&&w.kind==WindowKind::Personalization){self.personalization.cancel();}
+        if self.taskbar.windows.iter().any(|w| w.id == id && w.kind == WindowKind::MemoryDiagnostic) {
+            self.taskbar.remove_notification(0x4d544553);
+        }
         if self.taskbar.windows.iter().any(|w| w.id==id && w.kind==WindowKind::DisplaySettings) {
             self.display.open=false;
             self.revert_display();
@@ -2002,7 +2071,8 @@ impl ShellModel {
                 app.guest_dialog = None;
             }
         }
-        if self.drag_window == Some(id) { self.release_window_drag(); }
+        if self.application(id).is_some_and(|a|a.id==AppId::MediaPlayer){let _=crate::platform::services::media("reset",&[]);}
+        if self.drag_window == Some(id) { self.cancel_window_drag(); }
         self.applications.retain(|app|app.window_id!=id);
         self.explorers.retain(|app|app.window_id!=id);
         if self.text_target==Some(id) {self.text_target=None;}
@@ -2019,6 +2089,13 @@ impl ShellModel {
     pub fn select_window(&mut self, id: u32) {
         let id = self.guest_modal_for(id).unwrap_or(id);
         if self.taskbar.windows.iter().any(|window| window.id == id) {
+            for app in &mut self.applications {
+                if app.window_id != id && app.id == AppId::TaskManager {
+                    app.manager.menu = None;
+                    app.manager.submenu = None;
+                    app.manager.context = None;
+                }
+            }
             self.selected_window = Some(id);
             self.focus_window(id);
         }
@@ -2103,7 +2180,7 @@ impl ShellModel {
         else {
             return false;
         };
-        if window.minimized || window.maximized || !window.bounds().contains(cursor_x, cursor_y) {
+        if window.minimized || !window.bounds().contains(cursor_x, cursor_y) {
             return false;
         }
         let edge = window.resize_edge_at(cursor_x, cursor_y);
@@ -2118,6 +2195,11 @@ impl ShellModel {
         });
         self.drag_window = Some(window_id);
         self.drag_offset = (cursor_x - window.x, cursor_y - window.y);
+        self.drag_origin = (cursor_x, cursor_y);
+        self.drag_moved = false;
+        self.drag_snap = None;
+        self.drag_normal_geometry = Some(window.restore_geometry.unwrap_or(
+            (window.x, window.y, window.width, window.height)));
         true
     }
 
@@ -2137,19 +2219,67 @@ impl ShellModel {
         };
         let previous = (window.x, window.y, window.width, window.height);
         if let Some(drag) = self.resize_drag {
-            let next = drag.edge.resize(drag.geometry,
+            let mut next = drag.edge.resize(drag.geometry,
                 cursor_x.saturating_sub(drag.origin.0), cursor_y.saturating_sub(drag.origin.1));
+            if window.kind==WindowKind::Personalization {
+                if next.2<660 {if next.0!=drag.geometry.0 {next.0=drag.geometry.0+drag.geometry.2-660;} next.2=660;}
+                if next.3<520 {if next.1!=drag.geometry.1 {next.1=drag.geometry.1+drag.geometry.3-520;} next.3=520;}
+            }
             (window.x, window.y, window.width, window.height) = next;
+            window.snapped = None;
+            window.restore_geometry = None;
         } else {
+            if !self.drag_moved {
+                if cursor_x.abs_diff(self.drag_origin.0) < 4
+                    && cursor_y.abs_diff(self.drag_origin.1) < 4 {
+                    return false;
+                }
+                self.drag_moved = true;
+                if window.maximized {
+                    // SP1 anchors a restored caption at the first movement:
+                    // retain distance to a nearby screen edge, otherwise use
+                    // the restored window's center. Keep the initial Y anchor.
+                    let offset = cursor_x.saturating_sub(window.x);
+                    let right = window.width.saturating_sub(offset);
+                    window.restore_normal_placement();
+                    self.drag_offset.0 = if offset < window.width / 2 {
+                        offset
+                    } else if right < window.width / 2 {
+                        window.width.saturating_sub(right)
+                    } else {
+                        window.width / 2
+                    };
+                } else if window.snapped.is_some() {
+                    window.restore_normal_placement();
+                }
+            }
             window.x = cursor_x.saturating_sub(self.drag_offset.0);
             window.y = cursor_y.saturating_sub(self.drag_offset.1);
+            self.drag_snap = placement::DragSnap::at(cursor_x, cursor_y, self.viewport);
         }
         previous != (window.x, window.y, window.width, window.height)
     }
 
     pub fn release_window_drag(&mut self) {
+        if let (Some(id), Some(target)) = (self.drag_window, self.drag_snap.take()) {
+            if let Some(window) = self.taskbar.windows.iter_mut().find(|w| w.id == id) {
+                window.restore_geometry = self.drag_normal_geometry;
+            }
+            match target {
+                placement::DragSnap::Side(side) => self.snap_window(id, self.viewport.0, side),
+                placement::DragSnap::Maximize => self.toggle_window_maximize(
+                    id, self.viewport.0, self.viewport.1.saturating_sub(TASKBAR_HEIGHT)),
+            }
+        }
+        self.cancel_window_drag();
+    }
+
+    fn cancel_window_drag(&mut self) {
         self.drag_window = None;
         self.drag_offset = (0, 0);
+        self.drag_moved = false;
+        self.drag_snap = None;
+        self.drag_normal_geometry = None;
         self.resize_drag = None;
     }
 
@@ -2181,6 +2311,13 @@ impl ShellModel {
             return false;
         }
         let kind = window.kind;
+        if kind==WindowKind::Personalization && window.caption_control_at(cursor_x,cursor_y).is_none() {
+            let b=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
+            if b.contains(cursor_x,cursor_y) {
+                if self.personalization.click(b,cursor_x,cursor_y){self.close_window(window_id);}
+                return true;
+            }
+        }
         if kind==WindowKind::ShellSettings(Flyout::Network) && window.caption_control_at(cursor_x,cursor_y).is_none(){
             let b=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
             return self.network_settings.click(b,cursor_x,cursor_y);
@@ -2248,28 +2385,7 @@ impl ShellModel {
             return true;
         }
         if button == 1 {
-            if let Some(window) = self
-                .taskbar
-                .windows
-                .iter_mut()
-                .find(|window| window.id == window_id)
-            {
-                window.maximized = !window.maximized;
-                if window.maximized {
-                    window.restore_geometry =
-                        Some((window.x, window.y, window.width, window.height));
-                    window.x = 0;
-                    window.y = 0;
-                    window.width = screen_width as i32;
-                    window.height = work_area_height as i32;
-                } else if let Some((x, y, width, height)) = window.restore_geometry.take() {
-                    window.x = x;
-                    window.y = y;
-                    window.width = width;
-                    window.height = height;
-                }
-                return true;
-            }
+            self.toggle_window_maximize(window_id, screen_width, work_area_height);
             return true;
         }
         if button == 2 {
@@ -2519,18 +2635,33 @@ impl ShellModel {
             .iter_mut()
             .find(|window| window.id == id)
         {
+            window.remember_normal_placement();
+            window.maximized = false;
+            window.snapped = Some(side);
             let half = work_area / 2;
             match side {
                 SnapSide::Left => window.x = 0,
                 SnapSide::Right => window.x = half as i32,
             }
             window.y = 0;
-            window.width = half as i32;
-            window.height = work_area.saturating_sub(40) as i32;
+            window.width = match side {
+                SnapSide::Left => half,
+                SnapSide::Right => work_area - half,
+            } as i32;
+            window.height = self.viewport.1.saturating_sub(TASKBAR_HEIGHT) as i32;
         }
     }
 
     pub fn window_hit_test(&self, x: i32, y: i32) -> Option<u32> {
+        if let Some(id) = self.selected_window {
+            if self.taskbar.windows.iter().any(|w|w.id==id && !w.minimized) {
+                if let (Some(app),Some(body))=(self.application(id),self.application_body(id)) {
+                    if app.id==AppId::TaskManager && crate::applications::task_manager::popup_contains(app,body,x,y) {
+                        return Some(id);
+                    }
+                }
+            }
+        }
         self.taskbar
             .windows
             .iter()
@@ -2586,6 +2717,7 @@ pub const CONTROL_VOLUME_TRACK: u32 = 2908;
 pub const CONTROL_MUTE: u32 = 2909;
 pub const CONTROL_CALENDAR_PREV: u32 = 2910;
 pub const CONTROL_CALENDAR_NEXT: u32 = 2911;
+pub const CONTROL_TASK_MANAGER_TRAY: u32 = 2912;
 pub const CONTROL_POWER_BASE: u32 = 2920;
 pub const CONTROL_PROGRAM_PREV:u32=2930;
 pub const CONTROL_PROGRAM_NEXT:u32=2931;
@@ -2614,6 +2746,53 @@ pub enum SnapSide {
 mod tests {
     use super::*;
     use crate::theme::Theme;
+
+    #[test]
+    fn minimized_task_manager_can_hide_and_recover_from_notification_area() {
+        let mut shell=ShellModel::new(Theme::aero());
+        let manager=shell.launch_application(AppId::TaskManager);
+        let other=shell.launch_application(AppId::Calculator);
+        shell.applications.iter_mut().find(|a|a.window_id==manager).unwrap().manager.hide_minimized=true;
+        shell.taskbar.windows.iter_mut().find(|w|w.id==manager).unwrap().minimized=true;
+        let ids:Vec<_>=shell.taskbar_windows().map(|(_,w)|w.id).collect();
+        assert!(!ids.contains(&manager));assert!(ids.contains(&other));
+        assert_eq!(shell.task_manager_tray(),Some(manager));
+        shell.activate_control(CONTROL_TASK_MANAGER_TRAY);
+        assert!(!shell.taskbar.windows.iter().find(|w|w.id==manager).unwrap().minimized);
+        assert_eq!(shell.selected_window,Some(manager));
+        assert!(shell.taskbar_windows().any(|(_,w)|w.id==manager));
+    }
+    #[test]
+    fn boot_memory_result_is_validated_displayed_once_and_report_retained() {
+        use crate::memory_result::{ResultRecord, PASSED};
+        let mut shell = ShellModel::new(Theme::aero());
+        let windows = shell.files.mkdir(shell.files.root_id(), "Windows");
+        let report = shell.files.touch(windows, "MemoryDiagnosticResults.txt", b"retained report");
+        let record = ResultRecord {
+            status: PASSED, passes: 2, tested: 1024, available: 2048, excluded: 1024,
+            ..ResultRecord::default()
+        };
+        let pending = shell.files.touch(windows, "MemoryDiagnosticResults.bin", &record.encode());
+        assert!(shell.show_boot_memory_result());
+        assert_eq!(shell.memory_result, Some(record));
+        assert!(shell.files.node(pending).unwrap().deleted);
+        assert!(!shell.files.node(report).unwrap().deleted);
+        assert!(!shell.show_boot_memory_result());
+        let window = shell.taskbar.windows.iter().find(|w| w.kind == WindowKind::MemoryDiagnostic).unwrap().id;
+        assert!(shell.taskbar.notifications.iter().any(|n| n.id == 0x4d544553));
+        shell.close_window(window);
+        assert!(!shell.taskbar.notifications.iter().any(|n| n.id == 0x4d544553));
+    }
+
+    #[test]
+    fn corrupt_boot_memory_result_cannot_display_a_passing_notice() {
+        let mut shell = ShellModel::new(Theme::aero());
+        let windows = shell.files.mkdir(shell.files.root_id(), "Windows");
+        shell.files.touch(windows, "MemoryDiagnosticResults.bin", &[0; crate::memory_result::SIZE]);
+        assert!(!shell.show_boot_memory_result());
+        assert!(shell.memory_result.is_none());
+        assert!(!shell.taskbar.windows.iter().any(|w| w.kind == WindowKind::MemoryDiagnostic));
+    }
 
     #[test]
     fn topmost_task_manager_wins_both_drawing_and_pointer_order() {
@@ -2880,7 +3059,8 @@ mod tests {
         assert_eq!(shell.window_cursor_at(279, 50), WindowCursor::Arrow);
         let button = shell.taskbar.windows[1].caption_controls()[1];
         assert!(shell.handle_window_control_click(overlay, button.x + 10, button.y + 10, 1024, 728));
-        assert!(!shell.begin_window_drag(overlay, 0, 0));
+        assert!(shell.begin_window_drag(overlay, 0, 0));
+        shell.release_window_drag();
         assert_eq!(shell.window_cursor_at(0, 0), WindowCursor::Arrow);
         let button = shell.taskbar.windows[1].caption_controls()[1];
         assert!(shell.handle_window_control_click(overlay, button.x + 10, button.y + 10, 1024, 728));
@@ -2918,8 +3098,7 @@ mod tests {
         assert!(shell.handle_window_control_click(id, 398, 140, 800, 560));
         let maximized = shell.taskbar.windows.iter().find(|w| w.id == id).unwrap();
         assert!(maximized.maximized);
-        assert_eq!(maximized.width, 800);
-        assert_eq!(maximized.height, 560);
+        assert_eq!(maximized.bounds(), Rect::new(-8, -8, 816, 576));
         assert!(shell.handle_window_control_click(id, 738, 7, 800, 560));
         let restored = shell.taskbar.windows.iter().find(|w| w.id == id).unwrap();
         assert_eq!((restored.x, restored.y), (160, 130));
