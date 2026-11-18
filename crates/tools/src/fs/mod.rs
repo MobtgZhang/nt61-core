@@ -22,6 +22,7 @@ pub mod image;
 pub mod iso9660;
 pub mod lld_link;
 pub mod ntfs;
+pub mod original_gate;
 pub mod partition;
 pub mod pe;
 pub mod pe_read;

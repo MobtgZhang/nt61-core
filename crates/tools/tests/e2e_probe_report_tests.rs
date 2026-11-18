@@ -1,7 +1,8 @@
 //! Probe-orchestration semantics for the e2e runner, ported to host.
 //!
-//! These are pure logic tests; the actual ssh/scp/sftp probes run
-//! against a live QEMU guest via scripts/openssh-e2e.sh.
+//! These are pure logic tests for the historical SSH probe classifier.
+//! The obsolete OpenSSH shell harness was removed; these tests do not run
+//! ssh/scp/sftp against a live guest.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeCategory {

@@ -2615,6 +2615,7 @@ pub fn package_staged_image(source_dir: &Path, output_dir: &Path, format: &str, 
     for path in [&source.esp, &source.system] {
         if !path.is_dir() { return Err(BuildError::MissingFile(path.display().to_string())); }
     }
+    super::original_gate::validate_trees(&source.esp, &source.system)?;
     super::applications::clean_obsolete(&source.system.join("Windows/System32"))?;
     std::fs::create_dir_all(&output.images)?;
     if format.eq_ignore_ascii_case("iso") {
@@ -2711,6 +2712,7 @@ pub fn build_iso(build_dir: &Path, _format: &str, size_mb: u32, arch: &str) -> R
 /// winload snapshots this filesystem before leaving boot services.
 pub fn package_boot_iso(esp: &Path, system: &Path, size_mb: u32) -> Result<Vec<u8>> {
     validate_boot_volume_size(size_mb)?;
+    super::original_gate::validate_trees(esp, system)?;
     let mut boot_volume = super::fat32::Fat32Image::new(size_mb.max(512));
     super::image::populate_fat32_image(&mut boot_volume, system)?;
     super::image::populate_fat32_image(&mut boot_volume, esp)?;
@@ -2947,29 +2949,68 @@ fn generate_win32_dlls(system32_dir: &Path) -> Result<()> {
         std::fs::write(&dest, &bytes).map_err(BuildError::Io)?;
         total += bytes.len();
     }
+    total += generate_guest_runtime(system32_dir, current_pe_arch() == TargetArch::X86_64)?;
+    log::info(&format!("Generated native and guest Win32 libraries ({total} bytes)"));
+    Ok(())
+}
+
+/// Generate only source-owned guest DLLs into an existing or new system tree.
+/// Uses the same packaging path as the full image builder; does not regenerate
+/// native placeholders, registry hives, boot files or desktop resources.
+pub fn stage_guest_runtime(arch: &str, system_dir: &Path) -> Result<()> {
+    if !matches!(arch, "x86_64" | "aarch64" | "riscv64" | "loongarch64") {
+        return Err(BuildError::InvalidParam(format!("unsupported runtime host architecture: {arch}")));
+    }
+    let system32 = system_dir.join("Windows/System32");
+    std::fs::create_dir_all(&system32).map_err(BuildError::Io)?;
+    let total = generate_guest_runtime(&system32, arch == "x86_64")?;
+    log::info(&format!("Generated guest runtime ({total} bytes) in {}", system_dir.display()));
+    Ok(())
+}
+
+fn generate_guest_runtime(system32_dir: &Path, native_x64: bool) -> Result<usize> {
+    use super::win32_dlls;
+    let mut total = 0;
     // WOW64 always receives PE32/I386, independent of the host ISA. x64
     // guests on non-x86 hosts use an explicit directory, never native System32.
     let windows_dir = system32_dir.parent().ok_or_else(|| BuildError::InvalidParam("System32 has no parent".into()))?;
     let wow64_dir = windows_dir.join("SysWOW64");
     std::fs::create_dir_all(&wow64_dir).map_err(BuildError::Io)?;
-    let native_arch = arch_name(current_pe_arch());
-    let x64_dir = if native_arch == "x86_64" { system32_dir.to_path_buf() }
+    let x64_dir = if native_x64 { system32_dir.to_path_buf() }
         else { windows_dir.join("SysX64") };
     std::fs::create_dir_all(&x64_dir).map_err(BuildError::Io)?;
+    // Preflight both ABIs before writing either one. In-place upgrades can
+    // otherwise retain an old facade that the current generator deliberately
+    // omits. Do not delete such files: they may belong to another build.
     for (x64, directory) in [(false, &wow64_dir), (true, &x64_dir)] {
-        for name in win32_dlls::runtime_library_names() {
-            let bytes = refresh_pe_checksum(win32_dlls::build_runtime_dll(name, x64).expect("runtime catalog library"));
+        let delivered: Vec<_> = win32_dlls::runtime_library_names_for_arch(x64).collect();
+        for entry in std::fs::read_dir(directory).map_err(BuildError::Io)? {
+            let entry = entry.map_err(BuildError::Io)?;
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            if name.starts_with("api-ms-") && name.ends_with(".dll")
+                && !delivered.iter().any(|delivered| delivered.eq_ignore_ascii_case(&name)) {
+                return Err(BuildError::InvalidParam(format!(
+                    "runtime destination contains an undelivered API-set facade: {}; use a clean guest staging directory",
+                    entry.path().display()
+                )));
+            }
+        }
+    }
+    for (x64, directory) in [(false, &wow64_dir), (true, &x64_dir)] {
+        for name in win32_dlls::runtime_library_names_for_arch(x64) {
+            let resources = if name == "shell32.dll" { std::fs::read(directory.join(name)).ok() } else { None };
+            let resources = resources.filter(|data| super::pe_read::parse(data)
+                .and_then(|pe| pe.data_directories.get(2).copied()).is_some_and(|(rva, size)| rva != 0 && size != 0));
+            let bytes = refresh_pe_checksum(if let Some(resources) = resources {
+                win32_dlls::build_runtime_dll_with_resources(name, x64, &resources)
+            } else { win32_dlls::build_runtime_dll(name, x64) }.ok_or_else(||
+                BuildError::InvalidParam(format!("cannot compose guest runtime {name}")))?);
             total += bytes.len();
             std::fs::write(directory.join(name), bytes).map_err(BuildError::Io)?;
         }
         std::fs::write(directory.join("nt61-runtime-exports.json"), win32_dlls::runtime_manifest(x64)).map_err(BuildError::Io)?;
     }
-    log::info(&format!(
-        "Generated {} Win32 DLLs ({} bytes)",
-        win32_dlls::ALL_DLLS.len(),
-        total
-    ));
-    Ok(())
+    Ok(total)
 }
 
 fn refresh_pe_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
@@ -3058,6 +3099,13 @@ fn generate_desktop_resources(system32_dir: &Path) -> Result<()> {
             if !path.is_file() {
                 return Err(BuildError::MissingFile(path.display().to_string()));
             }
+        }
+        if matches!(resource_arch, "x86_64" | "i686") {
+            let path = destination.join("shell32.dll");
+            let resources = std::fs::read(&path).map_err(BuildError::Io)?;
+            let bytes = super::win32_dlls::build_runtime_dll_with_resources("shell32.dll", resource_arch == "x86_64", &resources)
+                .ok_or_else(|| BuildError::InvalidParam("cannot compose shell32 resources and runtime exports".into()))?;
+            std::fs::write(path, refresh_pe_checksum(bytes)).map_err(BuildError::Io)?;
         }
         log::info(&format!(
             "Generated Windows 7 resources in {}",

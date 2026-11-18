@@ -137,8 +137,8 @@ fn build_cli() -> Command {
             Arg::new("build")
                 .long("build")
                 .value_name("SUB")
-                .value_parser(["system", "esp", "boot", "kernel", "all", "iso", "image"])
-                .help("Build a sub-target: system (root tree), esp (EFI dir), boot, kernel, all (dual-partition disk), iso (CD-ROM image), or image (repackage staged trees)"),
+                .value_parser(["system", "runtime", "esp", "boot", "kernel", "all", "iso", "image"])
+                .help("Build a sub-target: system (root tree), runtime (guest DLLs only), esp (EFI dir), boot, kernel, all (dual-partition disk), iso (CD-ROM image), or image (repackage staged trees)"),
         )
         .arg(
             Arg::new("build-dir")
@@ -319,6 +319,7 @@ fn run_build(sub: &str, m: &ArgMatches) -> error::Result<()> {
 
     match sub {
         "system" => build_system(&build_dir, m).map(|_| ()),
+        "runtime" => fs::build::stage_guest_runtime(&arch, &build_dir.join("system")),
         "esp" => build_esp(&build_dir, &arch, m).map(|_| ()),
         "boot" => build_boot_only(&build_dir, &arch).map(|_| ()),
         "kernel" => build_kernel_only(&build_dir, &arch).map(|_| ()),
