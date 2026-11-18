@@ -672,3 +672,67 @@ fn concurrent_membership_publication_lookup_and_removal_preserves_links() {
     assert_eq!(process.kprocess_thread_list_head.flink, head);
     assert_eq!(process.kprocess_thread_list_head.blink, head);
 }
+
+#[test]
+fn asynchronous_worker_keeps_submitting_identity_and_restores_its_token() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    let primary = production_token::create_system_token();
+    let mut process = ps::process::Eprocess {
+        unique_process_id: 4,
+        kprocess_thread_list_head: ps::process::ListEntry::new(),
+        token: ps::process::TokenFastRef(primary as u64),
+    };
+    let mut caller = thread_code::Ethread::new();
+    caller.threads_process = &mut process;
+    arch::common::percpu::CURRENT.with(|current| current.set(&mut caller));
+    // A primary token is copied, rather than borrowed by the queued request.
+    let primary_request = effective_token::get_current_thread_token()
+        .snapshot_for_worker().unwrap();
+    assert_ne!(primary_request.token.token() as *const Token, primary);
+    assert_eq!(primary_request.token.token().token_type,
+        production_token::TokenTypeEnum::TokenImpersonation);
+    caller.impersonation.replace(snapshot()).unwrap();
+    let request = effective_token::get_current_thread_token()
+        .snapshot_for_worker().unwrap();
+    caller.impersonation.revert();
+    let mut worker = thread_code::Ethread::new();
+    worker.threads_process = &mut process;
+    arch::common::percpu::CURRENT.with(|current| current.set(&mut worker));
+    assert!(privilege::system_logon());
+    impersonation::with_current_thread_token(request, || {
+        let effective = effective_token::get_current_thread_token();
+        assert!(effective.as_ref().unwrap().user.equals(
+            &sid::sid::well_known(sid::WellKnownSid::AnonymousLogon)));
+        assert!(!privilege::system_logon());
+    }).unwrap();
+    assert!(privilege::system_logon());
+    assert!(worker.impersonation.reference().is_none());
+    // Existing worker impersonation also survives a failed/unwinding command.
+    worker.impersonation.replace(snapshot()).unwrap();
+    let original = worker.impersonation.reference().unwrap();
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = impersonation::with_current_thread_token(primary_request, || {
+            assert!(privilege::system_logon());
+            panic!("command failed");
+        });
+    }));
+    assert!(failure.is_err());
+    assert_eq!(worker.impersonation.reference().unwrap().token.token() as *const Token,
+        original.token.token() as *const Token);
+    drop(original);
+    worker.impersonation.revert();
+    arch::common::percpu::CURRENT.with(|current| current.set(core::ptr::null_mut()));
+    unsafe { mm::pool::free(primary.cast()); }
+    assert_eq!(mm::pool::live(), 0);
+}
+
+#[test]
+fn worker_token_scope_without_current_thread_never_runs_action() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    arch::common::percpu::CURRENT.with(|current| current.set(core::ptr::null_mut()));
+    let result = impersonation::with_current_thread_token(snapshot(), || {
+        panic!("action must not run without a live current thread");
+    });
+    assert_eq!(result, Err(ImpersonationError::NoCurrentThread));
+    assert_eq!(mm::pool::live(), 0);
+}

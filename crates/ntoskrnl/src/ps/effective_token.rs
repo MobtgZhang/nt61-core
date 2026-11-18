@@ -19,6 +19,23 @@ impl EffectiveTokenReference {
         }
     }
 
+    /// Retain an impersonation identity or copy the current primary identity
+    /// before dispatching asynchronous work. No borrowed token crosses threads.
+    pub fn snapshot_for_worker(
+        &self,
+    ) -> Result<ImpersonationReference, super::impersonation::ImpersonationError> {
+        if let Some(reference) = &self.impersonation {
+            return Ok(reference.clone());
+        }
+        let source = self.as_ref().ok_or(super::impersonation::ImpersonationError::WrongTokenType)?;
+        Ok(ImpersonationReference {
+            token: super::impersonation::ImpersonationTokenReference::copy_for_worker(source)?,
+            level: source.impersonation_level,
+            copy_on_open: false,
+            effective_only: false,
+        })
+    }
+
     pub fn is_null(&self) -> bool {
         self.as_ref().is_none()
     }

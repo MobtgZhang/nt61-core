@@ -25,9 +25,19 @@ impl ImpersonationTokenReference {
         if source.token_type != TokenTypeEnum::TokenImpersonation {
             return Err(ImpersonationError::WrongTokenType);
         }
+        Self::copy_for_worker(source)
+    }
+
+    /// Snapshot an effective caller token for a kernel worker. Primary tokens
+    /// become impersonation tokens; existing impersonation levels are preserved.
+    pub(crate) fn copy_for_worker(source: &Token) -> Result<Self, ImpersonationError> {
         let token = crate::se::token::duplicate_for_process(source);
         if token.is_null() {
             return Err(ImpersonationError::NoMemory);
+        }
+        // SAFETY: duplicate_for_process returned an exclusively owned token.
+        unsafe {
+            (*token).token_type = TokenTypeEnum::TokenImpersonation;
         }
         let allocation = crate::mm::pool::allocate(
             crate::mm::pool::PoolType::NonPaged,
@@ -106,6 +116,23 @@ pub enum ImpersonationError {
     WrongTokenType,
     NoMemory,
     Terminating,
+    NoCurrentThread,
+}
+
+/// Run trusted kernel work under an owned caller identity on the current
+/// thread. Keep ETHREAD's impersonation field private across crate boundaries.
+/// The scheduler retains the executing ETHREAD for this call, including yields.
+pub fn with_current_thread_token<T>(
+    token: ImpersonationReference,
+    action: impl FnOnce() -> T,
+) -> Result<T, ImpersonationError> {
+    let thread = crate::ps::thread::get_current_ethread();
+    if thread.is_null() {
+        return Err(ImpersonationError::NoCurrentThread);
+    }
+    // SAFETY: only the live current thread is used; with_token pins the owned
+    // identity and restores the previous snapshot before this call returns.
+    unsafe { (*thread).impersonation.with_token(token, action) }
 }
 
 #[derive(Clone)]
@@ -151,6 +178,41 @@ impl ThreadImpersonation {
         };
         drop(previous);
         Ok(())
+    }
+
+    /// Execute under an owned caller snapshot, restoring the previous identity
+    /// even on an early return or unwind. Termination never reinstalls a token.
+    pub(crate) fn with_token<T>(
+        &self,
+        token: ImpersonationReference,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, ImpersonationError> {
+        struct Restore<'a> {
+            owner: &'a ThreadImpersonation,
+            previous: Option<ImpersonationReference>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let replaced = {
+                    let mut state = self.owner.state.lock();
+                    if state.terminating {
+                        None
+                    } else {
+                        core::mem::replace(&mut state.token, self.previous.take())
+                    }
+                };
+                drop(replaced);
+            }
+        }
+        let previous = {
+            let mut state = self.state.lock();
+            if state.terminating {
+                return Err(ImpersonationError::Terminating);
+            }
+            state.token.replace(token)
+        };
+        let _restore = Restore { owner: self, previous };
+        Ok(action())
     }
 
     pub fn revert(&self) {

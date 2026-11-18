@@ -57,14 +57,16 @@ pub fn complete(id:u64,packet:wire::Packet)->Result<(),u32>{
     p.packet=packet;p.done=true;Ok(())
 }
 
-struct Command { id:u64, line:String, directory:Vec<u8>, result:Option<Result<Vec<u8>,u32>>, exit:bool }
+struct Command { id:u64, line:String, directory:Vec<u8>, identity:crate::ps::impersonation::ImpersonationReference, result:Option<Result<Vec<u8>,u32>>, exit:bool }
 static COMMANDS:Spinlock<Vec<Command>>=Spinlock::new(Vec::new());
 static NEXT:core::sync::atomic::AtomicU64=core::sync::atomic::AtomicU64::new(1);
 pub fn command_start(line:&str,directory:&[u8])->Result<u64,u32>{
     if !desktop_caller(){return Err(STATUS_ACCESS_DENIED);}
+    let identity=crate::ps::process::get_current_thread_token().snapshot_for_worker()
+        .map_err(|_|STATUS_ACCESS_DENIED)?;
     let id=NEXT.fetch_add(1,core::sync::atomic::Ordering::Relaxed);
     {let mut commands=COMMANDS.lock();if commands.len()>=16{return Err(0xc000009a);}
-    commands.push(Command{id,line:line.into(),directory:directory.to_vec(),result:None,exit:false});}
+    commands.push(Command{id,line:line.into(),directory:directory.to_vec(),identity,result:None,exit:false});}
     let context=Box::into_raw(Box::new(id));
     let created=crate::ps::thread::ps_create_system_thread(command_worker as *const () as u64,context as u64);
     if !created.success {
@@ -77,9 +79,12 @@ pub fn command_start(line:&str,directory:&[u8])->Result<u64,u32>{
 extern "C" fn command_worker(context:u64){
     // SAFETY: context is the unique Box<u64> transferred by command_start.
     let id=unsafe{*Box::from_raw(context as *mut u64)};
-    let input=COMMANDS.lock().iter().find(|c|c.id==id).map(|c|(c.line.clone(),c.directory.clone()));
-    if let Some((line,directory))=input {
-        let result=crate::servers::cmd::execute_captured_command(&line,&directory).map_err(|_|STATUS_ACCESS_DENIED);
+    let input=COMMANDS.lock().iter().find(|c|c.id==id).map(|c|(c.line.clone(),c.directory.clone(),c.identity.clone()));
+    if let Some((line,directory,identity))=input {
+        let result=crate::ps::impersonation::with_current_thread_token(identity, ||
+                crate::servers::cmd::execute_captured_command(&line,&directory)
+                    .map_err(|_|STATUS_ACCESS_DENIED))
+            .map_err(|_|STATUS_ACCESS_DENIED).and_then(|result|result);
         if let Some(command)=COMMANDS.lock().iter_mut().find(|c|c.id==id){
             command.result=Some(result.map(|r|{command.exit=r.exit;
                 let mut bytes=alloc::vec![0;CWD_BYTES];let n=r.directory.len().min(CWD_BYTES-1);
