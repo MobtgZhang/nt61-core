@@ -8,6 +8,7 @@
 #![allow(unexpected_cfgs)]
 
 pub mod bcrypt;
+pub mod catalog;
 pub mod cipher;
 pub mod csprng;
 pub mod hash;

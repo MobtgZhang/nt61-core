@@ -110,20 +110,63 @@ impl RsaPublicKey {
     }
 
     pub fn verify_pkcs1v15(&self, digest: &[u8], signature: &[u8]) -> bool {
-        let s = BigUint::from_bytes(signature);
-        let m = s.mod_exp(&self.e, &self.n);
-        let recovered = m.to_bytes();
-
+        if digest_info_prefix(digest).is_empty() {
+            return false;
+        }
+        let Some(recovered) = self.recover_signature(signature) else {
+            return false;
+        };
         pkcs1v15_verify_pad(&recovered, digest, self.n.byte_len())
     }
 
-    pub fn verify_pss(&self, digest: &[u8], signature: &[u8], salt_len: usize) -> bool {
-        if signature.len() != self.n.byte_len() {
+    /// Historical VeriSign PKCS#7 MD5 countersignatures on SP1 media use
+    /// block type 1 with a bare digest instead of DigestInfo. Kept separate
+    /// from standard RSA verification; catalog policy must explicitly permit
+    /// this obsolete timestamp profile.
+    pub(crate) fn verify_legacy_raw_md5(&self, digest: &[u8], signature: &[u8]) -> bool {
+        if digest.len() != 16 {
             return false;
         }
+        let Some(recovered) = self.recover_signature(signature) else {
+            return false;
+        };
+        let Some(padding) = self.n.byte_len().checked_sub(19) else {
+            return false;
+        };
+        padding >= 8
+            && recovered.len() + 1 == self.n.byte_len()
+            && recovered.first() == Some(&1)
+            && recovered
+                .get(1..1 + padding)
+                .is_some_and(|ps| ps.iter().all(|&b| b == 0xff))
+            && recovered.get(1 + padding) == Some(&0)
+            && recovered.get(2 + padding..) == Some(digest)
+    }
+
+    fn recover_signature(&self, signature: &[u8]) -> Option<Vec<u8>> {
+        // RFC 8017 8.2.2: reject a non-canonical signature representative
+        // before exponentiation. Reducing s >= n modulo n admits aliases.
+        if signature.len() != self.n.byte_len()
+            || !(512..=4096).contains(&self.n.bit_len())
+            || self.e.bit_len() > 32
+            || self.e.cmp(&BigUint::from(3)) < 0
+            || !self.e.bit(0)
+            || !self.n.bit(0)
+        {
+            return None;
+        }
         let s = BigUint::from_bytes(signature);
+        if s.cmp(&self.n) >= 0 {
+            return None;
+        }
         let m = s.mod_exp(&self.e, &self.n);
-        let recovered = m.to_bytes();
+        Some(m.to_bytes())
+    }
+
+    pub fn verify_pss(&self, digest: &[u8], signature: &[u8], salt_len: usize) -> bool {
+        let Some(recovered) = self.recover_signature(signature) else {
+            return false;
+        };
 
         pss_verify(
             &recovered,
@@ -173,6 +216,9 @@ fn pkcs1v15_sign_pad(digest: &[u8], key_len: usize) -> Result<Vec<u8>, &'static 
     else {
         return Err("RSA modulus is too small for digest");
     };
+    if padding_len < 8 {
+        return Err("RSA modulus is too small for digest");
+    }
     let mut padded = Vec::with_capacity(key_len);
     padded.push(0x00);
     padded.push(0x01);
@@ -197,14 +243,14 @@ fn to_bytes_padded(value: &BigUint, len: usize) -> Vec<u8> {
     padded
 }
 
-fn pkcs1v15_verify_pad(recovered: &[u8], digest: &[u8], _key_len: usize) -> bool {
+fn pkcs1v15_verify_pad(recovered: &[u8], digest: &[u8], key_len: usize) -> bool {
     // BigUint::to_bytes() strips the leading 0x00 from the encoded
     // message (0x00 0x01 PS 0x00 T), so recovered starts at 0x01.
-    if recovered.len() < digest.len() + 10 {
+    if recovered.len().checked_add(1) != Some(key_len) {
         return false;
     }
 
-    if recovered[0] != 0x01 {
+    if recovered.first() != Some(&0x01) {
         return false;
     }
 
@@ -213,19 +259,27 @@ fn pkcs1v15_verify_pad(recovered: &[u8], digest: &[u8], _key_len: usize) -> bool
         i += 1;
     }
 
-    if i >= recovered.len() || recovered[i] != 0x00 {
+    if i < 9 || recovered.get(i) != Some(&0x00) {
         return false;
     }
 
     let digest_info = digest_info_prefix(digest);
+    if digest_info.is_empty() {
+        return false;
+    }
     i += 1;
-    recovered[i..].starts_with(&digest_info) && recovered[i + digest_info.len()..] == *digest
+    recovered.get(i..i + digest_info.len()) == Some(digest_info.as_slice())
+        && recovered.get(i + digest_info.len()..) == Some(digest)
 }
 
 /// ASN.1 `DigestInfo` prefixes used by PKCS#1 v1.5 signatures. The
 /// prefix is selected by digest length, matching SHA-1/256/384/512.
 fn digest_info_prefix(digest: &[u8]) -> Vec<u8> {
     let prefix: &[u8] = match digest.len() {
+        16 => &[
+            0x30, 0x20, 0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x05,
+            0x05, 0x00, 0x04, 0x10,
+        ],
         20 => &[
             0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
             0x14,
