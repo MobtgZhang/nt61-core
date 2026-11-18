@@ -3,6 +3,9 @@
 use super::AppId;
 
 pub const ASSOCIATIONS: &[(&str, AppId)] = &[
+    ("wpl", AppId::MediaPlayer),
+    ("wav", AppId::MediaPlayer),
+    ("mp3", AppId::MediaPlayer),
     ("txt", AppId::Notepad),
     ("log", AppId::Notepad),
     ("ini", AppId::Notepad),

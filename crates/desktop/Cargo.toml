@@ -33,6 +33,8 @@ path = "src/bin/notepad/main.rs"
 test = false
 
 [dependencies]
+nanomp3 = { version = "=0.2.0", default-features = false, features = ["alloc"] }
+nt61-win32-metrics = { path = "../win32-metrics" }
 nt61-abi = { path = "../abi" }
 nt61-fonts = { path = "../fonts" }
 # Reuse a no_std size-binned allocator for font parsing and GUI allocations.
@@ -40,6 +42,7 @@ talc = { version = "=3.1.2", default-features = false }
 miniz_oxide = { version = "=0.8.9", default-features = false, features = ["with-alloc"] }
 crc32fast = { version = "=1.4.2", default-features = false }
 roxmltree = { version = "=0.20.0", default-features = false }
+zune-jpeg = { version = "=0.4.21", default-features = false }
 
 [[bin]]
 name = "application-host"

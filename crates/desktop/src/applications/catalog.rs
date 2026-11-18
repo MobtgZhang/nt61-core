@@ -25,6 +25,7 @@ pub enum AppId {
     EaseOfAccessCenter,
     DiskPart,
     BcdEdit,
+    MediaPlayer,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Application {
@@ -42,6 +43,7 @@ macro_rules! apps {
     };
 }
 apps! {
+    (MediaPlayer,"Windows Media Player","Windows 媒体播放器","wmplayer.exe","Programs","media_player"),
     (BcdEdit,"Boot Configuration Data Editor","启动配置数据编辑器","bcdedit.exe","System Tools","bcdedit"),
     (DiskPart,"DiskPart","磁盘分区","diskpart.exe","System Tools","diskpart"),
     (Calculator,"Calculator","计算器","calc.exe","Accessories","calculator"),
@@ -82,6 +84,7 @@ impl Application {
             | AppId::GamesExplorer
             | AppId::GettingStarted
             | AppId::EaseOfAccessCenter => return None,
+            AppId::MediaPlayer => "Program Files/Windows Media Player/wmplayer.exe",
             AppId::WordPad => "Program Files/Windows NT/Accessories/wordpad.exe",
             AppId::Minesweeper => "Program Files/Microsoft Games/Minesweeper/Minesweeper.exe",
             AppId::Explorer => "Windows/explorer.exe",
@@ -176,7 +179,7 @@ pub const DEFERRED: &[(&str, &str)] = &[
         "fax modem, scanner and WIA services",
     ),
     (
-        "Windows Media Center / Windows Media Player",
+        "Windows Media Center",
         "media pipeline, codecs and audio playback",
     ),
     (

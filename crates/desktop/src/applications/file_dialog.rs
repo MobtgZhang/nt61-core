@@ -24,6 +24,8 @@ pub enum Filter {
     Documents,
     Docx,
     Bitmap,
+    Media,
+    Playlist,
     All,
 }
 impl Filter {
@@ -37,6 +39,8 @@ impl Filter {
                 .any(|e| name.ends_with(e)),
             Self::Docx => name.ends_with(".docx"),
             Self::Bitmap => name.ends_with(".bmp"),
+            Self::Media => name.ends_with(".wav") || name.ends_with(".mp3") || name.ends_with(".wpl"),
+            Self::Playlist => name.ends_with(".wpl"),
             Self::All => true,
         }
     }
@@ -47,6 +51,8 @@ impl Filter {
             Self::Documents => "Documents (*.rtf;*.docx;*.doc;*.txt)",
             Self::Docx => "Office Open XML Document (*.docx)",
             Self::Bitmap => "Bitmap (*.bmp)",
+            Self::Media => "Media Files (*.wav;*.mp3;*.wpl)",
+            Self::Playlist => "Windows Media Playlist (*.wpl)",
             Self::All => "All Files (*.*)",
         }
     }
@@ -56,6 +62,8 @@ impl Filter {
             Self::RichText | Self::Documents => ".rtf",
             Self::Docx => ".docx",
             Self::Bitmap => ".bmp",
+            Self::Media => ".wav",
+            Self::Playlist => ".wpl",
             Self::All => "",
         }
     }
