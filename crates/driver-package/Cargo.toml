@@ -1,0 +1,12 @@
+[package]
+name = "nt61-driver-package"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
