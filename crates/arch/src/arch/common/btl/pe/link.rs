@@ -120,6 +120,7 @@ struct Linker<'a> {
     imports: usize,
     occupied: Vec<(u64, u64)>,
     dynamic: bool,
+    address_end: u64,
 }
 
 pub(super) fn load(
@@ -130,6 +131,7 @@ pub(super) fn load(
     let mut linker = Linker {
         resolver,
         mode: image.mode,
+        address_end: image.user_address_end()?,
         mapped_bytes: image.region.bytes.len(),
         imports: 0,
         occupied: Vec::new(),
@@ -195,6 +197,7 @@ pub(super) fn load_library(
     let mut linker = Linker {
         resolver,
         mode: guest.thread.context.mode,
+        address_end: guest.user_address_end,
         mapped_bytes: 0,
         imports: 0,
         modules: Vec::new(),
@@ -257,10 +260,24 @@ pub(super) fn load_library(
         .modules
         .try_reserve_exact(new_count)
         .map_err(|_| LoadError::OutOfMemory)?;
+    // Record imports and forward edges from both new DLLs and existing
+    // facades used by those imports. Reserve before publishing any mappings.
+    let mut dependencies = Vec::new();
+    for module in &linker.modules {
+        let owner = module.image.region.base;
+        for &index in &module.dependencies {
+            let edge = (owner, linker.modules[index].image.region.base);
+            if !guest.win32.module_dependencies.contains(&edge) && !dependencies.contains(&edge) {
+                dependencies.try_reserve(1).map_err(|_| LoadError::OutOfMemory)?;
+                dependencies.push(edge);
+            }
+        }
+    }
+    guest.win32.module_dependencies.try_reserve_exact(dependencies.len())
+        .map_err(|_| LoadError::OutOfMemory)?;
+    guest.win32.module_dependencies.extend(dependencies);
     for module in linker.modules.into_iter().skip(existing) {
-        guest
-            .module_metadata
-            .push(super::ModuleMetadata::from_image(&module.image));
+        guest.module_metadata.push(super::ModuleMetadata::from_image(&module.image));
         guest
             .win32
             .modules
@@ -269,6 +286,7 @@ pub(super) fn load_library(
     }
     guest.memory.regions.sort_by_key(|region| region.base);
     guest.thread.invalidate_code();
+    guest.threads.invalidate_code();
     Ok(handle)
 }
 
@@ -293,8 +311,12 @@ fn canonical_module(name: &str) -> Result<String, LoadError> {
 }
 
 impl MappedImage {
-    fn rebase(&mut self, base: u64) -> Result<(), LoadError> {
+    fn rebase(&mut self, base: u64, limit: u64) -> Result<(), LoadError> {
         let bad = LoadError::InvalidImage;
+        if base < 0x10000 || base & 0xffff != 0
+            || base.checked_add(self.region.bytes.len() as u64).is_none_or(|end| end > limit) {
+            return Err(bad);
+        }
         let (rva, size) = self.directories[5];
         if (rva, size) == (0, 0) && self.forwarders_only()? {
             // API-set facade DLLs have no code, initialization, absolute data
@@ -304,11 +326,6 @@ impl MappedImage {
         }
         if rva == 0
             || size < 8
-            || base & 0xffff != 0
-            || (self.mode == DecodeMode::X86
-                && base
-                    .checked_add(self.region.bytes.len() as u64)
-                    .is_none_or(|end| end > 0x1_0000_0000))
         {
             return Err(bad);
         }
@@ -471,25 +488,30 @@ impl Linker<'_> {
                 .iter()
                 .any(|&(base, limit)| start < limit && base < end)
         };
-        if conflicts(
+        if image.region.base + image.region.bytes.len() as u64 > self.address_end || conflicts(
             image.region.base,
             image.region.base + image.region.bytes.len() as u64,
         ) {
             // Application DLLs often share a linker-default preferred base.
             // Rebase only checked PE relocation records, never scan/patch words.
-            let mut base = if self.mode == DecodeMode::X86 {
+            let mut base: u64 = if self.mode == DecodeMode::X86 {
                 0x4000_0000
             } else {
                 0x2_0000_0000
             };
-            while conflicts(base, base + image.region.bytes.len() as u64) {
-                base += (image.region.bytes.len() as u64 + 0xffff) & !0xffff;
+            loop {
+                let end = base.checked_add(image.region.bytes.len() as u64)
+                    .filter(|end| *end <= self.address_end)
+                    .ok_or_else(|| LinkError::AddressConflict { name: name.clone() })?;
+                if !conflicts(base, end) { break; }
+                base = base.checked_add((image.region.bytes.len() as u64 + 0xffff) & !0xffff)
+                    .ok_or_else(|| LinkError::AddressConflict { name: name.clone() })?;
             }
             if image.directories[5] == (0, 0) && !image.forwarders_only()? {
                 return Err(LinkError::AddressConflict { name });
             }
             image
-                .rebase(base)
+                .rebase(base, self.address_end)
                 .map_err(|error| LinkError::LibraryImage {
                     name: name.clone(),
                     error,
@@ -518,24 +540,10 @@ impl Linker<'_> {
             },
             other => other,
         })?;
-        if self.dynamic && self.modules[index].image.forwarders_only()? {
-            // Resolve a facade's bounded export slots now, so a later
-            // GetProcAddress has real mapped target modules available.
-            let image = &self.modules[index].image;
-            let table = image.data(image.directories[0].0 as usize, 40)?;
-            let base = u32_at(table, 16)?;
-            let count = u32_at(table, 20)?;
-            if count as usize > MAX_SYMBOLS {
-                return Err(LinkError::LimitExceeded);
-            }
-            for offset in 0..count {
-                let ordinal = base
-                    .checked_add(offset)
-                    .filter(|v| *v <= u16::MAX as u32)
-                    .ok_or(LoadError::InvalidImage)?;
-                self.export(index, &ImportSymbol::Ordinal(ordinal as u16), depth + 1)?;
-            }
-        }
+        // Loading a DLL binds its imports, not every export. Sparse ordinal
+        // slots and unavailable, unused forwarders must not reject the load.
+        // Static imports resolve through export(); GetProcAddress loads a
+        // forward target on demand through the guest resolver in win32.rs.
         Ok(index)
     }
 
@@ -751,7 +759,7 @@ mod tests {
                 directories: [(0, 0); 16],
             };
             image.directories[5] = (0x1000, length as u32);
-            assert_eq!(image.rebase(0x4100_0000), Err(LoadError::ImageTooLarge));
+            assert_eq!(image.rebase(0x4100_0000, 0xffff_0000), Err(LoadError::ImageTooLarge));
             assert_eq!(image.region.base, 0x4000_0000);
             assert_eq!(&image.region.bytes[..8], &0x12345678u64.to_le_bytes());
         }

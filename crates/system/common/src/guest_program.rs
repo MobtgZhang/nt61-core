@@ -251,7 +251,7 @@ pub fn try_execute(
             if quantum != 0 && quantum % 128 == 0 {
                 crate::hal::serial::write_string_always(&format!(
                     "[PE] Progress {candidate}: retired={} pc=0x{:X}\r\n",
-                    image.thread.retired, image.thread.context.rip,
+                    image.retired(), image.thread.context.rip,
                 ));
             }
             let run_started = crate::ke::time::get_interrupt_time();
@@ -300,6 +300,7 @@ pub fn try_execute(
                             else { 0xc000008f }
                         }
                         StopReason::InitializationFailed { .. } => 0xc0000142,
+                        StopReason::UnsupportedApi { .. } => 0xc0000002,
                         _ => 0xc000001d,
                     };
                     let api = image
@@ -316,7 +317,7 @@ pub fn try_execute(
                     output(diagnostic.as_bytes());
                     crate::hal::serial::write_string_always(&format!(
                         "[PE] Fault details: retired={} bytes={:02X?} last_api_arguments={:X?} recent_api_failures={:?}\r\n",
-                        image.thread.retired, &bytes[..count], image.win32.last_arguments, image.win32.failures,
+                        image.retired(), &bytes[..count], image.win32.last_arguments, image.win32.failures,
                     ));
                     return Some(status);
                 }

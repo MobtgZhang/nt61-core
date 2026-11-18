@@ -21,6 +21,7 @@ const MAX_DATA: usize = 1024 * 1024;
 const MAX_CALLBACKS: usize = 128;
 const MAX_TOTAL_DATA: usize = 16 * 1024 * 1024;
 
+#[derive(Clone)]
 pub(super) struct Plan {
     base: u64,
     data: Vec<u8>,
@@ -108,12 +109,14 @@ impl Plan {
     }
 }
 
+#[derive(Clone)]
 struct Routine {
     address: u64,
     base: u64,
     dll_entry: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct InitialThread {
     plans: Vec<Plan>,
     routines: Vec<Routine>,
@@ -168,11 +171,36 @@ impl InitialThread {
         Ok(result)
     }
 
+    pub(super) fn data_size(&self) -> usize {
+        if self.plans.is_empty() { return 0; }
+        let mut cursor = DATA_OFFSET;
+        for plan in &self.plans {
+            cursor = cursor.div_ceil(DATA_OFFSET) * DATA_OFFSET + plan.data.len();
+        }
+        cursor.div_ceil(PAGE) * PAGE
+    }
+
+    pub(super) fn notifications(&self, disabled: &[u64], detach: bool, thread: &GuestThread) -> Option<Startup> {
+        let mut routines: Vec<_> = self.routines.iter()
+            .filter(|routine| !disabled.contains(&routine.base)).cloned().collect();
+        if detach { routines.reverse(); }
+        if routines.is_empty() { return None; }
+        Some(Startup { routines, next: 0, saved: thread.context, return_sp: None,
+            reason: if detach { 3 } else { 2 } })
+    }
+
     pub(super) fn install(
         self,
         memory: &mut ImageMemory,
         thread: &GuestThread,
         teb: u64,
+    ) -> Result<Option<Startup>, LoadError> {
+        self.install_at(memory, thread, teb, TLS_BASE, 1)
+    }
+
+    pub(super) fn install_at(
+        self, memory: &mut ImageMemory, thread: &GuestThread, teb: u64,
+        tls_base: u64, reason: u32,
     ) -> Result<Option<Startup>, LoadError> {
         let bad = LoadError::InvalidImage;
         let x86 = thread.context.mode == DecodeMode::X86;
@@ -196,9 +224,12 @@ impl InitialThread {
         }
         let length = cursor.div_ceil(PAGE) * PAGE;
         for (base, size) in [
-            (TLS_BASE, if self.plans.is_empty() { 0 } else { length }),
+            (tls_base, if self.plans.is_empty() { 0 } else { length }),
             (RETURN_GATE, if self.routines.is_empty() { 0 } else { PAGE }),
         ] {
+            if base == RETURN_GATE && memory.regions.iter().any(|r| r.base == base && r.bytes.len() == PAGE) {
+                continue;
+            }
             if size != 0
                 && memory
                     .regions
@@ -209,9 +240,9 @@ impl InitialThread {
             }
         }
         if !self.plans.is_empty() {
-            let mut region = Region::new(TLS_BASE, length, READ | WRITE)?;
+            let mut region = Region::new(tls_base, length, READ | WRITE)?;
             for (slot, (plan, &offset)) in self.plans.iter().zip(&offsets).enumerate() {
-                let pointer = TLS_BASE + offset as u64;
+                let pointer = tls_base + offset as u64;
                 region.bytes[slot * width..(slot + 1) * width]
                     .copy_from_slice(&pointer.to_le_bytes()[..width]);
                 region.bytes[offset..offset + plan.data.len()].copy_from_slice(&plan.data);
@@ -227,7 +258,7 @@ impl InitialThread {
             }
             if !memory.write_virt(
                 teb + if x86 { 0x2c } else { 0x58 },
-                &TLS_BASE.to_le_bytes()[..width],
+                &tls_base.to_le_bytes()[..width],
             ) {
                 return Err(bad);
             }
@@ -236,12 +267,15 @@ impl InitialThread {
         if self.routines.is_empty() {
             return Ok(None);
         }
-        memory.regions.push(Region::new(RETURN_GATE, PAGE, READ)?);
+        if !memory.regions.iter().any(|r| r.base == RETURN_GATE) {
+            memory.regions.push(Region::new(RETURN_GATE, PAGE, READ)?);
+        }
         Ok(Some(Startup {
             routines: self.routines,
             next: 0,
             saved: thread.context,
             return_sp: None,
+            reason,
         }))
     }
 }
@@ -251,6 +285,7 @@ pub(super) struct Startup {
     next: usize,
     saved: GuestState,
     return_sp: Option<u64>,
+    reason: u32,
 }
 impl Startup {
     pub(super) fn active(&self) -> bool {
@@ -272,10 +307,10 @@ impl Startup {
         let mut frame = [0; 40];
         frame[..width].copy_from_slice(&RETURN_GATE.to_le_bytes()[..width]);
         // DllMain's reserved pointer is non-NULL for static process startup.
-        let reserved = u64::from(routine.dll_entry);
+        let reserved = u64::from(routine.dll_entry && self.reason == 1);
         if x86 {
             frame[4..8].copy_from_slice(&(routine.base as u32).to_le_bytes());
-            frame[8..12].copy_from_slice(&1u32.to_le_bytes());
+            frame[8..12].copy_from_slice(&self.reason.to_le_bytes());
             frame[12..16].copy_from_slice(&(reserved as u32).to_le_bytes());
         }
         if !memory.write_virt(sp, &frame[..if x86 { 16 } else { 40 }]) {
@@ -286,7 +321,7 @@ impl Startup {
         thread.context.set_reg(X86Reg::Rip, routine.address);
         if !x86 {
             thread.context.set_reg(X86Reg::Rcx, routine.base);
-            thread.context.set_reg(X86Reg::Rdx, 1);
+            thread.context.set_reg(X86Reg::Rdx, u64::from(self.reason));
             thread.context.set_reg(X86Reg::R8, reserved);
         }
         self.return_sp = Some(sp + if x86 { 16 } else { 8 });
@@ -305,7 +340,7 @@ impl Startup {
             return Ok(false);
         }
         let routine = &self.routines[self.next - 1];
-        if routine.dll_entry && thread.context.reg(X86Reg::Rax) as u32 == 0 {
+        if self.reason == 1 && routine.dll_entry && thread.context.reg(X86Reg::Rax) as u32 == 0 {
             return Err(StopReason::InitializationFailed {
                 module_base: routine.base,
             });

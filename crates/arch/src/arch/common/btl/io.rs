@@ -333,7 +333,13 @@ impl<H: IoHost> GuestServices for IoServices<H> {
         self.host.processor_mask()
     }
     fn read_library(&mut self, name: &str, mode: super::ir::DecodeMode) -> Result<Vec<u8>, u32> {
-        self.host.read_library(name, mode)
+        if name.as_bytes().get(1) == Some(&b':') {
+            let abi = if mode == super::ir::DecodeMode::X86 { GuestAbi::X86_32 } else { GuestAbi::X86_64 };
+            let path = guest_file_path(abi, name, self.fs_redirection)?;
+            self.host.read_library(&path, mode)
+        } else {
+            self.host.read_library(name, mode)
+        }
     }
     fn call(
         &mut self,

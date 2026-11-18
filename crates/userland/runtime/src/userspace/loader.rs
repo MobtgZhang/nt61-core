@@ -180,6 +180,11 @@ pub struct VolumeLibraries<'a> { pub application_directory: &'a str }
 impl crate::arch::common::btl::pe::ImportResolver for VolumeLibraries<'_> {
     fn read_library(&mut self, name: &str, mode: crate::arch::common::btl::ir::DecodeMode)
         -> Result<alloc::vec::Vec<u8>, u32> {
+        // Explicit paths must not be prefixed with the application directory.
+        // IoServices already selected the caller's WOW64 filesystem view.
+        if name.as_bytes().get(1) == Some(&b':') {
+            return read_guest_pe(name);
+        }
         // A PE32 program must never bind to the host's 64-bit System32 DLLs.
         let system = match mode {
             crate::arch::common::btl::ir::DecodeMode::X86 => "C:\\Windows\\SysWOW64",

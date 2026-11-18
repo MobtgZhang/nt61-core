@@ -15,6 +15,8 @@ mod source;
 pub use source::{read_image_file, ImageReadError};
 #[path = "pe/tls.rs"]
 mod tls;
+#[path = "pe/threads.rs"]
+pub mod threads;
 #[path = "win32.rs"]
 pub mod win32;
 
@@ -81,15 +83,28 @@ struct Region {
     base: u64,
     bytes: Vec<u8>,
     permissions: Vec<u8>,
+    // Mapping metadata belongs to the loader/allocator, never mutable guest
+    // PE headers. Keep Windows protections separately from interpreter bits
+    // (which also contain the section-occupancy marker).
+    protections: Vec<u32>,
+    allocation_protection: u32,
+    image: bool,
 }
 impl Region {
     fn new(base: u64, length: usize, permission: u8) -> Result<Self, LoadError> {
         let mut permissions = zeroed(length.div_ceil(PAGE))?;
         permissions.fill(permission);
+        let allocation_protection = win32::win_protection(permission);
+        let mut protections = Vec::new();
+        protections.try_reserve_exact(permissions.len()).map_err(|_| LoadError::OutOfMemory)?;
+        protections.resize(permissions.len(), allocation_protection);
         Ok(Self {
             base,
             bytes: zeroed(length)?,
             permissions,
+            protections,
+            allocation_protection,
+            image: false,
         })
     }
     fn range(&self, va: u64, len: usize, permission: u8) -> Option<core::ops::Range<usize>> {
@@ -198,9 +213,15 @@ pub struct GuestImage {
     pub peb: u64,
     pub teb: u64,
     startup: Option<tls::Startup>,
+    initialization: tls::InitialThread,
+    threads: threads::State,
+    stack_reserve: usize,
     terminal: Option<ImageRunResult>,
     pub win32: win32::Runtime,
     module_metadata: Vec<ModuleMetadata>,
+    /// Exclusive application allocation boundary for the SP1 address model.
+    /// WOW64 LARGEADDRESSAWARE is an executable property, not a DLL property.
+    user_address_end: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,6 +247,17 @@ impl GuestImage {
             if remaining == 0 {
                 return ImageRunResult::Yielded;
             }
+            self.finish_detach();
+            if let Some(code) = self.all_threads_exited() {
+                let result = ImageRunResult::Exited(code);
+                self.terminal = Some(result);
+                return result;
+            }
+            match self.schedule(services) {
+                Ok(true) => {},
+                Ok(false) => return ImageRunResult::Yielded,
+                Err(reason) => { let result = ImageRunResult::Fault(reason); self.terminal = Some(result); return result; }
+            }
             if let Some(startup) = &mut self.startup {
                 if !startup.active() {
                     if let Err(reason) = startup.begin(&mut self.thread, &mut self.memory) {
@@ -238,8 +270,13 @@ impl GuestImage {
                     }
                 }
             }
-            let outcome = self.thread.run(&mut self.memory, remaining);
+            if self.startup.is_none() && self.detaching() { continue; }
+            // A bounded interpreter slice provides preemption even when a
+            // worker spins without calling an API.
+            let slice = remaining.min(self.thread_slice());
+            let outcome = self.thread.run(&mut self.memory, slice);
             remaining -= outcome.retired;
+            self.account_thread_slice(outcome.retired);
             if let Some(startup) = &mut self.startup {
                 match startup.complete(&mut self.thread, outcome.reason) {
                     Ok(true) => continue,
@@ -262,6 +299,20 @@ impl GuestImage {
                         match win32::dispatch(self, number, services) {
                             Ok(win32::Outcome::Return(value)) => self.thread.context.set_reg(X86Reg::Rax, if abi == GuestAbi::X86_32 { value as u32 as u64 } else { value }),
                             Ok(win32::Outcome::Continue) => {},
+                            Ok(win32::Outcome::Park(wait)) => self.park(wait),
+                            Ok(win32::Outcome::ParkRetry(wait)) => {
+                                self.thread.context.rip -= 2;
+                                self.park(wait);
+                            },
+                            Ok(win32::Outcome::Retry) => {
+                                // Retry the two-byte syscall/int 2e instruction
+                                // with its original arguments after another thread
+                                // or the host desktop has had a chance to run.
+                                self.thread.context.rip -= 2;
+                                self.yield_thread();
+                                return ImageRunResult::Yielded;
+                            },
+                            Ok(win32::Outcome::ExitThread(code)) => self.exit_thread(code),
                             Ok(win32::Outcome::Exit(code)) => {
                                 let result = ImageRunResult::Exited(code);
                                 self.terminal = Some(result);
@@ -285,14 +336,16 @@ impl GuestImage {
                         ServiceResult::Return(status) => {
                             self.thread.context.set_reg(X86Reg::Rax, status as u64)
                         }
-                        ServiceResult::ExitProcess(status) | ServiceResult::ExitThread(status) => {
+                        ServiceResult::ExitThread(status) => self.terminate_thread(status),
+                        ServiceResult::ExitProcess(status) => {
                             let result = ImageRunResult::Exited(status);
                             self.terminal = Some(result);
                             return result;
                         }
                     }
                 }
-                StopReason::QuantumExpired => return ImageRunResult::Yielded,
+                StopReason::QuantumExpired => { if remaining == 0 { return ImageRunResult::Yielded; } },
+                reason if self.returned_thread(reason) => self.exit_thread(self.thread.context.reg(X86Reg::Rax) as u32),
                 fault => {
                     let result = ImageRunResult::Fault(fault);
                     self.terminal = Some(result);
@@ -350,8 +403,17 @@ impl GuestImage {
             }
             cursor += 2;
         }
-        let env =
-            "SystemRoot=C:\\Windows\0WINDIR=C:\\Windows\0OS=Windows_NT\0USERNAME=Administrator\0\0";
+        // The installed mounted-volume image currently provisions this one
+        // account (fs/system.rs), also used by CMD. Keep guest profile paths
+        // consistent with that layout; never inherit the Linux host's user.
+        let env = concat!(
+            "SystemRoot=C:\\Windows\0WINDIR=C:\\Windows\0OS=Windows_NT\0USERNAME=Administrator\0",
+            "USERPROFILE=C:\\Users\\Administrator\0HOMEDRIVE=C:\0HOMEPATH=\\Users\\Administrator\0",
+            "APPDATA=C:\\Users\\Administrator\\AppData\\Roaming\0",
+            "LOCALAPPDATA=C:\\Users\\Administrator\\AppData\\Local\0",
+            "TEMP=C:\\Users\\Administrator\\AppData\\Local\\Temp\0",
+            "TMP=C:\\Users\\Administrator\\AppData\\Local\\Temp\0ProgramData=C:\\ProgramData\0\0"
+        );
         let env_offset = if x86 { 0x48 } else { 0x80 };
         params.bytes[env_offset..env_offset + width]
             .copy_from_slice(&(base + cursor as u64).to_le_bytes()[..width]);
@@ -408,6 +470,12 @@ impl GuestImage {
 
     fn from_mapped(mapped: MappedImage, libraries: Vec<MappedImage>) -> Result<Self, LoadError> {
         let bad = LoadError::InvalidImage;
+        let user_address_end = mapped.user_address_end()?;
+        if core::iter::once(&mapped).chain(libraries.iter()).any(|image|
+            image.region.base.checked_add(image.region.bytes.len() as u64)
+                .is_none_or(|end| end > user_address_end)) {
+            return Err(bad);
+        }
         let initialization = tls::InitialThread::plan(&mapped, &libraries)?;
         let mut module_metadata = Vec::new();
         module_metadata.try_reserve_exact(libraries.len() + 1).map_err(|_| LoadError::OutOfMemory)?;
@@ -420,6 +488,14 @@ impl GuestImage {
             ..
         } = mapped;
         let base = image.base;
+        let stack_reserve = if mode == DecodeMode::X86 {
+            u32_at(&image.bytes, u32_at(&image.bytes, 0x3c)? as usize + 24 + 72)? as usize
+        } else {
+            usize::try_from(u64_at(&image.bytes, u32_at(&image.bytes, 0x3c)? as usize + 24 + 72)?).map_err(|_| bad)?
+        };
+        let stack_reserve = if stack_reserve == 0 { 0x10_0000 } else {
+            stack_reserve.checked_add(0xffff).ok_or(bad)? / 0x10000 * 0x10000
+        };
         let (stack_base, peb, teb) = if mode == DecodeMode::X86 {
             (0x0010_0000, 0x7ffd_f000, 0x7ffd_e000)
         } else {
@@ -466,6 +542,8 @@ impl GuestImage {
                 (4, stack_top),
                 (8, stack_base),
                 (0x18, teb),
+                (0x20, 1),
+                (0x24, 1),
                 (0x30, peb),
             ] {
                 if !put(teb + offset, value, 4) {
@@ -482,7 +560,7 @@ impl GuestImage {
             }
         } else {
             thread.context.gs_base = teb;
-            for (offset, value) in [(8, stack_top), (0x10, stack_base), (0x30, teb), (0x60, peb)] {
+            for (offset, value) in [(8, stack_top), (0x10, stack_base), (0x30, teb), (0x40, 1), (0x48, 1), (0x60, peb)] {
                 if !put(teb + offset, value, 8) {
                     return Err(bad);
                 }
@@ -496,7 +574,7 @@ impl GuestImage {
                 return Err(bad);
             }
         }
-        let startup = initialization.install(&mut memory, &thread, teb)?;
+        let startup = initialization.clone().install(&mut memory, &thread, teb)?;
         Ok(Self {
             thread,
             memory,
@@ -504,9 +582,13 @@ impl GuestImage {
             peb,
             teb,
             startup,
+            initialization,
+            threads: threads::State::new(),
+            stack_reserve,
             terminal: None,
             win32: win32::Runtime::new(base),
             module_metadata,
+            user_address_end,
         })
     }
 }
@@ -537,7 +619,11 @@ impl ModuleMetadata {
         bytes.copy_from_slice(&source.bytes);
         let mut permissions = zeroed(source.permissions.len())?;
         permissions.copy_from_slice(&source.permissions);
-        Ok(MappedImage { region: Region { base: self.base, bytes, permissions },
+        let mut protections = Vec::new();
+        protections.try_reserve_exact(source.protections.len()).map_err(|_| LoadError::OutOfMemory)?;
+        protections.extend_from_slice(&source.protections);
+        Ok(MappedImage { region: Region { base: self.base, bytes, permissions,
+            protections, allocation_protection: source.allocation_protection, image: source.image },
             mode: self.mode, entry: self.entry, directories: self.directories })
     }
 }
@@ -550,6 +636,19 @@ struct MappedImage {
     directories: [(u32, u32); 16],
 }
 impl MappedImage {
+    // This is the exclusive maximum observed for the SP1 AMD64 process and
+    // its two WOW64 address models, including the top reserved 64 KiB.
+    fn address_end(mode: DecodeMode, large_address: bool) -> u64 {
+        if mode == DecodeMode::X64 { 0x0000_07ff_ffff_0000 }
+        else if large_address { 0xffff_0000 } else { 0x7fff_0000 }
+    }
+
+    fn user_address_end(&self) -> Result<u64, LoadError> {
+        let characteristics = u16_at(&self.region.bytes,
+            u32_at(&self.region.bytes, 0x3c)? as usize + 22)?;
+        Ok(Self::address_end(self.mode, characteristics & 0x20 != 0))
+    }
+
     fn parse(file: &[u8], dll: bool) -> Result<Self, LoadError> {
         let bad = LoadError::InvalidImage;
         if file.get(..2) != Some(b"MZ") {
@@ -604,15 +703,9 @@ impl MappedImage {
             return Err(bad);
         }
         let image_end = base.checked_add(size as u64).ok_or(bad)?;
-        let limit = if mode == DecodeMode::X86 {
-            if characteristics & 0x20 != 0 {
-                0x1_0000_0000
-            } else {
-                0x8000_0000
-            }
-        } else {
-            0x0000_8000_0000_0000
-        };
+        // DLLs inherit the executable's narrower limit at link time. Their
+        // own LAA bit must neither enlarge nor restrict that process limit.
+        let limit = Self::address_end(mode, dll || characteristics & 0x20 != 0);
         if image_end > limit {
             return Err(bad);
         }
@@ -637,8 +730,12 @@ impl MappedImage {
             return Err(bad);
         }
         let mut image = Region::new(base, size, 0)?;
+        image.image = true;
+        image.allocation_protection = 0x80; // SEC_IMAGE: PAGE_EXECUTE_WRITECOPY
+        image.protections.fill(0); // Unoccupied image pages are reserved.
         image.bytes[..header_size].copy_from_slice(&file[..header_size]);
         image.permissions[..header_size.div_ceil(PAGE)].fill(READ);
+        image.protections[..header_size.div_ceil(PAGE)].fill(2);
         for index in 0..count {
             let section = file
                 .get(end + index * 40..end + (index + 1) * 40)
@@ -681,6 +778,10 @@ impl MappedImage {
             }
             // Even a section with no access occupies its address range.
             pages.fill(permission | 8);
+            let protection = if permission & WRITE != 0 {
+                if permission & EXECUTE != 0 { 0x80 } else { 8 }
+            } else { win32::win_protection(permission) };
+            image.protections[rva / PAGE..section_end.div_ceil(PAGE)].fill(protection);
             let data = file
                 .get(raw..raw.checked_add(raw_size).ok_or(bad)?)
                 .ok_or(bad)?;
