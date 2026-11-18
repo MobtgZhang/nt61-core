@@ -1437,16 +1437,11 @@ impl NtfsImage {
         // insert new records. The original image has existing records at indices
         // that we should NOT overwrite. We'll find the first available record slot.
         let first_new_slot = if self.original_bytes.is_some() {
-            // Scan MFT for the highest used record number.
-            // Records 0..N are in use, so N+1 is the first available slot.
-            let max_record_in_image = (0..2048)
-                .find(|&i| {
-                    let off = mft_cluster_byte_offset + i * mft_record_size;
-                    off + mft_record_size > image.len() || &image[off..off + 4] != b"FILE"
-                })
-                .unwrap_or(2048);
-            crate::debug!("[DEBUG finalize] Original image has records 0..{} in use, using slot {} for new entries", max_record_in_image.saturating_sub(1), max_record_in_image);
-            max_record_in_image
+            // Reserved metadata slots need not contain FILE records. A scan
+            // stopping at the first gap can overwrite installed user records
+            // after several edits. Preserve every parsed file identity.
+            self.original_record_numbers.values().copied().max().unwrap_or(15).max(15)
+                as usize + 1
         } else {
             16 // Reserve NTFS metadata records, including the root at record 5.
         };
@@ -1632,12 +1627,10 @@ impl NtfsImage {
             }
         }
 
-        // For parsed images (original_bytes is Some), skip rebuilding the root
-        // record at slot 5. The original root record contains all Windows directories.
-        // We only write new entries at slots >= first_new_slot.
-        if self.original_bytes.is_none() {
+        // Parsed images also need a rebuilt root index: preserving record 5
+        // leaves appended MFT records unreachable to the mounted filesystem.
+        {
             // --- Build root directory entry (MFT record 5) ---
-            // Only for new images. For parsed images, keep the original root record.
             let root_entry = NtfsEntry::new_dir("C:\\");
             // Build owned (record_num, path) pairs for direct children
             // of the root by walking `child_meta` so we can sort and
@@ -1721,7 +1714,7 @@ impl NtfsImage {
             }
             image[root_record_offset..root_record_offset + mft_record_size]
                 .copy_from_slice(&root_record);
-        } // end if original_bytes.is_none()
+        }
 
         for index in self.directory_indexes.values() {
             let offset = index.clusters.0 as usize * cluster_size as usize;
@@ -2170,6 +2163,32 @@ impl FsBackend for NtfsImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edited_volume_publishes_new_root_files_to_firmware_reader() {
+        struct Reader(Vec<u8>);
+        impl nt61_bootfs::SectorReader for Reader {
+            fn read_sectors(&self, lba: u64, count: u32) -> Option<Vec<u8>> {
+                let start = usize::try_from(lba.checked_mul(512)?).ok()?;
+                let end = start.checked_add(count as usize * 512)?;
+                Some(self.0.get(start..end)?.to_vec())
+            }
+        }
+        let mut volume = NtfsImage::new(32, 4096).unwrap();
+        volume.create_dir("Windows/System32").unwrap();
+        volume.write_file("Windows/System32/installed.dll", b"installed").unwrap();
+        let mut bytes = volume.finalize().unwrap();
+        for i in 0..30 {
+            let mut edited = NtfsImage::from_bytes(&bytes).unwrap();
+            edited.write_file_path(&format!("picture{i:02}.bmp"), &[i; 5000]).unwrap();
+            bytes = edited.finalize().unwrap();
+            let reader = Reader(bytes.clone());
+            assert_eq!(nt61_bootfs::ntfs::read_file(&reader, "/Windows/System32/installed.dll"), Some(b"installed".to_vec()));
+            for n in 0..=i {
+                assert!(nt61_bootfs::ntfs::read_file(&reader, &format!("/picture{n:02}.bmp")) == Some(vec![n; 5000]), "edit {i}, root file {n}");
+            }
+        }
+    }
 
     #[test]
     fn single_data_run_has_explicit_terminator_and_positive_signed_offset() {
