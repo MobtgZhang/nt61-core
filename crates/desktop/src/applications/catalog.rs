@@ -26,6 +26,8 @@ pub enum AppId {
     DiskPart,
     BcdEdit,
     MediaPlayer,
+    PhotoViewer,
+    DeviceManager,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Application {
@@ -67,6 +69,8 @@ apps! {
     (Explorer,"Windows Explorer","资源管理器","explorer.exe","Accessories","explorer"),
     (ResourceMonitor,"Resource Monitor","资源监视器","resmon.exe","System Tools","resource_monitor"),
     (EaseOfAccessCenter,"Ease of Access Center","轻松访问中心","control.exe","Ease of Access","ease_of_access_center"),
+    (PhotoViewer,"Windows Photo Viewer","Windows 照片查看器","PhotoViewer.dll","Programs","photo_viewer"),
+    (DeviceManager,"Device Manager","设备管理器","devmgmt.msc","System Tools","device_manager"),
 }
 impl Application {
     /// PE subsystem identities follow the Windows console/GUI distinction.
@@ -84,6 +88,8 @@ impl Application {
             | AppId::GamesExplorer
             | AppId::GettingStarted
             | AppId::EaseOfAccessCenter => return None,
+            // These are hosted components on SP1, not standalone EXEs.
+            AppId::PhotoViewer | AppId::DeviceManager => return None,
             AppId::MediaPlayer => "Program Files/Windows Media Player/wmplayer.exe",
             AppId::WordPad => "Program Files/Windows NT/Accessories/wordpad.exe",
             AppId::Minesweeper => "Program Files/Microsoft Games/Minesweeper/Minesweeper.exe",
@@ -124,6 +130,13 @@ impl AppId {
 }
 pub fn resolve(command: &str) -> Option<AppId> {
     let command = command.trim().trim_matches('"');
+    if command.eq_ignore_ascii_case("devmgmt.msc")
+        || command.eq_ignore_ascii_case("mmc devmgmt.msc")
+        || command.eq_ignore_ascii_case("mmc.exe devmgmt.msc")
+        || command.eq_ignore_ascii_case("control hdwwiz.cpl")
+    {
+        return Some(AppId::DeviceManager);
+    }
     if command.eq_ignore_ascii_case("run") {
         return Some(AppId::Run);
     }

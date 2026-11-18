@@ -43,6 +43,7 @@ pub enum WindowKind {
     Explorer,
     ControlPanel,
     ControlCategory(u8),
+    ControlPage(crate::control_browser::Page),
     UserAccounts,
     SoundSettings,
     RecycleBin,
@@ -121,6 +122,7 @@ pub enum ContextMenuCommand {
     OpenDateTime,
     Properties,
     Manage,
+    DeviceManager,
     EmptyRecycleBin,
     ScreenResolution,
     Personalize,
@@ -602,9 +604,10 @@ impl StartMenu {
         if query.is_empty() {
             return Vec::new();
         }
+        let resolved = crate::applications::catalog::resolve(&query);
         self.all_programs()
             .into_iter()
-            .filter(|program| program.title().to_ascii_lowercase().contains(&query) || match program {StartProgram::Application(id)=>(id.application().install_path().is_some() && id.application().executable.to_ascii_lowercase().contains(&query)) || id.application().chinese.contains(&query),StartProgram::Notepad=>"notepad.exe 记事本".contains(&query),StartProgram::Explorer=>"explorer.exe 资源管理器".contains(&query),StartProgram::CommandPrompt=>"cmd.exe 命令提示符".contains(&query),_=>false})
+            .filter(|program| program.title().to_ascii_lowercase().contains(&query) || match program {StartProgram::Application(id)=>resolved == Some(*id) || (id.application().install_path().is_some() && id.application().executable.to_ascii_lowercase().contains(&query)) || id.application().chinese.contains(&query),StartProgram::Notepad=>"notepad.exe 记事本".contains(&query),StartProgram::Explorer=>"explorer.exe 资源管理器".contains(&query),StartProgram::CommandPrompt=>"cmd.exe 命令提示符".contains(&query),_=>false})
             .collect()
     }
 
@@ -762,6 +765,7 @@ pub struct ShellModel {
     pub desktop_editor: Option<crate::desktop_files::Editor>,
     pub desktop_error: String,
     pub display: crate::display_settings::Settings,
+    pub control_browsers: Vec<crate::control_browser::Browser>,
 }
 
 impl ShellModel {
@@ -833,6 +837,7 @@ impl ShellModel {
             desktop_editor: None,
             desktop_error: String::new(),
             display: Default::default(),
+            control_browsers: Vec::new(),
         }
     }
 
@@ -1622,7 +1627,8 @@ impl ShellModel {
             return true;
         }
         self.start_menu.close();
-        if submenu.group==MenuGroup::StartControlPanel&&index==0{self.open_window_with_kind(title,80,80,720,500,WindowKind::ControlPanel);}else{self.open_window(title,80,80,480,320);}
+        if submenu.group==MenuGroup::StartDevices&&index==1 {self.launch_application(AppId::DeviceManager);return true;}
+        if submenu.group==MenuGroup::StartControlPanel&&index==0{self.open_window_with_kind(title,80,80,800,600,WindowKind::ControlPanel);}else{self.open_window(title,80,80,480,320);}
         true
     }
 
@@ -1680,7 +1686,8 @@ impl ShellModel {
         } else if kind == WindowKind::Computer {
             self.files.navigate(self.files.root_id());
         }
-        let opened = self.open_window_with_kind(title, 80, 80, 720, 500, kind) > 0;
+        let (width, height) = if kind == WindowKind::ControlPanel { (800, 600) } else { (720, 500) };
+        let opened = self.open_window_with_kind(title, 80, 80, width, height, kind) > 0;
         self.start_menu.close();
         self.context_menu = None;
         self.context_submenu = None;
@@ -1704,6 +1711,7 @@ impl ShellModel {
         const COMPUTER: &[(&str, Option<ContextMenuCommand>)] = &[
             ("Open", Some(ContextMenuCommand::Open)),
             ("Manage", Some(ContextMenuCommand::Manage)),
+            ("Device Manager", Some(ContextMenuCommand::DeviceManager)),
             ("", None),
             ("Properties", Some(ContextMenuCommand::Properties)),
         ];
@@ -1841,6 +1849,7 @@ impl ShellModel {
                 self.open_window_with_kind(title, 80, 60, width, height, kind);
                 true
             }
+            ContextMenuCommand::DeviceManager => {self.launch_application(AppId::DeviceManager);true}
             ContextMenuCommand::Manage => {
                 self.open_window_with_kind("Computer Management", 170, 100, 580, 400, WindowKind::ComputerManagement);
                 true
@@ -1850,7 +1859,7 @@ impl ShellModel {
                 true
             }
             ContextMenuCommand::ScreenResolution => {
-                self.open_window_with_kind("Screen Resolution", 180, 70, 560, 480, WindowKind::DisplaySettings);
+                self.open_window_with_kind("Screen Resolution", 150, 70, 700, 500, WindowKind::DisplaySettings);
                 true
             }
             ContextMenuCommand::Personalize => {
@@ -1941,11 +1950,11 @@ impl ShellModel {
 
     /// Shared by category painting and hit testing. The Windows category order
     /// runs down the left column before continuing down the right.
-    pub fn namespace_link_rect(body:Rect,kind:WindowKind,index:usize)->Rect {
-        if kind==WindowKind::ControlPanel && body.width>=640 {
-            let width=body.width.saturating_sub(48)/2;
-            Rect::new(body.x+16+(index/4)as i32*width as i32,body.y+60+(index%4)as i32*88,width.saturating_sub(12),80)
-        }else{Rect::new(body.x+12,body.y+56+index as i32*36,body.width.saturating_sub(24),32)}
+    pub fn namespace_link_rect(&self,body:Rect,kind:WindowKind,index:usize)->Rect {
+        let page = crate::control_browser::content(body);
+        if kind == WindowKind::ControlPanel { self.fonts.get(crate::control_browser::paint::FONT).map_or(page, |font| crate::control_browser::category_rect(page,index,&font)) }
+        else if matches!(kind,WindowKind::ControlCategory(_)) { crate::control_browser::category_item_rect(page,index) }
+        else { Rect::new(body.x+12,body.y+56+index as i32*36,body.width.saturating_sub(24),32) }
     }
     pub fn namespace_links(kind: WindowKind) -> &'static [(&'static str, WindowKind)] {
         const CONTROL: &[(&str, WindowKind)] = &[
@@ -1960,13 +1969,14 @@ impl ShellModel {
         ];
         const SYSTEM: &[(&str,WindowKind)]=&[("System",WindowKind::System),("Administrative Tools",WindowKind::ComputerManagement)];
         const NETWORK: &[(&str,WindowKind)]=&[("Network and Sharing Center",WindowKind::ShellSettings(Flyout::Network))];
-        const HARDWARE: &[(&str,WindowKind)]=&[("Sound",WindowKind::SoundSettings),("Display",WindowKind::DisplaySettings)];
+        const HARDWARE: &[(&str,WindowKind)]=&[("Device Manager",WindowKind::Application(AppId::DeviceManager)),("Sound",WindowKind::SoundSettings),("Display",WindowKind::DisplaySettings)];
         const ACCOUNTS: &[(&str,WindowKind)]=&[("User Accounts",WindowKind::UserAccounts),("Manage another account",WindowKind::UserAccounts)];
         const APPEARANCE: &[(&str,WindowKind)]=&[("Personalization",WindowKind::Personalization),("Screen Resolution",WindowKind::DisplaySettings)];
         const CLOCK: &[(&str,WindowKind)]=&[("Date and Time",WindowKind::ShellSettings(Flyout::Clock))];
         const PROGRAMS: &[(&str,WindowKind)]=&[("Default Programs",WindowKind::Application(AppId::DefaultPrograms))];
         const ACCESS: &[(&str,WindowKind)]=&[("On-Screen Keyboard",WindowKind::Application(AppId::OnScreenKeyboard)),("Magnifier",WindowKind::Application(AppId::Magnifier))];
         const MANAGE: &[(&str, WindowKind)] = &[
+            ("Device Manager", WindowKind::Application(AppId::DeviceManager)),
             ("System information", WindowKind::System),
             ("Display adapter", WindowKind::DisplaySettings),
             ("Network adapters", WindowKind::ShellSettings(Flyout::Network)),
@@ -1987,7 +1997,8 @@ impl ShellModel {
             _ => WindowKind::Explorer,
         };
         if kind == WindowKind::Computer { self.files.navigate(self.files.root_id()); }
-        self.open_window_with_kind(&name, 130, 90, 600, 420, kind);
+        let (width, height) = if kind == WindowKind::ControlPanel { (800, 600) } else { (600, 420) };
+        self.open_window_with_kind(&name, 130, 90, width, height, kind);
         true
     }
 
@@ -2031,6 +2042,10 @@ impl ShellModel {
         self.next_window_id += 1;
         self.taskbar
             .add_window_with_kind(id, title, x, y, width, height, kind);
+        if crate::control_browser::is_page(kind) {
+            self.control_browsers.push(crate::control_browser::Browser::new(id, crate::control_browser::title(kind), kind));
+        }
+        if kind == WindowKind::System { self.refresh_control_system(); }
         if matches!(kind, WindowKind::Explorer | WindowKind::Computer) {
             let directory = if kind == WindowKind::Computer {
                 crate::applications::explorer::COMPUTER
@@ -2057,6 +2072,7 @@ impl ShellModel {
         if self.taskbar.windows.iter().any(|w| w.id==id && w.kind==WindowKind::DisplaySettings) {
             self.display.open=false;
             self.revert_display();
+            if self.display.previous.is_some() { return; }
         }
         if let Some(modal) = self.guest_modal_for(id) { self.select_window(modal); return; }
         if let Some(scene)=self.applications.iter_mut().find(|a|a.window_id==id).and_then(|a|a.guest_window.as_mut()) {
@@ -2072,6 +2088,7 @@ impl ShellModel {
             }
         }
         if self.application(id).is_some_and(|a|a.id==AppId::MediaPlayer){let _=crate::platform::services::media("reset",&[]);}
+        self.control_browsers.retain(|browser| browser.window_id != id);
         if self.drag_window == Some(id) { self.cancel_window_drag(); }
         self.applications.retain(|app|app.window_id!=id);
         self.explorers.retain(|app|app.window_id!=id);
@@ -2172,6 +2189,7 @@ impl ShellModel {
     }
 
     pub fn begin_window_drag(&mut self, window_id: u32, cursor_x: i32, cursor_y: i32) -> bool {
+        if self.fullscreen_photo()==Some(window_id) {return false;}
         let Some(window) = self
             .taskbar
             .windows
@@ -2284,6 +2302,7 @@ impl ShellModel {
     }
 
     pub fn window_cursor_at(&self, x: i32, y: i32) -> WindowCursor {
+        if self.fullscreen_photo().is_some() { return WindowCursor::Arrow; }
         if let Some(drag) = self.resize_drag { return drag.edge.cursor(); }
         self.window_hit_test(x, y)
             .and_then(|id| self.taskbar.windows.iter().find(|w| w.id == id))
@@ -2299,6 +2318,7 @@ impl ShellModel {
         screen_width: u32,
         work_area_height: u32,
     ) -> bool {
+        if self.fullscreen_photo()==Some(window_id) {return false;}
         let Some(window) = self
             .taskbar
             .windows
@@ -2311,8 +2331,14 @@ impl ShellModel {
             return false;
         }
         let kind = window.kind;
+        let window_body = crate::control_browser::body(window);
+        if window.caption_control_at(cursor_x,cursor_y).is_none() && self.control_browser(window_id).is_some() {
+            if self.control_click(window_id,window_body,cursor_x,cursor_y) { return true; }
+        }
+        let Some(window) = self.taskbar.windows.iter().find(|w|w.id==window_id) else {return true;};
         if kind==WindowKind::Personalization && window.caption_control_at(cursor_x,cursor_y).is_none() {
             let b=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
+            let b=if self.control_browser(window_id).is_some(){crate::control_browser::content(b)}else{b};
             if b.contains(cursor_x,cursor_y) {
                 if self.personalization.click(b,cursor_x,cursor_y){self.close_window(window_id);}
                 return true;
@@ -2320,16 +2346,19 @@ impl ShellModel {
         }
         if kind==WindowKind::ShellSettings(Flyout::Network) && window.caption_control_at(cursor_x,cursor_y).is_none(){
             let b=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
+            let b=if self.control_browser(window_id).is_some(){crate::control_browser::content(b)}else{b};
             return self.network_settings.click(b,cursor_x,cursor_y);
         }
         if kind==WindowKind::SoundSettings && window.caption_control_at(cursor_x,cursor_y).is_none(){
             let b=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
+            let b=if self.control_browser(window_id).is_some(){crate::control_browser::content(b)}else{b};
             let handled=self.sound_settings.click(b,cursor_x,cursor_y);
             if self.sound_settings.message.is_empty(){self.volume=self.sound_settings.volume;self.muted=self.sound_settings.muted;}
             return handled;
         }
         if kind==WindowKind::UserAccounts && window.caption_control_at(cursor_x,cursor_y).is_none() {
             let b=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
+            let b=if self.control_browser(window_id).is_some(){crate::control_browser::content(b)}else{b};
             return self.account_settings.click(b,cursor_x,cursor_y);
         }
         if kind == WindowKind::DisplaySettings && window.caption_control_at(cursor_x,cursor_y).is_none() {
@@ -2339,14 +2368,15 @@ impl ShellModel {
         }
         if kind == WindowKind::System {
             let body = Rect::new(window.x + 6, window.y + 30, window.width.saturating_sub(12) as u32, window.height.saturating_sub(36) as u32);
+            if crate::applications::explorer::system::device_manager_link(body).contains(cursor_x,cursor_y){self.launch_application(AppId::DeviceManager);return true;}
             if crate::applications::explorer::system::home_link(body).contains(cursor_x, cursor_y) {
                 self.open_window_with_kind("Control Panel", 110, 80, 720, 500, WindowKind::ControlPanel);
                 return true;
             }
         }
-        let links = Self::namespace_links(kind);
+        let links = if self.control_browser(window_id).is_some(){&[][..]}else{Self::namespace_links(kind)};
         let body=Rect::new(window.x+6,window.y+30,window.width.saturating_sub(12)as u32,window.height.saturating_sub(36)as u32);
-        if let Some((title,destination))=links.iter().enumerate().find_map(|(index,entry)|Self::namespace_link_rect(body,kind,index).contains(cursor_x,cursor_y).then_some(entry)) {
+        if let Some((title,destination))=links.iter().enumerate().find_map(|(index,entry)|self.namespace_link_rect(body,kind,index).contains(cursor_x,cursor_y).then_some(entry)) {
                 let title=*title;let destination=*destination;
                 if let WindowKind::Application(app)=destination {self.launch_application(app);return true;}
                 if destination==WindowKind::SoundSettings {self.refresh_audio();}
@@ -2399,6 +2429,7 @@ impl ShellModel {
         let Some(window_id) = self.selected_window else {
             return false;
         };
+        if self.control_key(window_id,key) {return true;}
         if self.taskbar.windows.iter().any(|w|w.id==window_id && w.kind==WindowKind::DisplaySettings) {
             return self.display_key(key);
         }
@@ -2652,7 +2683,12 @@ impl ShellModel {
         }
     }
 
+    pub fn fullscreen_photo(&self) -> Option<u32> {
+        self.selected_window.filter(|id| self.taskbar.windows.iter().any(|w| w.id==*id && !w.minimized)
+            && self.application(*id).is_some_and(|a| matches!(&a.state,crate::applications::AppState::PhotoViewer(v) if v.slideshow)))
+    }
     pub fn window_hit_test(&self, x: i32, y: i32) -> Option<u32> {
+        if let Some(id) = self.fullscreen_photo().filter(|_| Rect::new(0,0,self.viewport.0,self.viewport.1).contains(x,y)) {return Some(id);}
         if let Some(id) = self.selected_window {
             if self.taskbar.windows.iter().any(|w|w.id==id && !w.minimized) {
                 if let (Some(app),Some(body))=(self.application(id),self.application_body(id)) {
@@ -2954,6 +2990,15 @@ mod tests {
         start.move_highlight(-1);
         assert_eq!(start.highlighted, 3);
         assert_eq!(start.confirm(), Some(StartProgram::Explorer));
+    }
+
+    #[test]
+    fn start_search_resolves_management_console_commands() {
+        let mut start = StartMenu::new();
+        for command in ["devmgmt.msc", "mmc devmgmt.msc", "control hdwwiz.cpl"] {
+            start.set_query(command);
+            assert_eq!(start.confirm(), Some(StartProgram::Application(AppId::DeviceManager)), "{command}");
+        }
     }
 
     #[test]
@@ -3516,5 +3561,22 @@ mod shell_popup_tests {
         assert_eq!(shell.controls.focus(), CONTROL_CONTEXT_MENU_BASE);
         shell.handle_popup_key(0x28);
         assert_eq!(shell.controls.focus(), CONTROL_CONTEXT_MENU_BASE + 1);
+    }
+}
+
+#[cfg(test)]
+mod control_panel_navigation_regressions {
+    use super::*;
+
+    #[test]
+    fn control_panel_links_reuse_the_original_window() {
+        let mut shell = ShellModel::new(Theme::aero());
+        let id = shell.open_window_with_kind("Control Panel", 80, 60, 800, 580, WindowKind::ControlPanel);
+        let body = Rect::new(86, 90, 788, 544);
+        let link = shell.namespace_link_rect(body, WindowKind::ControlPanel, 0);
+        assert!(shell.handle_window_control_click(id, link.x + 66, link.y + 8, 1024, 728));
+        assert_eq!(shell.taskbar.windows.len(), 1, "a Control Panel hyperlink must navigate inside its window");
+        assert_eq!(shell.taskbar.windows[0].id, id);
+        assert_eq!(shell.taskbar.windows[0].kind, WindowKind::ControlCategory(0));
     }
 }

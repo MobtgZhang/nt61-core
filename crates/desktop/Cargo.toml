@@ -43,6 +43,8 @@ miniz_oxide = { version = "=0.8.9", default-features = false, features = ["with-
 crc32fast = { version = "=1.4.2", default-features = false }
 roxmltree = { version = "=0.20.0", default-features = false }
 zune-jpeg = { version = "=0.4.21", default-features = false }
+zune-png = { version = "=0.5.2", default-features = false }
+jpeg-encoder = { version = "=0.7.1", default-features = false }
 
 [[bin]]
 name = "application-host"
@@ -58,5 +60,11 @@ required-features = ["resource-gen"]
 [[bin]]
 name = "explorer-preview"
 path = "src/bin/explorer-preview.rs"
+test = false
+required-features = ["resource-gen"]
+
+[[bin]]
+name = "control-preview"
+path = "src/bin/control-preview.rs"
 test = false
 required-features = ["resource-gen"]

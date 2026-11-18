@@ -19,6 +19,10 @@ pub mod host;
 pub mod icons;
 pub mod minesweeper;
 pub mod media_player;
+pub mod photo_viewer;
+pub mod device_manager;
+pub mod system_icons;
+mod system_text;
 pub mod notepad;
 pub mod paint;
 pub mod processes;
@@ -55,12 +59,15 @@ pub enum AppAction {
     InsertTime,
     Manage(task_manager::Action),
     Media(media_player::Request),
+    Photo(photo_viewer::Request),
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppState {
     CommandPrompt(command_prompt::CommandPrompt),
     Calculator(Calculator),
     MediaPlayer(Box<media_player::Player>),
+    PhotoViewer(Box<photo_viewer::Viewer>),
+    DeviceManager(Box<device_manager::Manager>),
     Paint(Box<Paint>),
     Document(Document),
     CharacterMap {
@@ -147,6 +154,8 @@ impl ApplicationSession {
             AppId::BcdEdit => AppState::CommandPrompt(command_prompt::CommandPrompt::bcdedit()),
             AppId::DiskPart => AppState::CommandPrompt(command_prompt::CommandPrompt::diskpart()),
             AppId::MediaPlayer => AppState::MediaPlayer(Box::default()),
+            AppId::PhotoViewer => AppState::PhotoViewer(Box::default()),
+            AppId::DeviceManager => AppState::DeviceManager(Box::default()),
             AppId::Calculator => AppState::Calculator(Calculator::default()),
             AppId::Paint => AppState::Paint(Box::new(Paint::new(480, 240))),
             AppId::StickyNotes | AppId::WordPad | AppId::Notepad => {
@@ -218,6 +227,8 @@ impl ApplicationSession {
         }
     }
     pub fn key(&mut self, key: u8) -> AppAction {
+        if self.id == AppId::PhotoViewer { return photo_viewer::key(self, key); }
+        if self.id == AppId::DeviceManager { return device_manager::key(self, key); }
         if self.id==AppId::MediaPlayer {return media_player::key(self,key);}
         if self.id==AppId::TaskManager {return task_manager::key(self,key);}
         if let Some(scene)=&mut self.guest_window {scene.key(key);return AppAction::None;}
@@ -342,6 +353,7 @@ impl ApplicationSession {
             AppState::Document(d) => d.file_id,
             AppState::Paint(p) => p.file_id,
             AppState::MediaPlayer(p) => p.current,
+            AppState::PhotoViewer(p) => p.current,
             _ => None,
         }
     }
@@ -350,11 +362,13 @@ impl ApplicationSession {
             AppState::Document(d) => &d.filename,
             AppState::Paint(p) => &p.filename,
             AppState::MediaPlayer(p) => p.name(),
+            AppState::PhotoViewer(p) => &p.name,
             _ => "Capture.bmp",
         }
     }
     pub fn saved(&mut self, id: u32, name: String) {
         match &mut self.state {
+            AppState::PhotoViewer(p) => {p.current=Some(id);p.name=name;},
             AppState::MediaPlayer(p) => {p.playlist_file=Some(id);p.playlist_name=name;},
             AppState::Document(d) => {
                 d.file_id = Some(id);

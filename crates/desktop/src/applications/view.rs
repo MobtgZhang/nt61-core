@@ -11,6 +11,8 @@ use crate::{
 use alloc::{format, string::String, vec::Vec};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    Photo(super::photo_viewer::Command),
+    Device(super::device_manager::Command),
     TaskManager(super::task_manager::Command),
     Media(super::media_player::Command),
     WordPad(super::wordpad::Command),
@@ -92,6 +94,8 @@ fn button(
 }
 pub fn buttons(app: &ApplicationSession, b: Rect, env: &Environment) -> Vec<Button> {
     let mut out = Vec::new();
+    if app.id==AppId::PhotoViewer {return super::photo_viewer::buttons(app,b);}
+    if app.id==AppId::DeviceManager {return super::device_manager::buttons(app,b);}
     if app.id==AppId::MediaPlayer {return super::media_player::buttons(app,b);}
     if app.id==AppId::TaskManager {return super::task_manager::buttons(app,b,env);}
     if app.id == AppId::WordPad {
@@ -122,7 +126,7 @@ pub fn buttons(app: &ApplicationSession, b: Rect, env: &Environment) -> Vec<Butt
         return out;
     }
     match &app.state {
-        AppState::CommandPrompt(_) | AppState::MediaPlayer(_) => {}
+        AppState::CommandPrompt(_) | AppState::MediaPlayer(_) | AppState::PhotoViewer(_) | AppState::DeviceManager(_) => {}
         AppState::Calculator(_) => {
             let rows: [&[(&str, u8)]; 6] = [
                 &[("MC", b'x'), ("MR", b'p'), ("MS", b'm'), ("M+", b'a')],
@@ -539,6 +543,8 @@ pub fn click(
     y: i32,
     right: bool,
 ) -> AppAction {
+    if app.id==AppId::PhotoViewer {return super::photo_viewer::pointer(app,body,x,y,true,true,right).1;}
+    if app.id==AppId::DeviceManager {return super::device_manager::click(app,body,x,y,right);}
     if app.id==AppId::MediaPlayer {return super::media_player::click(app,body,x,y);}
     if app.id==AppId::TaskManager {return super::task_manager::click(app,body,env,x,y,right);}
     if app.common_dialog.is_some() {
@@ -569,7 +575,7 @@ pub fn click(
         app.menu = false;
     }
     match button.command {
-        Command::TaskManager(_) | Command::Media(_) => {},
+        Command::TaskManager(_) | Command::Media(_) | Command::Photo(_) | Command::Device(_) => {},
         Command::WordPad(command) => return super::wordpad::execute(app, command),
         Command::Notepad(command) => return super::notepad::execute(app, command),
         Command::File => {
@@ -818,6 +824,8 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
     env: &Environment,
     text: F,
 ) {
+    if app.id==AppId::PhotoViewer {super::photo_viewer::draw(app,frame,b,&text);if let Some(dialog)=&app.dialog {super::file_dialog::draw(dialog,frame,b,&text);}super::common_dialogs::draw(app,frame,b,&text);return;}
+    if app.id==AppId::DeviceManager {super::device_manager::draw(app,frame,b,&text);return;}
     if app.id==AppId::MediaPlayer {super::media_player::draw(app,frame,b,&text);if let Some(dialog)=&app.dialog {super::file_dialog::draw(dialog,frame,b,&text);}return;}
     if app.id==AppId::TaskManager {super::task_manager::draw(app,frame,b,env,text);return;}
     if let Some(scene)=&app.guest_window {scene.draw(frame,b,&text);return;}
@@ -872,7 +880,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
                 0xFFF4F4F4,
             );
         }
-        AppState::MediaPlayer(_) => {},
+        AppState::MediaPlayer(_) | AppState::PhotoViewer(_) | AppState::DeviceManager(_) => {},
         AppState::Calculator(c) => {
             let r = Rect::new(b.x + 14, b.y + 18, 272, 54);
             aero::menu_item(frame, r, true);

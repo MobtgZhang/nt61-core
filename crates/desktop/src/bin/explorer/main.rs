@@ -209,11 +209,15 @@ fn desktop_main() -> ! {
             if let Some(key)=session_decoder.expire(ticks){let intent=shell.model.session.key(key);shell.model.session_intent(intent);shell.scene_dirty.set(true);redraw=true;}
         }
         let display_focused = shell.model.taskbar.windows.iter().any(|w|
-            Some(w.id) == shell.model.selected_window && w.kind == nt61_desktop::shell::WindowKind::DisplaySettings);
+            Some(w.id) == shell.model.selected_window && shell.model.control_browser(w.id).is_some());
         if display_focused {
             if let Some(key) = display_decoder.expire(ticks) {
-                shell.model.display_key(key);
-                shell.scene_dirty.set(true);
+                let geometry = shell.window_geometry();
+                if let Some(id)=shell.model.selected_window {
+                    if !shell.model.control_key(id,key) { shell.model.handle_window_key(key); }
+                    shell.mark_window_dirty(id);
+                }
+                if shell.window_geometry() != geometry { shell.scene_dirty.set(true); }
                 redraw = true;
             }
         } else {
@@ -341,7 +345,8 @@ fn desktop_main() -> ! {
                     framebuffer.width,
                     framebuffer.height,
                 );
-                let over_window = shell.model.captured_pointer_window().is_some()
+                let over_window = shell.model.fullscreen_photo().is_some()
+                    || shell.model.captured_pointer_window().is_some()
                     || (!popup_over
                         && cursor_y < framebuffer.height.saturating_sub(TASKBAR_HEIGHT) as i32
                         && shell.model.window_hit_test(cursor_x, cursor_y).is_some());
@@ -359,7 +364,7 @@ fn desktop_main() -> ! {
                     }
                     shell.hovered_application = hovered_application;
                 }
-                let hovered_caption = if over_window && shell.model.drag_window.is_none() {
+                let hovered_caption = if over_window && shell.model.drag_window.is_none() && shell.model.fullscreen_photo().is_none() {
                     shell
                         .model
                         .window_hit_test(cursor_x, cursor_y)
@@ -382,8 +387,13 @@ fn desktop_main() -> ! {
                     pointer_full = true;
                 }
                 if action == PointerAction::Down && over_window {
-                    shell.scene_dirty.set(true);
                     if let Some(window_id) = shell.model.window_hit_test(cursor_x, cursor_y) {
+                        let browser_content = Some(window_id) == shell.model.selected_window
+                            && shell.model.control_browser(window_id).is_some()
+                            && shell.model.taskbar.windows.iter().find(|w|w.id==window_id)
+                                .is_some_and(|w|nt61_desktop::control_browser::body(w).contains(cursor_x,cursor_y));
+                        if browser_content { shell.mark_window_dirty(window_id); }
+                        else { shell.scene_dirty.set(true); }
                         if !shell.model.handle_window_control_click(
                             window_id,
                             cursor_x,
@@ -600,15 +610,21 @@ fn desktop_main() -> ! {
             } else if display_focused && shell.model.context_menu.is_none()
                 && !shell.model.start_menu.open && shell.model.flyout.is_none() {
                 if let Some(decoded) = display_decoder.feed(key, ticks) {
+                    let resolution_keys = shell.model.selected_window
+                        .and_then(|id| shell.model.control_browser(id))
+                        .is_some_and(|browser| browser.current().kind == nt61_desktop::shell::WindowKind::DisplaySettings && !browser.search_focus);
                     let decoded = match decoded {
-                        nt61_desktop::applications::explorer::input::UP => 0x26,
-                        nt61_desktop::applications::explorer::input::DOWN => 0x28,
-                        // Printable &/( are ordinary characters, never arrow keys.
-                        b'&' | b'(' => 0,
+                        nt61_desktop::applications::explorer::input::UP if resolution_keys => 0x26,
+                        nt61_desktop::applications::explorer::input::DOWN if resolution_keys => 0x28,
+                        b'&' | b'(' if resolution_keys => 0,
                         _ => decoded,
                     };
-                    shell.model.display_key(decoded);
-                    shell.scene_dirty.set(true);
+                    let geometry = shell.window_geometry();
+                    if let Some(id)=shell.model.selected_window {
+                        if !shell.model.control_key(id,decoded) { shell.model.handle_window_key(decoded); }
+                        shell.mark_window_dirty(id);
+                    }
+                    if shell.window_geometry() != geometry { shell.scene_dirty.set(true); }
                     true
                 } else { false }
             } else if shell.model.desktop_editor.is_some() || !shell.model.desktop_error.is_empty() {
@@ -987,7 +1003,11 @@ impl Shell {
         self.wallpaper_revision=self.model.personalization.revision;
         let preference=self.model.personalization.current.clone();
         if initial || preference.path!=self.wallpaper_preference.path {
-            let asset=self.model.files.read_bytes(&preference.path).ok().and_then(|b|nt61_desktop::personalization::decode_jpeg(&b));
+            let asset=self.model.files.resolve(&preference.path).and_then(|id|self.model.files.read_media(id).ok()).and_then(|b|nt61_desktop::applications::photo_viewer::codec::decode(&b,0).ok()).map(|(s,_)| {
+                let mut pixels=alloc::vec::Vec::with_capacity(s.pixels().len()*4);
+                for p in s.pixels(){pixels.extend([(p>>16)as u8,(p>>8)as u8,*p as u8,(p>>24)as u8]);}
+                png::Image{width:s.width(),height:s.height(),pixels}
+            });
             let Some(asset)=asset else {
                 self.model.personalization.message="This picture could not be loaded.".into();
                 self.model.personalization.current=self.wallpaper_preference.clone();
@@ -1042,6 +1062,7 @@ impl Shell {
     /// without invalidating the composed scene for every popup button click.
     fn window_geometry(&self) -> u64 {
         let mut key = self.model.selected_window.unwrap_or(0) as u64;
+        key ^= (self.model.fullscreen_photo().is_some() as u64) << 63;
         for window in &self.model.taskbar.windows {
             for value in [
                 window.id,
@@ -1128,6 +1149,16 @@ impl Shell {
         self.draw_context_menu(frame, framebuffer);
         self.draw_flyout(frame, framebuffer);
         self.draw_desktop_editor(frame);
+        if self.model.display.now < self.model.display.identified_until {
+            use nt61_desktop::{graphics::Rect, control_browser::paint};
+            let r=Rect::new(frame.width() as i32/2-70,frame.height() as i32/2-80,140,160);
+            frame.blend_rounded_rect(r,8,0xDD123C70);
+            if let Ok(font)=self.model.fonts.get(paint::FONT) {paint::label(&font,frame,"1",Rect::new(r.x+42,r.y+22,80,120),0xFFFFFFFF,96);}
+        }
+        if let Some(app)=self.model.selected_window.and_then(|id|self.model.application(id)).filter(|app|matches!(&app.state,nt61_desktop::applications::AppState::PhotoViewer(v) if v.slideshow)&&self.model.taskbar.windows.iter().any(|w|w.id==app.window_id&&!w.minimized)) {
+            let b=nt61_desktop::graphics::Rect::new(0,0,frame.width(),frame.height());
+            nt61_desktop::applications::view::draw(app,frame,b,&self.model.application_environment(),|f,t,r,c|self.fonts.draw_fit(f,t,r.x,r.y,r.width,c));
+        }
         nt61_desktop::session::draw_with_background(&self.model.session,frame,Some(&self.session_background),|frame,text,b,color|{if matches!(self.model.session.screen,nt61_desktop::session::Screen::Users|nt61_desktop::session::Screen::Credentials){self.centered(frame,text,b,color);}else{self.label(frame,text,b,color);}});
     }
 
@@ -1230,9 +1261,7 @@ impl Shell {
             let selected = self.model.desktop.selected.contains(&index);
             let hot = self.model.controls.hot() == CONTROL_DESKTOP_BASE + index as u32;
             // Paint the translucent selection behind both icon and label.
-            if selected || hot {
-                aero::selection(frame, bounds, selected, hot);
-            }
+            aero::desktop_selection(frame, bounds, selected, hot);
             let size = icon.width.min(icon.height).min(ICON_CELL);
             let x = bounds.x + (bounds.width - size) as i32 / 2;
             blit_rgba(
@@ -1293,16 +1322,17 @@ impl Shell {
             {
                 continue;
             }
-            let explorer_glass = matches!(
+            let explorer_glass = self.model.control_browser(window.id).is_some() || matches!(
                 window.kind,
                 nt61_desktop::shell::WindowKind::Explorer
                     | nt61_desktop::shell::WindowKind::Computer
             );
-            self.window_glass.borrow_mut().prepare(
+            self.window_glass.borrow_mut().prepare_extended(
                 frame,
                 window.id,
                 bounds,
                 if explorer_glass { 36 } else { 0 },
+                if matches!(window.kind,nt61_desktop::shell::WindowKind::Application(nt61_desktop::applications::AppId::PhotoViewer)){62}else{0},
                 refresh_glass,
             );
             aero::shadow(frame, bounds, 8);
@@ -1318,7 +1348,9 @@ impl Shell {
                 window.id,
                 Some(window.id) == self.model.selected_window,
             );
-            match window.kind {
+            if self.model.control_browser(window.id).is_some() {
+                nt61_desktop::control_browser::paint::draw(&self.model,window.id,frame,body,|f,t,r,c|self.label(f,t,r,c));
+            } else { match window.kind {
                 nt61_desktop::shell::WindowKind::Application(_) => {
                     if let Some(app) = self.model.application(window.id) {
                         nt61_desktop::applications::view::draw(
@@ -1382,6 +1414,7 @@ impl Shell {
                 }
                 nt61_desktop::shell::WindowKind::ControlPanel
                 | nt61_desktop::shell::WindowKind::ControlCategory(_)
+                | nt61_desktop::shell::WindowKind::ControlPage(_)
                 | nt61_desktop::shell::WindowKind::UserAccounts
                 | nt61_desktop::shell::WindowKind::SoundSettings
                 | nt61_desktop::shell::WindowKind::RecycleBin
@@ -1419,6 +1452,7 @@ impl Shell {
                     }
                 }
             }
+            }
             aero::blend_rect(
                 frame,
                 nt61_desktop::graphics::Rect::new(body.x, body.y, body.width, 1),
@@ -1448,6 +1482,12 @@ impl Shell {
             let title_x = window.x + 30;
             let title_y = window.y + 7;
             let title_width = width.saturating_sub(if application.is_some() { 140 } else { 120 });
+            if self.model.control_browser(window.id).is_some() {
+                if let Ok(font)=self.model.fonts.get(nt61_desktop::control_browser::paint::FONT) {
+                    nt61_desktop::control_browser::paint::label(&font,frame,&window.title,
+                        nt61_desktop::graphics::Rect::new(title_x,title_y,title_width,20),0xFF102030,12);
+                }
+            } else {
             for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
                 self.fonts.draw_fit(
                     frame,
@@ -1466,6 +1506,7 @@ impl Shell {
                 title_width,
                 0xFF102030,
             );
+            }
             aero::window_control_group(
                 frame,
                 window.caption_control_group(),

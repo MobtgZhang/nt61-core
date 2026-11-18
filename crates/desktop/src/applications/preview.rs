@@ -56,7 +56,8 @@ fn main() {
     }
     let width = args.get(5).and_then(|v| v.parse().ok()).unwrap_or(640);
     let height = args.get(6).and_then(|v| v.parse().ok()).unwrap_or(460);
-    let body = Rect::new(0, 0, width, height);
+    let framed=std::env::var_os("NT61_PREVIEW_FRAME").is_some() && !args.get(4).is_some_and(|s|s=="slideshow");
+    let body = if framed {Rect::new(6,30,width-12,height-36)} else {Rect::new(0, 0, width, height)};
     let id = AppId::from_raw(args[1].parse().unwrap()).unwrap();
     let mut app = ApplicationSession::new(1, id, 7919);
     if args.get(4).is_none_or(|s| s != "import") {
@@ -295,6 +296,33 @@ fn main() {
             }
         }
     }
+    if id == AppId::PhotoViewer {
+        if let nt61_desktop::applications::AppState::PhotoViewer(v)=&mut app.state {
+            if let Some(path)=std::env::var_os("NT61_PREVIEW_PICTURE") {
+                let bytes=std::fs::read(&path).unwrap();
+                let name=std::path::Path::new(&path).file_name().unwrap().to_string_lossy().into_owned();
+                v.load(1,name,&bytes,vec![1],0).unwrap();
+            }
+            match args.get(4).map(String::as_str) {
+                Some("slideshow")=>v.slideshow=true,
+                Some("zoom")=>v.menu=Some(6),
+                Some("file")=>v.menu=Some(0),
+                Some("print")=>v.print=Some(Default::default()),
+                _=>{},
+            }
+        }
+    }
+    if id == AppId::DeviceManager && args.get(4).is_some_and(|s|s=="sample"||s.starts_with("properties")) {
+        use nt61_desktop::applications::{AppState,device_manager::{Device,Row}};
+        if let AppState::DeviceManager(m)=&mut app.state {
+            // Host-only fixture: the production manager always reads the kernel snapshot.
+            for (address,hardware,compatible) in [(2,"PCI\\VEN_1234&DEV_1111","PCI\\CC_030000"),(3,"PCI\\VEN_8086&DEV_100E","PCI\\CC_020000"),(4,"PCI\\VEN_8086&DEV_2415","PCI\\CC_040100"),(5,"PCI\\VEN_8086&DEV_2922","PCI\\CC_010601")] {
+                m.devices.push(Device{bus:1,address,function:0,state:4,bound:true,hardware:hardware.into(),compatible:compatible.into()});
+            }
+            m.refresh=false;m.selected=Row::Root;
+            if args[4].starts_with("properties") {m.expanded[1]=true;m.properties=Some(0);m.tab=match args[4].as_str(){"properties-driver"=>1,"properties-details"=>2,_=>0};}
+        }
+    }
     let mut env = Environment {
         width: 1024,
         height: 768,
@@ -318,12 +346,28 @@ fn main() {
         if args.get(4).is_some_and(|v|v=="menu"){app.manager.menu=Some(0);}
     }
     let mut frame = Surface::new(width, height);
+    if framed {
+        use nt61_desktop::compositor::aero::{self,WindowGlassCache};
+        for y in 0..height {for x in 0..width {frame.set_pixel(x,y,0xff000000|((20+x*35/width)<<16)|((90+y*70/height)<<8)|(155+x*70/width));}}
+        let mut glass=WindowGlassCache::default();
+        let r=Rect::new(0,0,width,height);
+        glass.prepare_extended(&frame,1,r,0,if id==AppId::PhotoViewer{62}else{0},true);
+        aero::window_body(&mut frame,body);glass.paint(&mut frame,1,true);
+        aero::window_border(&mut frame,r,6);
+    }
     let font = FontLib::ui().unwrap();
+    if framed {
+        use nt61_desktop::{compositor::aero,applications::icons};
+        icons::draw(&mut frame,id,Rect::new(8,8,16,16));
+        let title=if matches!(id,AppId::Notepad|AppId::WordPad|AppId::Paint|AppId::PhotoViewer) && !app.file_name().is_empty(){format!("{} - {}",app.file_name(),id.application().title)}else{id.application().title.to_owned()};
+        font.draw_text(&mut frame,&title,29,8,12,0xff000000).unwrap();
+        for (i,kind) in [aero::WindowControlButtonKind::Minimize,aero::WindowControlButtonKind::Maximize,aero::WindowControlButtonKind::Close].into_iter().enumerate(){aero::window_control_button(&mut frame,Rect::new(width as i32-105+i as i32*32,1,32,20),kind,false);}
+    }
     let size = nt61_desktop::shell::layout::UI_FONT_SIZE;
     view::draw(
         &app,
         &mut frame,
-        Rect::new(0, 0, width, height),
+        body,
         &env,
         |frame, text, b, color| {
             let mut short = String::new();

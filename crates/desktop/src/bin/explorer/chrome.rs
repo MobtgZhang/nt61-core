@@ -70,8 +70,9 @@ impl Shell {
         if kind==WindowKind::SoundSettings {nt61_desktop::sound_settings::draw(&self.model.sound_settings,frame,body,|f,t,b,c|self.label(f,t,b,c));return;}
         if kind==WindowKind::UserAccounts {nt61_desktop::control_panel::draw(&self.model.account_settings,frame,body,|f,t,b,c|self.label(f,t,b,c));return;}
         if kind == WindowKind::System {
+            let Ok(font) = self.model.fonts.get(nt61_desktop::control_browser::paint::FONT) else { return; };
             nt61_desktop::applications::explorer::system::draw(
-                frame, body, self.model.process_snapshot.as_ref().map(|s| s.cpu_count),
+                frame, body, self.model.process_snapshot.as_ref().map(|s| s.cpu_count), &font,
                 |frame, value, rect, color| self.label(frame, value, rect, color),
             );
             return;
@@ -95,11 +96,12 @@ impl Shell {
         };
         self.label(frame,heading,Rect::new(body.x+16,body.y+14,body.width.saturating_sub(32),20),BLUE);
         if kind==WindowKind::DisplaySettings {
-            nt61_desktop::display_settings::draw(&self.model.display,frame,body,self.model.display.now,|f,t,b,c|self.label(f,t,b,c));return;
+            let Ok(font) = self.model.fonts.get(nt61_desktop::control_browser::paint::FONT) else { return; };
+            nt61_desktop::display_settings::draw(&self.model.display,frame,body,self.model.display.now,&font,|f,t,b,c|self.label(f,t,b,c));return;
         }
         let links = ShellModel::namespace_links(kind);
         for (index,(title,_)) in links.iter().enumerate() {
-            let row = ShellModel::namespace_link_rect(body,kind,index);
+            let row = self.model.namespace_link_rect(body,kind,index);
             if kind==WindowKind::ControlPanel&&body.width>=640 {
                 nt61_desktop::applications::explorer::theme::control_category(frame,index,Rect::new(row.x,row.y+2,48,48));
                 self.label(frame,title,Rect::new(row.x+60,row.y+4,row.width.saturating_sub(60),22),0xFF006600);
