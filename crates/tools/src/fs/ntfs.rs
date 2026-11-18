@@ -1113,8 +1113,15 @@ impl NtfsImage {
         entry: &NtfsEntry,
         file_clusters: (u64, u64),
     ) -> Vec<u8> {
+        self.build_non_resident_data_attr_sized(entry.data.len() as u64, file_clusters)
+    }
+
+    fn build_non_resident_data_attr_sized(
+        &self,
+        byte_size: u64,
+        file_clusters: (u64, u64),
+    ) -> Vec<u8> {
         let (start_lcn, cluster_count) = file_clusters;
-        let byte_size = entry.data.len() as u64;
         let cluster_size = self.sectors_per_cluster as u64 * self.sector_size as u64;
         let alloc_size = cluster_count * cluster_size;
         let real_size = byte_size;
@@ -1515,9 +1522,17 @@ impl NtfsImage {
         }
 
         let highest_record = record_assignment.values().copied().max().unwrap_or(5).max(5);
-        // The mounted writer allocates records below 1024. Keep that whole
-        // record window clear, including slots not yet used in this image.
-        let mft_end = self.mft_cluster + ((highest_record + 1).max(1024) * self.mft_record_size as u64).div_ceil(cluster_size as u64);
+        // Reserve space for new files as well as the installed resources. The
+        // runtime reads this capacity from $MFT::$DATA, rather than guessing a
+        // fixed record limit or scanning into ordinary file content.
+        let mft_records = (highest_record + 1 + 1024).next_multiple_of(1024);
+        let mft_clusters = (mft_records * self.mft_record_size as u64)
+            .div_ceil(cluster_size as u64);
+        let mft_end = self.mft_cluster + mft_clusters;
+        if mft_end >= self.total_sectors / self.sectors_per_cluster as u64 {
+            return Err(BuildError::NtfsError("MFT reserve exceeds volume capacity".into()));
+        }
+        self.data_cluster_assignments.insert("$MFT".into(), (self.mft_cluster, mft_clusters));
         self.data_cluster_cursor = self.data_cluster_cursor.max(mft_end);
         self.directory_indexes.clear();
         for (path, children) in &child_map {
@@ -1841,7 +1856,11 @@ impl NtfsImage {
         // a PE file, which truncates winload.efi mid-header and makes
         // LoadImage fail with EFI_UNSUPPORTED.
         if !entry.is_dir {
-            if entry.data.len() > Self::MAX_RESIDENT_DATA_SIZE || entry.path == "$Bitmap" {
+            if record_num == 0 && entry.path == "$MFT" {
+                let clusters = self.data_cluster_assignments["$MFT"];
+                let bytes = clusters.1 * self.sectors_per_cluster as u64 * self.sector_size as u64;
+                record.extend_from_slice(&self.build_non_resident_data_attr_sized(bytes, clusters));
+            } else if entry.data.len() > Self::MAX_RESIDENT_DATA_SIZE || entry.path == "$Bitmap" {
                 // The cluster allocation was done in a pre-pass by
                 // `finalize_with_offset`; the assignment lives in
                 // `data_cluster_assignments` keyed by `entry.path`.
@@ -2186,9 +2205,39 @@ mod tests {
             assert_eq!(bitmap[cluster / 8] & (1 << (cluster % 8)) != 0,
                 cluster < allocated || cluster == total as usize - 1, "cluster {cluster}");
         }
-        // The runtime can allocate MFT records through 1023. File content
-        // must not occupy that reserved record window.
-        assert!(volume.data_cluster_assignments["document.bmp"].0 >= volume.mft_cluster + 1024);
+        let mft = volume.data_cluster_assignments["$MFT"];
+        assert!(volume.data_cluster_assignments["document.bmp"].0 >= mft.0 + mft.1);
+    }
+
+    #[test]
+    fn resource_heavy_volume_describes_and_reserves_writable_mft_capacity() {
+        let mut volume = NtfsImage::new(32, 4096).unwrap();
+        for directory in 0..12 {
+            volume.create_dir(&format!("assets-{directory:02}")).unwrap();
+        }
+        for i in 0..1200 {
+            volume.write_file(&format!("assets-{:02}/asset-{i:04}.cur", i / 100), b"cursor").unwrap();
+        }
+        volume.write_file("document.bmp", &vec![0x5a; 12000]).unwrap();
+        let installed_records = 16 + volume.entries.len();
+        let bytes = volume.finalize().unwrap();
+        let (start, clusters) = volume.data_cluster_assignments["$MFT"];
+        let record_size = volume.mft_record_size as usize;
+        let record = &bytes[start as usize * 4096..start as usize * 4096 + record_size];
+        let mut at = u16::from_le_bytes(record[20..22].try_into().unwrap()) as usize;
+        while u32::from_le_bytes(record[at..at + 4].try_into().unwrap()) != ATTR_TYPE_DATA {
+            assert_ne!(&record[at..at + 4], &[255; 4]);
+            at += u32::from_le_bytes(record[at + 4..at + 8].try_into().unwrap()) as usize;
+        }
+        assert_eq!(record[at + 8], 1, "$MFT must describe its actual extent");
+        let size = u64::from_le_bytes(record[at + 48..at + 56].try_into().unwrap());
+        assert_eq!(size, clusters * 4096);
+        assert!(size / record_size as u64 >= installed_records as u64 + 1024);
+        assert_eq!(read_non_resident_data(record, at, &bytes, 4096),
+            bytes[start as usize * 4096..(start + clusters) as usize * 4096]);
+        let free_start = start as usize * 4096 + installed_records * record_size;
+        assert!(bytes[free_start..(start + clusters) as usize * 4096].iter().all(|b| *b == 0));
+        assert!(volume.data_cluster_assignments["document.bmp"].0 >= start + clusters);
     }
 
     #[test]

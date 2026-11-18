@@ -12,6 +12,8 @@ const NOT_FOUND: u32 = 0xC000_0034;
 const UNSUPPORTED: u32 = 0xC000_00BB;
 const IO_ERROR: u32 = 0xC000_0001;
 static BUSY: AtomicBool = AtomicBool::new(false);
+#[path = "volume_lock.rs"]
+mod volume_lock;
 
 /// Persist pending NTFS system-volume mutations to its identified boot disk.
 /// Returns an error for unsupported/ambiguous media or a short write.
@@ -23,7 +25,10 @@ pub fn flush() -> Result<(), u32> {
 struct VolumeGuard(Option<*const u8>);
 impl VolumeGuard {
     fn acquire() -> Result<Self, u32> {
-        BUSY.compare_exchange(false,true,Ordering::Acquire,Ordering::Relaxed).map_err(|_|IO_ERROR)?;
+        // A command worker can be flushing while Explorer polls a directory.
+        // Contention is not an I/O failure: wait without disabling interrupts
+        // so the owner can finish even on a single processor.
+        volume_lock::acquire(&BUSY,crate::ke::scheduler::yield_);
         let previous = super::active_partition_ramdisk();
         if let Some(base) = super::sys_mirror_address() { super::set_active_partition_ramdisk(Some(base)); }
         Ok(Self(previous))

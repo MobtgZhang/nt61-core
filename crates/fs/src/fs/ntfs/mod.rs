@@ -3430,15 +3430,60 @@ pub fn allocate_cluster_ntfs(ntfs: &NtfsFileSystem) -> Option<u64> {
     None
 }
 
-/// Allocate the first unused MFT record number in the mounted mirror.
-///
-/// The allocation is intentionally conservative: only records that are
-/// entirely unreadable/uninitialised are considered free. Records whose
-/// fixups are corrupt are treated as allocated rather than silently reused.
+/// Capacity of the contiguous MFT stream supported by this mounted writer.
+/// Reject fragmented or malformed mappings instead of writing past the MFT
+/// into unrelated file data. Older images without a mapping are read-only
+/// for record creation and must be rebuilt by the current image builder.
+fn mft_record_capacity(volume: &NtfsFileSystem) -> Option<u64> {
+    let ntfs = &volume.ntfs_data;
+    let record = read_mft_record(ntfs, 0)?;
+    let at = find_attribute_in_record(&record, AttributeHeader::TYPE_DATA)?;
+    let header = record.get(at..at.checked_add(64)?)?;
+    if header[8] != 1 || header[9] != 0 { return None; }
+    let length = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+    let mapping = u16::from_le_bytes(header[32..34].try_into().ok()?) as usize;
+    if mapping < 64 || mapping >= length { return None; }
+    let bytes = record.get(at.checked_add(mapping)?..at.checked_add(length)?)?;
+    // This writer addresses records through the BPB's contiguous MFT base.
+    // Accept exactly one ordinary run, with bounded integer widths and an
+    // explicit terminator, before passing it to the general run decoder.
+    let tag = *bytes.first()?;
+    let length_bytes = (tag & 15) as usize;
+    let offset_bytes = (tag >> 4) as usize;
+    if !(1..=8).contains(&length_bytes) || !(1..=8).contains(&offset_bytes)
+        || bytes.get(1 + length_bytes + offset_bytes) != Some(&0) {
+        return None;
+    }
+    let mut runs = [(0, 0); 2];
+    if parse_run_list(bytes, &mut runs) != 1 { return None; }
+    let (lcn, clusters) = runs[0];
+    if u64::from_le_bytes(header[16..24].try_into().ok()?) != 0
+        || u64::from_le_bytes(header[24..32].try_into().ok()?) != clusters.checked_sub(1)? {
+        return None;
+    }
+    let cluster_size = u64::from(ntfs.cluster_size);
+    let record_size = u64::from(ntfs.mft_record_size);
+    if cluster_size == 0 || cluster_size % 512 != 0
+        || !(512..=4096).contains(&record_size) || record_size % 512 != 0 {
+        return None;
+    }
+    if lcn.checked_mul(cluster_size / 512)? != ntfs.mft_start { return None; }
+    if lcn.checked_add(clusters)? > volume.base.total_clusters { return None; }
+    let allocated = u64::from_le_bytes(header[40..48].try_into().ok()?);
+    let size = u64::from_le_bytes(header[48..56].try_into().ok()?);
+    let initialized = u64::from_le_bytes(header[56..64].try_into().ok()?);
+    if allocated != clusters.checked_mul(cluster_size)? || size > allocated
+        || initialized < size || initialized > allocated || size % record_size != 0 {
+        return None;
+    }
+    Some(size / record_size)
+}
+
+/// Allocate a zeroed or explicitly deleted record within $MFT::$DATA.
+/// Unreadable records and damaged fixups are never evidence of free space.
 fn allocate_mft_record(ntfs: &NtfsFileSystem) -> Option<u64> {
-    // This project's mirror reserves a contiguous 1024-record MFT area.
-    // An unreadable or corrupt record must never be mistaken for free space.
-    for number in 32..1024 {
+    let capacity = mft_record_capacity(ntfs)?;
+    for number in 32..capacity {
         let Some(mut record)=read_mft_slot(&ntfs.ntfs_data,number) else {return None;};
         if record.iter().all(|b|*b==0){return Some(number);}
         if record.get(..4)==Some(b"FILE") && apply_fixup(&mut record)
