@@ -33,7 +33,7 @@ impl ShellModel {
         self.applications.iter().find(|a| a.window_id == id)
     }
     pub fn launch_application(&mut self, id: AppId) -> u32 {
-        if id==AppId::TaskManager {if let Some(window)=self.applications.iter().find(|a|a.id==id).map(|a|a.window_id){if let Some(w)=self.taskbar.windows.iter_mut().find(|w|w.id==window){w.minimized=false;}self.select_window(window);return window;}}
+        if matches!(id,AppId::TaskManager|AppId::MediaPlayer) {if let Some(window)=self.applications.iter().find(|a|a.id==id).map(|a|a.window_id){if let Some(w)=self.taskbar.windows.iter_mut().find(|w|w.id==window){w.minimized=false;}self.select_window(window);return window;}}
         if id == AppId::Explorer {
             return self.open_window_with_kind(
                 "Windows Explorer",
@@ -45,6 +45,7 @@ impl ShellModel {
             );
         }
         let (width, height) = match id {
+            AppId::MediaPlayer => (780, 540),
             AppId::WordPad => (800, 600),
             AppId::Calculator => (350, 430),
             AppId::StickyNotes => (430, 350),
@@ -70,6 +71,7 @@ impl ShellModel {
         let mut app = ApplicationSession::new(window, id, window as u64 * 7919);
         app.notepad.fonts = self.fonts.clone();
         self.applications.push(app);
+        if id==AppId::MediaPlayer {self.media_action(window,super::media_player::Request::Refresh);}
         if id == AppId::Notepad {
             self.update_application_title(window);
         }
@@ -118,6 +120,7 @@ impl ShellModel {
         let Some(index) = self.applications.iter().position(|a| a.window_id == id) else {
             return;
         };
+        self.applications[index].manager.menu_viewport = self.viewport;
         if self.applications[index].id == AppId::Notepad
             && !self.applications[index].status.starts_with("Saved ")
             && !self.applications[index].status.is_empty()
@@ -186,11 +189,14 @@ impl ShellModel {
         let mut changed = !expired.is_empty();
         let mut closed=alloc::vec::Vec::new();
         for app in &mut self.applications {
+            if let AppState::MediaPlayer(p)=&mut app.state {changed|=p.poll(now);}
             if let AppState::CommandPrompt(console)=&mut app.state {
                 let (updated,exit)=console.poll_command();changed|=updated;
                 if exit {closed.push(app.window_id);}
             }
         }
+        let media:alloc::vec::Vec<_>=self.applications.iter_mut().filter_map(|a|if let AppState::MediaPlayer(p)=&mut a.state {p.pending.take().map(|r|(a.window_id,r))}else{None}).collect();
+        for (id,request) in media {self.media_action(id,request);changed=true;}
         for id in closed {self.close_window(id);}
 
         for (id, key) in expired {
@@ -257,8 +263,8 @@ impl ShellModel {
             return;
         };
         let app = &self.applications[index];
-        let current = app.current_file();
-        let name = if mode == super::file_dialog::Mode::Open {
+        let current = if let AppState::MediaPlayer(p)=&app.state {if mode==super::file_dialog::Mode::SaveAs {p.playlist_file}else{p.current}}else{app.current_file()};
+        let name = if let AppState::MediaPlayer(p)=&app.state {if mode==super::file_dialog::Mode::SaveAs {p.playlist_name.clone()}else{String::new()}}else if mode == super::file_dialog::Mode::Open {
             String::new()
         } else {
             app.file_name().into()
@@ -283,6 +289,7 @@ impl ShellModel {
         };
         let filter = match app.state {
             AppState::Paint(_) | AppState::Snipping { .. } => super::file_dialog::Filter::Bitmap,
+            AppState::MediaPlayer(_) => if mode==super::file_dialog::Mode::SaveAs {super::file_dialog::Filter::Playlist}else{super::file_dialog::Filter::Media},
             _ if app.id == AppId::WordPad => super::file_dialog::Filter::Documents,
             _ => super::file_dialog::Filter::Text,
         };
@@ -328,11 +335,13 @@ impl ShellModel {
                 name,
                 existing,
             } => {
+                let playlist_bytes=self.application(id).and_then(|a|if let AppState::MediaPlayer(p)=&a.state {Some(super::media_player::playlist::encode(&name,p.playlist.iter().filter_map(|t|self.files.path(t.id)).collect::<alloc::vec::Vec<_>>().iter().map(String::as_str)))}else{None});
                 let action = self
                     .applications
                     .iter_mut()
                     .find(|a| a.window_id == id)
                     .map(|a| {
+                        if let Some(bytes)=playlist_bytes {return AppAction::Save(name.clone(),bytes);}
                         if a.id == AppId::WordPad {
                             if let AppState::Document(d) = &a.state {
                                 if let Some(r) = &d.rich {
@@ -418,6 +427,7 @@ impl ShellModel {
         file: u32,
         encoding: Option<super::document::Encoding>,
     ) -> Result<(), String> {
+        if self.application(id).is_some_and(|a|a.id==AppId::MediaPlayer){return self.load_media(id,file);}
         self.files
             .load_file(file)
             .map_err(|s| format!("Open failed (0x{s:08X})"))?;
@@ -537,7 +547,9 @@ impl ShellModel {
         }
         let dialog_capture = self.applications.iter().find(|app| app.window_id == id)
             .is_some_and(|app| app.manager.scroll_grab.is_some() || app.dialog.as_ref().is_some_and(|d| d.captures_pointer()) || super::common_dialogs::captures_pointer(app) || app.guest_window.as_ref().is_some_and(|s|s.captures_pointer()));
-        if !body.contains(x, y) && !dialog_capture {
+        let menu_capture = self.applications.iter().find(|a|a.window_id==id && a.id==AppId::TaskManager)
+            .is_some_and(|a|super::task_manager::popup_contains(a,body,x,y));
+        if !body.contains(x, y) && !dialog_capture && !menu_capture {
             if !held {
                 if let Some(app) = self.applications.iter_mut().find(|a| a.window_id == id) {
                     match &mut app.state {
@@ -552,11 +564,17 @@ impl ShellModel {
             }
             return self.clear_application_hover(id);
         }
+        if !down && !held && !right {
+            if let Some(app) = self.applications.iter_mut().find(|a| a.window_id == id && a.id == AppId::TaskManager) {
+                if let Some(changed) = super::task_manager::quiet_pointer(app, body, x, y) { return changed; }
+            }
+        }
         let clipboard = !self.files.clipboard_text().is_empty();
         let env = self.application_environment();
         let Some(app) = self.applications.iter_mut().find(|a| a.window_id == id) else {
             return false;
         };
+        app.manager.menu_viewport = self.viewport;
         if app.id == AppId::TaskManager && super::task_manager::scroll_pointer(app,body,&env,x,y,down,held) { return true; }
         app.notepad.clipboard = clipboard;
         if app.confirm {
@@ -605,6 +623,8 @@ impl ShellModel {
             }
             return down;
         }
+        let menu_changed = app.id == AppId::TaskManager && !down && !held && !right
+            && super::task_manager::menu_hover(app,body,x,y);
         let hot = super::view::buttons(app, body, &env)
             .into_iter()
             .rev()
@@ -646,7 +666,7 @@ impl ShellModel {
             let action = super::view::click(app, body, &env, x, y, right);
             self.apply_application_action(id, action);
         }
-        down || hover_changed || editor_changed
+        down || hover_changed || editor_changed || menu_changed
     }
     pub fn apply_application_action(&mut self, id: u32, action: AppAction) {
         match action {
@@ -736,6 +756,7 @@ impl ShellModel {
             }
             AppAction::EndTask(target) => self.request_application_close(target),
             AppAction::Manage(action) => self.task_manager_action(id, action),
+            AppAction::Media(request) => self.media_action(id,request),
             AppAction::Type(key) => {
                 if let Some(target) = self.text_target.filter(|target| *target != id) {
                     if self.applications.iter().any(|a| a.window_id == target) {
@@ -750,6 +771,46 @@ impl ShellModel {
             }
         }
     }
+    fn load_media(&mut self,id:u32,file:u32)->Result<(),String>{
+        let name=self.files.node(file).ok_or("File not found.")?.name.clone();
+        let bytes=self.files.read_media(file).map_err(|s|format!("Cannot open media (0x{s:08X}); maximum file size is 32 MiB."))?;
+        if name.to_ascii_lowercase().ends_with(".wpl") {
+            let paths=super::media_player::playlist::decode(&bytes).map_err(String::from)?;
+            let location=self.files.path(file).ok_or("Invalid playlist path.")?.replace('\\',"/");
+            let directory=location.rsplit_once('/').map(|(p,_)|p).ok_or("Invalid playlist path.")?;
+            let mut tracks=alloc::vec::Vec::new();
+            for path in paths {
+                let path=path.replace('\\',"/");let path=if path.as_bytes().get(1)==Some(&b':'){path}else{format!("{directory}/{path}")};
+                let target=self.files.resolve(&path).ok_or_else(||format!("Playlist item not found: {path}"))?;
+                let node=self.files.node(target).ok_or("Playlist item not found.")?;
+                if node.name.to_ascii_lowercase().ends_with(".wpl"){return Err("Nested playlists are not supported.".into());}
+                tracks.push(super::media_player::Track{id:target,name:node.name.clone()});
+            }
+            let first=tracks.first().map(|t|t.id);
+            if let Some(app)=self.applications.iter_mut().find(|a|a.window_id==id){if let AppState::MediaPlayer(p)=&mut app.state {p.playlist=tracks;p.playlist_file=Some(file);p.playlist_name=name;}}
+            return if let Some(first)=first {self.load_media(id,first)}else{Ok(())};
+        }
+        let stream=super::media_player::audio::Stream::open(bytes).map_err(String::from)?;
+        let app=self.applications.iter_mut().find(|a|a.window_id==id).ok_or("Window closed.")?;
+        let AppState::MediaPlayer(p)=&mut app.state else{return Err("Invalid media window.".into());};
+        if !p.library.iter().any(|t|t.id==file){p.library.push(super::media_player::Track{id:file,name});}
+        p.load(file,stream);p.start_output();Ok(())
+    }
+    fn media_action(&mut self,id:u32,request:super::media_player::Request){
+        match request {
+            super::media_player::Request::Load(file)=>{if let Err(error)=self.load_media(id,file){if let Some(app)=self.applications.iter_mut().find(|a|a.window_id==id){if let AppState::MediaPlayer(p)=&mut app.state{p.error=error;}}}},
+            super::media_player::Request::Refresh=>{
+                let mut dirs=alloc::vec::Vec::new();
+                for path in [format!("C:/Users/{}/Music",self.session.identity),"C:/Users/Public/Music".into(),"C:/Music".into()] {if let Some(dir)=self.files.resolve(&path){dirs.push(dir);}}let mut library=alloc::vec::Vec::new();let mut visited=0;
+                while let Some(dir)=dirs.pop(){if visited>=128||library.len()>=2048{break;}visited+=1;
+                    if self.files.load_directory(dir).is_err(){continue;}
+                    for n in self.files.children(dir){if n.kind==crate::file::NodeKind::Directory {dirs.push(n.id);}else if super::associations::resolve(&n.name)==Some(AppId::MediaPlayer)&&!n.name.to_ascii_lowercase().ends_with(".wpl"){library.push(super::media_player::Track{id:n.id,name:n.name.clone()});}}
+                }
+                library.sort_by(|a,b|a.name.cmp(&b.name));
+                if let Some(app)=self.applications.iter_mut().find(|a|a.window_id==id){if let AppState::MediaPlayer(p)=&mut app.state{for old in &p.playlist {if !library.iter().any(|t|t.id==old.id){library.push(old.clone());}}p.library=library;}}
+            },
+        }
+    }
     fn save_application_file(&mut self, id: u32, _name: &str, bytes: &[u8]) -> Result<String, u32> {
         let file = self
             .application(id)
@@ -761,6 +822,9 @@ impl ShellModel {
             .ok_or(nt61_abi::desktop_bridge::STATUS_NOT_FOUND)
     }
     pub fn open_application_file(&mut self, file_id: u32) -> Option<u32> {
+        if self.files.node(file_id).is_some_and(|n|super::associations::resolve(&n.name)==Some(AppId::MediaPlayer)) {
+            let id=self.launch_application(AppId::MediaPlayer);self.media_action(id,super::media_player::Request::Load(file_id));return Some(id);
+        }
         if let Err(status) = self.files.load_file(file_id) {
             self.report_file_open(file_id, &format!("Open failed (0x{status:08X})"));
             return None;
@@ -865,6 +929,62 @@ impl ShellModel {
 mod tests {
     use super::*;
     use crate::theme::Theme;
+    #[test]
+    fn task_manager_file_and_window_menu_actions_reach_shell_windows() {
+        use super::super::explorer::input;
+        let mut shell = ShellModel::new(Theme::aero());
+        let note = shell.launch_application(AppId::Notepad);
+        let manager = shell.launch_application(AppId::TaskManager);
+        shell.application_decoded_key(manager, input::ALT_FILE);
+        shell.application_decoded_key(manager, 13);
+        assert!(shell.applications.iter().any(|a| a.id == AppId::Run));
+        shell.applications.iter_mut().find(|a| a.window_id == manager).unwrap().manager.selected = Some(u64::from(note));
+        for (item, minimized, maximized) in [(2, true, false), (3, false, true), (5, false, true)] {
+            shell.application_decoded_key(manager, 0xa5); // Alt+W
+            shell.applications.iter_mut().find(|a| a.window_id == manager).unwrap().manager.menu_focus = item;
+            shell.application_decoded_key(manager, 13);
+            let window = shell.taskbar.windows.iter().find(|w| w.id == note).unwrap();
+            assert_eq!((window.minimized, window.maximized), (minimized, maximized));
+        }
+        assert_eq!(shell.selected_window, Some(note));
+        for item in [0, 1, 4] {
+            shell.application_decoded_key(manager, 0xa5);
+            shell.applications.iter_mut().find(|a| a.window_id == manager).unwrap().manager.menu_focus = item;
+            shell.application_decoded_key(manager, 13);
+            let window = shell.taskbar.windows.iter().find(|w| w.id == note).unwrap();
+            assert!(!window.minimized && !window.maximized);
+            assert!(window.width > 0 && window.height > 0);
+            assert!(window.restore_geometry.is_some());
+        }
+        shell.application_decoded_key(manager, input::ALT_FILE);
+        shell.application_decoded_key(manager, input::DOWN);
+        shell.application_decoded_key(manager, 13);
+        assert!(shell.application(manager).is_none());
+        assert!(shell.application(note).is_some());
+    }
+    #[test]
+    fn task_manager_submenu_receives_mouse_outside_owner_and_dismisses_on_activation() {
+        use super::super::{explorer::input, task_manager};
+        let mut shell = ShellModel::new(Theme::aero());
+        let id = shell.launch_application(AppId::TaskManager);
+        shell.application_decoded_key(id, input::ALT_VIEW);
+        shell.application_decoded_key(id, input::DOWN);
+        shell.application_decoded_key(id, input::RIGHT);
+        let body = shell.application_body(id).unwrap();
+        let env = shell.application_environment();
+        let paused = task_manager::buttons(shell.application(id).unwrap(),body,&env)
+            .into_iter().find(|b|b.command == super::super::view::Command::TaskManager(task_manager::Command::Item(14))).unwrap().bounds;
+        let point = (paused.x + paused.width as i32 - 8, paused.y + 8);
+        assert!(!body.contains(point.0, point.1));
+        assert_eq!(shell.window_hit_test(point.0,point.1),Some(id));
+        shell.application_pointer(id,point.0,point.1,true,true,false);
+        assert!(shell.application(id).unwrap().manager.paused);
+        assert!(shell.application(id).unwrap().manager.menu.is_none());
+        shell.application_decoded_key(id,input::ALT_VIEW);
+        let other=shell.launch_application(AppId::Calculator);
+        shell.select_window(other);
+        assert!(shell.application(id).unwrap().manager.menu.is_none());
+    }
     #[test]
     fn shared_modals_capture_shell_input_and_prevent_owner_close_until_dismissed() {
         use super::super::common_dialogs::{self, ColorTarget, Dialog};
@@ -1251,6 +1371,35 @@ mod notepad_workflow_tests {
             shell.application(id).unwrap().common_dialog,
             Some(super::super::common_dialogs::Dialog::Font(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod media_workflow_tests {
+    use super::*;
+    use crate::theme::Theme;
+
+    #[test]
+    fn saved_windows_paths_and_relative_wpl_sources_reopen() {
+        let mut shell = ShellModel::new(Theme::aero());
+        let directory = shell.files.mkdir(1, "Music");
+        let mut wave = b"RIFF\x26\0\0\0WAVEfmt \x10\0\0\0\x01\0\x01\0".to_vec();
+        wave.extend_from_slice(&8000u32.to_le_bytes());
+        wave.extend_from_slice(&16000u32.to_le_bytes());
+        wave.extend_from_slice(b"\x02\0\x10\0data\x02\0\0\0\0\0");
+        let track = shell.files.touch(directory, "A & B.wav", &wave);
+        let id = shell.launch_application(AppId::MediaPlayer);
+        let absolute = shell.files.path(track).unwrap();
+        for (index, source) in [absolute.as_str(), "A & B.wav"].into_iter().enumerate() {
+            let bytes = super::super::media_player::playlist::encode("Test", [source].into_iter());
+            let playlist = shell.files.touch(directory, &format!("saved{index}.wpl"), &bytes);
+            shell.load_media(id, playlist).unwrap();
+            let AppState::MediaPlayer(player) = &shell.application(id).unwrap().state else { panic!() };
+            assert_eq!(player.current, Some(track));
+            assert_eq!(player.playlist_file, Some(playlist));
+            assert_eq!(player.playlist.len(), 1);
+            assert!(player.stream.is_some());
+        }
     }
 }
 

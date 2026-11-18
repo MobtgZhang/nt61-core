@@ -134,6 +134,11 @@ impl FileSystem {
             .and_then(|bytes| VolumeSpace::decode(&bytes));
     }
     pub fn is_mounted(&self)->bool{self.backend.is_some()}
+    /// Persist completed file operations; an in-memory filesystem needs no I/O.
+    pub fn flush(&mut self)->Result<(),u32>{
+        if self.backend.is_some(){self.request(abi::FLUSH,"C:\\",&[])?;}
+        Ok(())
+    }
     fn request(&mut self,operation:u32,path:&str,data:&[u8])->Result<Vec<u8>,u32>{
         let backend=self.backend.ok_or(abi::STATUS_NOT_SUPPORTED)?;
         let result=(backend.0)(operation,path,data);
@@ -192,6 +197,25 @@ impl FileSystem {
         let bytes=self.request(abi::READ,&path,&[])?;
         let node=self.node_mut(id).ok_or(abi::STATUS_NOT_FOUND)?;node.size=Some(bytes.len() as u64);node.contents=bytes;
         Ok(())
+    }
+    /// Read media without retaining every full-resolution image in the node cache.
+    pub fn read_bytes(&mut self,path:&str)->Result<Vec<u8>,u32>{
+        if self.backend.is_some(){return self.request(abi::READ,path,&[]);}
+        let id=self.resolve(path).ok_or(abi::STATUS_NOT_FOUND)?;
+        self.node(id).map(|n|n.contents.clone()).ok_or(abi::STATUS_NOT_FOUND)
+    }
+    pub fn read_media(&mut self,id:u32)->Result<Vec<u8>,u32>{
+        const LIMIT:usize=32*1024*1024;
+        let node=self.node(id).ok_or(abi::STATUS_NOT_FOUND)?;
+        if node.size.unwrap_or(node.contents.len() as u64)>LIMIT as u64{return Err(abi::STATUS_INVALID_PARAMETER);}
+        if self.backend.is_none(){return Ok(node.contents.clone());}
+        let path=self.path(id).ok_or(abi::STATUS_NOT_FOUND)?;let mut bytes=Vec::new();
+        loop {
+            let mut input=(bytes.len() as u64).to_le_bytes().to_vec();input.extend(65536u32.to_le_bytes());
+            let chunk=self.request(abi::READ_AT,&path,&input)?;
+            if chunk.len()>65536||bytes.len()+chunk.len()>LIMIT{return Err(abi::STATUS_INVALID_PARAMETER);}
+            let done=chunk.len()<65536;bytes.extend(chunk);if done {return Ok(bytes);}
+        }
     }
     pub fn save(&mut self,id:u32,bytes:&[u8])->Result<(),u32>{
         if self.backend.is_some(){

@@ -18,6 +18,11 @@ fn execute(request:&mut Request)->Result<Vec<u8>,u32>{
                 bytes.extend_from_slice(&w.to_le_bytes());bytes.extend_from_slice(&h.to_le_bytes());
             } Ok(bytes)
         },
+        nt61_abi::session_bridge::MEDIA=> {
+            if request.capacity > (nt61_abi::session_bridge::MEDIA_MAX_SAMPLES * 2 + 4) as u64 {return Err(STATUS_INVALID_PARAMETER);}
+            let input=copy_input(request.data,request.capacity as usize)?;
+            super::session_service::media(path,&input)
+        },
         nt61_abi::session_bridge::SOUND=>super::session_service::sound(path),
         nt61_abi::session_bridge::NETWORK=>super::session_service::network(path),
         nt61_abi::session_bridge::DISPLAY_SET=>super::session_service::display_set(path),
@@ -99,6 +104,7 @@ fn execute(request:&mut Request)->Result<Vec<u8>,u32>{
         },
         MKDIR=>{crate::fs::system_volume::mkdir(path)?;Ok(Vec::new())},
         REMOVE=>{crate::fs::system_volume::remove(path)?;Ok(Vec::new())},
+        FLUSH=>{crate::fs::system_volume::flush()?;Ok(Vec::new())},
         COMMAND=>{
             if request.capacity<CWD_BYTES as u64{return Err(STATUS_INVALID_PARAMETER);}
             let directory=copy_input(request.data,CWD_BYTES)?;

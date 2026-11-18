@@ -12,6 +12,7 @@ use alloc::{format, string::String, vec::Vec};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     TaskManager(super::task_manager::Command),
+    Media(super::media_player::Command),
     WordPad(super::wordpad::Command),
     Notepad(super::notepad::Command),
     Key(u8),
@@ -91,6 +92,7 @@ fn button(
 }
 pub fn buttons(app: &ApplicationSession, b: Rect, env: &Environment) -> Vec<Button> {
     let mut out = Vec::new();
+    if app.id==AppId::MediaPlayer {return super::media_player::buttons(app,b);}
     if app.id==AppId::TaskManager {return super::task_manager::buttons(app,b,env);}
     if app.id == AppId::WordPad {
         return super::wordpad::buttons(app, b);
@@ -120,7 +122,7 @@ pub fn buttons(app: &ApplicationSession, b: Rect, env: &Environment) -> Vec<Butt
         return out;
     }
     match &app.state {
-        AppState::CommandPrompt(_) => {}
+        AppState::CommandPrompt(_) | AppState::MediaPlayer(_) => {}
         AppState::Calculator(_) => {
             let rows: [&[(&str, u8)]; 6] = [
                 &[("MC", b'x'), ("MR", b'p'), ("MS", b'm'), ("M+", b'a')],
@@ -537,6 +539,7 @@ pub fn click(
     y: i32,
     right: bool,
 ) -> AppAction {
+    if app.id==AppId::MediaPlayer {return super::media_player::click(app,body,x,y);}
     if app.id==AppId::TaskManager {return super::task_manager::click(app,body,env,x,y,right);}
     if app.common_dialog.is_some() {
         if !right { super::common_dialogs::pointer(app, body, x, y); }
@@ -566,7 +569,7 @@ pub fn click(
         app.menu = false;
     }
     match button.command {
-        Command::TaskManager(_) => {},
+        Command::TaskManager(_) | Command::Media(_) => {},
         Command::WordPad(command) => return super::wordpad::execute(app, command),
         Command::Notepad(command) => return super::notepad::execute(app, command),
         Command::File => {
@@ -815,6 +818,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
     env: &Environment,
     text: F,
 ) {
+    if app.id==AppId::MediaPlayer {super::media_player::draw(app,frame,b,&text);if let Some(dialog)=&app.dialog {super::file_dialog::draw(dialog,frame,b,&text);}return;}
     if app.id==AppId::TaskManager {super::task_manager::draw(app,frame,b,env,text);return;}
     if let Some(scene)=&app.guest_window {scene.draw(frame,b,&text);return;}
     if app.guest_dialog.is_some() {
@@ -868,6 +872,7 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
                 0xFFF4F4F4,
             );
         }
+        AppState::MediaPlayer(_) => {},
         AppState::Calculator(c) => {
             let r = Rect::new(b.x + 14, b.y + 18, 272, 54);
             aero::menu_item(frame, r, true);
@@ -1297,6 +1302,17 @@ pub fn draw<F: Fn(&mut Surface, &str, Rect, u32)>(
         &app.status
     };
     if !matches!(app.state, AppState::Document(_) | AppState::Paint(_)) || !app.status.is_empty() {
+        // A transient message replaces the document's own status text.
+        // Clear that row first so both strings are never painted together.
+        if !app.status.is_empty() && matches!(app.state, AppState::Document(_) | AppState::Paint(_)) {
+            frame.fill_rect(
+                b.x,
+                b.y + b.height.saturating_sub(30) as i32,
+                b.width,
+                30.min(b.height),
+                if app.id == AppId::StickyNotes { 0xFFFFF3A6 } else { 0xFFF3F5F7 },
+            );
+        }
         text(
             frame,
             status,
@@ -1354,5 +1370,38 @@ fn architecture() -> &'static str {
         "riscv64"
     } else {
         "loongarch64"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graphics::font::FontLib;
+
+    #[test]
+    fn saved_status_replaces_existing_paint_status_pixels() {
+        let mut app = ApplicationSession::new(1, AppId::Paint, 1);
+        app.status = "Saved C:\\Users\\Administrator\\Documents\\Untitled.bmp".into();
+        let env = Environment {
+            width: 1024, height: 768, network_adapters: 0, audio: false,
+            tasks: Vec::new(), processes: None, monitor: None,
+            services: Vec::new(), users: Vec::new(),
+        };
+        let body = Rect::new(0, 0, 640, 424);
+        let mut frame = Surface::new(body.width, body.height);
+        let font = FontLib::ui().expect("bundled UI font");
+        let size = crate::shell::layout::UI_FONT_SIZE;
+        draw(&app, &mut frame, body, &env, |frame, text, bounds, color| {
+            font.draw_text(frame, text, bounds.x, bounds.y, size, color).unwrap();
+        });
+        let mut expected = Surface::new(body.width, 30);
+        expected.fill_rect(0, 0, body.width, 30, 0xFFF3F5F7);
+        font.draw_text(&mut expected, &app.status, 12, 3, size, 0xFF526578).unwrap();
+        for y in 0..30 {
+            for x in 0..body.width {
+                assert_eq!(frame.pixel(x, body.height - 30 + y), expected.pixel(x, y),
+                    "status pixel at ({x}, {y})");
+            }
+        }
     }
 }

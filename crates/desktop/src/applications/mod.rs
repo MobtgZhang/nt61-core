@@ -18,6 +18,7 @@ pub mod file_dialog;
 pub mod host;
 pub mod icons;
 pub mod minesweeper;
+pub mod media_player;
 pub mod notepad;
 pub mod paint;
 pub mod processes;
@@ -53,11 +54,13 @@ pub enum AppAction {
     Capture,
     InsertTime,
     Manage(task_manager::Action),
+    Media(media_player::Request),
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppState {
     CommandPrompt(command_prompt::CommandPrompt),
     Calculator(Calculator),
+    MediaPlayer(Box<media_player::Player>),
     Paint(Box<Paint>),
     Document(Document),
     CharacterMap {
@@ -143,6 +146,7 @@ impl ApplicationSession {
             AppId::CommandPrompt => AppState::CommandPrompt(command_prompt::CommandPrompt::new()),
             AppId::BcdEdit => AppState::CommandPrompt(command_prompt::CommandPrompt::bcdedit()),
             AppId::DiskPart => AppState::CommandPrompt(command_prompt::CommandPrompt::diskpart()),
+            AppId::MediaPlayer => AppState::MediaPlayer(Box::default()),
             AppId::Calculator => AppState::Calculator(Calculator::default()),
             AppId::Paint => AppState::Paint(Box::new(Paint::new(480, 240))),
             AppId::StickyNotes | AppId::WordPad | AppId::Notepad => {
@@ -214,6 +218,7 @@ impl ApplicationSession {
         }
     }
     pub fn key(&mut self, key: u8) -> AppAction {
+        if self.id==AppId::MediaPlayer {return media_player::key(self,key);}
         if self.id==AppId::TaskManager {return task_manager::key(self,key);}
         if let Some(scene)=&mut self.guest_window {scene.key(key);return AppAction::None;}
         if self.common_dialog.is_some() { return common_dialogs::key(self, key); }
@@ -336,6 +341,7 @@ impl ApplicationSession {
         match &self.state {
             AppState::Document(d) => d.file_id,
             AppState::Paint(p) => p.file_id,
+            AppState::MediaPlayer(p) => p.current,
             _ => None,
         }
     }
@@ -343,11 +349,13 @@ impl ApplicationSession {
         match &self.state {
             AppState::Document(d) => &d.filename,
             AppState::Paint(p) => &p.filename,
+            AppState::MediaPlayer(p) => p.name(),
             _ => "Capture.bmp",
         }
     }
     pub fn saved(&mut self, id: u32, name: String) {
         match &mut self.state {
+            AppState::MediaPlayer(p) => {p.playlist_file=Some(id);p.playlist_name=name;},
             AppState::Document(d) => {
                 d.file_id = Some(id);
                 d.filename = name;

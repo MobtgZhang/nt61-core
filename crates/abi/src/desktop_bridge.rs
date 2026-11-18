@@ -26,6 +26,8 @@ pub const PROCESSES: u32 = 11;
 pub const DISKPART:u32=12;
 /// Mounted volume allocation: total bytes u64, free bytes u64, little endian.
 pub const VOLUME_SPACE: u32 = 13;
+/// Persist pending system-volume mutations to the identified backing disk.
+pub const FLUSH: u32 = 19; // 14..=18 are dialog_bridge operations.
 pub const DISKPART_HEADER:usize=16;
 pub const PROCESS_HEADER: usize = 36;
 pub const MAX_PROCESSES: usize = 4096;
