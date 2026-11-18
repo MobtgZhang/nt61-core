@@ -1,7 +1,8 @@
 //! Code Integrity (ci.dll)
 //
 //! Implements checked PE content hashing and explicit digest authorization.
-//! Certificate/catalog trust and Windows CI ABI are not implemented here.
+//! Catalog verification requires explicit anchors, time and revocation policy.
+//! Windows CI ABI and installation/loader integration remain separate work.
 //
 //! Code Integrity uses the WDK driver naming convention
 //! (CiInitialize, IMAGE_POLICY, ...).
@@ -29,9 +30,70 @@ pub const CI_NOLMS: u32 = 0x00000001; // No LMS is available
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-pub use crate::crypto::hash::Sha256;
+use crate::crypto::catalog::{
+    self, AuthenticatedCatalog, Catalog, DigestAlgorithm, MemberKind, TrustPolicy,
+};
+pub use crate::crypto::hash::{Sha1, Sha256};
 mod image_hash;
-pub use image_hash::{compute_pe_hash, ImageHashError};
+pub use image_hash::{compute_pe_hash, compute_pe_sha1, ImageHashError};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogImageError {
+    Image(ImageHashError),
+    Catalog(catalog::Error),
+}
+
+/// Evidence binds an authenticated catalog to a checked PE SIP digest.
+/// This does not assert that the PE implements a compatible driver ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogImageEvidence {
+    pub signer_sha256: [u8; 32],
+    pub timestamp: Option<u64>,
+    pub algorithm: DigestAlgorithm,
+}
+
+/// Verify catalog integrity/trust before authorizing any PE member. A catalog
+/// containing the same raw file hash under another SIP kind cannot authorize
+/// a PE image. No filename-based or embedded-root fallback is available.
+pub fn validate_pe_image_with_catalog(
+    image: &[u8],
+    catalog_bytes: &[u8],
+    policy: &TrustPolicy<'_>,
+) -> Result<CatalogImageEvidence, CatalogImageError> {
+    let catalog = Catalog::parse(catalog_bytes).map_err(CatalogImageError::Catalog)?;
+    let authenticated = catalog
+        .authenticate(policy)
+        .map_err(CatalogImageError::Catalog)?;
+    validate_catalog_member(image, &authenticated)
+}
+
+/// Reuse a previously authenticated, immutable catalog for multiple images.
+/// SHA-1 is limited to historical SP1 member matching; MD5 members never
+/// authorize PE images through this API, even under a legacy TSA policy.
+pub fn validate_catalog_member(
+    image: &[u8],
+    catalog: &AuthenticatedCatalog<'_>,
+) -> Result<CatalogImageEvidence, CatalogImageError> {
+    let sha256 = compute_pe_hash(image).map_err(CatalogImageError::Image)?;
+    let sha1 = compute_pe_sha1(image).map_err(CatalogImageError::Image)?;
+    for (algorithm, digest) in [
+        (DigestAlgorithm::Sha256, sha256.as_slice()),
+        (DigestAlgorithm::Sha1, sha1.as_slice()),
+    ] {
+        match catalog.require_member(MemberKind::PeImage, algorithm, digest) {
+            Ok(()) => {
+                return Ok(CatalogImageEvidence {
+                    signer_sha256: catalog.signer_sha256,
+                    timestamp: catalog.timestamp,
+                    algorithm,
+                })
+            }
+            Err(catalog::Error::MemberNotFound) => (),
+            Err(error) => return Err(CatalogImageError::Catalog(error)),
+        }
+    }
+    Err(CatalogImageError::Catalog(catalog::Error::MemberNotFound))
+}
 
 static CI_POLICY: AtomicU32 = AtomicU32::new(0);
 
@@ -66,7 +128,10 @@ pub fn validate_pe_image(image: &[u8]) -> u32 {
 
 /// Initialise the Code Integrity module.
 pub fn init() {
-    CI_POLICY.store(CI_POLICY_ENABLED | CI_POLICY_DRIVER_ENFORCEMENT, Ordering::Release);
+    CI_POLICY.store(
+        CI_POLICY_ENABLED | CI_POLICY_DRIVER_ENFORCEMENT,
+        Ordering::Release,
+    );
 }
 
 /// Query policy separately from validation; disabled enforcement is not
@@ -83,10 +148,10 @@ pub fn se_ci_check_image(image: &[u8]) -> u32 {
 }
 
 pub fn smoke_test() -> bool {
-    compute_sha256(b"Hello, World!") == [
-        0xdf, 0xfd, 0x60, 0x21, 0xbb, 0x2b, 0xd5, 0xb0,
-        0xaf, 0x67, 0x62, 0x90, 0x80, 0x9e, 0xc3, 0xa5,
-        0x31, 0x91, 0xdd, 0x81, 0xc7, 0xf7, 0x0a, 0x4b,
-        0x28, 0x68, 0x8a, 0x36, 0x21, 0x82, 0x98, 0x6f,
-    ]
+    compute_sha256(b"Hello, World!")
+        == [
+            0xdf, 0xfd, 0x60, 0x21, 0xbb, 0x2b, 0xd5, 0xb0, 0xaf, 0x67, 0x62, 0x90, 0x80, 0x9e,
+            0xc3, 0xa5, 0x31, 0x91, 0xdd, 0x81, 0xc7, 0xf7, 0x0a, 0x4b, 0x28, 0x68, 0x8a, 0x36,
+            0x21, 0x82, 0x98, 0x6f,
+        ]
 }

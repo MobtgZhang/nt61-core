@@ -9,6 +9,8 @@ path = "src/lib.rs"
 test = false
 
 [dependencies]
+nt61-win32-metrics = { path = "../win32-metrics" }
+nt61-driver-package = { path = "../driver-package" }
 nt61-abi = { path = "../abi" }
 nt61-boot-types = { path = "../boot-types" }
 des = { version = "0.8", optional = true, default-features = false }

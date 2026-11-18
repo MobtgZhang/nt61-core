@@ -1,9 +1,8 @@
 #![allow(dead_code, unused_imports)]
 extern crate alloc;
-// The same cryptography source used by ntoskrnl, without kernel services.
-#[path = "../../crypto/src/crypto/hash.rs"]
-pub mod hash;
-mod crypto { pub use crate::hash; }
+// CI now also depends on catalog authentication. Reuse the complete production
+// crypto module rather than a hash-only stand-in that cannot compile CI.
+mod crypto { pub use ntoskrnl::crypto::{catalog, hash}; }
 #[path = "../src/drivers/ci/mod.rs"]
 mod ci;
 

@@ -68,6 +68,7 @@ pub mod wdf;
 
 pub mod bootvid;
 pub mod ci;
+pub use nt61_driver_package as package;
 pub mod clfs;
 pub mod fileinfo;
 pub mod fltmgr;
