@@ -10,6 +10,12 @@ pub struct Network {
     pub received: u64,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cpu {
+    pub total: u64,
+    pub idle: u64,
+    pub kernel: u64,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sample {
     pub uptime: u64,
     pub total: u64,
@@ -19,6 +25,7 @@ pub struct Sample {
     pub ticks: u64,
     pub idle: u64,
     pub network: Vec<Network>,
+    pub cpus: Vec<Cpu>,
 }
 fn number(b: &[u8], i: usize) -> Result<u64, u32> {
     Ok(u64::from_le_bytes(
@@ -39,7 +46,7 @@ fn word(b: &[u8], i: usize) -> Result<u32, u32> {
 impl Sample {
     pub fn decode(b: &[u8]) -> Result<Self, u32> {
         let count = word(b, 56)? as usize;
-        if count > 256 || b.len() != 60 + count * 40 {
+        if count > 256 || b.len() < 60 + count * 40 {
             return Err(INVALID);
         }
         let mut sample = Self {
@@ -51,6 +58,7 @@ impl Sample {
             ticks: number(b, 40)?,
             idle: number(b, 48)?,
             network: Vec::new(),
+            cpus: Vec::new(),
         };
         if sample.available > sample.total || sample.idle > sample.ticks {
             return Err(INVALID);
@@ -68,6 +76,28 @@ impl Sample {
                 sent: number(b, n + 24)?,
                 received: number(b, n + 32)?,
             });
+        }
+        let at = 60 + count * 40;
+        if b.len() != at {
+            if b.get(at..at + 4) != Some(b"CPU1") {
+                return Err(INVALID);
+            }
+            let count = word(b, at + 4)? as usize;
+            if count == 0 || count > 256 || b.len() != at + 8 + count * 24 {
+                return Err(INVALID);
+            }
+            for i in 0..count {
+                let at = at + 8 + i * 24;
+                let cpu = Cpu {
+                    total: number(b, at)?,
+                    idle: number(b, at + 8)?,
+                    kernel: number(b, at + 16)?,
+                };
+                if cpu.idle > cpu.total || cpu.kernel > cpu.total - cpu.idle {
+                    return Err(INVALID);
+                }
+                sample.cpus.push(cpu);
+            }
         }
         Ok(sample)
     }
@@ -231,5 +261,36 @@ mod service_metadata_tests {
         assert!(decode_services(&invalid).is_err());
         b.push(0);
         assert!(decode_services(&b).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cpu_protocol_tests {
+    use super::*;
+    #[test]
+    fn optional_per_cpu_extension_is_bounded_and_validated() {
+        let mut bytes = alloc::vec![0;60];
+        assert!(Sample::decode(&bytes).unwrap().cpus.is_empty());
+        bytes.extend(b"CPU1");
+        bytes.extend(1u32.to_le_bytes());
+        for value in [100u64, 20, 30] {
+            bytes.extend(value.to_le_bytes());
+        }
+        assert_eq!(
+            Sample::decode(&bytes).unwrap().cpus,
+            alloc::vec![Cpu {
+                total: 100,
+                idle: 20,
+                kernel: 30
+            }]
+        );
+        for end in 61..bytes.len() {
+            assert!(Sample::decode(&bytes[..end]).is_err());
+        }
+        let mut bad = bytes.clone();
+        bad[64..68].copy_from_slice(&257u32.to_le_bytes());
+        assert!(Sample::decode(&bad).is_err());
+        bytes[84..92].copy_from_slice(&81u64.to_le_bytes());
+        assert!(Sample::decode(&bytes).is_err());
     }
 }

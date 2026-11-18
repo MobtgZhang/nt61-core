@@ -1,4 +1,5 @@
 //! Task Manager state and UI shared by the desktop and native image.
+mod menu;
 use super::{
     system_monitor::Sample,
     view::{Button, Command as ViewCommand},
@@ -18,6 +19,8 @@ pub enum Action {
     User(String, bool),
     Minimize(u32),
     NewTask,
+    Refresh,
+    Arrange(usize),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -35,6 +38,8 @@ pub enum Command {
     All,
     Resource,
     Dismiss,
+    Column(usize),
+    ColumnsDone(bool),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manager {
@@ -45,6 +50,24 @@ pub struct Manager {
     pub sort: usize,
     pub descending: bool,
     pub menu: Option<usize>,
+    pub submenu: Option<usize>,
+    pub menu_focus: usize,
+    pub menu_viewport: (u32, u32),
+    pub columns: [u32; 6],
+    pub column_dialog: Option<u32>,
+    pub per_cpu: bool,
+    pub kernel_times: bool,
+    pub network_active: bool,
+    pub cumulative: bool,
+    pub auto_scale: bool,
+    pub show_scale: bool,
+    pub network_lines: u8,
+    pub full_names: bool,
+    pub refresh: bool,
+    pub network_reset: Option<Sample>,
+    pub cpu_history: Vec<Vec<(u32, u32)>>,
+    pub kernel_history: Vec<(u32, u32)>,
+    pub network_history: Vec<(u64, Vec<(u32, u32)>)>,
     pub context: Option<(i32, i32)>,
     pub confirmation: Option<(u64, bool)>,
     pub always_on_top: bool,
@@ -71,11 +94,29 @@ impl Default for Manager {
             sort: 0,
             descending: false,
             menu: None,
+            submenu: None,
+            menu_focus: 0,
+            menu_viewport: (1024, 768),
+            columns: [u32::MAX; 6],
+            column_dialog: None,
+            per_cpu: true,
+            kernel_times: false,
+            network_active: false,
+            cumulative: false,
+            auto_scale: true,
+            show_scale: true,
+            network_lines: 4,
+            full_names: false,
+            refresh: false,
+            network_reset: None,
+            cpu_history: Vec::new(),
+            kernel_history: Vec::new(),
+            network_history: Vec::new(),
             context: None,
             confirmation: None,
             always_on_top: false,
             minimize_on_use: true,
-            hide_minimized: true,
+            hide_minimized: false,
             show_all: false,
             interval: 1000,
             paused: false,
@@ -125,6 +166,72 @@ impl Manager {
             self.history.push((cpu, mem));
             if self.history.len() > 120 {
                 self.history.remove(0);
+            }
+        }
+        if let Some(previous) = &self.last {
+            while self.cpu_history.len() < s.cpus.len() {
+                self.cpu_history.push(Vec::new());
+            }
+            let mut total_delta = 0u64;
+            let mut kernel_delta = 0u64;
+            for (i, (cpu, old)) in s.cpus.iter().zip(&previous.cpus).enumerate() {
+                if let (Some(total), Some(idle), Some(kernel)) = (
+                    cpu.total.checked_sub(old.total),
+                    cpu.idle.checked_sub(old.idle),
+                    cpu.kernel.checked_sub(old.kernel),
+                ) {
+                    if total > 0 && idle <= total {
+                        let value = ((total - idle) as u128 * 100 / total as u128) as u32;
+                        let kernel = (kernel as u128 * 100 / total as u128).min(100) as u32;
+                        let h = &mut self.cpu_history[i];
+                        h.push((value, kernel));
+                        if h.len() > 120 {
+                            h.remove(0);
+                        }
+                        total_delta += total;
+                        kernel_delta += cpu.kernel.saturating_sub(old.kernel);
+                    }
+                }
+            }
+            self.kernel_history.push((
+                if total_delta > 0 {
+                    (kernel_delta as u128 * 100 / total_delta as u128).min(100) as u32
+                } else {
+                    0
+                },
+                0,
+            ));
+            if self.kernel_history.len() > 120 {
+                self.kernel_history.remove(0);
+            }
+            let elapsed = s.uptime.saturating_sub(previous.uptime);
+            if elapsed > 0 {
+                for network in &s.network {
+                    if let Some(old) = previous.network.iter().find(|n| n.index == network.index) {
+                        let sent = (network.sent.saturating_sub(old.sent) as u128 * 1000
+                            / elapsed as u128)
+                            .min(u32::MAX as u128) as u32;
+                        let received = (network.received.saturating_sub(old.received) as u128
+                            * 1000
+                            / elapsed as u128)
+                            .min(u32::MAX as u128) as u32;
+                        let i = if let Some(i) = self
+                            .network_history
+                            .iter()
+                            .position(|(id, _)| *id == network.index)
+                        {
+                            i
+                        } else {
+                            self.network_history.push((network.index, Vec::new()));
+                            self.network_history.len() - 1
+                        };
+                        let h = &mut self.network_history[i].1;
+                        h.push((sent, received));
+                        if h.len() > 120 {
+                            h.remove(0);
+                        }
+                    }
+                }
             }
         }
         self.last = Some(s.clone());
@@ -203,6 +310,15 @@ fn headers(page: usize) -> &'static [(&'static str, u32)] {
             ("Status", 18),
             ("Group", 16),
         ],
+        4 => &[
+            ("Adapter", 20),
+            ("Utilization", 15),
+            ("Link Speed", 15),
+            ("State", 14),
+            ("Bytes Sent", 12),
+            ("Bytes Received", 12),
+            ("Bytes Total", 12),
+        ],
         5 => &[
             ("User", 36),
             ("ID", 10),
@@ -213,16 +329,29 @@ fn headers(page: usize) -> &'static [(&'static str, u32)] {
         _ => &[],
     }
 }
-fn cell(b: Rect, page: usize, index: usize, y: i32, height: u32) -> Rect {
+fn cell(b: Rect, m: &Manager, index: usize, y: i32, height: u32) -> Rect {
     let r = list_bounds(b);
-    let columns = headers(page);
+    let columns = headers(m.page);
     let total = r.width.saturating_sub(18);
-    let left = columns[..index].iter().map(|(_, w)| w).sum::<u32>();
+    let visible = |i: usize| m.columns[m.page] & (1 << i) != 0;
+    let sum = columns
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| visible(*i))
+        .map(|(_, (_, w))| *w)
+        .sum::<u32>()
+        .max(1);
+    let left = columns[..index]
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| visible(*i))
+        .map(|(_, (_, w))| *w)
+        .sum::<u32>();
     let right = left + columns[index].1;
     Rect::new(
-        r.x + 1 + (total * left / 100) as i32,
+        r.x + 1 + (total * left / sum) as i32,
         y,
-        total * right / 100 - total * left / 100,
+        total * right / sum - total * left / sum,
         height,
     )
 }
@@ -231,6 +360,7 @@ fn entry_count(m: &Manager, e: &Environment) -> usize {
         0 => e.tasks.len(),
         1 => processes(m, e).len(),
         2 => e.services.len(),
+        4 => m.last.as_ref().map_or(0, |s| s.network.len()),
         5 => e.users.len(),
         _ => 0,
     }
@@ -267,82 +397,19 @@ fn add(out: &mut Vec<Button>, r: Rect, label: impl Into<String>, c: Command) {
     });
 }
 fn menu_items(m: &Manager) -> Vec<(String, usize)> {
-    match m.menu {
-        Some(0) => alloc::vec![
-            ("New Task (Run...)".into(), 0),
-            ("Exit Task Manager".into(), 1)
-        ],
-        Some(1) => alloc::vec![
-            (
-                format!(
-                    "{} Always On Top",
-                    if m.always_on_top { "[x]" } else { "[ ]" }
-                ),
-                0
-            ),
-            (
-                format!(
-                    "{} Minimize On Use",
-                    if m.minimize_on_use { "[x]" } else { "[ ]" }
-                ),
-                1
-            ),
-            (
-                format!(
-                    "{} Hide When Minimized",
-                    if m.hide_minimized { "[x]" } else { "[ ]" }
-                ),
-                2
-            )
-        ],
-        Some(2) => alloc::vec![
-            ("Refresh Now".into(), 0),
-            ("Update Speed: High (0.5 s)".into(), 1),
-            ("Update Speed: Normal (1 s)".into(), 2),
-            ("Update Speed: Low (4 s)".into(), 3),
-            (
-                format!("{} Paused", if m.paused { "[x]" } else { "[ ]" }),
-                4
-            )
-        ],
-        Some(3) => alloc::vec![
-            ("Switch To".into(), 0),
-            ("Minimize".into(), 1),
-            ("Close Window".into(), 2)
-        ],
-        Some(4) => alloc::vec![
-            ("Task Manager Help".into(), 0),
-            ("About Task Manager".into(), 1)
-        ],
-        Some(5) => alloc::vec![
-            ("End Process...".into(), 0),
-            ("End Process Tree...".into(), 1),
-            ("Priority: Low".into(), 2),
-            ("Priority: Below Normal".into(), 3),
-            ("Priority: Normal".into(), 4),
-            ("Priority: Above Normal".into(), 5),
-            ("Priority: High".into(), 6),
-            ("Affinity: All CPUs".into(), 7),
-            ("Affinity: CPU 0".into(), 8)
-        ],
-        _ => Vec::new(),
-    }
+    menu::items(m, false)
 }
 fn menu_origin(m: &Manager, b: Rect) -> (i32, i32) {
-    m.context
-        .unwrap_or((menu_button(b, m.menu.unwrap_or(0).min(4)).x, b.y + 23))
+    m.context.unwrap_or((
+        menu::title_bounds(m, b, m.menu.unwrap_or(0).min(4)).x,
+        b.y + 23,
+    ))
 }
 fn menu_bounds(m: &Manager, b: Rect) -> Rect {
     let (x, y) = menu_origin(m, b);
-    let width = match m.menu {
-        Some(0) => 190,
-        Some(1) => 216,
-        Some(2) => 224,
-        Some(3) => 148,
-        Some(4) => 182,
-        _ => 216,
-    };
-    Rect::new(x, y, width, menu_items(m).len() as u32 * 26 + 6)
+    let height = menu_items(m).len() as u32 * 26 + 6;
+    Rect::new(x.clamp(0, m.menu_viewport.0.saturating_sub(244) as i32),
+        y.clamp(0, m.menu_viewport.1.saturating_sub(height) as i32), 244, height)
 }
 pub fn buttons(app: &ApplicationSession, b: Rect, e: &Environment) -> Vec<Button> {
     let m = &app.manager;
@@ -351,7 +418,10 @@ pub fn buttons(app: &ApplicationSession, b: Rect, e: &Environment) -> Vec<Button
         .iter()
         .enumerate()
     {
-        add(&mut out, menu_button(b, i), *t, Command::Menu(i));
+        if i == 3 && m.page != 0 {
+            continue;
+        }
+        add(&mut out, menu::title_bounds(m, b, i), *t, Command::Menu(i));
     }
     for (i, t) in TABS.iter().enumerate() {
         add(&mut out, tab(b, i), *t, Command::Page(i));
@@ -359,20 +429,23 @@ pub fn buttons(app: &ApplicationSession, b: Rect, e: &Environment) -> Vec<Button
     let y = b.y + b.height as i32 - 55;
     let count = rows(m, b);
     for (i, (label, _)) in headers(m.page).iter().enumerate() {
+        if m.columns[m.page] & (1 << i) == 0 {
+            continue;
+        }
         add(
             &mut out,
-            cell(b, m.page, i, b.y + 65, 22),
+            cell(b, m, i, b.y + 65, 22),
             *label,
             Command::Sort(i),
         );
     }
-    for (i, (id, _, _)) in row_values(m, e)
-        .iter()
+    for (i, id) in row_ids(m, e)
+        .into_iter()
         .skip(m.offset)
         .take(count)
         .enumerate()
     {
-        add(&mut out, row_bounds(b, i), "", Command::Row(*id));
+        add(&mut out, row_bounds(b, i), "", Command::Row(id));
     }
     match m.page {
         0 => {
@@ -446,15 +519,31 @@ pub fn buttons(app: &ApplicationSession, b: Rect, e: &Environment) -> Vec<Button
         _ => {}
     }
     if m.menu.is_some() {
-        let r = menu_bounds(m, b);
-        for (i, (label, n)) in menu_items(m).into_iter().enumerate() {
+        menu::buttons(m, b, &mut out);
+    }
+    if let Some(mask) = m.column_dialog {
+        let r = confirm_rect(b);
+        for (i, (name, _)) in headers(m.page).iter().enumerate() {
             add(
                 &mut out,
-                Rect::new(r.x + 3, r.y + 3 + i as i32 * 26, r.width - 6, 26),
-                label,
-                Command::Item(n),
+                Rect::new(r.x + 20, r.y + 32 + i as i32 * 26, 330, 24),
+                format!("{} {}", if mask & (1 << i) != 0 { "✓" } else { "  " }, name),
+                Command::Column(i),
             );
         }
+        let y = r.y + 40 + headers(m.page).len() as i32 * 26;
+        add(
+            &mut out,
+            Rect::new(r.x + 175, y, 80, 24),
+            "OK",
+            Command::ColumnsDone(true),
+        );
+        add(
+            &mut out,
+            Rect::new(r.x + 265, y, 90, 24),
+            "Cancel",
+            Command::ColumnsDone(false),
+        );
     }
     if m.confirmation.is_some() {
         let r = confirm_rect(b);
@@ -472,7 +561,7 @@ pub fn buttons(app: &ApplicationSession, b: Rect, e: &Environment) -> Vec<Button
         );
     }
     if !app.status.is_empty() {
-        add(&mut out, notice_button(b), "OK", Command::Dismiss);
+        add(&mut out, notice_button(app, b), "OK", Command::Dismiss);
     }
     out
 }
@@ -484,9 +573,34 @@ fn confirm_rect(b: Rect) -> Rect {
         148,
     )
 }
-fn notice_button(b: Rect) -> Rect {
-    let r = confirm_rect(b);
-    Rect::new(r.x + r.width as i32 - 98, r.y + 137, 80, 24)
+fn notice_lines(message: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in message.lines() {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > 46 {
+                lines.push(core::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        lines.push(line);
+    }
+    lines
+}
+fn notice_rect(app: &ApplicationSession, b: Rect) -> Rect {
+    let mut r = confirm_rect(b);
+    r.height = (88 + notice_lines(&app.status).len() as u32 * 20).max(176);
+    // Keep short operation notices at their existing position. Longer help
+    // text grows upward as well as downward so the OK button remains visible.
+    r.y = r.y.min(b.y + b.height as i32 - r.height as i32 - 8).max(b.y + 4);
+    r
+}
+fn notice_button(app: &ApplicationSession, b: Rect) -> Rect {
+    let r = notice_rect(app, b);
+    Rect::new(r.x + r.width as i32 - 98, r.y + r.height as i32 - 39, 80, 24)
 }
 pub fn click(
     app: &mut ApplicationSession,
@@ -509,6 +623,11 @@ pub fn click(
         app.manager.context = None;
         return AppAction::None;
     };
+    if app.manager.column_dialog.is_some()
+        && !matches!(c, Command::Column(_) | Command::ColumnsDone(_))
+    {
+        return AppAction::None;
+    }
     if !app.status.is_empty() && c != Command::Dismiss {
         return AppAction::None;
     }
@@ -546,6 +665,8 @@ fn execute(app: &mut ApplicationSession, c: Command, e: &Environment) -> AppActi
     let m = &mut app.manager;
     match c {
         Command::Page(p) => {
+            m.submenu = None;
+            m.column_dialog = None;
             m.page = p.min(5);
             m.selected = None;
             m.offset = 0;
@@ -564,6 +685,7 @@ fn execute(app: &mut ApplicationSession, c: Command, e: &Environment) -> AppActi
                 0 => e.tasks.len(),
                 1 => processes(m, e).len(),
                 2 => e.services.len(),
+                4 => m.last.as_ref().map_or(0, |s| s.network.len()),
                 5 => e.users.len(),
                 _ => 0,
             };
@@ -584,6 +706,8 @@ fn execute(app: &mut ApplicationSession, c: Command, e: &Environment) -> AppActi
         Command::Menu(i) => {
             m.menu = if m.menu == Some(i) { None } else { Some(i) };
             m.context = None;
+            m.submenu = None;
+            m.menu_focus = 0;
         }
         Command::New => return AppAction::Manage(Action::NewTask),
         Command::Resource => return AppAction::Launch(AppId::ResourceMonitor),
@@ -638,18 +762,19 @@ fn execute(app: &mut ApplicationSession, c: Command, e: &Environment) -> AppActi
                 }
             }
         }
-        Command::Item(n) => {
-            let menu = m.menu.take();
-            m.context = None;
-            match(menu,n){
-   (Some(0),0)=>return AppAction::Manage(Action::NewTask),(Some(0),1)=>return AppAction::RequestClose,
-   (Some(1),0)=>m.always_on_top=!m.always_on_top,(Some(1),1)=>m.minimize_on_use=!m.minimize_on_use,(Some(1),2)=>m.hide_minimized=!m.hide_minimized,
-   (Some(2),0)=>{m.sampled=0;m.paused=false;},(Some(2),1..=3)=>{m.interval=match n{1=>500,2=>1000,_=>4000};m.paused=false;},(Some(2),4)=>m.paused=!m.paused,
-   (Some(3),0)=>if let Some(id)=m.selected{return AppAction::Activate(id as u32);},(Some(3),1)=>if let Some(id)=m.selected{return AppAction::Manage(Action::Minimize(id as u32));},(Some(3),2)=>if let Some(id)=m.selected{return AppAction::EndTask(id as u32);},
-   (Some(4),_)=>app.status=if n==0{"Select a row, then use an action. Right-click a process for priority and affinity. Delete ends the selected task; Ctrl+Tab changes tabs."}else{"Windows Task Manager - NT61 desktop"}.into(),
-   (Some(5),0..=1)=>if let Some(id)=m.selected{m.confirmation=Some((id,n==1));},
-   (Some(5),2..=8)=>if let Some(id)=m.selected{return AppAction::Manage(Action::Process(id,match n{2=>"priority:4",3=>"priority:6",4=>"priority:8",5=>"priority:10",6=>"priority:13",7=>"affinity:all",_=>"affinity:1"}.into()));},_=>{}
-  }
+        Command::Item(n) => return menu::execute(app, n, e),
+        Command::Column(i) => {
+            if let Some(mask) = &mut m.column_dialog {
+                *mask ^= 1 << i;
+            }
+        }
+        Command::ColumnsDone(ok) => {
+            if let Some(mask) = m.column_dialog.take() {
+                if ok && mask != 0 {
+                    m.columns[m.page] = mask;
+                    m.sort = 0;
+                }
+            }
         }
         Command::Dismiss => {}
     }
@@ -662,6 +787,9 @@ pub fn key(app: &mut ApplicationSession, key: u8) -> AppAction {
         }
         return AppAction::None;
     }
+    if let Some(action) = menu::key(app, key) {
+        return action;
+    }
     let m = &mut app.manager;
     if key == 27 {
         m.menu = None;
@@ -672,6 +800,10 @@ pub fn key(app: &mut ApplicationSession, key: u8) -> AppAction {
         m.page = (m.page + 1) % 6;
         m.offset = 0;
         m.selected = None;
+        m.menu = None;
+        m.submenu = None;
+        m.context = None;
+        m.sort = 0;
     } else if matches!(key, 13 | 10) && m.confirmation.is_some() {
         let (id, tree) = m.confirmation.take().unwrap();
         return AppAction::Manage(Action::Process(
@@ -698,6 +830,9 @@ fn graph(frame: &mut Surface, r: Rect, h: &[(u32, u32)], memory: bool) {
     for y in (0..r.height).step_by(16) {
         frame.fill_rect(r.x, r.y + y as i32, r.width, 1, 0xFF003C18);
     }
+    trace(frame, r, h, memory, 0xff00ff00);
+}
+fn trace(frame: &mut Surface, r: Rect, h: &[(u32, u32)], memory: bool, color: u32) {
     let values: Vec<_> = h.iter().rev().take(r.width as usize).rev().collect();
     let mut last = None;
     for (i, v) in values.iter().enumerate() {
@@ -707,12 +842,84 @@ fn graph(frame: &mut Surface, r: Rect, h: &[(u32, u32)], memory: bool) {
             - (if memory { v.1 } else { v.0 }.min(100) * r.height.saturating_sub(1) / 100) as i32;
         if let Some(py) = last {
             let top = y.min(py);
-            frame.fill_rect(x, top, 1, (y - py).unsigned_abs() + 1, 0xFF00FF00);
+            frame.fill_rect(x, top, 1, (y - py).unsigned_abs() + 1, color);
         } else {
-            frame.fill_rect(x, y, 1, 1, 0xFF00FF00);
+            frame.fill_rect(x, y, 1, 1, color);
         }
         last = Some(y);
     }
+}
+// Sort references/indices, never cloned service text, on the input path.
+fn service_order(m: &Manager, e: &Environment) -> Vec<usize> {
+    let mut order: Vec<_> = (0..e.services.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (a, b) = (&e.services[a], &e.services[b]);
+        let result = match m.sort {
+            1 => a.pid.cmp(&b.pid),
+            2 => a.description.cmp(&b.description),
+            3 => service_state(a.state).cmp(service_state(b.state)),
+            4 => a.group.cmp(&b.group),
+            _ => a.name.cmp(&b.name),
+        };
+        if m.descending {
+            result.reverse()
+        } else {
+            result
+        }
+    });
+    order
+}
+fn service_state(state: u32) -> &'static str {
+    match state {
+        4 => "Running",
+        1 => "Stopped",
+        2 => "Starting",
+        3 => "Stopping",
+        7 => "Paused",
+        _ => "Pending",
+    }
+}
+fn service_cells(s: &super::system_monitor::Service) -> Vec<String> {
+    alloc::vec![
+        s.name.clone(),
+        if s.pid == 0 {
+            String::new()
+        } else {
+            format!("{}", s.pid)
+        },
+        s.description.clone(),
+        service_state(s.state).into(),
+        s.group.clone()
+    ]
+}
+fn row_ids(m: &Manager, e: &Environment) -> Vec<u64> {
+    if m.page == 2 {
+        return service_order(m, e).into_iter().map(|i| i as u64).collect();
+    }
+    row_values(m, e).into_iter().map(|r| r.0).collect()
+}
+/// List rows in Windows Task Manager do not change appearance on pointer hover.
+/// This path runs before the host clones telemetry or builds hit targets.
+pub fn menu_hover(app: &mut ApplicationSession, b: Rect, x: i32, y: i32) -> bool {
+    menu::hover(app, b, x, y)
+}
+pub fn popup_contains(app: &ApplicationSession, b: Rect, x: i32, y: i32) -> bool {
+    menu::contains(&app.manager, b, x, y)
+}
+pub fn quiet_pointer(app: &mut ApplicationSession, b: Rect, x: i32, y: i32) -> Option<bool> {
+    if app.manager.menu.is_none()
+        && app.manager.column_dialog.is_none()
+        && app.manager.confirmation.is_none()
+        && app.status.is_empty()
+        && app.dialog.is_none()
+        && app.common_dialog.is_none()
+        && app.manager.scroll_grab.is_none()
+        && list_bounds(b).contains(x, y)
+        && y >= list_bounds(b).y + 23
+    {
+        return Some(app.hot.take().is_some());
+    }
+    None
 }
 fn row_values(m: &Manager, e: &Environment) -> Vec<(u64, Vec<String>, Option<AppId>)> {
     let mut values: Vec<(u64, Vec<String>, Option<AppId>)> = match m.page {
@@ -776,6 +983,56 @@ fn row_values(m: &Manager, e: &Environment) -> Vec<(u64, Vec<String>, Option<App
                 )
             })
             .collect(),
+        4 => m
+            .last
+            .iter()
+            .flat_map(|s| s.network.iter())
+            .enumerate()
+            .map(|(i, n)| {
+                let base = m
+                    .network_reset
+                    .as_ref()
+                    .and_then(|s| s.network.iter().find(|x| x.index == n.index));
+                let sent = n.sent.saturating_sub(base.map_or(0, |n| n.sent));
+                let received = n.received.saturating_sub(base.map_or(0, |n| n.received));
+                let rate = m
+                    .network_history
+                    .iter()
+                    .find(|(id, _)| *id == n.index)
+                    .and_then(|(_, h)| h.last())
+                    .map_or(0, |v| u64::from(v.0) + u64::from(v.1));
+                let (a, b) = if m.cumulative {
+                    (sent, received)
+                } else {
+                    m.network_history
+                        .iter()
+                        .find(|(id, _)| *id == n.index)
+                        .and_then(|(_, h)| h.last())
+                        .map_or((0, 0), |v| (u64::from(v.0), u64::from(v.1)))
+                };
+                (
+                    i as u64,
+                    alloc::vec![
+                        format!("Adapter {}", n.index),
+                        if n.speed > 0 {
+                            format!("{}%", (rate as u128 * 800 / n.speed as u128).min(100))
+                        } else {
+                            "--".into()
+                        },
+                        format!("{} Mbps", n.speed / 1_000_000),
+                        if n.up {
+                            "Connected".into()
+                        } else {
+                            "Disconnected".into()
+                        },
+                        format!("{a}"),
+                        format!("{b}"),
+                        format!("{}", a.saturating_add(b))
+                    ],
+                    None,
+                )
+            })
+            .collect(),
         5 => e
             .users
             .iter()
@@ -784,7 +1041,11 @@ fn row_values(m: &Manager, e: &Environment) -> Vec<(u64, Vec<String>, Option<App
                 (
                     i as u64,
                     alloc::vec![
-                        name.clone(),
+                        if m.full_names {
+                            name.clone()
+                        } else {
+                            name.rsplit('\\').next().unwrap_or(name).into()
+                        },
                         format!("{}", i + 1),
                         String::from(if *active { "Active" } else { "Disconnected" }),
                         String::new(),
@@ -820,11 +1081,27 @@ fn row_cells(
     text: &impl Fn(&mut Surface, &str, Rect, u32),
 ) {
     let m = &app.manager;
-    let values = row_values(m, e);
-    for (i, (_, cells, icon)) in values.iter().skip(m.offset).take(rows(m, b)).enumerate() {
+    let values = if m.page == 2 {
+        service_order(m, e)
+            .into_iter()
+            .skip(m.offset)
+            .take(rows(m, b))
+            .map(|i| (i as u64, service_cells(&e.services[i]), None))
+            .collect()
+    } else {
+        row_values(m, e)
+            .into_iter()
+            .skip(m.offset)
+            .take(rows(m, b))
+            .collect::<Vec<_>>()
+    };
+    for (i, (_, cells, icon)) in values.iter().enumerate() {
         let row = row_bounds(b, i);
         for (j, value) in cells.iter().enumerate() {
-            let mut r = cell(b, m.page, j, row.y + 3, 17);
+            if m.columns[m.page] & (1 << j) == 0 {
+                continue;
+            }
+            let mut r = cell(b, m, j, row.y + 3, 17);
             r.x += 5;
             r.width = r.width.saturating_sub(10);
             if j == 0 && m.page == 0 {
@@ -876,7 +1153,7 @@ fn draw_button(f: &mut Surface, r: Rect, hot: bool, enabled: bool) {
 fn enabled(m: &Manager, c: &Command, e: &Environment) -> bool {
     match c {
         Command::Menu(3) => m.page == 0,
-        Command::Item(_) if m.menu == Some(3) => m.page == 0 && m.selected.is_some(),
+        Command::Item(2..=3 | 5) if m.menu == Some(3) => m.page == 0 && m.selected.is_some(),
         Command::End | Command::Switch => m.selected.is_some(),
         Command::Start(start) if m.page == 2 => m
             .selected
@@ -905,7 +1182,7 @@ pub fn draw(
     f.fill_rect(pane.x, pane.y, pane.width, pane.height, 0xFFF9F9F9);
     f.stroke_rounded_rect(pane, 0, 1, 0xFF898C95);
     let list = list_bounds(b);
-    if matches!(m.page, 0..=2 | 5) {
+    if matches!(m.page, 0..=2 | 4..=5) {
         f.fill_rect(list.x, list.y, list.width, list.height, 0xFFFFFFFF);
         f.stroke_rounded_rect(list, 0, 1, 0xFF828790);
         let r = Rect::new(
@@ -933,7 +1210,28 @@ pub fn draw(
             Rect::new(z.x, z.y - 24, gw, 20),
             0xFF111111,
         );
-        graph(f, a, &m.history, false);
+        if m.per_cpu && !m.cpu_history.is_empty() {
+            let count = m.cpu_history.len().min(16);
+            let columns = if count > 4 { 4 } else { count } as u32;
+            let rows = (count as u32).div_ceil(columns);
+            for (i, h) in m.cpu_history.iter().take(count).enumerate() {
+                let r = Rect::new(
+                    a.x + (i as u32 % columns * (a.width / columns)) as i32,
+                    a.y + (i as u32 / columns * (a.height / rows)) as i32,
+                    (a.width / columns).saturating_sub(2),
+                    (a.height / rows).saturating_sub(2),
+                );
+                graph(f, r, h, false);
+                if m.kernel_times {
+                    trace(f, r, h, true, 0xffff3030);
+                }
+            }
+        } else {
+            graph(f, a, &m.history, false);
+            if m.kernel_times {
+                trace(f, a, &m.kernel_history, false, 0xffff3030);
+            }
+        }
         graph(f, z, &m.history, true);
         if let Some(s) = &m.last {
             let y = a.y + gh as i32 + 16;
@@ -980,33 +1278,71 @@ pub fn draw(
             );
         }
     } else if m.page == 4 {
-        if let Some(s) = &m.last {
-            for (i, n) in s.network.iter().take(5).enumerate() {
-                let y = b.y + 76 + i as i32 * 64;
-                text(
-                    f,
-                    &format!(
-                        "Adapter {}  |  {}  |  {} Mbps",
-                        n.index,
-                        if n.up { "Connected" } else { "Disconnected" },
-                        n.speed / 1_000_000
-                    ),
-                    Rect::new(b.x + 18, y, b.width - 36, 22),
-                    0xFF111111,
+        if let Some(sample) = &m.last {
+            let top = b.y + 95 + (sample.network.len().min(5) as i32) * 20;
+            let height = (b.y + b.height as i32 - 90 - top).max(30) as u32;
+            let count = sample.network.len().min(4).max(1) as u32;
+            let width = b.width.saturating_sub(40) / count;
+            for (i, n) in sample.network.iter().take(count as usize).enumerate() {
+                let r = Rect::new(
+                    b.x + 18 + i as i32 * width as i32,
+                    top,
+                    width.saturating_sub(8),
+                    height,
                 );
-                text(
-                    f,
-                    &format!("Bytes Sent: {}    Bytes Received: {}", n.sent, n.received),
-                    Rect::new(b.x + 18, y + 25, b.width - 36, 22),
-                    0xFF111111,
-                );
+                let history = m
+                    .network_history
+                    .iter()
+                    .find(|(id, _)| *id == n.index)
+                    .map(|(_, h)| h.as_slice())
+                    .unwrap_or(&[]);
+                let peak = history
+                    .iter()
+                    .map(|(a, b)| u64::from(*a) + u64::from(*b))
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let scale = if m.auto_scale {
+                    peak.max(n.speed / 8000).max(1)
+                } else {
+                    (n.speed / 8).max(1)
+                };
+                let percent: Vec<_> = history
+                    .iter()
+                    .map(|(a, b)| {
+                        (
+                            (u64::from(*a) * 100 / scale).min(100) as u32,
+                            (u64::from(*b) * 100 / scale).min(100) as u32,
+                        )
+                    })
+                    .collect();
+                graph(f, r, &[], false);
+                if m.network_lines & 1 != 0 {
+                    trace(f, r, &percent, false, 0xffff3030);
+                }
+                if m.network_lines & 2 != 0 {
+                    trace(f, r, &percent, true, 0xffffff00);
+                }
+                if m.network_lines & 4 != 0 {
+                    let total: Vec<_> =
+                        percent.iter().map(|(a, b)| ((a + b).min(100), 0)).collect();
+                    trace(f, r, &total, false, 0xff00ff00);
+                }
+                if m.show_scale {
+                    text(
+                        f,
+                        &format!("{} B/s", scale),
+                        Rect::new(r.x, r.y + r.height as i32 + 2, r.width, 18),
+                        0xff111111,
+                    );
+                }
             }
-            if s.network.is_empty() {
+            if sample.network.is_empty() {
                 text(
                     f,
                     "No network adapters available.",
-                    Rect::new(b.x + 18, b.y + 90, b.width - 36, 22),
-                    0xFF333333,
+                    Rect::new(b.x + 18, b.y + 100, b.width - 36, 22),
+                    0xff333333,
                 );
             }
         }
@@ -1018,7 +1354,14 @@ pub fn draw(
         let ViewCommand::TaskManager(c) = &btn.command else {
             continue;
         };
-        if matches!(c, Command::Item(_) | Command::Confirm(_) | Command::Dismiss) {
+        if matches!(
+            c,
+            Command::Item(_)
+                | Command::Confirm(_)
+                | Command::Dismiss
+                | Command::Column(_)
+                | Command::ColumnsDone(_)
+        ) {
             continue;
         }
         let hot = app.hot == Some(btn.bounds);
@@ -1029,7 +1372,7 @@ pub fn draw(
         label.width = label.width.saturating_sub(10);
         match c {
             Command::Row(_) => {
-                if selected || hot {
+                if selected {
                     aero::menu_item(f, btn.bounds, true);
                 }
                 continue;
@@ -1172,23 +1515,35 @@ pub fn draw(
         scroll.draw(f, false, m.scroll_grab.is_some());
     }
     if m.menu.is_some() {
-        let r = menu_bounds(m, b);
-        aero::menu_surface(f, r);
+        menu::draw(app, f, b, e, &text);
+    }
+    if m.column_dialog.is_some() {
+        let mut r = confirm_rect(b);
+        r.height = 90 + headers(m.page).len() as u32 * 26;
+        aero::shadow(f, r, 8);
+        f.fill_rect(r.x, r.y, r.width, r.height, 0xfff0f0f0);
+        text(
+            f,
+            "Select Columns",
+            Rect::new(r.x + 16, r.y + 6, 300, 24),
+            0xff173e64,
+        );
         for btn in &controls {
-            if matches!(btn.command, ViewCommand::TaskManager(Command::Item(_))) {
-                if app.hot == Some(btn.bounds) {
-                    aero::menu_item(f, btn.bounds, true);
-                }
+            if matches!(
+                btn.command,
+                ViewCommand::TaskManager(Command::Column(_) | Command::ColumnsDone(_))
+            ) {
+                draw_button(f, btn.bounds, app.hot == Some(btn.bounds), true);
                 text(
                     f,
                     &btn.label,
                     Rect::new(
-                        btn.bounds.x + 30,
-                        btn.bounds.y + 5,
-                        btn.bounds.width - 35,
+                        btn.bounds.x + 6,
+                        btn.bounds.y + 3,
+                        btn.bounds.width - 12,
                         20,
                     ),
-                    0xFF111111,
+                    0xff111111,
                 );
             }
         }
@@ -1227,8 +1582,7 @@ pub fn draw(
         }
     }
     if !app.status.is_empty() {
-        let mut r = confirm_rect(b);
-        r.height = 176;
+        let r = notice_rect(app, b);
         aero::shadow(f, r, 10);
         f.fill_rect(r.x, r.y, r.width, r.height, 0xFFF0F0F0);
         f.stroke_rounded_rect(r, 0, 1, 0xFF777777);
@@ -1238,31 +1592,12 @@ pub fn draw(
             Rect::new(r.x + 16, r.y + 12, r.width - 32, 24),
             0xFF173E64,
         );
-        let mut line = String::new();
         let mut y = r.y + 42;
-        for word in app.status.split_whitespace() {
-            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > 46 {
-                text(
-                    f,
-                    &line,
-                    Rect::new(r.x + 16, y, r.width - 32, 20),
-                    0xFF111111,
-                );
-                line.clear();
-                y += 20;
-            }
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
+        for line in notice_lines(&app.status) {
+            text(f, &line, Rect::new(r.x + 16, y, r.width - 32, 20), 0xFF111111);
+            y += 20;
         }
-        text(
-            f,
-            &line,
-            Rect::new(r.x + 16, y, r.width - 32, 20),
-            0xFF111111,
-        );
-        let button = notice_button(b);
+        let button = notice_button(app, b);
         draw_button(f, button, app.hot == Some(button), true);
         text(
             f,
@@ -1274,27 +1609,36 @@ pub fn draw(
 }
 impl crate::shell::ShellModel {
     pub fn sample_task_manager(&mut self) {
+        let mut refresh_services = self.service_snapshot.is_empty();
         if let Ok(sample) = crate::platform::services::monitor() {
             for app in &mut self.applications {
                 if app.id == AppId::TaskManager {
-                    if !app.manager.paused
-                        && (app.manager.sampled == 0
+                    if (!app.manager.paused || app.manager.refresh)
+                        && (app.manager.refresh
+                            || app.manager.sampled == 0
                             || sample.uptime.saturating_sub(app.manager.sampled)
                                 >= app.manager.interval)
                     {
+                        refresh_services |= app.manager.page == 2;
                         if let Some(snapshot) = &self.process_snapshot {
                             app.manager.observe_processes(snapshot, sample.ticks);
                         }
                     }
+                    let paused = app.manager.paused;
+                    if app.manager.refresh {
+                        app.manager.paused = false;
+                        app.manager.sampled = 0;
+                    }
                     app.manager.observe(&sample);
+                    app.manager.paused = paused;
+                    app.manager.refresh = false;
                 }
             }
             self.monitor_sample = Some(sample);
         }
         // Service metadata changes independently of process CPU sampling. Query
         // it only while the Services tab is visible, or before the first snapshot.
-        if self.service_snapshot.is_empty() || self.applications.iter().any(|a|
-            a.id == AppId::TaskManager && a.manager.page == 2 && !a.manager.paused) {
+        if refresh_services {
             if let Ok(services) = crate::platform::services::service_list() {
                 self.service_snapshot = services;
             }
@@ -1308,6 +1652,79 @@ impl crate::shell::ShellModel {
             }
             Action::Power(a) => {
                 self.power_action = Some(a);
+                Ok(())
+            }
+            Action::Refresh => {
+                self.sample_task_manager();
+                Ok(())
+            }
+            Action::Arrange(kind) => {
+                let selected = self
+                    .application(id)
+                    .and_then(|a| a.manager.selected)
+                    .map(|v| v as u32);
+                let targets: Vec<_> = self
+                    .taskbar
+                    .windows
+                    .iter()
+                    .filter(|w| w.id != id)
+                    .map(|w| w.id)
+                    .collect();
+                let count = targets.len().max(1) as i32;
+                let (width, height) = (
+                    self.viewport.0 as i32,
+                    self.viewport.1.saturating_sub(40) as i32,
+                );
+                for (i, target) in targets.iter().enumerate() {
+                    if let Some(w) = self.taskbar.windows.iter_mut().find(|w| w.id == *target) {
+                        if (kind <= 1 || kind == 4 || (kind == 3 && Some(*target) == selected))
+                            && w.restore_geometry.is_none()
+                        {
+                            w.restore_geometry = Some((w.x, w.y, w.width, w.height));
+                        }
+                        if kind <= 1 {
+                            w.minimized = false;
+                            w.maximized = false;
+                            if kind == 0 {
+                                w.x = 0;
+                                w.y = i as i32 * height / count;
+                                w.width = width;
+                                w.height = height / count;
+                            } else {
+                                w.x = i as i32 * width / count;
+                                w.y = 0;
+                                w.width = width / count;
+                                w.height = height;
+                            }
+                        } else if kind == 4 {
+                            w.minimized = false;
+                            w.maximized = false;
+                            w.x = 24 * i as i32;
+                            w.y = 24 * i as i32;
+                            w.width = (width * 3 / 4).max(200);
+                            w.height = (height * 3 / 4).max(150);
+                        } else if Some(*target) == selected {
+                            if kind == 2 {
+                                w.minimized = true;
+                            } else if kind == 3 {
+                                w.minimized = false;
+                                w.maximized = true;
+                                w.x = 0;
+                                w.y = 0;
+                                w.width = width;
+                                w.height = height;
+                            }
+                        }
+                    }
+                }
+                if kind == 5 {
+                    if let Some(target) = selected {
+                        if let Some(w) = self.taskbar.windows.iter_mut().find(|w| w.id == target) {
+                            w.minimized = false;
+                        }
+                        self.select_window(target);
+                    }
+                }
                 Ok(())
             }
             Action::NewTask => {
@@ -1424,8 +1841,8 @@ mod tests {
             menu_bounds(&a.manager, Rect::new(0, 0, 480, 400)),
         );
         assert_eq!(
-            f.pixel(100, 40),
-            expected.pixel(100, 40),
+            f.pixel(100, 58),
+            expected.pixel(100, 58),
             "tab background must not paint through menu"
         );
     }
@@ -1550,6 +1967,21 @@ mod table_tests {
         }
     }
     #[test]
+    fn help_notice_keeps_every_line_and_dismiss_button_inside_default_window() {
+        let b = Rect::new(66, 90, 468, 404);
+        let mut app = ApplicationSession::new(1, AppId::TaskManager, 0);
+        key(&mut app, super::super::explorer::input::HELP);
+        let r = notice_rect(&app, b);
+        let lines = notice_lines(&app.status);
+        let button = notice_button(&app, b);
+        assert!(lines.len() > 5);
+        assert!(r.y >= b.y && r.y + r.height as i32 <= b.y + b.height as i32);
+        assert!(r.y + 42 + lines.len() as i32 * 20 <= button.y);
+        assert!(b.contains(button.x + 40, button.y + 12));
+        click(&mut app, b, &environment(), button.x + 40, button.y + 12, false);
+        assert!(app.status.is_empty());
+    }
+    #[test]
     fn operation_notice_blocks_task_actions_until_dismissed() {
         let e = environment();
         let b = Rect::new(0, 0, 480, 400);
@@ -1566,7 +1998,7 @@ mod table_tests {
             AppAction::None
         );
         assert_eq!(app.manager.selected, Some(7));
-        let button = notice_button(b);
+        let button = notice_button(&app, b);
         assert_eq!(
             click(&mut app, b, &e, button.x + 10, button.y + 10, false),
             AppAction::None

@@ -1770,7 +1770,14 @@ unsafe fn publish_switch_context(current: Option<*mut Ethread>, next: *mut Ethre
 static ACTIVITY_TOTAL: AtomicU64 = AtomicU64::new(0);
 static ACTIVITY_IDLE: AtomicU64 = AtomicU64::new(0);
 pub fn activity_ticks()->(u64,u64){(ACTIVITY_TOTAL.load(Ordering::Relaxed),ACTIVITY_IDLE.load(Ordering::Relaxed))}
-pub fn tick() {
+static CPU_TOTAL:[AtomicU64;MAX_CPUS]=[const{AtomicU64::new(0)};MAX_CPUS];
+static CPU_IDLE:[AtomicU64;MAX_CPUS]=[const{AtomicU64::new(0)};MAX_CPUS];
+static CPU_KERNEL:[AtomicU64;MAX_CPUS]=[const{AtomicU64::new(0)};MAX_CPUS];
+pub fn cpu_activity()->alloc::vec::Vec<(u64,u64,u64)>{
+    (0..(get_cpu_count() as usize).min(MAX_CPUS)).map(|i|(CPU_TOTAL[i].load(Ordering::Relaxed),CPU_IDLE[i].load(Ordering::Relaxed),CPU_KERNEL[i].load(Ordering::Relaxed))).collect()
+}
+pub fn tick(){tick_with_mode(false);}
+pub fn tick_with_mode(user:bool) {
     unsafe {
         // The clock ISR runs at CLOCK_LEVEL (28). A context switch is only
         // legal at DISPATCH_LEVEL, so the ISR records a reschedule request
@@ -1796,6 +1803,7 @@ pub fn tick() {
                 return;
             }
             ACTIVITY_TOTAL.fetch_add(1,Ordering::Relaxed);
+            if cpu<MAX_CPUS {CPU_TOTAL[cpu].fetch_add(1,Ordering::Relaxed);if current==prcb.idle_thread{CPU_IDLE[cpu].fetch_add(1,Ordering::Relaxed);}else if !user{CPU_KERNEL[cpu].fetch_add(1,Ordering::Relaxed);}}
             let process=(*current).threads_process;
             if !process.is_null(){(*process).activity_ticks.fetch_add(1,Ordering::Relaxed);}
             if current==prcb.idle_thread {ACTIVITY_IDLE.fetch_add(1,Ordering::Relaxed);}
