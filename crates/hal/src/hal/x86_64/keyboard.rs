@@ -286,6 +286,7 @@ pub fn process_scancode(sc: u8) {
         let direction = match code { 0x48=>b'A',0x50=>b'B',0x4B=>b'D',0x4D=>b'C',0x47=>b'H',0x4F=>b'F',_=>0 };
         if direction != 0 {
             if CTRL_DOWN.load(Ordering::Relaxed) && matches!(direction,b'H'|b'F') { push_sequence(b"\x1b[1;5"); push_byte(direction); }
+            else if ALT_DOWN.load(Ordering::Relaxed) && matches!(direction, b'C' | b'D') { push_sequence(b"\x1b[1;3"); push_byte(direction); }
             else if SHIFT_DOWN.load(Ordering::Relaxed) { push_sequence(b"\x1b[1;2"); push_byte(direction); }
             else { push_ansi_escape(direction); }
         } else { match code {0x49=>push_sequence(b"\x1b[5~"),0x51=>push_sequence(b"\x1b[6~"),0x53=>push_sequence(b"\x1b[3~"),_=>{}} }

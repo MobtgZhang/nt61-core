@@ -17,6 +17,7 @@ pub const DELETE: u8 = 0x89;
 pub const RENAME: u8 = 0x8A;
 pub const REFRESH: u8 = 0x8B;
 pub const FIND_NEXT:u8=0x8C;
+pub const FULLSCREEN:u8=0x8F;
 pub const REPLACE:u8=0x8E;
 pub const HELP:u8=0x8D;
 pub const SHIFT_UP:u8=0x90;
@@ -27,6 +28,8 @@ pub const SHIFT_HOME:u8=0x94;
 pub const SHIFT_END:u8=0x95;
 pub const CTRL_HOME:u8=0x96;
 pub const CTRL_END:u8=0x97;
+pub const BACK:u8=0x98;
+pub const FORWARD:u8=0x99;
 pub const ALT_FILE:u8=0xA0;
 pub const ALT_EDIT:u8=0xA1;
 pub const ALT_FORMAT:u8=0xA2;
@@ -61,6 +64,8 @@ impl Decoder {
             b"\x1b[1;2C"=>Some(SHIFT_RIGHT),b"\x1b[1;2D"=>Some(SHIFT_LEFT),
             b"\x1b[1;2H"=>Some(SHIFT_HOME),b"\x1b[1;2F"=>Some(SHIFT_END),
             b"\x1b[1;5H"=>Some(CTRL_HOME),b"\x1b[1;5F"=>Some(CTRL_END),
+            b"\x1b[1;3D" => Some(BACK),
+            b"\x1b[1;3C" => Some(FORWARD),
             b"\x1b[A" => Some(UP),
             b"\x1b[B" => Some(DOWN),
             b"\x1b[C" => Some(RIGHT),
@@ -72,6 +77,7 @@ impl Decoder {
             b"\x1b[3~" => Some(DELETE),
             b"\x1bOQ" | b"\x1b[12~" => Some(RENAME),
             b"\x1b[15~" => Some(REFRESH),
+            b"\x1b[23~" => Some(FULLSCREEN),
             _ => None,
         };
         if result.is_some() || key == b'~' || (self.length > 2 && key.is_ascii_alphabetic()) {
@@ -98,6 +104,8 @@ mod tests {
             (b"\x1b[A".as_slice(), UP),
             (b"\x1b[6~", PAGE_DOWN),
             (b"\x1bOQ", RENAME),
+            (b"\x1b[1;3D", BACK),
+            (b"\x1b[1;3C", FORWARD),
         ] {
             let mut got = None;
             for key in stream {

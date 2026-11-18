@@ -175,7 +175,7 @@ pub fn hid_emit_modifiers(usage:u8,modifiers:u8,caps:bool){
     let sequence:&[u8]=match usage{0x3a=>b"\x1bOP",0x3b=>b"\x1bOQ",0x3c=>b"\x1bOR",0x3e=>b"\x1b[15~",0x4b=>b"\x1b[5~",0x4e=>b"\x1b[6~",0x4c=>b"\x1b[3~",_=>b""};
     if !sequence.is_empty(){for &b in sequence{inject_byte(b);}return;}
     let nav=match usage{0x52=>b'A',0x51=>b'B',0x50=>b'D',0x4f=>b'C',0x4a=>b'H',0x4d=>b'F',_=>0};
-    if nav!=0{let prefix:&[u8]=if control&&matches!(nav,b'H'|b'F'){b"\x1b[1;5"}else if shift{b"\x1b[1;2"}else{b"\x1b["};for &b in prefix{inject_byte(b);}inject_byte(nav);return;}
+    if nav!=0{let prefix:&[u8]=if control&&matches!(nav,b'H'|b'F'){b"\x1b[1;5"}else if alt&&matches!(nav,b'C'|b'D'){b"\x1b[1;3"}else if shift{b"\x1b[1;2"}else{b"\x1b["};for &b in prefix{inject_byte(b);}inject_byte(nav);return;}
 
     if usage == 0 {
         return;

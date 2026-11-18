@@ -426,7 +426,7 @@ fn decode_event(event: &[u8; EVENT_SIZE]) {
         set_caps_lock(!caps_lock());
     } else {
         let bytes = translate_key(code);
-        if !bytes.is_empty() && ALT_KEYS.load(Ordering::Relaxed) != 0 {
+        if !bytes.is_empty() && ALT_KEYS.load(Ordering::Relaxed) != 0 && !matches!(code, 105 | 106) {
             enqueue_byte(27);
         }
         for byte in bytes {
@@ -487,6 +487,13 @@ pub fn pop_mouse_report() -> Option<(i16, i16, u8, i16)> {
 }
 
 fn translate_key(code: u16) -> &'static [u8] {
+    if ALT_KEYS.load(Ordering::Relaxed) != 0 {
+        match code {
+            105 => return b"\x1b[1;3D",
+            106 => return b"\x1b[1;3C",
+            _ => {}
+        }
+    }
     if control_state() {
         match code {
             35 => return b"\x8e",
