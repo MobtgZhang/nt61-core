@@ -29,6 +29,7 @@ fn execute(request:&mut Request)->Result<Vec<u8>,u32>{
         nt61_abi::session_bridge::HOTKEYS=>super::session_service::hotkeys(),
         nt61_abi::session_bridge::MONITOR=>super::session_service::monitor(),
         nt61_abi::session_bridge::ACCOUNTS=>super::session_service::accounts(),
+        nt61_abi::session_bridge::DEVICES=>super::session_service::devices(),
         nt61_abi::session_bridge::SERVICES=>super::session_service::services(),
         op @ (nt61_abi::session_bridge::SESSION|nt61_abi::session_bridge::TASK_CONTROL|nt61_abi::session_bridge::SERVICE_CONTROL|nt61_abi::session_bridge::ACCOUNT_CONTROL)=>{
             if request.capacity>512{return Err(STATUS_INVALID_PARAMETER);}

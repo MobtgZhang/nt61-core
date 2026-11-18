@@ -34,3 +34,8 @@ pub const NETWORK: u32 = 75;
 pub const MEDIA: u32 = 76;
 pub const MEDIA_STATUS_BYTES: usize = 16;
 pub const MEDIA_MAX_SAMPLES: usize = 9600;
+
+/// Read-only PnP snapshot: DEV1, count (u32 LE), at most 64 records of 88 bytes.
+/// Record: bus, address, function, state, reserved, driver-bound (u32 LE each),
+/// hardware ID and compatible ID (32 ASCII bytes, NUL padded each). No pointers.
+pub const DEVICES: u32 = 77;

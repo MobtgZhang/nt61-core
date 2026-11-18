@@ -345,3 +345,20 @@ pub fn media(action:&str,input:&[u8])->Result<Vec<u8>,u32>{
     let input=input.get(4..4usize.checked_add(length).ok_or(STATUS_INVALID_PARAMETER)?).ok_or(STATUS_INVALID_PARAMETER)?;
     Ok(crate::drivers::audio::hda_pcm::media(action,input)?.into_iter().flat_map(u32::to_le_bytes).collect())
 }
+
+/// Export registered device identities only, never kernel object addresses.
+pub fn devices() -> Result<Vec<u8>,u32> {
+    desktop()?;
+    if LOCKED.load(Ordering::Acquire)||SECURE.load(Ordering::Acquire){return Err(STATUS_ACCESS_DENIED);}
+    let mut bytes=b"DEV1".to_vec();
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    let mut count=0u32;
+    for node in crate::drivers::bus::pnp::enumerate().take(64) {
+        for value in [node.bus,node.address,node.function,node.state,0,u32::from(!node.driver.is_null())] { bytes.extend_from_slice(&value.to_le_bytes()); }
+        bytes.extend_from_slice(&node.hw_id);
+        bytes.extend_from_slice(&node.compatible_id);
+        count+=1;
+    }
+    bytes[4..8].copy_from_slice(&count.to_le_bytes());
+    Ok(bytes)
+}

@@ -53,7 +53,7 @@ fn exchange_with(
     } else if operation == nt61_abi::session_bridge::SOUND {16
     } else if operation == nt61_abi::session_bridge::SESSION && path=="user" {128
     } else if operation == nt61_abi::session_bridge::SESSION && path=="wallpaper-get" {512
-    } else if matches!(operation,nt61_abi::session_bridge::MONITOR|nt61_abi::session_bridge::SERVICES|nt61_abi::session_bridge::ACCOUNTS|nt61_abi::session_bridge::NETWORK) {65536
+    } else if matches!(operation,nt61_abi::session_bridge::DEVICES|nt61_abi::session_bridge::MONITOR|nt61_abi::session_bridge::SERVICES|nt61_abi::session_bridge::ACCOUNTS|nt61_abi::session_bridge::NETWORK) {65536
     } else if matches!(operation, COMMAND | nt61_abi::dialog_bridge::COMMAND_POLL) {
         CWD_BYTES + 65536
     } else if operation == nt61_abi::dialog_bridge::PRINT_WRITE { input.len().max(4)
