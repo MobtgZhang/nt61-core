@@ -406,6 +406,21 @@ pub unsafe extern "win64" fn dispatch_trap_frame(vector: u64, tf: *mut TrapFrame
                 }
             }
         }
+        // Service only verified non-present user image BSS faults here. The
+        // existing nested-fault guard is armed before entering this path.
+        if frame.error_code & 0x0d == 4 && crate::mm::is_initialized() {
+            let access = AccessFlags {
+                read: frame.error_code & 0x12 == 0,
+                write: frame.error_code & 2 != 0,
+                execute: frame.error_code & 16 != 0,
+                user: true, reserved_bit: false,
+                instruction_fetch: frame.error_code & 16 != 0,
+            };
+            if matches!(access_fault::try_image_zero(cr2, access), Some(access_fault::FaultStatus::Handled)) {
+                PF_IN_HANDLER.store(false, Ordering::Release);
+                return;
+            }
+        }
         unsafe {
             crate::rtl::klog::set_fault_context(true);
             trace_fault_walk(cr2, frame.error_code, frame.rip, frame.cs, cr3);
@@ -567,7 +582,7 @@ pub unsafe extern "win64" fn dispatch_trap_frame(vector: u64, tf: *mut TrapFrame
                 // ke::timer::tick() was never wired into the clock
                 // ISR, so armed KTIMERs never fired.
                 crate::ke::timer::tick();
-                crate::ke::scheduler::tick();
+                crate::ke::scheduler::tick_with_mode(tf_ref.cs&3!=0);
                 // ke_sched P0-5: the PSSS workers and the dispatcher
                 // wait list (wait-timeout expiry) also ran on no
                 // clock path at all — `psss_tick` had no callers,
@@ -852,7 +867,7 @@ fn handle_page_fault(error_code: u64, tf: &TrapFrame) {
 
     #[cfg(target_arch = "x86_64")]
     let access = AccessFlags {
-        read: error_code & 0x1 == 0,
+        read: error_code & 0x12 == 0,
         write: error_code & 0x2 != 0,
         execute: error_code & 0x10 != 0,
         user: error_code & 0x4 != 0,

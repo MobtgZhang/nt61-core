@@ -1171,7 +1171,19 @@ pub fn debug_read_user_pte(pml4_phys: u64, va: u64) -> u64 {
     }
 }
 
+/// Reserve a private writable, non-executable image BSS page without a frame.
+/// 0x80 is MMPTE's demand-zero READWRITE protection (4 << 5), not a PA.
+/// Caller owns an unpublished process root and registers its image VAD before run.
+#[cfg(target_arch = "x86_64")]
+pub fn reserve_image_zero_page(pml4_phys: u64, va: u64) -> MmStatus {
+    map_leaf_in_pml4(pml4_phys, va, 0, PTE_US, Some(0x80))
+}
+
 pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatus {
+    map_leaf_in_pml4(pml4_phys, va, pa, flags, None)
+}
+
+fn map_leaf_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64, software: Option<u64>) -> MmStatus {
     if flags & PTE_US != 0 && !user_mapping_available(va, PAGE_SIZE as u64) {
         return MmStatus::InvalidAddress;
     }
@@ -1179,6 +1191,7 @@ pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatu
         return MmStatus::InvalidAddress;
     }
     if !crate::arch::common::self_map::current_recursive_self_map_is_supported() {
+        if software.is_some() { return MmStatus::InvalidAddress; }
         return if unsafe {
             crate::arch::map_page_in_root(crate::mm::pfn::phys_to_pfn(pml4_phys), va, pa, flags)
         } {
@@ -1304,6 +1317,16 @@ pub fn map_page_in_pml4(pml4_phys: u64, va: u64, pa: u64, flags: u64) -> MmStatu
         // The NX bit lives in bit 63, well above the 12-bit flags
         // window that holds the protection bits, so we OR it in
         // explicitly instead of relying on `flags & 0xFFF`.
+        if let Some(raw) = software {
+            // Never discard an existing user mapping or another software owner.
+            let previous = pte_read(pt_phys, pt_idx);
+            if previous != 0 && (previous & PTE_P == 0 || previous & PTE_US != 0) {
+                return MmStatus::InvalidAddress;
+            }
+            pte_write(pt_phys, pt_idx, raw);
+            invalidate_tlb(va);
+            return MmStatus::Ok;
+        }
         let leaf = (pa & 0x000F_FFFF_FFFF_F000)
             | (flags & 0xFFF)
             | PTE_P
@@ -1498,11 +1521,11 @@ pub fn unmap_user_pages(pml4_phys: u64, va: u64, size: u64) -> MmStatus {
             }
             let pt_phys = pde_val & 0x000F_FFFF_FFFF_F000;
             let pte = pte_read(pt_phys, pt_idx);
-            if (pte & PTE_P) != 0 {
+            if pte == 0x80 {
+                pte_write(pt_phys, pt_idx, 0);
+                invalidate_tlb(cur);
+            } else if (pte & PTE_P) != 0 {
                 let pa = pte & 0x000F_FFFF_FFFF_F000;
-                if pa != 0 {
-                    pfn::free_pfn(pa >> 12);
-                }
                 pte_write(pt_phys, pt_idx, 0);
                 // NT 6.1: after clearing a PTE, the TLB must be
                 // invalidated for that virtual address.  Without this,
@@ -1510,6 +1533,7 @@ pub fn unmap_user_pages(pml4_phys: u64, va: u64, size: u64) -> MmStatus {
                 // writable until an unrelated CR3 reload evicts it —
                 // a use-after-free observable by the previous owner.
                 invalidate_tlb(cur);
+                if pa != 0 { pfn::free_pfn(pa >> 12); }
             }
         }
         cur += 0x1000;

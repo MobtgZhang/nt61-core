@@ -1452,7 +1452,7 @@ pub fn load_and_create_process(
         }
 
         // Step 5: Load the PE into the process's address space using the loader
-        let mapping = match crate::loader::load_into_user_address_space(pml4_phys, &pe_data) {
+        let mapping = match crate::loader::load_into_process_address_space(&mut *process, &pe_data) {
             Some(mapping) => mapping,
             None => {
                 boot_println!(

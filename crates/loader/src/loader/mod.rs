@@ -1991,12 +1991,56 @@ pub fn load_into_user_address_space(pml4_phys: u64, image: &[u8]) -> Option<User
     load_named_image_into_user_address_space(pml4_phys, image, "user.exe")
 }
 
+/// Load a bootstrap process image with demand-zero private writable BSS.
+/// The process must not be runnable while its mappings/VAD are installed.
+/// Other loader callers retain eager mapping until they own an image VAD.
+pub fn load_into_process_address_space(
+    process: &mut ntoskrnl::ps::process::Eprocess,
+    image: &[u8],
+) -> Option<UserImageMapping> {
+    use ntoskrnl::mm::{pool, vad::{VadEntry, VadFlags, VadProtection, VadType}, vas};
+    if process.user_image_size != 0 { return None; }
+    let root = process.pml4_phys;
+    let mapping = load_named_user_image(root, image, "user.exe", cfg!(target_arch = "x86_64"))?;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let node = pool::allocate(pool::PoolType::NonPaged, core::mem::size_of::<VadEntry>()) as *mut VadEntry;
+        let installed = if node.is_null() { false } else {
+            // SAFETY: private pool allocation, retained by the process VAD tree.
+            unsafe {
+                node.write(VadEntry::new());
+                (*node).set_range(mapping.image_base, mapping.image_base + mapping.image_size - 1);
+                (*node).flags = VadFlags::SEC_COMMIT;
+                (*node).vad_type = VadType::VadImage;
+                // Individual present leaves retain section permissions. Only
+                // explicit RW/NX zero PTEs are faulted in under this VAD.
+                (*node).protection = VadProtection::READWRITE;
+                process.vad_root.insert(&mut *node).is_ok()
+            }
+        };
+        if !installed {
+            let _ = vas::unmap_user_pages(root, mapping.image_base, mapping.image_size);
+            if !node.is_null() { unsafe { pool::free(node as *mut u8); } }
+            return None;
+        }
+    }
+    process.user_image_base = mapping.image_base;
+    process.user_image_size = mapping.image_size;
+    Some(mapping)
+}
+
 /// Load a user-mode image after running the full PE pipeline (base
 /// relocations and imports) when a global image database is available.
 pub fn load_named_image_into_user_address_space(
     pml4_phys: u64,
     image: &[u8],
     image_name: &str,
+) -> Option<UserImageMapping> {
+    load_named_user_image(pml4_phys, image, image_name, false)
+}
+
+fn load_named_user_image(
+    pml4_phys: u64, image: &[u8], image_name: &str, allow_demand_zero: bool,
 ) -> Option<UserImageMapping> {
     #[cfg(target_arch = "riscv64")]
     {
@@ -2025,7 +2069,7 @@ pub fn load_named_image_into_user_address_space(
                 return None;
             }
         };
-        match map_prebuilt_image_into_user_address_space(pml4_phys, &loaded) {
+        match map_prebuilt_image_into_user_address_space(pml4_phys, &loaded, allow_demand_zero) {
             Some(m) => Some(m),
             None => {
                 ntoskrnl::hal::serial::write_string_always("K:load-map-failed\r\n");
@@ -2338,163 +2382,104 @@ fn load_raw_image_into_user_address_space(
 fn map_prebuilt_image_into_user_address_space(
     pml4_phys: u64,
     loaded: &LoadedImage,
+    allow_demand_zero: bool,
 ) -> Option<UserImageMapping> {
+    use ntoskrnl::mm::vas;
     let prebuilt = &loaded.bytes;
     let image_base = loaded.image_base;
     let size_of_image = loaded.image_size as usize;
-    if prebuilt.is_empty() || size_of_image == 0 || image_base == 0 {
-        ntoskrnl::hal::serial::write_string_always("K:mapf-empty\r\n");
+    if prebuilt.is_empty() || size_of_image == 0 || image_base & 0xfff != 0
+        || prebuilt.len() > size_of_image
+        || !vas::user_mapping_available(image_base, size_of_image as u64)
+    {
         return None;
     }
-    // Reject non-canonical user bases: a kernel-half base must never
-    // be mapped into a user PML4.
-    if image_base >= 0x0000_8000_0000_0000 {
-        ntoskrnl::hal::serial::write_string_always("K:mapf-noncanon\r\n");
-        return None;
-    }
-    if !ntoskrnl::mm::vas::user_mapping_available(image_base, size_of_image as u64) {
-        ntoskrnl::hal::serial::write_string_always("K:mapf-kernel-collision\r\n");
-        return None;
-    }
-    let (file_hdr, _opt_size, magic, opt_off) = match parse_headers(prebuilt) {
-        Some(h) => h,
-        None => {
-            ntoskrnl::hal::serial::write_string_always("K:mapf-parsehdr\r\n");
-            return None;
-        }
-    };
-    let aep: u32 = if magic == 0x10B {
-        match read_opt32(prebuilt, opt_off) {
-            Some(v) => v.2,
-            None => {
-                ntoskrnl::hal::serial::write_string_always("K:mapf-opt32\r\n");
-                return None;
-            }
-        }
-    } else {
-        match read_opt64(prebuilt, opt_off) {
-            Some(v) => v.2,
-            None => {
-                ntoskrnl::hal::serial::write_string_always("K:mapf-opt64\r\n");
-                return None;
-            }
-        }
-    };
-
-    let page_count = size_of_image.div_ceil(0x1000);
-    let mut phys_pages: alloc::vec::Vec<u64> = alloc::vec::Vec::with_capacity(page_count);
-    for _ in 0..page_count {
-        let Some(p) = ntoskrnl::mm::vas::alloc_zeroed_page_for_vas() else {
-            ntoskrnl::hal::serial::write_string_always("K:mapf-alloc\r\n");
-            for &pa in &phys_pages {
-                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
-            }
-            return None;
-        };
-        phys_pages.push(p);
-    }
-
-    // Per-page final protection from the section table.
+    let (file_hdr, _, magic, opt_off) = parse_headers(prebuilt)?;
+    let aep = if magic == 0x10B { read_opt32(prebuilt, opt_off)?.2 }
+              else { read_opt64(prebuilt, opt_off)?.2 };
+    if aep as usize >= size_of_image { return None; }
     #[derive(Copy, Clone)]
-    struct SectInfo {
-        va_start: u64,
-        va_end: u64,
-        chars: u32,
-    }
-    let sect_off = opt_off + file_hdr.size_of_optional_header as usize;
-    let mut section_info: alloc::vec::Vec<SectInfo> =
-        alloc::vec::Vec::with_capacity(file_hdr.number_of_sections as usize);
+    struct SectInfo { start: usize, end: usize, raw_end: usize, chars: u32 }
+    let sect_off = opt_off.checked_add(file_hdr.size_of_optional_header as usize)?;
+    let mut sections = alloc::vec::Vec::with_capacity(file_hdr.number_of_sections as usize);
     for i in 0..file_hdr.number_of_sections as usize {
-        let sh_off = sect_off + i * 40;
-        if sh_off + 40 > prebuilt.len() {
-            continue;
-        }
+        let offset = sect_off.checked_add(i.checked_mul(40)?)?;
+        prebuilt.get(offset..offset.checked_add(40)?)?;
         let sh: SectionHeader = unsafe {
-            core::ptr::read_unaligned(prebuilt.as_ptr().add(sh_off) as *const SectionHeader)
+            core::ptr::read_unaligned(prebuilt.as_ptr().add(offset) as *const SectionHeader)
         };
-        if sh.virtual_size == 0 {
+        let start = sh.virtual_address as usize;
+        let end = start.checked_add(sh.virtual_size.max(sh.size_of_raw_data) as usize)?;
+        if end > size_of_image { return None; }
+        if end > start {
+            sections.push(SectInfo { start, end,
+                raw_end: start.checked_add(sh.size_of_raw_data as usize)?, chars: sh.characteristics });
+        }
+    }
+    let page_count = size_of_image.div_ceil(4096);
+    // (PA, final protection); PA=0 is an explicitly reserved demand-zero leaf.
+    let mut pages: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::with_capacity(page_count);
+    for i in 0..page_count {
+        let start = i * 4096;
+        let end = (start + 4096).min(size_of_image);
+        let mut final_flags = vas::PTE_US | vas::PTE_NX; // headers/gaps are read-only
+        let mut matching = sections.iter().filter(|s| start < s.end && end > s.start);
+        let first = matching.next();
+        let shared_page = matching.next().is_some();
+        if let Some(s) = first {
+            final_flags = determine_section_protection(s.chars);
+            // PE sections can share a page; combine all actual page permissions.
+            for s in sections.iter().filter(|s| start < s.end && end > s.start) {
+                let flags = determine_section_protection(s.chars);
+                final_flags |= flags & vas::PTE_RW;
+                if flags & vas::PTE_NX == 0 { final_flags &= !vas::PTE_NX; }
+            }
+        }
+        let zero_bss = allow_demand_zero && cfg!(target_arch = "x86_64") && !shared_page
+            && end - start == 4096
+            && first.is_some_and(|s| start >= s.raw_end && end <= s.end && start >= s.start)
+            && final_flags == (vas::PTE_US | vas::PTE_RW | vas::PTE_NX)
+            && prebuilt.get(start..end.min(prebuilt.len())).is_none_or(|bytes| bytes.iter().all(|&b| b == 0));
+        let va = image_base + start as u64;
+        if zero_bss {
+            #[cfg(target_arch = "x86_64")]
+            if vas::reserve_image_zero_page(pml4_phys, va) != vas::MmStatus::Ok {
+                let _ = vas::unmap_user_pages(pml4_phys, image_base, start as u64);
+                return None;
+            }
+            pages.push((0, final_flags));
             continue;
         }
-        let va_start = image_base + sh.virtual_address as u64;
-        let va_end = va_start + (sh.virtual_size.max(sh.size_of_raw_data)) as u64;
-        section_info.push(SectInfo {
-            va_start,
-            va_end,
-            chars: sh.characteristics,
-        });
-    }
-
-    // Initial mapping: RW+NX so bytes can be written and no stale
-    // I-cache translation can exist for this VA.
-    for (page_index, &p) in phys_pages.iter().enumerate() {
-        let page_va = image_base + (page_index as u64) * 0x1000;
-        let mut final_flags = ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_US;
-        for &s in &section_info {
-            if page_va >= s.va_start && page_va < s.va_end {
-                final_flags = determine_section_protection(s.chars);
-                break;
-            }
-        }
-        let initial_flags = final_flags | ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_NX;
-        if ntoskrnl::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, initial_flags)
-            != ntoskrnl::mm::vas::MmStatus::Ok
-        {
-            ntoskrnl::hal::serial::write_string_always("K:mapf-init-map\r\n");
-            for &pa in &phys_pages {
-                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
-            }
+        let Some(pa) = vas::alloc_zeroed_page_for_vas() else {
+            let _ = vas::unmap_user_pages(pml4_phys, image_base, start as u64);
+            return None;
+        };
+        if vas::map_page_in_pml4(pml4_phys, va, pa, final_flags | vas::PTE_RW | vas::PTE_NX) != vas::MmStatus::Ok {
+            ntoskrnl::mm::pfn::free_pfn(pa >> 12);
+            let _ = vas::unmap_user_pages(pml4_phys, image_base, start as u64);
             return None;
         }
+        pages.push((pa, final_flags));
     }
-
-    // Copy the prebuilt image (headers + sections at their RVAs) into
-    // the fresh pages via physical addresses while the system root is
-    // active, mirroring load_raw_image_into_user_address_space.
     let saved_cr3 = ntoskrnl::arch::switch_to_system_address_space();
-    for (page_index, &p) in phys_pages.iter().enumerate() {
-        let start = page_index * 0x1000;
-        if start >= prebuilt.len() {
-            break;
+    for (i, &(pa, flags)) in pages.iter().enumerate() {
+        if pa == 0 { continue; }
+        let start = i * 4096;
+        if start < prebuilt.len() {
+            let end = (start + 4096).min(prebuilt.len());
+            unsafe { core::ptr::copy_nonoverlapping(prebuilt[start..end].as_ptr(), pa as *mut u8, end - start); }
         }
-        let end = core::cmp::min(start + 0x1000, prebuilt.len());
-        unsafe {
-            let dst = p as *mut u8;
-            for (off, &b) in prebuilt[start..end].iter().enumerate() {
-                core::ptr::write_volatile(dst.add(off), b);
-            }
-        }
-    }
-
-    // NX->X transition per page so the QEMU TB cache is invalidated
-    // and real CPUs observe the new PTE (same protocol as load_raw).
-    for (i, &p) in phys_pages.iter().enumerate() {
-        let page_va = image_base + (i as u64) * 0x1000;
-        let mut final_flags = ntoskrnl::mm::vas::PTE_RW | ntoskrnl::mm::vas::PTE_US;
-        for &s in &section_info {
-            if page_va >= s.va_start && page_va < s.va_end {
-                final_flags = determine_section_protection(s.chars);
-                break;
-            }
-        }
-        let r = ntoskrnl::mm::vas::map_page_in_pml4(pml4_phys, page_va, p, final_flags);
-        if r != ntoskrnl::mm::vas::MmStatus::Ok {
-            ntoskrnl::hal::serial::write_string_always("K:mapf-final-map\r\n");
+        let va = image_base + start as u64;
+        if vas::map_page_in_pml4(pml4_phys, va, pa, flags) != vas::MmStatus::Ok {
             ntoskrnl::arch::restore_system_address_space(saved_cr3);
-            for &pa in &phys_pages {
-                ntoskrnl::mm::pfn::free_pfn(pa >> 12);
-            }
+            let _ = vas::unmap_user_pages(pml4_phys, image_base, size_of_image as u64);
             return None;
         }
-        ntoskrnl::mm::vas::invalidate_tlb(page_va);
+        vas::invalidate_tlb(va);
     }
     ntoskrnl::arch::flush_tlb();
     ntoskrnl::arch::restore_system_address_space(saved_cr3);
-
-    Some(UserImageMapping {
-        image_base,
-        image_size: size_of_image as u64,
-        entry_point: image_base + aep as u64,
-    })
+    Some(UserImageMapping { image_base, image_size: size_of_image as u64, entry_point: image_base + aep as u64 })
 }
 
 /// Map a fully-relocated `LoadedImage` into the system (kernel)

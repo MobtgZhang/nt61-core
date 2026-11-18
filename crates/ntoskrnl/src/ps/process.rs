@@ -2035,6 +2035,8 @@ pub fn process_exit(exit_code: u32) -> ! {
                     );
                 }
 
+                release_bootstrap_image(process);
+
                 let process_ptr = process as *mut Eprocess;
 
                 // Remove the process while its EPROCESS memory is still
@@ -2187,6 +2189,8 @@ pub fn terminate_process(pid: u64, exit_code: i32) -> bool {
         let handle_table = process.object_table;
         let main_thread = process.main_thread;
 
+        release_bootstrap_image(process);
+
         // Registry readers may operate on the thread while holding its lock.
         // Unpublish before freeing either allocation, so those readers finish
         // before teardown can release their alert state and process storage.
@@ -2206,6 +2210,34 @@ pub fn terminate_process(pid: u64, exit_code: i32) -> bool {
     }
     free_pid(pid);
     true
+}
+
+/// Release the private image installed by the bootstrap loader. The caller
+/// must have stopped the process before removing its VAD and page ownership.
+/// Other image paths, without this exact VadImage, retain their own lifecycle.
+fn release_bootstrap_image(process: &mut Eprocess) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let base = process.user_image_base;
+        let size = process.user_image_size;
+        let Some(end) = base.checked_add(size).and_then(|e| e.checked_sub(1)) else { return; };
+        if base == 0 || size == 0 || process.pml4_phys == 0 { return; }
+        let Some(node) = process.vad_root.find_by_start(base >> 12) else { return; };
+        // SAFETY: the stopped process exclusively owns this pool VAD. Remove
+        // it under the tree lock before clearing markers or releasing frames.
+        unsafe {
+            if (*node).vad_type != VadType::VadImage || (*node).ending_vpn != end >> 12 {
+                return;
+            }
+            if process.vad_root.remove(&mut *node).is_err() { return; }
+            let _ = crate::mm::vas::unmap_user_pages(process.pml4_phys, base, size);
+            crate::mm::pool::free(node as *mut u8);
+        }
+        process.user_image_base = 0;
+        process.user_image_size = 0;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = process;
 }
 
 /// Remove a terminated process from PROCESS_LIST and compact the array.

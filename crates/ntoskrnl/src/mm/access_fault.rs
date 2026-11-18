@@ -77,6 +77,8 @@ pub enum FaultStatus {
 /// disabled. It walks the page table to resolve the fault.
 #[cfg(target_arch = "x86_64")]
 pub fn handle(va: u64, access: AccessFlags) -> FaultStatus {
+    if access.reserved_bit { return FaultStatus::AccessViolation; }
+    if let Some(status) = try_image_zero(va, access) { return status; }
     // Canonicalise: anything above 0x0000_7FFF_FFFF_FFFF and below
     // 0xFFFF_8000_0000_0000 is a non-canonical hole. The CPU should
     // not get here in the first place, but check defensively.
@@ -99,6 +101,29 @@ pub fn handle(va: u64, access: AccessFlags) -> FaultStatus {
     }
     let pte = unsafe { *pte_ptr };
     resolve_pte(pte, va, pte_ptr, access)
+}
+
+#[cfg(target_arch = "x86_64")]
+mod image_zero;
+
+/// The process and its VAD lock retain image commitment through installation.
+/// This is also called before expensive diagnostics for recoverable BSS faults.
+#[cfg(target_arch = "x86_64")]
+pub fn try_image_zero(va: u64, access: AccessFlags) -> Option<FaultStatus> {
+    if !access.user || !crate::mm::vas::user_mapping_available(va & !4095, 4096) { return None; }
+    let process = crate::arch::common::percpu::get_current_process();
+    if process.is_null() { return None; }
+    // SAFETY: the running thread owns a reference to its process.
+    let process = unsafe { &*process };
+    // Direct user entry and assembly context switches write the hardware
+    // root without updating the bootstrap attach/detach mirror. Validate
+    // against the executing CPU, never the process-global cached value.
+    if process.pml4_phys != crate::arch::read_current_page_root() { return Some(FaultStatus::AccessViolation); }
+    process.vad_root.with_entry(va, |vad| {
+        if vad.vad_type == crate::mm::vad::VadType::VadImage {
+            image_zero::resolve(process.pml4_phys, va, access, vad)
+        } else { None }
+    }).flatten()
 }
 
 // Native formats are walked by their ISA implementations. Only the x86 path
@@ -226,6 +251,9 @@ fn walk_user_page_table(va: u64) -> Option<*mut MMPTE> {
 
 /// Decide what to do based on the PTE type.
 fn resolve_pte(pte: MMPTE, va: u64, pte_ptr: *mut MMPTE, access: AccessFlags) -> FaultStatus {
+    // Image READWRITE demand-zero PTEs require the owning image VAD and the
+    // checked private-image path. Never treat an orphan marker as a pagefile.
+    if pte.raw() == 0x80 { return FaultStatus::AccessViolation; }
     if pte.is_hardware() {
         return resolve_hardware(pte, va, pte_ptr, access);
     }
