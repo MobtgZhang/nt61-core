@@ -15,6 +15,7 @@ struct WindowGlass {
     id: u32,
     bounds: Rect,
     extension: u32,
+    footer: u32,
     strips: Vec<GlassStrip>,
 }
 
@@ -51,16 +52,22 @@ impl WindowGlassCache {
         extension: u32,
         refresh: bool,
     ) {
+        self.prepare_extended(backdrop,id,bounds,extension,0,refresh);
+    }
+
+    /// Extend DWM glass into the Photo Viewer transport strip as well as the caption.
+    pub fn prepare_extended(&mut self,backdrop:&Surface,id:u32,bounds:Rect,extension:u32,footer:u32,refresh:bool) {
         let index = self.windows.iter().position(|window| window.id == id);
         if let Some(index) = index {
             let window = &self.windows[index];
-            if !refresh && window.bounds == bounds && window.extension == extension {
+            if !refresh && window.bounds == bounds && window.extension == extension && window.footer==footer {
                 return;
             }
         }
         let rim = 6.min(bounds.width / 2).min(bounds.height / 2);
         let top = (30 + extension).min(bounds.height.saturating_sub(rim));
-        let side_height = bounds.height.saturating_sub(top + rim);
+        let bottom=(rim+footer).min(bounds.height.saturating_sub(top));
+        let side_height = bounds.height.saturating_sub(top + bottom);
         let strips = [
             Rect::new(bounds.x, bounds.y, bounds.width, top),
             Rect::new(bounds.x, bounds.y + top as i32, rim, side_height),
@@ -72,9 +79,9 @@ impl WindowGlassCache {
             ),
             Rect::new(
                 bounds.x,
-                bounds.y + (bounds.height - rim) as i32,
+                bounds.y + (bounds.height - bottom) as i32,
                 bounds.width,
-                rim,
+                bottom,
             ),
         ]
         .into_iter()
@@ -84,6 +91,7 @@ impl WindowGlassCache {
             id,
             bounds,
             extension,
+            footer,
             strips,
         };
         if let Some(index) = index {
@@ -197,6 +205,22 @@ fn inflate(rect: Rect, radius: u32) -> Rect {
 mod tests {
     use super::*;
 
+    #[test]
+    fn photo_footer_samples_the_backdrop_and_invalidates_its_cache() {
+        let mut backdrop=Surface::new(120,120);backdrop.fill_rect(0,0,120,120,0xff507ca1);
+        let bounds=Rect::new(10,10,100,100);let mut cache=WindowGlassCache::default();
+        cache.prepare(&backdrop,1,bounds,0,true);
+        let mut frame=backdrop.clone();cache.paint(&mut frame,1,true);
+        assert_eq!(frame.pixel(50,85),backdrop.pixel(50,85));
+        cache.prepare_extended(&backdrop,1,bounds,0,32,false);
+        frame.copy_from(&backdrop);cache.paint(&mut frame,1,true);
+        assert_ne!(frame.pixel(50,85),backdrop.pixel(50,85));
+        assert_eq!(frame.pixel(50,60),backdrop.pixel(50,60));
+        assert!(cache.intersects_blur(Rect::new(50,85,1,1),|_|true));
+        cache.prepare_extended(&backdrop,1,bounds,0,0,false);
+        frame.copy_from(&backdrop);cache.paint(&mut frame,1,true);
+        assert_eq!(frame.pixel(50,85),backdrop.pixel(50,85));
+    }
     #[test]
     fn clipped_hover_replay_matches_full_composition_at_every_screen_edge() {
         for bounds in [Rect::new(-20, -10, 100, 80), Rect::new(40, 30, 100, 80)] {

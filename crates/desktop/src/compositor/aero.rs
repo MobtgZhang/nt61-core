@@ -495,6 +495,28 @@ pub fn window_control_button(
 
 /// Explorer's translucent icon highlight: pale border, inner highlight and
 /// a blue lower gradient. It must be composited before the icon itself.
+pub fn desktop_selection(surface: &mut Surface, b: Rect, selected: bool, hovered: bool) {
+    if hovered {
+        selection(surface, b, selected, hovered);
+    }
+}
+
+#[cfg(test)]
+mod desktop_selection_tests {
+    use super::*;
+
+    #[test]
+    fn moving_away_from_a_clicked_icon_restores_the_wallpaper() {
+        let mut background = Surface::new(96, 96);
+        background.fill_rect(0, 0, 96, 96, 0xff327ca4);
+        let mut frame = background.clone();
+        desktop_selection(&mut frame, Rect::new(8, 8, 72, 80), true, false);
+        assert!(frame == background, "selection must not leave a hover shadow");
+        desktop_selection(&mut frame, Rect::new(8, 8, 72, 80), true, true);
+        assert_ne!(frame, background);
+    }
+}
+
 pub fn selection(surface: &mut Surface, b: Rect, selected: bool, hovered: bool) {
     let border = if selected { 0xD06C_AAD9 } else { 0xA0D7_EEFF };
     surface.blend_rounded_rect(b, 3, border);

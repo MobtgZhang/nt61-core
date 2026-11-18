@@ -17,6 +17,8 @@ pub fn draw(frame: &mut Surface, id: AppId, b: Rect) {
 }
 pub fn rgba(id: AppId) -> &'static [u8] {
     match id {
+        AppId::PhotoViewer => &super::system_icons::PHOTO_RGBA,
+        AppId::DeviceManager => &super::system_icons::DEVICE_RGBA,
         AppId::MediaPlayer => &super::media_player::icon::RGBA,
         AppId::Calculator => include_bytes!("calculator/resources/icon.rgba"),
         AppId::Paint => include_bytes!("paint/resources/icon.rgba"),
@@ -78,6 +80,8 @@ macro_rules! native_icon {
 
 fn sized(id: AppId, size: u32) -> (&'static [u8], u32) {
     match id {
+        AppId::PhotoViewer => match size {0..=16 => (&super::system_icons::PHOTO_16,16),17..=32 => (&super::system_icons::PHOTO_32,32),_ => (&super::system_icons::PHOTO_RGBA,64)},
+        AppId::DeviceManager => match size {0..=16 => (&super::system_icons::DEVICE_16,16),17..=32 => (&super::system_icons::DEVICE_32,32),_ => (&super::system_icons::DEVICE_RGBA,64)},
         AppId::MediaPlayer => (&super::media_player::icon::RGBA,64),
         AppId::Calculator => native_icon!("calculator", size),
         AppId::Paint => native_icon!("paint", size),

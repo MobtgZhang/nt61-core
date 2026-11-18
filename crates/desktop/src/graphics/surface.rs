@@ -130,12 +130,37 @@ impl Surface {
         if pixel_count > MAX_SURFACE_PIXELS {
             return None;
         }
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(pixel_count).ok()?;
+        pixels.resize(pixel_count, 0);
         Some(Self {
             width,
             height,
-            pixels: alloc::vec![0; pixel_count],
+            pixels,
             draw_clip: None,
         })
+    }
+
+    /// Native-endian storage for decoders that write directly into the surface.
+    /// Callers must convert the decoded byte order to ARGB before drawing it.
+    pub(crate) fn pixel_storage_bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: u32 has no invalid bit patterns; the initialized Vec exclusively
+        // owns this contiguous allocation. The borrow prevents any simultaneous
+        // pixel access or reallocation, and a byte slice needs no extra alignment.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.pixels.as_mut_ptr().cast(),
+                self.pixels.len() * core::mem::size_of::<u32>(),
+            )
+        }
+    }
+
+    /// Convert an RGBA decoder's bytes to the surface's native ARGB pixels.
+    pub(crate) fn finish_rgba_decode(&mut self) {
+        for pixel in &mut self.pixels {
+            let [r, g, b, a] = pixel.to_ne_bytes();
+            *pixel = u32::from_be_bytes([a, r, g, b]);
+        }
     }
 
     pub fn set_draw_clip(&mut self, clip: Option<Rect>) {
