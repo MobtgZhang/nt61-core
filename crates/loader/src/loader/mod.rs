@@ -725,6 +725,8 @@ fn read_opt32(image: &[u8], opt_off: usize) -> Option<(u64, u32, u32, u16)> {
     Some((img_base, soi, aep, subsys))
 }
 
+mod image_bounds;
+
 /// Map a file PE into memory and return a fully loaded image with
 /// all sections copied, base relocations applied, and import
 /// tables resolved through `image_db`. This is the OS Loader's
@@ -751,12 +753,6 @@ pub fn load_image_full(
     if size_of_image == 0 || bytes.len() < 0x40 + 4 {
         return None;
     }
-    // size_of_image comes from the file, so an image can claim a huge size and
-    // exhaust the kernel pool here. Cap it at a sane maximum.
-    const MAX_IMAGE_SIZE: usize = 128 * 1024 * 1024;
-    if size_of_image as usize > MAX_IMAGE_SIZE {
-        return None;
-    }
     unsafe {
         ntoskrnl::mm::heap::KERNEL_HEAP.debug_free_list();
     }
@@ -767,7 +763,7 @@ pub fn load_image_full(
         bytes[opt_off + 0x3E],
         bytes[opt_off + 0x3F],
     ]) as usize;
-    let mut initialized_extent = header_extent.min(size_of_image as usize);
+    let mut section_layout = Vec::with_capacity(file_hdr.number_of_sections as usize);
     for i in 0..file_hdr.number_of_sections as usize {
         let sh_off = sect_table_off + i * 40;
         if sh_off + 40 > bytes.len() {
@@ -776,15 +772,21 @@ pub fn load_image_full(
         let section: SectionHeader = unsafe {
             core::ptr::read_unaligned(bytes.as_ptr().add(sh_off) as *const SectionHeader)
         };
-        if section.size_of_raw_data == 0 {
-            continue;
+        let raw_end = (section.pointer_to_raw_data as usize)
+            .checked_add(section.size_of_raw_data as usize)?;
+        if section.size_of_raw_data != 0 && raw_end > bytes.len() {
+            return None;
         }
-        let section_end = section.virtual_address as usize
-            + section
-                .size_of_raw_data
-                .min(size_of_image.saturating_sub(section.virtual_address)) as usize;
-        initialized_extent = initialized_extent.max(section_end);
+        section_layout.push((section.virtual_address as usize,
+            section.virtual_size as usize, section.size_of_raw_data as usize));
     }
+    let headers = if header_extent == 0 {
+        (sect_table_off + file_hdr.number_of_sections as usize * 40).min(4096)
+    } else { header_extent };
+    // Large private BSS reserves address space; it does not consume this buffer.
+    // Validate section extents before any RVA-sized allocation as well.
+    let initialized_extent = image_bounds::initialized_extent(
+        size_of_image as usize, headers, section_layout)?;
     let mut img = alloc::vec![0; initialized_extent];
     // `loaded.bytes` is addressed by RVA.  The headers live at RVA 0 and
     // are not part of any section, so they must be copied explicitly.
