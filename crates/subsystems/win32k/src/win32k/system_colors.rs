@@ -7,16 +7,9 @@ use crate::{arch::common::syscall_frame::SyscallFrame, ke::sync::Spinlock, mm::u
 use super::objects::{self, GdiBrush};
 
 pub const COLOR_COUNT: usize = 31;
-// Preserve this system's existing palette defaults. Theme/registry loading is
-// separate; these are not claimed to be an original Windows theme snapshot.
-const DEFAULTS: [u32; COLOR_COUNT] = [
-    0x00e1e4e0, 0x00c8c3b7, 0x00994e2e, 0x00bfc8d3, 0x00f0f0f0,
-    0x00f0f0f0, 0x00646a6f, 0, 0, 0, 0x00c0c0c0,
-    0x00c0c0c0, 0x00ababab, 0x00ff9933, 0x00ffffff, 0x00f0f0f0,
-    0x00a0a0a0, 0x006d6d6d, 0, 0, 0x00ffffff, 0x00696969,
-    0x00e3e3e3, 0, 0x00e1ffff, 0, 0x00cc6600, 0x00ead1b9,
-    0x00f2e4d7, 0x00ff9933, 0x00f0f0f0,
-];
+// Default Basic/96-DPI colors measured in the pinned original SP1 guest.
+// Keep requested/realized mutable state for the existing color/brush consumers.
+const DEFAULTS: [u32; COLOR_COUNT] = nt61_win32_metrics::BASIC_96_COLORS;
 
 struct SystemColors {
     requested: [u32; COLOR_COUNT],

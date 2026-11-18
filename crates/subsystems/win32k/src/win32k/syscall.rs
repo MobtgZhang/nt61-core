@@ -1127,43 +1127,7 @@ pub extern "C" fn nt_user_dispatch_message(frame: &SyscallFrame) -> u64 {
     result as u64
 }
 
-/// NtUserGetSystemMetrics - Get system metrics
-pub extern "C" fn nt_user_get_system_metrics(frame: &SyscallFrame) -> u64 {
-    let n_index = unsafe { get_arg0(frame) };
-    let _ = &n_index;
-
-    // kprintln!("[win32k] NtUserGetSystemMetrics(n_index={})", n_index);
-
-    let primary = crate::libs::win32k::surface::get_primary_surface();
-    let (width, height) = if primary.is_null() {
-        (800, 600)
-    } else {
-        let surface = unsafe { &*primary };
-        (surface.width as u64, surface.height as u64)
-    };
-
-    match n_index as i32 {
-        0 => width,
-        1 => height,
-        4 => 1,
-        5 => 1,
-        6 => 17,
-        7 => 17,
-        8 => 8,
-        9 => 8,
-        10 => 18,
-        11 => 18,
-        13 => 4,
-        14 => 4,
-        15 => 2,
-        16 => 2,
-        17 => 2,
-        18 => 2,
-        68 => width,
-        69 => height,
-        _ => 0,
-    }
-}
+pub use super::system_metrics::nt_user_get_system_metrics;
 
 /// NT_USER_SYSTEM_PARAMETERS_INFO - System parameters
 pub extern "C" fn nt_user_system_parameters_info(frame: &SyscallFrame) -> u64 {

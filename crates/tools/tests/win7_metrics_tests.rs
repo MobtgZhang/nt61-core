@@ -1,14 +1,6 @@
-//! Validation of `docs/desktop/win7-metrics.toml`.
-//!
-//! The metrics file is the single source of truth for every pixel-level
-//! decision in the NT61 desktop. If it drifts, the whole shell drifts
-//! with it, so the file is validated here rather than trusted.
-//!
-//! The checks are split into three groups:
-//!   * **schema** — every required key exists and has the right type;
-//!   * **values** — the numbers actually match Windows 7 SP1;
-//!   * **cross-section** — derived relationships (e.g. the start menu's
-//!     two pane widths must fit inside the menu) hold.
+//! Desktop parameter schema checks and independently captured SP1 metrics.
+//! Exact checks of legacy rendering parameters detect configuration drift only;
+//! they do not establish Windows 7 pixel or timing conformance.
 
 use std::path::PathBuf;
 
@@ -113,38 +105,26 @@ fn meta_declares_windows_7_sp1() {
 }
 
 #[test]
-fn system_metrics_match_windows_7_values() {
+fn system_metrics_match_original_sp1_capture() {
     let metrics = load_metrics();
-    // The exact Win7 SP1 x64 values for the SM_* indices the desktop
-    // relies on. These are the numbers GetSystemMetrics must return.
-    let expected: &[(&str, i64)] = &[
-        ("sm_cxframe", 8),
-        ("sm_cyframe", 8),
-        ("sm_cxcaption", 22),
-        ("sm_cycaption", 22),
-        ("sm_cymenu", 19),
-        ("sm_cxscrollbar", 17),
-        ("sm_cyscrollbar", 17),
-        ("sm_cxicon", 32),
-        ("sm_cyicon", 32),
-        ("sm_cxiconv", 16),
-        ("sm_cyiconv", 16),
-        ("sm_cxsize", 26),
-        ("sm_cysize", 26),
-        ("sm_cxdoubleclk", 4),
-        ("sm_cydoubleclk", 4),
-    ];
-    for (key, value) in expected {
-        assert_eq!(
-            int_at(&metrics, "screen", key),
-            *value,
-            "screen.{key} must be the Windows 7 value {value}"
-        );
+    let path = metrics_path().parent().unwrap()
+        .join("baselines/win7-sp1-window-placement/metrics.json");
+    let capture: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(capture["dpi"], serde_json::json!([96, 96]));
+    assert_eq!(capture["dwm_composition"], false);
+    let original = capture["metrics"].as_object().unwrap();
+    let recorded = table(&metrics, "reference_system_metrics");
+    assert_eq!(recorded.len(), original.len());
+    for (name, value) in original {
+        assert_eq!(int_at(&metrics, "reference_system_metrics", &name.to_ascii_lowercase()),
+            value.as_i64().unwrap(), "original SP1 {name}");
     }
+    assert!(!table(&metrics, "screen").keys().any(|key| key.starts_with("sm_")),
+        "unmeasured/invalid legacy SM aliases must not reappear as system metrics");
 }
 
 #[test]
-fn taskbar_and_caption_metrics_match_windows_7() {
+fn legacy_taskbar_and_caption_parameters_remain_stable() {
     let metrics = load_metrics();
     assert_eq!(int_at(&metrics, "screen", "taskbar_height"), 40);
     assert_eq!(int_at(&metrics, "screen", "taskbar_button_width"), 160);
@@ -164,7 +144,7 @@ fn taskbar_and_caption_metrics_match_windows_7() {
 }
 
 #[test]
-fn aero_glass_parameters_match_windows_7() {
+fn legacy_aero_parameters_remain_stable_without_a_pixel_conformance_claim() {
     let metrics = load_metrics();
     assert_eq!(rgb_at(&metrics, "aero", "glass_tint"), [0x1E, 0x40, 0x7A]);
     assert_eq!(float_at(&metrics, "aero", "glass_tint_alpha"), 0.55);

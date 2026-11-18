@@ -320,6 +320,26 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
     p.values[1] = w::ACCEPTED;
     p.values[19] = 0;
     let action = p.values[4];
+    if action == w::SYSTEM_COLOR {
+        // The guest desktop currently supports the captured Basic defaults.
+        // Native USER consumers use win32k's mutable system palette; theme and
+        // per-user color updates still need a shared session settings service.
+        let color = nt61_win32_metrics::BASIC_96_COLORS
+            .get(p.values[6] as usize).copied().unwrap_or(0);
+        scalar(p, color as u64);
+        return;
+    }
+    if action == w::SYSTEM_METRICS {
+        let width = shell.viewport.0.min(i32::MAX as u32) as i32;
+        let height = shell.viewport.1.min(i32::MAX as u32) as i32;
+        let value = nt61_win32_metrics::Display {
+            width, height, work_width: width,
+            work_height: height.saturating_sub(crate::shell::TASKBAR_HEIGHT as i32).max(0),
+            max_track_padding: shell.metrics.max_track_padding(),
+    }.basic_96_metric(p.values[6] as i32);
+        scalar(p, value as u32 as u64);
+        return;
+    }
     let hwnd = p.values[5];
     let parent = p.values[6];
     let client = p.values[63];
@@ -681,6 +701,30 @@ mod tests {
  use crate::theme::Theme;
  fn call(shell:&mut ShellModel,action:u32,hwnd:u32,parent:u32,kind:u32,msg:u32,wp:u64,lp:u64,text:&str)->w::Packet{
     let mut p=w::EMPTY;p.values[0]=w::WINDOW;p.values[4]=action;p.values[5]=hwnd;p.values[6]=parent;p.values[7]=kind;p.values[8]=msg;p.values[9]=wp as u32;p.values[10]=(wp>>32)as u32;p.values[11]=lp as u32;p.values[12]=(lp>>32)as u32;p.values[63]=41;p.values[15]=640;p.values[16]=460;p.values[18]=0x10000000;p.set_string(0,text);execute(shell,&mut p);assert_eq!(p.values[19],0);p
+ }
+ #[test]
+ fn metrics_query_needs_no_hwnd_and_follows_current_viewport() {
+    let mut shell=ShellModel::new(Theme::aero());
+    let before=shell.applications.len();
+    for ((width,height),index,expected) in [((800,600),0,800),((1024,768),1,768),((1024,768),17,706),((1024,768),61,1040),((1024,768),59,1036),((800,600),59,812),((1024,768),68,4),((1024,768),-1,0)] {
+        shell.refresh_controls(width,height);
+        let mut p=w::EMPTY;p.values[4]=w::SYSTEM_METRICS;p.values[6]=index as u32;
+        execute(&mut shell,&mut p);
+        assert_eq!(p.values[1],w::ACCEPTED);assert_eq!(p.values[19],0);assert_eq!(p.values[20],expected);
+        assert_eq!(p.values[21],0);assert_eq!(shell.applications.len(),before);
+    }
+ }
+ #[test]
+ fn default_system_colors_match_original_capture_without_creating_a_window() {
+    let mut shell = ShellModel::new(Theme::aero());
+    for index in -1i32..=31 {
+        let mut p=w::EMPTY;p.values[4]=w::SYSTEM_COLOR;p.values[6]=index as u32;
+        execute(&mut shell,&mut p);
+        let expected = if (0..31).contains(&index) { nt61_win32_metrics::BASIC_96_COLORS[index as usize] } else { 0 };
+        assert_eq!(p.values[20], expected, "index={index}");
+        assert_eq!(p.values[1], w::ACCEPTED);assert_eq!(p.values[19],0);
+        assert_eq!(p.values[21],0);assert!(shell.applications.is_empty());
+    }
  }
  #[test]
  fn hwnd_models_messages_notifications_and_client_isolation(){

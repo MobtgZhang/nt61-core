@@ -68,6 +68,7 @@ pub mod pen_services;
 pub mod object_queries;
 pub mod object_enumeration;
 pub mod system_colors;
+pub mod system_metrics;
 pub mod polygon;
 pub mod raster;
 pub mod region;

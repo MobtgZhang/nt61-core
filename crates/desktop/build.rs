@@ -42,6 +42,8 @@ fn main() {
         ("POWER_BUTTON_WIDTH", "start_menu.power_button_width"),
         ("POWER_ARROW_WIDTH", "start_menu.power_arrow_width"),
         ("POWER_BUTTON_HEIGHT", "start_menu.power_button_height"),
+        ("MAXIMIZED_FRAME_X", "reference_system_metrics.sm_cxframe"),
+        ("MAXIMIZED_FRAME_Y", "reference_system_metrics.sm_cyframe"),
     ] {
         let value = values
             .get(key)

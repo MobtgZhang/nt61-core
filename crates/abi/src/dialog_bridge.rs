@@ -55,3 +55,9 @@ impl Packet {
         bytes.fill(0); bytes[..text.len()].copy_from_slice(text.as_bytes()); true
     }
 }
+
+/// WINDOW action for a read-only system metric query (index in value 6).
+pub const SYSTEM_METRICS: u32 = 10;
+
+/// WINDOW action for a read-only default system color (signed index in value 6).
+pub const SYSTEM_COLOR: u32 = 11;

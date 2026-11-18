@@ -102,8 +102,9 @@ pub fn test_class_register() -> bool {
 }
 
 pub fn test_get_system_metrics() -> bool {
-    input::get_system_metrics(input::sm::SM_CXSCREEN) == 1024
-        && input::get_system_metrics(input::sm::SM_CYSCREEN) == 768
+    input::get_system_metrics(input::sm::SM_CXSCREEN) > 0
+        && input::get_system_metrics(input::sm::SM_CYSCREEN) > 0
+        && input::get_system_metrics(input::sm::SM_CXDRAG) == 4
 }
 
 pub fn test_keyboard_state() -> bool {

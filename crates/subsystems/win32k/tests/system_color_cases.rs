@@ -32,6 +32,8 @@ fn shared_system_colors_capture_inputs_update_live_brush_pixels_and_repaint_cons
 
     assert_eq!(set(&[5], &[0xa2112233], 1, 0), 1);
     assert_eq!(get_sys_color(5), 0x00112233);
+    assert_eq!(user32_input::get_sys_color(5), 0x00112233);
+    assert_eq!(user32_input::get_sys_color(-1), 0);
     assert_eq!(set(&[5, 6], &[0, 0x01000001], 2, 0), 0);
     assert_eq!(get_sys_color(5), 0x00112233);
     assert!(set_system_colors(&[5], &[original[5]], 0));

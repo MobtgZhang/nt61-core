@@ -41,6 +41,9 @@ pub mod object_enumeration;
 mod object_enumeration_cases;
 #[path = "../src/win32k/system_colors.rs"]
 pub mod system_colors;
+#[path = "../src/win32k/system_metrics.rs"]
+pub mod system_metrics;
+mod system_metrics_cases;
 mod system_color_cases;
 
 #[path = "mapping_cases.rs"]
@@ -112,7 +115,7 @@ pub mod polygon;
 
 mod libs {
     pub mod win32k {
-        pub use crate::{clipboard, dc, input_services, objects, surface, window};
+        pub use crate::{clipboard, dc, input_services, objects, surface, window, system_metrics, system_colors};
         pub mod message {
             pub use crate::message::{MessageQueue, Msg};
             pub static POSTED: std::sync::Mutex<Vec<(u64, u32, u64, i64)>> = std::sync::Mutex::new(Vec::new());
@@ -138,8 +141,12 @@ mod hal {
                 pub pitch: u32,
                 pub address: usize,
             }
+            std::thread_local! {
+                pub static TEST_DISPLAY: core::cell::Cell<(u32,u32)> = const { core::cell::Cell::new((0,0)) };
+            }
             pub fn info() -> Info {
-                Info::default()
+                let (width,height) = TEST_DISPLAY.with(|display| display.get());
+                Info { width,height,..Info::default() }
             }
         }
     }

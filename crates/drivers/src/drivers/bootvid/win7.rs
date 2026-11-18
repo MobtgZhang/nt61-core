@@ -423,6 +423,7 @@ pub fn change_display_mode(width:u32,height:u32) -> bool {
     super::FB_HEIGHT.store(height, Ordering::Release);
     super::FB_PITCH.store(info.pitch, Ordering::Release);
     crate::drivers::input::virtio_input::set_mouse_screen_bounds(width,height);
+    nt61_win32_metrics::record_display_mode_change();
     true
 }
 
