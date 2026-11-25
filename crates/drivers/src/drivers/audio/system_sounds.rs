@@ -11,6 +11,7 @@ pub const EVENTS: &[(&str, &str)] = &[
     ("default", "Windows Default.wav"),
     ("error", "Windows Critical Stop.wav"),
     ("exclamation", "Windows Exclamation.wav"),
+    ("information", "Windows Ding.wav"),
     ("notify", "Windows Notify.wav"),
     ("device-connect", "Windows Hardware Insert.wav"),
     ("device-disconnect", "Windows Hardware Remove.wav"),
@@ -131,6 +132,33 @@ pub fn play(event: &str) -> Result<u64, u32> {
         return Err(0xC00000BB);
     }
     Ok(pcm.len() as u64 * 1000 / 96000)
+}
+
+pub fn message_beep(kind: u32) -> bool {
+    let event = match kind {
+        u32::MAX => None,
+        0 | 0x20 => Some("default"),
+        0x10 => Some("error"),
+        0x30 => Some("exclamation"),
+        0x40 => Some("information"),
+        _ => return false,
+    };
+    if !configuration().enabled {
+        return true;
+    }
+    if event.is_some_and(|event| play(event).is_ok() || (event != "default" && play("default").is_ok())) {
+        return true;
+    }
+    if !super::hda_pcm::ready() {
+        return false;
+    }
+    let mut tone = Vec::with_capacity(4800 * 2);
+    for frame in 0..4800 {
+        let amplitude = ((4800 - frame) * 2048 / 4800) as i16;
+        let sample = if frame * 800 % 48000 < 24000 { amplitude } else { -amplitude };
+        tone.extend_from_slice(&[sample, sample]);
+    }
+    super::hda_pcm::submit(&tone) == tone.len()
 }
 
 #[cfg(test)]

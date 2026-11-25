@@ -7,6 +7,7 @@ use crate::{
     widgets::{
         combo_box::ComboBox,
         popup_menu::{PopupItem, PopupKey, PopupResult},
+        textbox::TextBox,
     },
 };
 use alloc::{
@@ -25,6 +26,12 @@ enum Model {
     },
     Text(String),
     Button(String),
+    Edit {
+        contents: TextBox,
+        multiline: bool,
+        read_only: bool,
+        modified: bool,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Control {
@@ -44,6 +51,12 @@ pub struct Scene {
     controls: Vec<Control>,
     events: Vec<w::Packet>,
     focus: Option<u32>,
+    hidden_minimized: Option<bool>,
+    minimized_position: [i32; 2],
+    maximized_position: [i32; 2],
+    enabled: bool,
+    close_enabled: bool,
+    dialog: bool,
     body:Rect,
     capture:Option<u32>,
 }
@@ -73,7 +86,7 @@ impl Scene {
         self.events.push(p);
     }
     pub fn close_request(&mut self) {
-        if !self.events.iter().any(|p| p.values[8] == 0x10) {
+        if self.enabled && self.close_enabled && !self.events.iter().any(|p| p.values[8] == 0x10) {
             self.event(self.hwnd, 0x10, 0, 0);
         }
     }
@@ -156,6 +169,23 @@ impl Scene {
                 Model::Bar(v) => v.draw(frame, r, text),
                 Model::Combo { combo, .. } => combo.draw(frame, r, text),
                 Model::Text(s) => text(frame, s, r, 0xff000000),
+                Model::Edit { contents, .. } => {
+                    frame.fill_rect(r.x, r.y, r.width, r.height, 0xffffffff);
+                    if let Some(edit_clip) = clip.intersection(&r) {
+                        frame.set_draw_clip(Some(edit_clip));
+                        let mut y = r.y + 3;
+                        for line in contents.text.split('\n') {
+                            if y >= r.y + r.height as i32 {
+                                break;
+                            }
+                            text(frame, line.trim_end_matches('\r'),
+                                Rect::new(r.x + 4, y, r.width.saturating_sub(8), 20),
+                                0xff000000);
+                            y += 20;
+                        }
+                        frame.set_draw_clip(Some(clip));
+                    }
+                }
                 Model::Button(s) => {
                     crate::compositor::aero::menu_item(frame, r, true);
                     text(
@@ -180,6 +210,7 @@ impl Scene {
         frame.set_draw_clip(Some(old));
     }
     pub fn pointer(&mut self, body: Rect, x: i32, y: i32, down: bool, held: bool) {
+        if !self.enabled { return; }
         self.body=body;
         let release = !down && !held;
         let popup = self
@@ -254,6 +285,7 @@ impl Scene {
     }
     pub fn key(&mut self, key: u8) {
         use super::explorer::input;
+        if !self.enabled { return; }
         let common = match key {
             input::UP => Some(CommonKey::Up),
             input::DOWN => Some(CommonKey::Down),
@@ -268,6 +300,10 @@ impl Scene {
             _ => None,
         };
         if key==27{for c in &mut self.controls{if let Model::Combo{combo,..}=&mut c.model{if combo.popup().is_open(){combo.close();return;}}}}
+        if self.dialog && key == 27 {
+            self.event(self.hwnd, 0x111, 2, 0);
+            return;
+        }
         if key == 9 {
             let next = self
                 .controls
@@ -283,10 +319,35 @@ impl Scene {
         if let Some(index) = self
             .controls
             .iter()
-            .position(|c| Some(c.hwnd) == self.focus)
+            .position(|c| Some(c.hwnd) == self.focus && c.visible && c.enabled)
         {
             let c = &mut self.controls[index];
             let (hwnd, id) = (c.hwnd, c.id);
+            if let Model::Edit { contents, multiline, read_only, modified } = &mut c.model {
+                let changed = match key {
+                    input::LEFT => { contents.move_cursor_left(); false }
+                    input::RIGHT => { contents.move_cursor_right(); false }
+                    input::CTRL_HOME => { contents.cursor = 0; false }
+                    input::CTRL_END => { contents.cursor = contents.text.chars().count(); false }
+                    8 | 127 if !*read_only => contents.backspace(),
+                    input::DELETE if !*read_only && contents.move_cursor_right() => contents.backspace(),
+                    13 if *multiline && !*read_only && contents.text.len() + 2 < w::EMPTY.text[0].len() => {
+                        contents.insert('\r');
+                        contents.insert('\n');
+                        true
+                    }
+                    b' '..=b'~' if !*read_only && contents.text.len() + 1 < w::EMPTY.text[0].len() => {
+                        contents.insert(char::from(key));
+                        true
+                    }
+                    _ => false,
+                };
+                if changed {
+                    *modified = true;
+                    self.event(self.hwnd, 0x0111, u64::from((id & 0xffff) | 0x0300_0000), u64::from(hwnd));
+                }
+                return;
+            }
             if let Some(key) = common {
                 let anchor=Self::bounds(c,self.body);
                 let n = match &mut c.model {
@@ -320,6 +381,12 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
     p.values[1] = w::ACCEPTED;
     p.values[19] = 0;
     let action = p.values[4];
+    if action == w::CURSOR_POSITION {
+        let (x, y) = shell.pointer_position;
+        p.values[20] = x as u32;
+        p.values[21] = y as u32;
+        return;
+    }
     if action == w::SYSTEM_COLOR {
         // The guest desktop currently supports the captured Basic defaults.
         // Native USER consumers use win32k's mutable system palette; theme and
@@ -343,7 +410,61 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
     let hwnd = p.values[5];
     let parent = p.values[6];
     let client = p.values[63];
-    if action==8{let ids:Vec<u32>=shell.applications.iter().filter(|a|a.guest_window.as_ref().is_some_and(|s|s.client==client)).map(|a|a.window_id).collect();for id in ids{if let Some(a)=shell.applications.iter_mut().find(|a|a.window_id==id){a.guest_window=None;}shell.close_window(id);}scalar(p,1);return;}
+    if action == w::CLIPBOARD_FORMAT_AVAILABLE {
+        let text = shell.files.clipboard_text();
+        scalar(p, u64::from(!text.is_empty() && matches!(p.values[6], 1 | 7 | 13 | 16)));
+        return;
+    }
+    if matches!(action, w::OPEN_CLIPBOARD | w::CLOSE_CLIPBOARD) {
+        let owner = (client, p.values[6]);
+        if action == w::OPEN_CLIPBOARD {
+            if hwnd != 0 && !shell.applications.iter().any(|app| {
+                app.guest_window.as_ref().is_some_and(|scene| scene.client == client && scene.contains(hwnd))
+            }) {
+                p.values[19] = 1400;
+                return;
+            }
+            if shell.guest_clipboard_lock.is_some_and(|holder| holder != owner) {
+                p.values[19] = 5;
+                return;
+            }
+            shell.guest_clipboard_lock = Some(owner);
+        } else if shell.guest_clipboard_lock == Some(owner) {
+            shell.guest_clipboard_lock = None;
+        } else {
+            p.values[19] = 1418;
+            return;
+        }
+        scalar(p, 1);
+        return;
+    }
+    if action == w::FOREGROUND_WINDOW {
+        let foreground = shell.selected_window
+            .filter(|id| shell.taskbar.windows.iter().any(|window| window.id == *id && !window.minimized))
+            .and_then(|id| shell.applications.iter().find(|app| app.window_id == id))
+            .and_then(|app| app.guest_window.as_ref())
+            .filter(|scene| scene.client == client)
+            .map_or(0, |scene| u64::from(scene.hwnd));
+        scalar(p, foreground);
+        return;
+    }
+    if action == 8 {
+        if shell.guest_clipboard_lock.is_some_and(|(holder, _)| holder == client) {
+            shell.guest_clipboard_lock = None;
+        }
+        let ids: Vec<u32> = shell.applications.iter()
+            .filter(|app| app.guest_window.as_ref().is_some_and(|scene| scene.client == client))
+            .map(|app| app.window_id)
+            .collect();
+        for id in ids {
+            if let Some(app) = shell.applications.iter_mut().find(|app| app.window_id == id) {
+                app.guest_window = None;
+            }
+            shell.close_window(id);
+        }
+        scalar(p, 1);
+        return;
+    }
     if action == 1 && parent == 0 {
         if shell
             .applications
@@ -356,10 +477,14 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
             return;
         }
         let id = shell.launch_application(super::AppId::Notepad);
+        let dialog = p.values[23] != 0;
         if let Some(win) = shell.taskbar.windows.iter_mut().find(|v| v.id == id) {
             win.title = p.string(0).unwrap_or("").into();
+            if p.values[13] != 0x8000_0000 { win.x = p.values[13] as i32; }
+            if p.values[14] != 0x8000_0000 { win.y = p.values[14] as i32; }
             win.width = p.values[15].clamp(160, 1920) as i32;
             win.height = p.values[16].clamp(100, 1080) as i32;
+            if dialog && p.values[18] & 0x10000000 == 0 { win.minimized = true; }
         }
         let body=shell.application_body(id).unwrap_or(Rect::new(0,0,640,480));
         shell
@@ -373,6 +498,12 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
             controls: Vec::new(),
             events: Vec::new(),
             focus: None,
+            hidden_minimized: (dialog && p.values[18] & 0x10000000 == 0).then_some(false),
+            minimized_position: [-1, -1],
+            maximized_position: [-1, -1],
+            enabled: p.values[18] & 0x08000000 == 0,
+            close_enabled: true,
+            dialog,
             body,capture:None,
         });
         scalar(p, hwnd as u64);
@@ -387,6 +518,146 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
         return;
     };
     let id = shell.applications[index].window_id;
+    if action == w::SET_SYSTEM_CLOSE_ENABLED {
+        let scene = shell.applications[index].guest_window.as_mut().unwrap();
+        if scene.hwnd != hwnd {
+            p.values[19] = 1400;
+            return;
+        }
+        scene.close_enabled = p.values[9] != 0;
+        scalar(p, 1);
+        return;
+    }
+    if action == w::CHILD_WINDOW_FROM_POINT {
+        let scene = shell.applications[index].guest_window.as_ref().unwrap();
+        let bounds = if scene.hwnd == hwnd {
+            shell.application_body(id)
+        } else {
+            scene.controls.iter().find(|control| control.hwnd == hwnd).map(|control| control.rect)
+        };
+        let x = p.values[9] as i32;
+        let y = p.values[10] as i32;
+        let target = if bounds.is_some_and(|rect| Rect::new(0, 0, rect.width, rect.height).contains(x, y)) {
+            scene.controls.iter().rev()
+                .find(|control| control.parent == hwnd && control.rect.contains(x, y))
+                .map_or(hwnd, |control| control.hwnd)
+        } else {
+            0
+        };
+        scalar(p, u64::from(target));
+        return;
+    }
+    if action == w::SCREEN_TO_CLIENT {
+        let Some(mut bounds) = shell.application_body(id) else {
+            p.values[19] = 1400;
+            return;
+        };
+        let scene = shell.applications[index].guest_window.as_ref().unwrap();
+        if let Some(control) = scene.controls.iter().find(|control| control.hwnd == hwnd) {
+            bounds = Scene::bounds(control, bounds);
+        }
+        p.values[20] = (p.values[9] as i32).wrapping_sub(bounds.x) as u32;
+        p.values[21] = (p.values[10] as i32).wrapping_sub(bounds.y) as u32;
+        return;
+    }
+    if matches!(action, w::GET_WINDOW_PLACEMENT | w::SET_WINDOW_PLACEMENT) {
+        let scene = shell.applications[index].guest_window.as_mut().unwrap();
+        let Some(window) = shell.taskbar.windows.iter_mut().find(|window| window.id == id && scene.hwnd == hwnd) else {
+            p.values[19] = 1400;
+            return;
+        };
+        let fields = &mut p.values[w::WINDOW_PLACEMENT_FIELDS];
+        if action == w::GET_WINDOW_PLACEMENT {
+            let minimized = scene.hidden_minimized.unwrap_or(window.minimized);
+            let show = if minimized { 2 } else if window.maximized { 3 } else { 1 };
+            let (x, y, width, height) = window.restore_geometry
+                .unwrap_or((window.x, window.y, window.width, window.height));
+            let [min_x, min_y] = scene.minimized_position;
+            let [max_x, max_y] = scene.maximized_position;
+            fields.copy_from_slice(&[
+                0, show, min_x as u32, min_y as u32, max_x as u32, max_y as u32,
+                x as u32, y as u32, x.saturating_add(width) as u32, y.saturating_add(height) as u32,
+            ]);
+            return;
+        }
+        let [flags, show, min_x, min_y, max_x, max_y, left, top, right, bottom] =
+            core::array::from_fn(|index| fields[index] as i32);
+        let Some(width) = right.checked_sub(left).filter(|width| *width >= 0) else {
+            p.values[19] = 87;
+            return;
+        };
+        let Some(height) = bottom.checked_sub(top).filter(|height| *height >= 0) else {
+            p.values[19] = 87;
+            return;
+        };
+        if !(0..=11).contains(&show) || flags & !7 != 0 {
+            p.values[19] = 87;
+            return;
+        }
+        if flags & 1 != 0 {
+            scene.minimized_position = [min_x, min_y];
+        }
+        scene.maximized_position = [max_x, max_y];
+        let was_maximized = window.maximized;
+        window.restore_normal_placement();
+        window.x = left;
+        window.y = top;
+        window.width = width.clamp(160, 1920);
+        window.height = height.clamp(100, 1080);
+        let minimized = matches!(show, 2 | 6 | 7 | 11);
+        let maximized = show == 3 || (minimized && flags & 2 != 0)
+            || (matches!(show, 0 | 5 | 8) && was_maximized);
+        if maximized {
+            window.maximize(shell.viewport.0, shell.viewport.1.saturating_sub(crate::shell::TASKBAR_HEIGHT));
+            if scene.maximized_position != [-1, -1] {
+                [window.x, window.y] = scene.maximized_position;
+            }
+        }
+        if show == 0 {
+            scene.hidden_minimized.get_or_insert(window.minimized);
+        } else {
+            scene.hidden_minimized = None;
+        }
+        window.minimized = minimized || show == 0;
+        p.values[30] = window.width as u32;
+        p.values[31] = window.height as u32;
+        return;
+    }
+    if action == 7 && shell.applications[index].guest_window.as_ref().unwrap().hwnd == hwnd {
+        if let Some(window) = shell.taskbar.windows.iter_mut().find(|window| window.id == id) {
+            window.restore_normal_placement();
+            window.x = p.values[13] as i32;
+            window.y = p.values[14] as i32;
+            window.width = p.values[15].clamp(160, 1920) as i32;
+            window.height = p.values[16].clamp(100, 1080) as i32;
+            scalar(p, 1);
+            return;
+        }
+    }
+    if action == w::IS_ICONIC {
+        let scene = shell.applications[index].guest_window.as_ref().unwrap();
+        let minimized = scene.hwnd == hwnd && scene.hidden_minimized.unwrap_or_else(|| {
+            shell.taskbar.windows.iter().any(|window| window.id == id && window.minimized)
+        });
+        scalar(p, u64::from(minimized));
+        return;
+    }
+    if action == w::ACTIVATE_WINDOW {
+        if shell.applications[index].guest_window.as_ref().unwrap().hwnd != hwnd {
+            p.values[19] = 1400;
+            return;
+        }
+        let foreground_client = shell.selected_window.and_then(|selected| {
+            shell.applications.iter().find(|app| app.window_id == selected)
+                .and_then(|app| app.guest_window.as_ref()).map(|scene| scene.client)
+        });
+        let visible = shell.taskbar.windows.iter().any(|window| window.id == id && !window.minimized);
+        if visible && (shell.selected_window.is_none() || foreground_client == Some(client)) {
+            shell.select_window(id);
+        }
+        scalar(p, u64::from(visible && shell.selected_window == Some(id)));
+        return;
+    }
     if action == 2
         && shell.applications[index]
             .guest_window
@@ -402,12 +673,70 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
     }
     if action == 5 && shell.applications[index].guest_window.as_ref().unwrap().hwnd==hwnd {
         if let Some(win) = shell.taskbar.windows.iter_mut().find(|v| v.id == id) {
-            win.minimized = p.values[9] == 0;
+            let scene = shell.applications[index].guest_window.as_mut().unwrap();
+            match p.values[9] {
+                0 => {
+                    scene.hidden_minimized.get_or_insert(win.minimized);
+                    win.minimized = true;
+                }
+                2 | 6 | 7 | 11 => {
+                    scene.hidden_minimized = None;
+                    win.minimized = true;
+                }
+                5 | 8 => {
+                    win.minimized = scene.hidden_minimized.take().unwrap_or(win.minimized);
+                }
+                3 => {
+                    scene.hidden_minimized = None;
+                    win.minimized = false;
+                    win.maximize(shell.viewport.0, shell.viewport.1.saturating_sub(crate::shell::TASKBAR_HEIGHT));
+                }
+                9 => {
+                    if !scene.hidden_minimized.take().unwrap_or(win.minimized) {
+                        win.restore_normal_placement();
+                    }
+                    win.minimized = false;
+                }
+                _ => {
+                    scene.hidden_minimized = None;
+                    win.minimized = false;
+                }
+            }
         }
         scalar(p, 1);
         return;
     }
     let scene = shell.applications[index].guest_window.as_mut().unwrap();
+    if action == w::ENABLE_WINDOW {
+        let enabled = p.values[9] != 0;
+        let previous = if scene.hwnd == hwnd {
+            if !enabled { scene.capture = None; }
+            core::mem::replace(&mut scene.enabled, enabled)
+        } else {
+            let Some(control) = scene.controls.iter_mut().find(|control| control.hwnd == hwnd) else {
+                p.values[19] = 1400;
+                return;
+            };
+            if !enabled && scene.focus == Some(hwnd) { scene.focus = None; }
+            core::mem::replace(&mut control.enabled, enabled)
+        };
+        scalar(p, u64::from(!previous));
+        return;
+    }
+    if action == w::FOCUS {
+        scalar(p, u64::from(scene.focus.unwrap_or(0)));
+        if p.values[9] != 0 {
+            let target = p.values[6];
+            if target != 0 && target != scene.hwnd && !scene.controls.iter().any(|control| {
+                control.hwnd == target && control.enabled && control.visible
+            }) {
+                p.values[19] = 1400;
+                return;
+            }
+            scene.focus = (target != 0).then_some(target);
+        }
+        return;
+    }
     if action == 4 {
         if let Some(event) = scene.events.first().copied() {
             if p.values[9] != 0 {
@@ -444,6 +773,12 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
                 combo: ComboBox::new(id, Vec::new()),
             },
             6 => Model::Button(text.into()),
+            w::EDIT_CONTROL => Model::Edit {
+                contents: TextBox { text: text.into(), ..TextBox::new(id) },
+                multiline: p.values[18] & 4 != 0,
+                read_only: p.values[18] & 0x800 != 0,
+                modified: false,
+            },
             _ => Model::Text(text.into()),
         };
         scene.controls.push(Control {
@@ -470,6 +805,9 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
         scene
             .controls
             .retain(|c| c.hwnd != hwnd && c.parent != hwnd);
+        if scene.focus.is_some_and(|focused| !scene.contains(focused)) {
+            scene.focus = None;
+        }
         scalar(p, 1);
         return;
     }
@@ -498,6 +836,11 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
     if action == 6 {
         match &mut control.model {
             Model::Text(s) | Model::Button(s) => *s = p.string(0).unwrap_or("").into(),
+            Model::Edit { contents, modified, .. } => {
+                contents.text = p.string(0).unwrap_or("").into();
+                contents.cursor = 0;
+                *modified = false;
+            }
             _ => {
                 p.values[19] = 120;
                 return;
@@ -680,6 +1023,40 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
                 return;
             }
         },
+        Model::Edit { contents, modified, read_only, multiline } => match p.values[8] {
+            0x000c => {
+                contents.text = text;
+                contents.cursor = 0;
+                *modified = false;
+                1
+            }
+            0x000d => {
+                p.set_string(0, &contents.text);
+                contents.text.encode_utf16().count() as u64
+            }
+            0x000e => contents.text.encode_utf16().count() as u64,
+            0x00b0 => {
+                let cursor = contents.text.chars().take(contents.cursor)
+                    .map(char::len_utf16).sum::<usize>() as u32;
+                p.values[22] = cursor;
+                p.values[23] = cursor;
+                0
+            }
+            0x00b8 => u64::from(*modified),
+            0x00b9 => {
+                *modified = wp != 0;
+                0
+            }
+            0x00bb => edit_line_index(contents, *multiline, wp as i32),
+            0x00cf => {
+                *read_only = wp != 0;
+                1
+            }
+            _ => {
+                p.values[19] = 120;
+                return;
+            }
+        },
         Model::Text(s) | Model::Button(s) => match p.values[8] {
             0x000e => s.encode_utf16().count() as u64,
             0x000c => {
@@ -693,6 +1070,27 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
         },
     };
     scalar(p, result);
+}
+
+fn edit_line_index(contents: &TextBox, multiline: bool, line: i32) -> u64 {
+    let line = match line {
+        -1 if multiline => contents.text.chars().take(contents.cursor)
+            .filter(|character| *character == '\n').count(),
+        -1 | 0 => return 0,
+        1.. if multiline => line as usize,
+        _ => return u64::MAX,
+    };
+    if line == 0 {
+        return 0;
+    }
+    let mut offset = 0;
+    for (index, text) in contents.text.split_inclusive('\n').enumerate() {
+        offset += text.encode_utf16().count() as u64;
+        if index + 1 == line && text.ends_with('\n') {
+            return offset;
+        }
+    }
+    u64::MAX
 }
 
 #[cfg(test)]
@@ -713,6 +1111,164 @@ mod tests {
         assert_eq!(p.values[1],w::ACCEPTED);assert_eq!(p.values[19],0);assert_eq!(p.values[20],expected);
         assert_eq!(p.values[21],0);assert_eq!(shell.applications.len(),before);
     }
+ }
+ #[test]
+ fn disabling_system_close_suppresses_desktop_close_requests() {
+    let mut shell = ShellModel::new(Theme::aero());
+    call(&mut shell, 1, 42, 0, 0, 0, 0, 0, "System menu");
+    let id = shell.selected_window.unwrap();
+    call(&mut shell, w::SET_SYSTEM_CLOSE_ENABLED, 42, 0, 0, 0, 0, 0, "");
+    shell.close_window(id);
+    assert!(shell.application(id).unwrap().guest_window.as_ref().unwrap().events.is_empty());
+    call(&mut shell, w::SET_SYSTEM_CLOSE_ENABLED, 42, 0, 0, 0, 1, 0, "");
+    shell.close_window(id);
+    let scene = shell.application(id).unwrap().guest_window.as_ref().unwrap();
+    assert_eq!(scene.events.len(), 1);
+    assert_eq!(scene.events[0].values[8], 0x10);
+ }
+ #[test]
+ fn coordinate_queries_follow_pointer_and_owned_client_origins() {
+    let mut shell = ShellModel::new(Theme::aero());
+    shell.set_pointer_position(430, 260);
+    let cursor = call(&mut shell, w::CURSOR_POSITION, 0, 0, 0, 0, 0, 0, "");
+    assert_eq!(&cursor.values[20..22], &[430, 260]);
+
+    call(&mut shell, 1, 100, 0, 0, 0, 0, 0, "Guest");
+    call(&mut shell, 1, 101, 100, 7, 0, 0, 0, "Editor");
+    let window_id = shell.selected_window.unwrap();
+    let mut move_child = w::EMPTY;
+    move_child.values[4] = 7;
+    move_child.values[5] = 101;
+    move_child.values[13] = 17;
+    move_child.values[14] = 8;
+    move_child.values[15] = 224;
+    move_child.values[16] = 90;
+    move_child.values[63] = 41;
+    execute(&mut shell, &mut move_child);
+    assert_eq!(move_child.values[19], 0);
+
+    let body = shell.application_body(window_id).unwrap();
+    let point = u64::from((body.x + 14) as u32) | (u64::from((body.y + 5) as u32) << 32);
+    let root = call(&mut shell, w::SCREEN_TO_CLIENT, 100, 0, 0, 0, point, 0, "");
+    assert_eq!(&root.values[20..22], &[14, 5]);
+    let child = call(&mut shell, w::SCREEN_TO_CLIENT, 101, 0, 0, 0, point, 0, "");
+    assert_eq!(&child.values[20..22], &[(-3i32) as u32, (-3i32) as u32]);
+    let mut foreign = child;
+    foreign.values[63] = 42;
+    execute(&mut shell, &mut foreign);
+    assert_eq!(foreign.values[19], 1400);
+ }
+ #[test]
+ fn edit_get_selection_reports_the_live_utf16_caret() {
+    let mut shell = ShellModel::new(Theme::aero());
+    call(&mut shell, 1, 100, 0, 0, 0, 0, 0, "Guest");
+    call(&mut shell, 1, 101, 100, w::EDIT_CONTROL, 0, 0, 0, "a😀b");
+    let initial = call(&mut shell, 3, 101, 0, 0, 0x00b0, 0, 0, "");
+    assert_eq!(initial.values[22..24], [0, 0]);
+    let scene = shell.applications.iter_mut().find_map(|app| app.guest_window.as_mut()).unwrap();
+    let Model::Edit { contents, .. } = &mut scene.controls[0].model else { panic!("expected Edit") };
+    contents.move_cursor_right();
+    contents.move_cursor_right();
+    let after_move = call(&mut shell, 3, 101, 0, 0, 0x00b0, 0, 0, "");
+    assert_eq!(after_move.values[22..24], [3, 3]);
+ }
+ #[test]
+ fn edit_line_index_counts_utf16_units_and_trailing_empty_line() {
+    let contents = TextBox { text: "a😀\r\nb\n".into(), cursor: 4, ..TextBox::new(101) };
+    assert_eq!(edit_line_index(&contents, true, 0), 0);
+    assert_eq!(edit_line_index(&contents, true, 1), 5);
+    assert_eq!(edit_line_index(&contents, true, 2), 7);
+    assert_eq!(edit_line_index(&contents, true, 3), u64::MAX);
+    assert_eq!(edit_line_index(&contents, true, -1), 5);
+    assert_eq!(edit_line_index(&contents, false, -1), 0);
+    assert_eq!(edit_line_index(&contents, false, 1), u64::MAX);
+ }
+ #[test]
+ fn child_hit_testing_checks_only_direct_children_in_client_coordinates() {
+    let mut shell = ShellModel::new(Theme::aero());
+    call(&mut shell, 1, 100, 0, 0, 0, 0, 0, "Guest");
+    call(&mut shell, 1, 101, 100, w::EDIT_CONTROL, 0, 0, 0, "Editor");
+    call(&mut shell, 1, 102, 101, 6, 0, 0, 0, "Nested control");
+    call(&mut shell, 1, 103, 100, 6, 0, 0, 0, "Top sibling");
+    let scene = shell.applications.iter_mut().find_map(|app| app.guest_window.as_mut()).unwrap();
+    scene.controls[0].rect = Rect::new(10, 20, 160, 120);
+    scene.controls[1].rect = Rect::new(0, 0, 100, 100);
+    scene.controls[2].rect = Rect::new(50, 50, 30, 30);
+    scene.controls[2].visible = false;
+    scene.controls[2].enabled = false;
+
+    let query = |shell: &mut ShellModel, hwnd, x: i32, y: i32| {
+        let point = u64::from(x as u32) | (u64::from(y as u32) << 32);
+        call(shell, w::CHILD_WINDOW_FROM_POINT, hwnd, 0, 0, 0, point, 0, "").values[20]
+    };
+    assert_eq!(query(&mut shell, 100, 3, 3), 100);
+    assert_eq!(query(&mut shell, 100, 15, 25), 101);
+    assert_eq!(query(&mut shell, 100, 60, 60), 103);
+    assert_eq!(query(&mut shell, 101, 15, 25), 102);
+    assert_eq!(query(&mut shell, 101, 160, 25), 0);
+    assert_eq!(query(&mut shell, 100, -1, 25), 0);
+ }
+ #[test]
+ fn foreground_query_tracks_visibility_and_client_ownership() {
+    let mut shell = ShellModel::new(Theme::aero());
+    assert_eq!(call(&mut shell, w::FOREGROUND_WINDOW, 0, 0, 0, 0, 0, 0, "").values[20], 0);
+    call(&mut shell, 1, 100, 0, 0, 0, 0, 0, "Guest");
+    assert_eq!(call(&mut shell, w::FOREGROUND_WINDOW, 0, 0, 0, 0, 0, 0, "").values[20], 100);
+    let mut foreign = w::EMPTY;
+    foreign.values[4] = w::FOREGROUND_WINDOW;
+    foreign.values[63] = 42;
+    foreign.values[20] = u32::MAX;
+    execute(&mut shell, &mut foreign);
+    assert_eq!(foreign.values[20], 0);
+    call(&mut shell, 5, 100, 0, 0, 0, 0, 0, "");
+    assert_eq!(call(&mut shell, w::FOREGROUND_WINDOW, 0, 0, 0, 0, 0, 0, "").values[20], 0);
+ }
+ #[test]
+ fn iconic_query_distinguishes_hidden_and_minimized_windows() {
+    let mut shell = ShellModel::new(Theme::aero());
+    call(&mut shell, 1, 100, 0, 0, 0, 0, 0, "Guest");
+    for (show, minimized) in [(0, 0), (6, 1), (0, 1), (5, 1), (9, 0)] {
+        call(&mut shell, 5, 100, 0, 0, 0, show, 0, "");
+        let reply = call(&mut shell, w::IS_ICONIC, 100, 0, 0, 0, 0, 0, "");
+        assert_eq!(reply.values[19], 0);
+        assert_eq!(reply.values[20], minimized);
+    }
+ }
+ #[test]
+ fn placement_reports_the_restore_rectangle_while_maximized_and_minimized() {
+    let mut shell = ShellModel::new(Theme::aero());
+    shell.refresh_controls(800, 600);
+    call(&mut shell, 1, 100, 0, 0, 0, 0, 0, "Guest");
+    let make_request = |action| {
+        let mut packet = w::EMPTY;
+        packet.values[4] = action;
+        packet.values[5] = 100;
+        packet.values[63] = 41;
+        packet
+    };
+    let normal = [100, 120, 500, 420];
+    let mut request = make_request(w::SET_WINDOW_PLACEMENT);
+    request.values[20..26].copy_from_slice(&[0, 3, u32::MAX, u32::MAX, u32::MAX, u32::MAX]);
+    request.values[26..30].copy_from_slice(&normal);
+    execute(&mut shell, &mut request);
+    assert_eq!(request.values[19], 0);
+    assert!(shell.taskbar.windows[0].maximized);
+    assert_ne!(shell.taskbar.windows[0].x, 100);
+    for (command, expected_show) in [(None, 3), (Some(6), 2), (Some(9), 3), (Some(9), 1)] {
+        if let Some(command) = command {
+            call(&mut shell, 5, 100, 0, 0, 0, command, 0, "");
+        }
+        let mut query = make_request(w::GET_WINDOW_PLACEMENT);
+        execute(&mut shell, &mut query);
+        assert_eq!(query.values[19], 0);
+        assert_eq!(query.values[21], expected_show);
+        assert_eq!(query.values[26..30], normal);
+    }
+    let mut invalid = request;
+    invalid.values[28] = 99;
+    execute(&mut shell, &mut invalid);
+    assert_eq!(invalid.values[19], 87);
+    assert_eq!(shell.taskbar.windows[0].x, 100);
  }
  #[test]
  fn default_system_colors_match_original_capture_without_creating_a_window() {

@@ -38,7 +38,7 @@ impl WindowState {
         }
     }
 
-    pub(super) fn restore_normal_placement(&mut self) {
+    pub(crate) fn restore_normal_placement(&mut self) {
         if let Some(geometry) = self.restore_geometry.take() {
             (self.x, self.y, self.width, self.height) = geometry;
         }
@@ -46,7 +46,7 @@ impl WindowState {
         self.snapped = None;
     }
 
-    fn maximize(&mut self, width: u32, height: u32) {
+    pub(crate) fn maximize(&mut self, width: u32, height: u32) {
         self.remember_normal_placement();
         self.snapped = None;
         self.maximized = true;

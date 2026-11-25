@@ -160,6 +160,7 @@ fn desktop_main() -> ! {
     let mut previous_buttons = 0u32;
     let mut cursor_x = (framebuffer.width / 2) as i32;
     let mut cursor_y = (framebuffer.height / 2) as i32;
+    shell.model.set_pointer_position(cursor_x, cursor_y);
     let mut previous_cursor_x = cursor_x;
     let mut previous_cursor_y = cursor_y;
     let mut cursor_rgba = alloc::vec![0u8; 32 * 32 * 4];
@@ -248,14 +249,14 @@ fn desktop_main() -> ! {
             if unsafe { arch::poll_mouse(&mut mouse) == 0 } {
                 break;
             }
+            cursor_x = mouse.x.clamp(0, framebuffer.width.saturating_sub(1) as i32);
+            cursor_y = mouse.y.clamp(0, framebuffer.height.saturating_sub(1) as i32);
+            shell.model.set_pointer_position(cursor_x, cursor_y);
             if shell.model.session.screen!=nt61_desktop::session::Screen::Desktop {
-                cursor_x=mouse.x.clamp(0,framebuffer.width.saturating_sub(1)as i32);cursor_y=mouse.y.clamp(0,framebuffer.height.saturating_sub(1)as i32);
                 if mouse.buttons&1!=0 && previous_buttons&1==0 {let intent=shell.model.session.hit(cursor_x,cursor_y,framebuffer.width,framebuffer.height);shell.model.session_intent(intent);shell.scene_dirty.set(true);pointer_full=true;}
                 pointer_moved|=cursor_x!=previous_cursor_x||cursor_y!=previous_cursor_y;previous_buttons=mouse.buttons;continue;
             }
             if shell.model.desktop_editor.is_some() || !shell.model.desktop_error.is_empty() {
-                cursor_x = mouse.x.clamp(0, framebuffer.width.saturating_sub(1) as i32);
-                cursor_y = mouse.y.clamp(0, framebuffer.height.saturating_sub(1) as i32);
                 if mouse.buttons & 1 != 0 && previous_buttons & 1 == 0 {
                     shell.model.desktop_editor_click(cursor_x, cursor_y);
                     shell.scene_dirty.set(true); pointer_full = true;
@@ -264,10 +265,6 @@ fn desktop_main() -> ! {
                 previous_buttons = mouse.buttons; continue;
             }
             let previous_scene = shell.window_geometry();
-            cursor_x = mouse.x.clamp(0, framebuffer.width.saturating_sub(1) as i32);
-            cursor_y = mouse
-                .y
-                .clamp(0, framebuffer.height.saturating_sub(1) as i32);
             if mouse.wheel != 0 {
                 if let Some(id) = shell.model.window_hit_test(cursor_x, cursor_y) {
                     if shell

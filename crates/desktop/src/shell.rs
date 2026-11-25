@@ -737,6 +737,7 @@ pub struct ShellModel {
     desktop_restore: Vec<u32>,
     pub controls: ControlTree,
     pub(crate) viewport: (u32, u32),
+    pub(crate) pointer_position: (i32, i32),
     pub(crate) metrics: nt61_win32_metrics::SessionMetrics,
     pub textboxes: Vec<TextBox>,
     pub memory_result: Option<crate::memory_result::ResultRecord>,
@@ -766,6 +767,7 @@ pub struct ShellModel {
     pub desktop_error: String,
     pub display: crate::display_settings::Settings,
     pub control_browsers: Vec<crate::control_browser::Browser>,
+    pub(crate) guest_clipboard_lock: Option<(u32, u32)>,
 }
 
 impl ShellModel {
@@ -809,6 +811,7 @@ impl ShellModel {
             desktop_restore: Vec::new(),
             controls: ControlTree::new(),
             viewport: (1024, 768),
+            pointer_position: (512, 384),
             metrics: Default::default(),
             textboxes: Vec::new(),
             memory_result: None,
@@ -838,7 +841,12 @@ impl ShellModel {
             desktop_error: String::new(),
             display: Default::default(),
             control_browsers: Vec::new(),
+            guest_clipboard_lock: None,
         }
+    }
+
+    pub fn set_pointer_position(&mut self, x: i32, y: i32) {
+        self.pointer_position = (x, y);
     }
 
     /// Keep the tray and Sound properties on the same per-user output settings.

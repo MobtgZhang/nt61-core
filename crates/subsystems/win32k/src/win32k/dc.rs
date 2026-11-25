@@ -845,18 +845,13 @@ pub fn gre_get_bk_color(dc_handle: u64) -> u32 {
 
 /// Set background mode
 pub fn gre_set_bk_mode(dc_handle: u64, mode: i32) -> i32 {
+    set_bk_mode(dc_handle, mode).unwrap_or(OPAQUE)
+}
+
+pub fn set_bk_mode(dc_handle: u64, mode: i32) -> Option<i32> {
     let mut table = get_dc_table();
-    let _ = &table;
-    let _ = &table;
-    if let Some(dc) = table.get(dc_handle) {
-        let old = dc.bk_mode;
-        let _ = &old;
-        let _ = &old;
-        dc.bk_mode = mode;
-        old
-    } else {
-        OPAQUE
-    }
+    let dc = table.get(dc_handle)?;
+    Some(core::mem::replace(&mut dc.bk_mode, mode))
 }
 
 /// Get background mode

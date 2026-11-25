@@ -124,6 +124,26 @@ pub fn apply(transform: Xform, point: PointL) -> Option<PointL> {
     ))
 }
 
+fn transform_point_buffer(transform: Xform, bytes: &mut [u8]) -> bool {
+    for point in bytes.chunks_exact_mut(8) {
+        let x = i32::from_le_bytes(point[..4].try_into().unwrap());
+        let y = i32::from_le_bytes(point[4..].try_into().unwrap());
+        let Some(result) = apply(transform, PointL::new(x, y)) else {
+            return false;
+        };
+        point[..4].copy_from_slice(&result.x.to_le_bytes());
+        point[4..].copy_from_slice(&result.y.to_le_bytes());
+    }
+    true
+}
+
+pub fn logical_to_device(handle: u64, points: &mut [u8]) -> bool {
+    let Some(transform) = dc::get_dc(handle).and_then(|dc| world_to_device(&dc)) else {
+        return false;
+    };
+    transform_point_buffer(transform, points)
+}
+
 pub extern "C" fn nt_gdi_combine_transform(frame: &SyscallFrame) -> u64 {
     let Ok(first) = user_copy::read_user_object::<Xform>(frame.args[1]) else {
         return 0;
@@ -215,14 +235,8 @@ pub extern "C" fn nt_gdi_transform_points(frame: &SyscallFrame) -> u64 {
     if user_copy::copy_from_user(&mut bytes, frame.args[1]).is_err() {
         return 0;
     }
-    for point in bytes.chunks_exact_mut(8) {
-        let x = i32::from_le_bytes([point[0], point[1], point[2], point[3]]);
-        let y = i32::from_le_bytes([point[4], point[5], point[6], point[7]]);
-        let Some(result) = apply(transform, PointL::new(x, y)) else {
-            return 0;
-        };
-        point[..4].copy_from_slice(&result.x.to_le_bytes());
-        point[4..].copy_from_slice(&result.y.to_le_bytes());
+    if !transform_point_buffer(transform, &mut bytes) {
+        return 0;
     }
     user_copy::copy_to_user(frame.args[2], &bytes).is_ok() as u64
 }

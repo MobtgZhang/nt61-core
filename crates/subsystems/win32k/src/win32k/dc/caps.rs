@@ -35,11 +35,13 @@ pub(crate) fn device_color_count() -> u32 {
     snapshot()[12]
 }
 pub extern "C" fn nt_gdi_get_device_caps(frame: &SyscallFrame) -> u64 {
-    let Some(_dc) = get_dc(frame.args[0]) else {
-        return 0;
-    };
+    u64::from(device_caps(frame.args[0], frame.args[1] as i32).unwrap_or(0))
+}
+
+pub fn device_caps(handle: u64, index: i32) -> Option<u32> {
+    let _dc = get_dc(handle)?;
     let caps = snapshot();
-    let slot = match frame.args[1] as i32 {
+    let slot = match index {
         0 => 0,
         2 => 1,
         4 => 4,
@@ -70,9 +72,9 @@ pub extern "C" fn nt_gdi_get_device_caps(frame: &SyscallFrame) -> u64 {
         119 => 29,
         120 => 34,
         121 => 35,
-        _ => return 0,
+        _ => return Some(0),
     };
-    caps[slot] as u64
+    Some(caps[slot])
 }
 pub extern "C" fn nt_gdi_get_device_caps_all(frame: &SyscallFrame) -> u64 {
     let Some(_dc) = get_dc(frame.args[0]) else {

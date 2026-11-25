@@ -357,6 +357,32 @@ fn draw(hdc: u64, runs: &[TextRun]) -> Option<()> {
     Some(())
 }
 
+pub fn draw_text_layout(hdc: u64, rectangle: Option<[i32; 4]>, lines: &[(i32, i32, &[u16])]) -> bool {
+    let rectangle = rectangle.map(|[left, top, right, bottom]| Rect { left, top, right, bottom });
+    let mut runs = Vec::new();
+    if runs.try_reserve_exact(lines.len()).is_err() {
+        return false;
+    }
+    for &(x, y, text) in lines {
+        if text.is_empty() {
+            continue;
+        }
+        let mut units = Vec::new();
+        if text.len() > MAX_CHARACTERS || units.try_reserve_exact(text.len()).is_err() {
+            return false;
+        }
+        units.extend_from_slice(text);
+        runs.push(TextRun {
+            position: dc::PointL::new(x, y),
+            flags: if rectangle.is_some() { ETO_CLIPPED } else { 0 },
+            rectangle,
+            units,
+            distances: None,
+        });
+    }
+    draw(hdc, &runs).is_some()
+}
+
 pub extern "C" fn nt_gdi_ext_text_out(frame: &SyscallFrame) -> u64 {
     let result = (|| {
         let flags = frame.args[3] as u32;

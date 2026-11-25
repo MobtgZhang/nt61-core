@@ -26,7 +26,7 @@ mod string_bitmap;
 
 #[path = "font_services/drawing.rs"]
 mod drawing;
-pub use drawing::{nt_gdi_ext_text_out, nt_gdi_poly_text_out, nt_gdi_set_text_justification};
+pub use drawing::{draw_text_layout, nt_gdi_ext_text_out, nt_gdi_poly_text_out, nt_gdi_set_text_justification};
 
 const GDI_ERROR: u64 = u32::MAX as u64;
 const MAX_CHARACTERS: usize = 65_536;
@@ -52,6 +52,16 @@ pub extern "C" fn nt_gdi_hfont_create(frame: &SyscallFrame) -> u64 {
     // ENUMLOGFONTEXW occupies 348 bytes, followed by DESIGNVECTOR's
     // reserved DWORD, axis count, and sixteen LONG coordinates.
     bytes[352..356].fill(0);
+    create_captured_font(&bytes)
+}
+
+pub fn create_logfont_w(logfont: &[u8; 92]) -> u64 {
+    let mut bytes = [0; 420];
+    bytes[..logfont.len()].copy_from_slice(logfont);
+    create_captured_font(&bytes)
+}
+
+fn create_captured_font(bytes: &[u8; 420]) -> u64 {
     let integer = |offset| i32::from_le_bytes([
         bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3],
     ]);
@@ -321,6 +331,25 @@ pub extern "C" fn nt_gdi_get_font_unicode_ranges(frame: &SyscallFrame) -> u64 {
     }).unwrap_or(0)
 }
 
+fn measure_text(dc: u64, units: &[u16], glyph_indices: bool, mut distance: impl FnMut(i32)) -> Option<[i32; 2]> {
+    if units.len() > MAX_CHARACTERS { return None; }
+    with_font(dc, |font| {
+        let mut advance = 0i64;
+        let mut width = 0;
+        for &unit in units {
+            let glyph = font.glyph(unit, glyph_indices);
+            advance = advance.checked_add(i64::from(font.font.glyph_metrics(glyph)?.advance))?;
+            width = font.horizontal(advance)?;
+            distance(width);
+        }
+        Some([width, if units.is_empty() { 0 } else { font.cell_height()? }])
+    })
+}
+
+pub fn text_extent_w(dc: u64, units: &[u16]) -> Option<[i32; 2]> {
+    measure_text(dc, units, false, |_| {})
+}
+
 fn extent(frame: &SyscallFrame, extended: bool) -> Option<()> {
     let count = frame.args[2] as i32;
     if count < 0 { return None; }
@@ -333,29 +362,21 @@ fn extent(frame: &SyscallFrame, extended: bool) -> Option<()> {
         if frame.args[4] != 0 { probe_user_write(frame.args[4], 4).ok()?; }
         if frame.args[5] != 0 && count != 0 { probe_user_write(frame.args[5], count as usize * 4).ok()?; }
     }
-    with_font(frame.args[0], |font| {
-        let mut advance = 0i64;
-        let mut width = 0i32;
-        let mut fit = 0i32;
-        let mut distances = output_bytes(units.len() * 4)?;
-        let mut fits = true;
-        for unit in units {
-            let glyph = font.glyph(unit, flags & 1 != 0);
-            advance = advance.checked_add(i64::from(font.font.glyph_metrics(glyph)?.advance))?;
-            width = font.horizontal(advance)?;
-            distances.extend_from_slice(&width.to_le_bytes());
-            if extended {
-                fits &= width <= frame.args[3] as i32;
-                if fits { fit += 1; }
-            }
-        }
-        let size = [width, if count == 0 { 0 } else { font.cell_height()? }];
+    let mut fit = 0i32;
+    let mut distances = output_bytes(if extended { units.len() * 4 } else { 0 })?;
+    let mut fits = true;
+    let size = measure_text(frame.args[0], &units, flags & 1 != 0, |width| {
         if extended {
-            if frame.args[4] != 0 { write_user_object(frame.args[4], &fit).ok()?; }
-            if frame.args[5] != 0 && count != 0 { copy_to_user(frame.args[5], &distances).ok()?; }
+            distances.extend_from_slice(&width.to_le_bytes());
+            fits &= width <= frame.args[3] as i32;
+            if fits { fit += 1; }
         }
-        write_user_object(size_output, &size).ok()
-    })
+    })?;
+    if extended {
+        if frame.args[4] != 0 { write_user_object(frame.args[4], &fit).ok()?; }
+        if frame.args[5] != 0 && count != 0 { copy_to_user(frame.args[5], &distances).ok()?; }
+    }
+    write_user_object(size_output, &size).ok()
 }
 
 pub extern "C" fn nt_gdi_get_text_extent(frame: &SyscallFrame) -> u64 {
@@ -366,27 +387,39 @@ pub extern "C" fn nt_gdi_get_text_extent_ex_w(frame: &SyscallFrame) -> u64 {
     extent(frame, true).is_some() as u64
 }
 
+pub fn text_face_w(dc_handle: u64) -> Option<Vec<u16>> {
+    with_font(dc_handle, |font| Some(font.source.family()))
+}
+
 pub extern "C" fn nt_gdi_get_text_face_w(frame: &SyscallFrame) -> u64 {
     let count = frame.args[1] as i32;
     if count < 0 { return 0; }
-    with_font(frame.args[0], |font| {
-        let mut units = font.source.family();
-        units.push(0);
-        if frame.args[2] == 0 { return Some(units.len() as u64); }
+    let copy_face = || {
+        let units = text_face_w(frame.args[0])?;
+        if frame.args[2] == 0 { return Some(units.len() as u64 + 1); }
         if count == 0 { return Some(0); }
-        let copied = (count as usize).min(units.len());
+        let copied = (count as usize).min(units.len() + 1);
         let mut bytes = output_bytes(copied * 2)?;
         for unit in &units[..copied - 1] { bytes.extend_from_slice(&unit.to_le_bytes()); }
         bytes.extend_from_slice(&0u16.to_le_bytes());
         copy_to_user(frame.args[2], &bytes).ok()?;
         Some(copied as u64)
-    }).unwrap_or(0)
+    };
+    copy_face().unwrap_or(0)
 }
 
 pub extern "C" fn nt_gdi_get_text_metrics_w(frame: &SyscallFrame) -> u64 {
     // Native slot two is the caller's buffer size, not Win32 flags.
     if frame.args[2] < 60 { return 0; }
-    with_font(frame.args[0], |font| {
+    text_metrics_w(frame.args[0])
+        .is_some_and(|bytes| copy_to_user(frame.args[1], &bytes).is_ok()) as u64
+}
+
+pub fn text_metrics_w(dc_handle: u64) -> Option<[u8; 60]> {
+    with_font(dc_handle, metrics_w)
+}
+
+fn metrics_w(font: &RealizedFont<'_>) -> Option<[u8; 60]> {
         let info = font.description;
         let ascent = font.vertical(i64::from(info.ascent))?;
         let descent = font.vertical(i64::from(info.descent))?;
@@ -408,8 +441,36 @@ pub extern "C" fn nt_gdi_get_text_metrics_w(frame: &SyscallFrame) -> u64 {
         bytes[54] = font.requested.strike_out;
         bytes[55] = 4 | u8::from(!info.fixed_pitch); // TMPF_TRUETYPE, variable pitch
         bytes[56] = font.requested.charset;
-        copy_to_user(frame.args[1], &bytes).ok()
-    }).is_some() as u64
+        Some(bytes)
+}
+
+pub fn enumerate_fonts_w(dc_handle: u64, family: Option<&str>) -> Option<Vec<([u8; 92], [u8; 60])>> {
+    dc::get_dc(dc_handle)?;
+    let filter = family.map(str::to_lowercase);
+    let mut fonts = Vec::new();
+    for mono in [false, true] {
+        let source = FontSource::BuiltIn(mono);
+        let name = source.family();
+        if filter.as_ref().is_some_and(|filter| {
+            alloc::string::String::from_utf16_lossy(&name).to_lowercase() != *filter
+        }) {
+            continue;
+        }
+        let selection = FontSelection { requested: objects::GdiFont::new(), source };
+        let font = selection.realize()?;
+        let metrics = metrics_w(&font)?;
+        let mut logical = [0; 92];
+        logical[..4].copy_from_slice(&metrics[..4]);
+        logical[16..20].copy_from_slice(&metrics[28..32]);
+        logical[20] = metrics[52];
+        logical[23] = metrics[56];
+        logical[27] = if mono { 1 } else { 2 };
+        for (slot, unit) in logical[28..].chunks_exact_mut(2).take(31).zip(name) {
+            slot.copy_from_slice(&unit.to_le_bytes());
+        }
+        fonts.push((logical, metrics));
+    }
+    Some(fonts)
 }
 
 pub extern "C" fn nt_gdi_get_char_width_info(frame: &SyscallFrame) -> u64 {
