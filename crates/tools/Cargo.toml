@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "driver-package-plan"
 path = "src/bin/driver_package_plan.rs"
 
+[[bin]]
+name = "nt61-debug"
+path = "src/bin/nt61_debug.rs"
+
 # build-esp 通过 fs::build 产物管线生成 PE，不再依赖 nt61 门面
 [[bin]]
 name = "build-esp"
