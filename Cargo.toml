@@ -46,6 +46,7 @@ members = [
   "crates/tools",
   "crates/desktop",
   "crates/tools/cmd-stub-gen",
+  "crates/tools/muigen",
 ]
 
 [profile.release]

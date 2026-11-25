@@ -158,7 +158,7 @@ QEMU_AUDIO_X86 = -audiodev $(QEMU_AUDIO_BACKEND),id=audio0$(QEMU_AUDIO_OPTIONS) 
 # differs from what EDK2 nightly expects.
 QEMU_CPU_x86_64     := -accel kvm -cpu host
 QEMU_CPU_aarch64    := -cpu cortex-a57
-QEMU_CPU_riscv64    :=
+QEMU_CPU_riscv64    ?= -cpu rv64,sv48=off,sv57=off
 QEMU_CPU_loongarch64 := -cpu la464
 
 # Per-arch disk-controller device. The QEMU `virt` machine on
