@@ -76,6 +76,7 @@ pub mod frame;
 pub mod heap;
 mod large_heap;
 mod kernel_heap_map;
+pub mod jit_code;
 
 /// Stable supervisor address for a complete extent of the managed RAM bank.
 /// Bootstrap/firmware memory outside this bank has no alias here.
@@ -888,6 +889,27 @@ pub fn init(boot_info: &BootInfo) {
     #[cfg(target_arch = "loongarch64")]
     crate::arch::loongarch64::paging::vector_page_check("mm8");
 
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        let handoff_ranges = [
+            (boot_info as *const BootInfo as u64, core::mem::size_of::<BootInfo>() as u64),
+            (boot_info.memory_map, boot_info.memory_map_size_bytes),
+            (boot_info.device_tree_base, u64::from(boot_info.device_tree_size)),
+            (
+                boot_info.boot_driver_records,
+                u64::from(boot_info.boot_driver_records_count.min(64))
+                    * core::mem::size_of::<crate::boot_types::BootDriverLoadRecord>() as u64,
+            ),
+        ];
+        for (base, size) in handoff_ranges {
+            if base != 0 && size != 0 {
+                assert!(vas::ensure_low_identity_map(base, size), "Sv39 boot handoff at {base:#x}");
+            }
+        }
+        let root = crate::arch::riscv64::paging::read_page_root_pfn();
+        crate::arch::riscv64::paging::load_page_root(root);
+    }
+
     // Every future process inherits these immutable supervisor aliases.
     // Allocate backing frames on demand, without adding root-local mappings
     // from inside the global allocator after process creation.
@@ -910,6 +932,9 @@ pub fn init(boot_info: &BootInfo) {
         );
     }
     crate::hal::serial::write_string_always("[mm] PFN storage protected by kernel mapping\r\n");
+    if jit_code::init(chosen_base) {
+        crate::hal::serial::write_string_always("[mm] guest JIT code window ready\r\n");
+    }
 
     // ------------------------------------------------------------------
     // 8. Mark MM as fully initialized.  After this point the

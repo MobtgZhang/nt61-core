@@ -433,7 +433,7 @@ pub fn create_user_address_space() -> Option<u64> {
 
 /// Copy the native page-table tree; leaf frames retain their kernel mappings.
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn copy_native_tables(src: *const u64, dst: *mut u64, levels: u8) -> bool {
+unsafe fn copy_native_tables(src: *const u64, dst: *mut u64, levels: u8, prefix: u64) -> bool {
     for index in 0..PT_ENTRIES {
         let entry = core::ptr::read_volatile(src.add(index));
         #[cfg(target_arch = "aarch64")]
@@ -442,13 +442,14 @@ unsafe fn copy_native_tables(src: *const u64, dst: *mut u64, levels: u8) -> bool
         let table = levels > 1 && entry & 1 != 0 && entry & 0xe == 0;
         #[cfg(target_arch = "loongarch64")]
         let table = levels > 1 && entry != 0;
-        if table {
+        if table && !super::jit_code::shared_branch(levels, index, prefix) {
             #[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
             let address = entry & 0x0000_ffff_ffff_f000;
             #[cfg(target_arch = "riscv64")]
             let address = ((entry & 0x003f_ffff_ffff_fc00) >> 10) << 12;
             let Some(copy) = alloc_zeroed_page() else { return false; };
-            if !copy_native_tables(address as *const u64, copy as *mut u64, levels - 1) {
+            let next_prefix = prefix | ((index as u64) << (12 + 9 * (levels - 1)));
+            if !copy_native_tables(address as *const u64, copy as *mut u64, levels - 1, next_prefix) {
                 return false;
             }
             #[cfg(any(target_arch = "aarch64", target_arch = "loongarch64"))]
@@ -510,7 +511,7 @@ fn create_user_address_space_inner() -> Option<u64> {
         const LEVELS: u8 = 3;
         #[cfg(target_arch = "loongarch64")]
         const LEVELS: u8 = 5;
-        if !copy_native_tables(system as *const u64, dst as *mut u64, LEVELS) {
+        if !copy_native_tables(system as *const u64, dst as *mut u64, LEVELS, 0) {
             pfn::free_pfn(pfn);
             return None;
         }
@@ -2304,11 +2305,6 @@ pub fn init() {
         // Map in 2 MiB superpage chunks. `identity_map_region` handles
         // the superpage / sub-page split internally.
         ensure_identity_or_log(ram_base, ram_end - ram_base, "RISC-V tracked RAM range");
-
-        // Map the UEFI SystemTable and firmware runtime region near the
-        // top of RAM (above the PFN database's tracked range). This is
-        // where EDK2 places its runtime data on QEMU virt.
-        ensure_identity_or_log(0x27FF0000, 0x10_000, "RISC-V UEFI runtime region");
 
         // The kernel boots in Sv39 bare mode and the system root is
         // only enabled later. Preserve the current image and stack in

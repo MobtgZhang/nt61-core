@@ -1,7 +1,4 @@
-//! Resumable x86/x64 execution shared by all three non-x86 hosts.
-//!
-//! This is the correctness backend. Experimental native emitters must not be
-//! entered until they preserve the same instruction/exception semantics.
+//! Resumable x86/x64 execution shared by all hosts.
 
 use super::exec::{execute_block, ExecOutcome, GuestState, SyscallHook};
 use super::ir::{DecodeMode, IROp, IrInst, X86Reg};
@@ -9,7 +6,10 @@ use super::memory::GuestMemory;
 use super::x86_decoder::decode_one_mode;
 use alloc::vec::Vec;
 
-const CACHE_LIMIT: usize = 256;
+#[path = "runtime/jit.rs"]
+pub mod jit;
+
+const CACHE_SLOTS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StopReason {
@@ -30,7 +30,7 @@ pub enum StopReason {
     IllegalInstruction {
         pc: u64,
     },
-    /// A statically imported guest DLL returned FALSE from DLL_PROCESS_ATTACH.
+    /// A guest DLL returned FALSE from DLL_PROCESS_ATTACH.
     InitializationFailed {
         module_base: u64,
     },
@@ -54,8 +54,7 @@ struct CachedInstruction {
 /// mode or current PC can be overwritten by another CPU/thread.
 pub struct GuestThread {
     pub context: GuestState,
-    cache: Vec<CachedInstruction>,
-    replacement: usize,
+    cache: Vec<Option<CachedInstruction>>,
     pub retired: u64,
 }
 
@@ -68,24 +67,24 @@ impl GuestThread {
         Self {
             context,
             cache: Vec::new(),
-            replacement: 0,
             retired: 0,
         }
     }
 
     pub fn invalidate_code(&mut self) {
-        self.cache.clear();
-        self.replacement = 0;
+        self.cache.fill_with(|| None);
     }
 
     fn instruction(&mut self, memory: &mut dyn GuestMemory) -> Result<IrInst, StopReason> {
         let pc = self.context.rip;
+        let slot = ((pc ^ (pc >> 12) ^ (pc >> 24)) as usize) & (CACHE_SLOTS - 1);
         // Incremental fetch avoids demanding executable bytes beyond the end
         // of an instruction (e.g. RET at the final byte of an executable page).
         if let Some(entry) = self
             .cache
-            .iter()
-            .find(|entry| entry.mode == self.context.mode && entry.instruction.guest_va == pc)
+            .get(slot)
+            .and_then(Option::as_ref)
+            .filter(|entry| entry.mode == self.context.mode && entry.instruction.guest_va == pc)
         {
             let len = entry.instruction.guest_len as usize;
             let mut bytes = [0; 15];
@@ -108,20 +107,15 @@ impl GuestThread {
                 return Err(StopReason::InstructionFault { pc });
             }
             if let Some((instruction, _)) = decode_one_mode(&bytes[..len], pc, self.context.mode) {
-                let cached = CachedInstruction {
-                    instruction,
-                    mode: self.context.mode,
-                    bytes,
-                };
-                if let Some(entry) = self.cache.iter_mut().find(|entry| {
-                    entry.mode == self.context.mode && entry.instruction.guest_va == pc
-                }) {
-                    *entry = cached;
-                } else if self.cache.len() < CACHE_LIMIT {
-                    self.cache.push(cached);
-                } else {
-                    self.cache[self.replacement] = cached;
-                    self.replacement = (self.replacement + 1) % CACHE_LIMIT;
+                if self.cache.is_empty() && self.cache.try_reserve_exact(CACHE_SLOTS).is_ok() {
+                    self.cache.resize_with(CACHE_SLOTS, || None);
+                }
+                if let Some(entry) = self.cache.get_mut(slot) {
+                    *entry = Some(CachedInstruction {
+                        instruction,
+                        mode: self.context.mode,
+                        bytes,
+                    });
                 }
                 return Ok(instruction);
             }
@@ -132,6 +126,14 @@ impl GuestThread {
     /// Run at most `quantum` guest instructions, yielding at every syscall or
     /// precise fault. Callers can reschedule without holding a global lock.
     pub fn run(&mut self, memory: &mut dyn GuestMemory, quantum: u64) -> RunResult {
+        self.run_inner(memory, quantum, None)
+    }
+
+    pub fn run_with_jit(&mut self, memory: &mut dyn GuestMemory, quantum: u64, jit: &mut jit::Jit<'_>) -> RunResult {
+        self.run_inner(memory, quantum, Some(jit))
+    }
+
+    fn run_inner(&mut self, memory: &mut dyn GuestMemory, quantum: u64, mut jit: Option<&mut jit::Jit<'_>>) -> RunResult {
         struct Trap;
         impl SyscallHook for Trap {
             fn syscall(&mut self, _: &mut GuestState, _: &mut dyn GuestMemory) {}
@@ -145,6 +147,11 @@ impl GuestThread {
                 Ok(i) => i,
                 Err(reason) => break reason,
             };
+            if jit.as_deref_mut().is_some_and(|jit| jit.try_execute(instruction, &mut self.context)) {
+                retired += 1;
+                self.retired = self.retired.saturating_add(1);
+                continue;
+            }
             match execute_block(
                 core::slice::from_ref(&instruction),
                 &mut self.context,
