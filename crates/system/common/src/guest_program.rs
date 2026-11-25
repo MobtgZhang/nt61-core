@@ -4,10 +4,11 @@
 //! remain separate). Normal imports link only to checked guest DLL code.
 use crate::arch::common::btl::{
     io::{IoHost, IoServices},
+    nt61::{DcExtent, SocketKind},
     pe::ImageRunResult,
     runtime::StopReason,
 };
-use alloc::{format, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 
 struct VolumeIo {
     output: fn(&[u8]),
@@ -16,9 +17,153 @@ struct VolumeIo {
     application_directory: String,
 }
 impl Drop for VolumeIo {
-    fn drop(&mut self){if self.desktop_windows{let mut packet=nt61_abi::dialog_bridge::EMPTY;packet.values[0]=nt61_abi::dialog_bridge::WINDOW;packet.values[4]=8;packet.values[63]=self.desktop_client;let _=crate::arch::common::dialog_broker::request(packet);}}
+    fn drop(&mut self) {
+        if self.desktop_windows {
+            let mut packet = Box::new(nt61_abi::dialog_bridge::EMPTY);
+            packet.values[0] = nt61_abi::dialog_bridge::WINDOW;
+            packet.values[4] = 8;
+            packet.values[63] = self.desktop_client;
+            let _ = crate::arch::common::dialog_broker::request(packet);
+        }
+    }
 }
+fn socket_error(error: crate::netstack::socket::SocketError) -> u32 {
+    use crate::netstack::socket::SocketError;
+
+    match error {
+        SocketError::WouldBlock => 10035,
+        SocketError::ConnectionRefused => 10061,
+        SocketError::ConnectionReset => 10054,
+        SocketError::NotConnected => 10057,
+        SocketError::InvalidSocket => 10038,
+        SocketError::AddressInUse => 10048,
+        SocketError::AddressNotAvailable => 10049,
+        SocketError::InvalidArgument => 10022,
+        SocketError::OutOfMemory => 10055,
+    }
+}
+
 impl IoHost for VolumeIo {
+    fn resolve_ipv4(&mut self, name: &str) -> Result<[u8; 4], u32> {
+        use crate::netstack::dns::{resolve, DnsError};
+
+        resolve(name).map(u32::to_be_bytes).map_err(|error| match error {
+            DnsError::Timeout => 11002,
+            DnsError::NotFound => 11001,
+            DnsError::AddrFamilyNotSupported => 10047,
+            DnsError::Format | DnsError::Other => 11003,
+        })
+    }
+
+    fn open_socket(&mut self, kind: SocketKind) -> Result<u32, u32> {
+        use crate::netstack::socket::{socket_auto, SocketType};
+
+        let socket_type = match kind {
+            SocketKind::TcpV4 => SocketType::Stream,
+            SocketKind::UdpV4 => SocketType::Dgram,
+        };
+        socket_auto(socket_type).ok_or(10055)
+    }
+
+    fn close_socket(&mut self, socket: u32) -> Result<(), u32> {
+        crate::netstack::socket::close_owned(socket).map_err(socket_error)
+    }
+
+    fn connect_tcp(&mut self, socket: u32, ip: [u8; 4], port: u16) -> Result<(), u32> {
+        use crate::netstack::socket::{connect, SockAddr};
+
+        connect(socket, &SockAddr::new(2, port, u32::from_be_bytes(ip))).map_err(socket_error)
+    }
+
+    fn send_tcp(&mut self, socket: u32, bytes: &[u8]) -> Result<usize, u32> {
+        crate::netstack::socket::send(socket, bytes).map_err(socket_error)
+    }
+
+    fn recv_tcp(&mut self, socket: u32, bytes: &mut [u8]) -> Result<usize, u32> {
+        crate::drivers::net::poll_all();
+        crate::netstack::socket::recv(socket, bytes).map_err(socket_error)
+    }
+
+    fn message_beep(&mut self, kind: u32) -> bool {
+        crate::drivers::audio::system_sounds::message_beep(kind)
+    }
+
+    fn create_memory_dc(&mut self, source: u64) -> Option<u64> {
+        let dc = crate::libs::win32k::dc::gre_create_compatible_dc(source);
+        (dc != 0).then_some(dc)
+    }
+
+    fn delete_memory_dc(&mut self, dc: u64) -> bool {
+        crate::libs::win32k::dc::gre_delete_dc(dc)
+    }
+
+    fn device_caps(&mut self, dc: u64, index: i32) -> Option<u32> {
+        crate::libs::win32k::dc::caps::device_caps(dc, index)
+    }
+
+    fn draw_text_layout(&mut self, dc: u64, clip: Option<[i32; 4]>, lines: &[(i32, i32, &[u16])]) -> bool {
+        crate::libs::win32k::font_services::draw_text_layout(dc, clip, lines)
+    }
+
+    fn create_font_w(&mut self, description: &[u8; 92]) -> Option<u64> {
+        let font = crate::libs::win32k::font_services::create_logfont_w(description);
+        (font != 0).then_some(font)
+    }
+
+    fn select_font(&mut self, dc: u64, font: u64) -> Option<u64> {
+        use crate::libs::win32k::{dc, objects};
+        let default = objects::gdi_get_stock_object(13);
+        if default == 0 { return None; }
+        dc::get_dc(dc)?;
+        if dc::gre_get_current_font(dc) == 0 {
+            dc::select_typed_object(dc, default, Some(objects::GdiObjectType::Font));
+        }
+        let previous = dc::select_typed_object(dc, font, Some(objects::GdiObjectType::Font));
+        (previous != 0).then_some(previous)
+    }
+
+    fn delete_font(&mut self, font: u64) -> bool {
+        crate::libs::win32k::objects::gdi_delete_object(font)
+    }
+
+    fn enumerate_fonts_w(&mut self, dc: u64, family: Option<&str>) -> Option<Vec<crate::arch::common::btl::nt61::FontEnumeration>> {
+        crate::libs::win32k::font_services::enumerate_fonts_w(dc, family)
+    }
+
+    fn text_metrics_w(&mut self, dc: u64) -> Option<[u8; 60]> {
+        crate::libs::win32k::font_services::text_metrics_w(dc)
+    }
+
+    fn text_face_w(&mut self, dc: u64) -> Option<Vec<u16>> {
+        crate::libs::win32k::font_services::text_face_w(dc)
+    }
+
+    fn text_extent_w(&mut self, dc: u64, text: &[u16]) -> Option<[i32; 2]> {
+        crate::libs::win32k::font_services::text_extent_w(dc, text)
+    }
+
+    fn set_bk_mode(&mut self, dc: u64, mode: i32) -> Option<i32> {
+        crate::libs::win32k::dc::set_bk_mode(dc, mode)
+    }
+
+    fn set_map_mode(&mut self, dc: u64, mode: i32) -> Option<i32> {
+        Some(crate::libs::win32k::dc::gre_set_map_mode(dc, mode))
+    }
+
+    fn set_dc_extent(&mut self, dc: u64, kind: DcExtent, [x, y]: [i32; 2]) -> Option<(bool, [i32; 2])> {
+        use crate::libs::win32k::dc::{gre_set_viewport_ext_ex, gre_set_window_ext_ex, SizeL};
+        let mut previous = SizeL::new(0, 0);
+        let success = match kind {
+            DcExtent::Window => gre_set_window_ext_ex(dc, x, y, Some(&mut previous)),
+            DcExtent::Viewport => gre_set_viewport_ext_ex(dc, x, y, Some(&mut previous)),
+        };
+        Some((success, [previous.cx, previous.cy]))
+    }
+
+    fn logical_to_device(&mut self, dc: u64, points: &mut [u8]) -> bool {
+        crate::libs::win32k::transforms::logical_to_device(dc, points)
+    }
+
     fn create_event(&mut self, manual: bool, signaled: bool) -> Result<u64, u32> {
         crate::libs::ntdll::sync::create_event_kernel(u32::from(!manual), signaled)
             .map(|handle| handle as u64).map_err(|status| status as u32)
@@ -36,6 +181,17 @@ impl IoHost for VolumeIo {
         let status = crate::libs::ntdll::sync::nt_wait_for_single_object_kernel(event as _, 0, timeout);
         if status < 0 { Err(status as u32) } else { Ok(status as u32) }
     }
+    fn poll_events(&mut self, events: &[u64], all: bool) -> Result<u32, u32> {
+        let mut handles = [core::ptr::null_mut(); 64];
+        let handles = handles.get_mut(..events.len()).ok_or(0xc000_000du32)?;
+        for (handle, event) in handles.iter_mut().zip(events) {
+            *handle = *event as _;
+        }
+        let status = crate::libs::ntdll::sync::nt_wait_for_multiple_objects_kernel(
+            handles.len() as u32, handles, u32::from(!all), 0, Some(0),
+        );
+        if status < 0 { Err(status as u32) } else { Ok(status as u32) }
+    }
     fn close_event(&mut self, event: u64) -> Result<(), u32> {
         // SAFETY: this is an owned opaque native handle, not a guest address.
         let status = unsafe { crate::libs::ntdll::file::nt_close(event as _) };
@@ -43,6 +199,15 @@ impl IoHost for VolumeIo {
     }
     fn create_directory(&mut self, path: &str) -> Result<(), u32> {
         crate::fs::system_volume::mkdir(path)
+    }
+    fn file_attributes(&mut self, path: &str) -> Result<u32, u32> {
+        crate::fs::system_volume::file_attributes(path)
+    }
+    fn set_file_attributes(&mut self, path: &str, attributes: u32) -> Result<(), u32> {
+        crate::fs::system_volume::set_file_attributes(path, attributes)
+    }
+    fn set_file_times(&mut self, path: &str, times: [Option<u64>; 3]) -> Result<(), u32> {
+        crate::fs::system_volume::set_file_times(path, times)
     }
     fn directory_entries(&mut self, path: &str) -> Result<Vec<crate::arch::common::btl::nt61::DirectoryEntry>, u32> {
         Ok(crate::fs::system_volume::directory_metadata(path)?.into_iter().map(|entry| {
@@ -147,13 +312,46 @@ impl IoHost for VolumeIo {
         }
         .read_library(name, mode)
     }
+    fn read_system_library(
+        &mut self,
+        name: &str,
+        mode: crate::arch::common::btl::ir::DecodeMode,
+    ) -> Result<Vec<u8>, u32> {
+        crate::userspace::loader::VolumeLibraries {
+            application_directory: &self.application_directory,
+        }
+        .resolve_system_library(name, mode)
+        .map(|library| library.bytes)
+    }
+    fn resolve_library(
+        &mut self,
+        name: &str,
+        mode: crate::arch::common::btl::ir::DecodeMode,
+        system: bool,
+    ) -> Result<crate::arch::common::btl::pe::ResolvedLibrary, u32> {
+        use crate::arch::common::btl::pe::ImportResolver;
+        let mut libraries = crate::userspace::loader::VolumeLibraries {
+            application_directory: &self.application_directory,
+        };
+        if system { libraries.resolve_system_library(name, mode) }
+        else { libraries.resolve_library(name, mode) }
+    }
     fn open_read(&mut self, path: &str) -> Result<(), u32> {
         // This read validates file existence through the mounted FS without
         // loading its complete contents or opening directories as files.
         crate::fs::system_volume::read_at(path, 0, 1).map(|_| ())
     }
+    fn open_file(&mut self, path: &str, disposition: u32, writable: bool, allow_directory: bool) -> Result<(u64, bool), u32> {
+        crate::fs::system_volume::open_guest_file(path, disposition, writable, allow_directory)
+    }
+    fn file_size(&mut self, path: &str) -> Result<u64, u32> {
+        crate::fs::system_volume::file_size(path)
+    }
     fn read_at(&mut self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, u32> {
         crate::fs::system_volume::read_at(path, offset, len)
+    }
+    fn write_at(&mut self, path: &str, offset: u64, bytes: &[u8]) -> Result<usize, u32> {
+        crate::fs::system_volume::write_at(path, offset, bytes)
     }
     fn console_write(&mut self, bytes: &[u8]) -> Result<(), u32> {
         (self.output)(bytes);
@@ -180,26 +378,25 @@ pub fn try_execute(
         line.split_whitespace().next()?
     };
     let leaf = name.rsplit(['\\', '/']).next()?;
-    let name = if leaf.contains('.') {
-        String::from(name)
-    } else {
-        format!("{name}.exe")
+    let suffixes: &[&str] = match leaf.rsplit_once('.') {
+        Some((_, extension)) if extension.eq_ignore_ascii_case("exe")
+            || extension.eq_ignore_ascii_case("com") => &[""],
+        Some(_) => return None,
+        None => &[".com", ".exe"],
     };
-    if !name.to_ascii_lowercase().ends_with(".exe") {
-        return None;
-    }
     let mut candidates = Vec::new();
     if name.contains(['\\', '/']) || name.contains(':') {
         let absolute = if name.as_bytes().get(1) == Some(&b':') || name.starts_with(['\\', '/']) {
-            name
+            String::from(name)
         } else {
             format!("{directory}\\{name}")
         };
-        candidates.push(absolute);
+        candidates.extend(suffixes.iter().map(|suffix| format!("{absolute}{suffix}")));
     } else {
-        candidates.push(format!("{directory}\\{name}"));
-        for entry in search_path.split(';').filter(|e| !e.is_empty()) {
-            candidates.push(format!("{}\\{name}", entry.trim_matches('"')));
+        let directories = core::iter::once(directory).chain(search_path.split(';').filter(|entry| !entry.is_empty()));
+        for entry in directories {
+            let entry = entry.trim_matches('"');
+            candidates.extend(suffixes.iter().map(|suffix| format!("{entry}\\{name}{suffix}")));
         }
     }
     for candidate in candidates {
@@ -211,6 +408,9 @@ pub fn try_execute(
             Err(_) => continue,
         };
         if header.len() < 64 || &header[..2] != b"MZ" {
+            if candidate.rsplit_once('.').is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("com")) {
+                crate::hal::serial::write_string_always(&format!("[PE] Legacy COM execution is unavailable: {candidate}\r\n"));
+            }
             output(b"The file is not a valid Windows executable.\r\n");
             return Some(193);
         }
@@ -247,6 +447,8 @@ pub fn try_execute(
         // retain a scheduler yield after every 8192-instruction quantum.
         let execution_started = crate::ke::time::get_interrupt_time();
         let mut run_elapsed = 0u64;
+        let mut publisher = crate::mm::jit_code::KernelPublisher;
+        let mut jit = crate::arch::common::btl::runtime::jit::Jit::new(&mut publisher);
         for quantum in 0..16384 {
             if quantum != 0 && quantum % 128 == 0 {
                 crate::hal::serial::write_string_always(&format!(
@@ -255,10 +457,14 @@ pub fn try_execute(
                 ));
             }
             let run_started = crate::ke::time::get_interrupt_time();
-            let result = image.run(8192, &mut services);
+            let result = image.run_with_jit(8192, &mut services, &mut jit);
             run_elapsed = run_elapsed.saturating_add(
                 crate::ke::time::get_interrupt_time().saturating_sub(run_started));
             if !matches!(result, ImageRunResult::Yielded) {
+                crate::hal::serial::write_string_always(&format!(
+                    "[PE] Translation {candidate}: native={} interpreted={}\r\n",
+                    jit.retired(), image.retired().saturating_sub(jit.retired()),
+                ));
                 crate::hal::serial::write_string_always(&format!(
                     "[PE] Timing {candidate}: run_elapsed_ms={} wall_elapsed_ms={} batches={}\r\n",
                     run_elapsed / 10_000,
@@ -269,13 +475,17 @@ pub fn try_execute(
             match result {
                 ImageRunResult::Exited(code) => {
                     crate::hal::serial::write_string_always(&format!("[PE] Guest exited {candidate}: {code}\r\n"));
-                    if !image.win32.failures.is_empty() {
-                        let diagnostic = format!(
-                            "[PE] Guest exited {code}; recent API failures: {:?}\r\n",
-                            image.win32.failures
-                        );
-                        crate::hal::serial::write_string_always(&diagnostic);
-                        output(diagnostic.as_bytes());
+                    if code != 0 {
+                        crate::hal::serial::write_string_always(&format!(
+                            "[PE] Exit context {candidate}: {:?}\r\n", image.win32.exit_context,
+                        ));
+                        for (id, error, detail) in &image.win32.failures {
+                            let name = crate::arch::common::btl::pe::win32::catalog::resolve(*id)
+                                .map_or("unknown", |api| api.name);
+                            crate::hal::serial::write_string_always(&format!(
+                                "[PE] Recent API failure {name} ({id}): {error} {detail}\r\n",
+                            ));
+                        }
                     }
                     return Some(code);
                 }
@@ -315,6 +525,11 @@ pub fn try_execute(
                     crate::hal::serial::write_string_always("[PE] ");
                     crate::hal::serial::write_string_always(&diagnostic);
                     output(diagnostic.as_bytes());
+                    if let Some((dll, symbol)) = crate::arch::common::btl::pe::win32::delay_load_fault(&mut image) {
+                        crate::hal::serial::write_string_always(&format!(
+                            "[PE] Delay-load fault in {candidate}: {dll}!{symbol}\r\n"
+                        ));
+                    }
                     crate::hal::serial::write_string_always(&format!(
                         "[PE] Fault details: retired={} bytes={:02X?} last_api_arguments={:X?} recent_api_failures={:?}\r\n",
                         image.retired(), &bytes[..count], image.win32.last_arguments, image.win32.failures,
