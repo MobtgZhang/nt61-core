@@ -3,6 +3,9 @@
 //! Unsupported calls stop explicitly in the runtime instead of returning success.
 
 pub const GATEWAY_BASE: u32 = 0x7f00_0000;
+pub const MSVCRT_DATA_RVA: u32 = 0x2000;
+pub const MSVCRT_DATA_TAG: [u8; 8] = *b"NT61CRT\0";
+pub const MSVCRT_DATA_EXPORTS: &[(&str, u32)] = &[("_acmdln", 0), ("_fmode", 8), ("_commode", 12)];
 #[derive(Clone, Copy, Debug)]
 pub struct Api {
     pub id: u32,
@@ -14,12 +17,224 @@ pub struct Api {
     pub cdecl: bool,
 }
 pub const APIS: &[Api] = &[
+    Api { id: 3944, dll: "kernel32.dll", name: "SetThreadPriority", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3945, dll: "kernel32.dll", name: "GetThreadPriority", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3946, dll: "kernel32.dll", name: "GetHandleInformation", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3947, dll: "ntdll.dll", name: "RtlCharToInteger", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3948, dll: "ntdll.dll", name: "RtlUnicodeStringToInteger", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3949, dll: "ntdll.dll", name: "RtlIntegerToChar", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 3950, dll: "ntdll.dll", name: "RtlIntegerToUnicodeString", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3951, dll: "ntdll.dll", name: "RtlSecondsSince1970ToTime", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3952, dll: "ntdll.dll", name: "RtlSecondsSince1980ToTime", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3953, dll: "ntdll.dll", name: "RtlTimeToSecondsSince1970", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3954, dll: "ntdll.dll", name: "RtlTimeToSecondsSince1980", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3955, dll: "kernel32.dll", name: "SetProcessShutdownParameters", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3956, dll: "kernel32.dll", name: "GetProcessShutdownParameters", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3957, dll: "kernel32.dll", name: "GetPriorityClass", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3958, dll: "kernel32.dll", name: "SetPriorityClass", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3959, dll: "kernel32.dll", name: "QueueUserAPC", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3960, dll: "kernel32.dll", name: "OpenThread", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3961, dll: "kernel32.dll", name: "GetThreadPriorityBoost", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3962, dll: "kernel32.dll", name: "SetThreadPriorityBoost", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3963, dll: "gdi32.dll", name: "CreateCompatibleDC", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3964, dll: "gdi32.dll", name: "GetTextMetricsW", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3965, dll: "gdi32.dll", name: "SetBkMode", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3966, dll: "kernel32.dll", name: "GetProcessIdOfThread", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3967, dll: "gdi32.dll", name: "LPtoDP", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3968, dll: "gdi32.dll", name: "SetMapMode", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3969, dll: "gdi32.dll", name: "SetWindowExtEx", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 3970, dll: "gdi32.dll", name: "SetViewportExtEx", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 3971, dll: "gdi32.dll", name: "GetTextExtentPoint32W", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 3972, dll: "kernel32.dll", name: "InterlockedExchange", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3973, dll: "kernel32.dll", name: "InterlockedCompareExchange", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3974, dll: "kernel32.dll", name: "InterlockedExchangeAdd", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3975, dll: "kernel32.dll", name: "InterlockedIncrement", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3976, dll: "kernel32.dll", name: "InterlockedDecrement", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3977, dll: "gdi32.dll", name: "CreateFontIndirectW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3978, dll: "gdi32.dll", name: "EnumFontsW", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 3979, dll: "gdi32.dll", name: "SelectObject", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3980, dll: "gdi32.dll", name: "DeleteObject", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3981, dll: "gdi32.dll", name: "GetTextFaceW", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3982, dll: "user32.dll", name: "GetDlgItemTextW", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 3983, dll: "user32.dll", name: "GetDlgCtrlID", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3984, dll: "user32.dll", name: "SendDlgItemMessageW", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 3985, dll: "user32.dll", name: "SetActiveWindow", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3986, dll: "user32.dll", name: "GetActiveWindow", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 3987, dll: "user32.dll", name: "GetKeyboardLayout", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3988, dll: "user32.dll", name: "GetKeyboardLayoutList", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3989, dll: "user32.dll", name: "GetKeyboardLayoutNameA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3990, dll: "user32.dll", name: "GetKeyboardLayoutNameW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3991, dll: "user32.dll", name: "GetForegroundWindow", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 3992, dll: "user32.dll", name: "IsIconic", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3993, dll: "user32.dll", name: "GetFocus", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 3994, dll: "user32.dll", name: "SetFocus", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3995, dll: "user32.dll", name: "GetWindowTextLengthW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3996, dll: "user32.dll", name: "MoveWindow", arguments: 6, x86_arguments: 6, cdecl: false },
+    Api { id: 3997, dll: "user32.dll", name: "MessageBeep", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4000, dll: "kernel32.dll", name: "FindResourceA", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4001, dll: "kernel32.dll", name: "FindResourceW", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4002, dll: "kernel32.dll", name: "FindResourceExA", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4003, dll: "kernel32.dll", name: "FindResourceExW", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4004, dll: "kernel32.dll", name: "LoadResource", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4005, dll: "kernel32.dll", name: "LockResource", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4006, dll: "kernel32.dll", name: "SizeofResource", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4007, dll: "user32.dll", name: "EndDialog", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4008, dll: "user32.dll", name: "DialogBoxParamW", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4009, dll: "user32.dll", name: "CreateDialogParamW", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4010, dll: "user32.dll", name: "SetDlgItemTextW", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4011, dll: "user32.dll", name: "EnableWindow", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4012, dll: "user32.dll", name: "GetWindowPlacement", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4013, dll: "user32.dll", name: "SetWindowPlacement", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4014, dll: "ole32.dll", name: "CoInitialize", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4015, dll: "oleaut32.dll", name: "SysAllocString", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4016, dll: "oleaut32.dll", name: "SysFreeString", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4017, dll: "shlwapi.dll", name: "PathIsFileSpecW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4018, dll: "shlwapi.dll", name: "SHStrDupW", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4019, dll: "shell32.dll", name: "SHGetFolderPathW", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4020, dll: "user32.dll", name: "CharUpperW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4021, dll: "user32.dll", name: "WinHelpW", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4022, dll: "user32.dll", name: "GetCursorPos", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4023, dll: "user32.dll", name: "ScreenToClient", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4024, dll: "user32.dll", name: "ChildWindowFromPoint", arguments: 2, x86_arguments: 3, cdecl: false },
+    Api { id: 4025, dll: "user32.dll", name: "GetSystemMenu", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4026, dll: "user32.dll", name: "GetMenuState", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4027, dll: "user32.dll", name: "EnableMenuItem", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4028, dll: "user32.dll", name: "CheckMenuItem", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4029, dll: "user32.dll", name: "LoadImageW", arguments: 6, x86_arguments: 6, cdecl: false },
+    Api { id: 4030, dll: "user32.dll", name: "LoadIconW", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4031, dll: "user32.dll", name: "LoadCursorW", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4032, dll: "user32.dll", name: "SetCursor", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4033, dll: "user32.dll", name: "LoadAcceleratorsW", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4034, dll: "user32.dll", name: "TranslateAcceleratorW", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4035, dll: "user32.dll", name: "GetWindowLongW", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4036, dll: "user32.dll", name: "SetWindowLongW", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4037, dll: "user32.dll", name: "RegisterWindowMessageW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4038, dll: "user32.dll", name: "GetAncestor", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4039, dll: "user32.dll", name: "SetScrollPos", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4040, dll: "user32.dll", name: "InvalidateRect", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4041, dll: "user32.dll", name: "CharNextW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4042, dll: "user32.dll", name: "FindWindowW", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4043, dll: "user32.dll", name: "SetForegroundWindow", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4044, dll: "user32.dll", name: "GetDC", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4045, dll: "user32.dll", name: "ReleaseDC", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4046, dll: "user32.dll", name: "DrawTextExW", arguments: 6, x86_arguments: 6, cdecl: false },
+    Api { id: 4047, dll: "user32.dll", name: "GetMenu", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4048, dll: "user32.dll", name: "GetSubMenu", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4049, dll: "user32.dll", name: "OpenClipboard", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4050, dll: "user32.dll", name: "CloseClipboard", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 4051, dll: "user32.dll", name: "IsClipboardFormatAvailable", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4052, dll: "msvcrt.dll", name: "__getmainargs", arguments: 5, x86_arguments: 5, cdecl: true },
+    Api { id: 4053, dll: "msvcrt.dll", name: "_initterm", arguments: 2, x86_arguments: 2, cdecl: true },
+    Api { id: 4054, dll: "msvcrt.dll", name: "__p__fmode", arguments: 0, x86_arguments: 0, cdecl: true },
+    Api { id: 4055, dll: "msvcrt.dll", name: "__p__commode", arguments: 0, x86_arguments: 0, cdecl: true },
+    Api { id: 4056, dll: "msvcrt.dll", name: "__set_app_type", arguments: 1, x86_arguments: 1, cdecl: true },
+    Api { id: 4057, dll: "msvcrt.dll", name: "__setusermatherr", arguments: 1, x86_arguments: 1, cdecl: true },
+    Api { id: 4058, dll: "msvcrt.dll", name: "_amsg_exit", arguments: 1, x86_arguments: 1, cdecl: true },
+    Api { id: 4059, dll: "msvcrt.dll", name: "exit", arguments: 1, x86_arguments: 1, cdecl: true },
+    Api { id: 4060, dll: "msvcrt.dll", name: "_exit", arguments: 1, x86_arguments: 1, cdecl: true },
+    Api { id: 4061, dll: "msvcrt.dll", name: "_cexit", arguments: 0, x86_arguments: 0, cdecl: true },
+    Api { id: 4062, dll: "user32.dll", name: "SetWinEventHook", arguments: 7, x86_arguments: 7, cdecl: false },
+    Api { id: 4063, dll: "user32.dll", name: "UnhookWinEvent", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4064, dll: "user32.dll", name: "IsDialogMessageW", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4065, dll: "user32.dll", name: "MessageBoxW", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4066, dll: "msvcrt.dll", name: "_wtol", arguments: 1, x86_arguments: 1, cdecl: true },
+    Api { id: 4067, dll: "msvcrt.dll", name: "iswctype", arguments: 2, x86_arguments: 2, cdecl: true },
+    Api { id: 4068, dll: "msvcrt.dll", name: "_ismbblead", arguments: 1, x86_arguments: 1, cdecl: true },
+    Api { id: 4069, dll: "msvcrt.dll", name: "_vsnwprintf", arguments: 4, x86_arguments: 4, cdecl: true },
+    Api { id: 4070, dll: "msvcrt.dll", name: "__C_specific_handler", arguments: 4, x86_arguments: 4, cdecl: true },
+    Api { id: 4071, dll: "msvcrt.dll", name: "_XcptFilter", arguments: 2, x86_arguments: 2, cdecl: true },
+    Api { id: 4072, dll: "msvcrt.dll", name: "_except_handler4_common", arguments: 6, x86_arguments: 6, cdecl: true },
+    Api { id: 4073, dll: "msvcrt.dll", name: "_controlfp", arguments: 2, x86_arguments: 2, cdecl: true },
+    Api { id: 4074, dll: "msvcrt.dll", name: "?terminate@@YAXXZ", arguments: 0, x86_arguments: 0, cdecl: true },
+    Api { id: 4075, dll: "comdlg32.dll", name: "FindTextW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4076, dll: "comdlg32.dll", name: "ReplaceTextW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4077, dll: "comdlg32.dll", name: "PrintDlgExW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4078, dll: "comctl32.dll", name: "TaskDialogIndirect", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4079, dll: "shell32.dll", name: "DragAcceptFiles", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4080, dll: "shell32.dll", name: "DragFinish", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4081, dll: "shell32.dll", name: "DragQueryFileW", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4082, dll: "shell32.dll", name: "SHAddToRecentDocs", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4083, dll: "shell32.dll", name: "SHCreateItemFromParsingName", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4084, dll: "shell32.dll", name: "ShellAboutW", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4085, dll: "shell32.dll", name: "ShellExecuteExW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4086, dll: "ole32.dll", name: "CoCreateInstance", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4087, dll: "version.dll", name: "GetFileVersionInfoExW", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4088, dll: "version.dll", name: "GetFileVersionInfoSizeExW", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4089, dll: "version.dll", name: "VerQueryValueW", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4090, dll: "winspool.drv", name: "ClosePrinter", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4091, dll: "winspool.drv", name: "GetPrinterDriverW", arguments: 6, x86_arguments: 6, cdecl: false },
+    Api { id: 4092, dll: "winspool.drv", name: "OpenPrinterW", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4093, dll: "ntdll.dll", name: "WinSqmAddToStream", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4094, dll: "ntdll.dll", name: "WinSqmIncrementDWORD", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4095, dll: "oleaut32.dll", name: "SysAllocStringLen", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4096, dll: "oleaut32.dll", name: "SysStringLen", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4097, dll: "oleaut32.dll", name: "VariantInit", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4098, dll: "oleaut32.dll", name: "VariantClear", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4099, dll: "advapi32.dll", name: "AdjustTokenPrivileges", arguments: 6, x86_arguments: 6, cdecl: false },
+    Api { id: 4100, dll: "kernel32.dll", name: "WaitForMultipleObjectsEx", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4101, dll: "ws2_32.dll", name: "WSAStartup", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4102, dll: "ws2_32.dll", name: "WSACleanup", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 4103, dll: "ws2_32.dll", name: "WSAGetLastError", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 4104, dll: "ws2_32.dll", name: "WSASetLastError", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4105, dll: "ws2_32.dll", name: "htons", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4106, dll: "ws2_32.dll", name: "ntohs", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4107, dll: "ws2_32.dll", name: "htonl", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4108, dll: "ws2_32.dll", name: "ntohl", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4109, dll: "ws2_32.dll", name: "__WSAFDIsSet", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4110, dll: "ws2_32.dll", name: "socket", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4111, dll: "ws2_32.dll", name: "closesocket", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4112, dll: "ws2_32.dll", name: "accept", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4113, dll: "ws2_32.dll", name: "bind", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4114, dll: "ws2_32.dll", name: "connect", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4115, dll: "ws2_32.dll", name: "getpeername", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4116, dll: "ws2_32.dll", name: "getsockname", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4117, dll: "ws2_32.dll", name: "getsockopt", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4118, dll: "ws2_32.dll", name: "ioctlsocket", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4119, dll: "ws2_32.dll", name: "listen", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4120, dll: "ws2_32.dll", name: "recv", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4121, dll: "ws2_32.dll", name: "recvfrom", arguments: 6, x86_arguments: 6, cdecl: false },
+    Api { id: 4122, dll: "ws2_32.dll", name: "select", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4123, dll: "ws2_32.dll", name: "send", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4124, dll: "ws2_32.dll", name: "sendto", arguments: 6, x86_arguments: 6, cdecl: false },
+    Api { id: 4125, dll: "ws2_32.dll", name: "setsockopt", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4126, dll: "ws2_32.dll", name: "shutdown", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4127, dll: "ws2_32.dll", name: "gethostbyaddr", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4128, dll: "ws2_32.dll", name: "gethostbyname", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4129, dll: "ws2_32.dll", name: "getprotobyname", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4130, dll: "ws2_32.dll", name: "getprotobynumber", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4131, dll: "ws2_32.dll", name: "gethostname", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4132, dll: "ws2_32.dll", name: "WSAIoctl", arguments: 9, x86_arguments: 9, cdecl: false },
+    Api { id: 4133, dll: "ws2_32.dll", name: "WSASocketW", arguments: 6, x86_arguments: 6, cdecl: false },
+    Api { id: 4134, dll: "ws2_32.dll", name: "WSCEnumProtocols", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4135, dll: "ws2_32.dll", name: "WSCGetProviderInfo", arguments: 6, x86_arguments: 6, cdecl: false },
+    Api { id: 4136, dll: "ws2_32.dll", name: "WSCGetProviderPath", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4137, dll: "ws2_32.dll", name: "freeaddrinfo", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4138, dll: "ws2_32.dll", name: "getaddrinfo", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4139, dll: "ws2_32.dll", name: "getnameinfo", arguments: 7, x86_arguments: 7, cdecl: false },
+    Api { id: 4140, dll: "ws2_32.dll", name: "inet_ntop", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4141, dll: "ws2_32.dll", name: "inet_pton", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4142, dll: "ws2_32.dll", name: "inet_addr", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4143, dll: "ws2_32.dll", name: "inet_ntoa", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4144, dll: "kernel32.dll", name: "CreateDirectoryA", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4145, dll: "kernel32.dll", name: "GetFileAttributesA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4146, dll: "kernel32.dll", name: "FindFirstFileA", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4147, dll: "kernel32.dll", name: "FindNextFileA", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4148, dll: "kernel32.dll", name: "GetTempPathA", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4149, dll: "kernel32.dll", name: "GetEnvironmentStrings", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 4150, dll: "kernel32.dll", name: "FreeEnvironmentStringsA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4151, dll: "kernel32.dll", name: "CancelIo", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4152, dll: "kernel32.dll", name: "CreateMutexA", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4153, dll: "kernel32.dll", name: "ReleaseMutex", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4154, dll: "kernel32.dll", name: "CreateSemaphoreA", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4155, dll: "kernel32.dll", name: "CreateSemaphoreW", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4156, dll: "kernel32.dll", name: "ReleaseSemaphore", arguments: 3, x86_arguments: 3, cdecl: false },
     // Process/thread token gateway used by the SP1 Kernel32 API-set
     // processthreads contract. These entries define ABI only: token handling
     // remains explicitly unsupported until a guest-owned token backend exists.
     Api { id: 3940, dll:"advapi32.dll", name:"OpenProcessToken", arguments:3, x86_arguments:3, cdecl:false },
     Api { id: 3941, dll:"advapi32.dll", name:"OpenThreadToken", arguments:4, x86_arguments:4, cdecl:false },
     Api { id: 3942, dll:"advapi32.dll", name:"SetThreadToken", arguments:2, x86_arguments:2, cdecl:false },
+    Api { id: 3943, dll:"advapi32.dll", name:"GetTokenInformation", arguments:5, x86_arguments:5, cdecl:false },
     Api { id:3934, dll:"ole32.dll", name:"CoInitializeEx", arguments:2, x86_arguments:2, cdecl:false },
     Api { id:3935, dll:"ole32.dll", name:"CoUninitialize", arguments:0, x86_arguments:0, cdecl:false },
     Api { id:3936, dll:"ole32.dll", name:"CoGetContextToken", arguments:1, x86_arguments:1, cdecl:false },
@@ -116,6 +331,7 @@ pub const APIS: &[Api] = &[
     Api { id:3613, dll:"gdi32.dll", name:"MoveToEx", arguments:4, x86_arguments:4, cdecl:false },
     Api { id:3614, dll:"gdi32.dll", name:"LineTo", arguments:3, x86_arguments:3, cdecl:false },
     Api { id:3615, dll:"gdi32.dll", name:"Rectangle", arguments:5, x86_arguments:5, cdecl:false },
+    Api { id:3616, dll:"gdi32.dll", name:"SetAbortProc", arguments:2, x86_arguments:2, cdecl:false },
 
     Api {
         id: 1,
@@ -4343,6 +4559,19 @@ pub const APIS: &[Api] = &[
     Api { id: 3467, dll: "comctl32.dll", name: "ImageList_GetIconSize", arguments: 3, x86_arguments: 3, cdecl: false },
     Api { id: 3468, dll: "comctl32.dll", name: "ImageList_SetImageCount", arguments: 2, x86_arguments: 2, cdecl: false },
     Api { id: 3469, dll: "comctl32.dll", name: "ImageList_Remove", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3470, dll: "kernel32.dll", name: "GetUserDefaultUILanguage", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 3471, dll: "kernel32.dll", name: "Wow64DisableWow64FsRedirection", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3472, dll: "kernel32.dll", name: "Wow64RevertWow64FsRedirection", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3473, dll: "kernel32.dll", name: "Wow64EnableWow64FsRedirection", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3474, dll: "ntdll.dll", name: "RtlWow64EnableFsRedirection", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3475, dll: "ntdll.dll", name: "RtlWow64EnableFsRedirectionEx", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3476, dll: "kernel32.dll", name: "FindNLSString", arguments: 7, x86_arguments: 7, cdecl: false },
+    Api { id: 3477, dll: "kernel32.dll", name: "LocalReAlloc", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3478, dll: "kernel32.dll", name: "FoldStringW", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 3479, dll: "kernel32.dll", name: "LocalLock", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3480, dll: "kernel32.dll", name: "LocalUnlock", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 3481, dll: "kernel32.dll", name: "SetThreadPreferredUILanguages", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3482, dll: "kernel32.dll", name: "GetThreadUILanguage", arguments: 0, x86_arguments: 0, cdecl: false },
 ];
 
 pub fn resolve(id: u32) -> Option<&'static Api> {
@@ -4377,7 +4606,7 @@ pub struct RuntimeSupport {
     pub scope: &'static str,
 }
 
-pub const RUNTIME_LIMITATIONS: &str = "Linkability is not Windows compatibility. Limited implementations operate in one isolated GuestImage with bounded buffers and allocations; Win32 ANSI text accepts ASCII only, while CRT byte strings preserve arbitrary bytes. API-set facades use the audited default host and do not implement importer-specific routing; x86 schema hosts come from the same ISO's AMD64 schema. Host services depend on the selected GuestServices backend and may return NOT_IMPLEMENTED. Dynamic DLLs requiring DllMain or static TLS initialization are rejected. Guest threads have bounded stacks and cooperative host scheduling; APCs, threadpools and cross-thread window callbacks are unsupported. No certificate validation or exception unwinding is provided.";
+pub const RUNTIME_LIMITATIONS: &str = "Limited implementations operate in one isolated GuestImage with bounded buffers and allocations. Win32 ANSI coverage depends on the API. API-set facades use the audited default host, and x86 schema hosts come from the same ISO's AMD64 schema. Host services depend on the selected GuestServices backend and may return NOT_IMPLEMENTED. LoadLibrary initializes static TLS and runs DLL attach notifications. Reentrant module loading and process-exit detach remain unsupported. Guest threads have bounded stacks and cooperative host scheduling. User APC delivery covers SleepEx, WaitForSingleObjectEx and thread startup. Native APC services, threadpools and cross-thread window callbacks remain unsupported.";
 
 /// Explicit allowlist of the shipping runtime handlers. Unknown DLLs, exports
 /// and subsequently added catalog entries default to unsupported.
@@ -4385,14 +4614,32 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
     use SupportStatus::{HostService as H, ImplementedLimited as L, Unsupported as U};
     let (status, scope) = if find(dll, name).is_none() {
         (U, "No catalog entry or runtime implementation")
+    } else if dll.eq_ignore_ascii_case("ws2_32.dll") {
+        match name {
+            "WSAStartup" | "WSACleanup" => (L, "SP1 WSADATA layouts, process-local startup count and endpoint cleanup on the final call; provider catalog unavailable"),
+            "socket" | "WSASocketW" | "closesocket" => (H, "Process-owned IPv4 TCP and UDP endpoint creation and release through GuestServices; no protocol info or overlapped I/O"),
+            "connect" | "send" | "recv" => (H, "Blocking IPv4 TCP client with bounded partial transfers and no message flags; no nonblocking or overlapped I/O"),
+            "inet_pton" | "inet_ntop" => (L, "IPv4 and IPv6 presentation conversion with checked guest buffers"),
+            "getaddrinfo" | "freeaddrinfo" => (H, "Guest-width IPv4 result lists with checked lifetime, numeric services and a single IPv4 answer from the guest DNS stack"),
+            "WSAGetLastError" | "WSASetLastError" | "htons" | "ntohs" | "htonl" | "ntohl" | "__WSAFDIsSet" =>
+                (L, "Win32 thread last-error slot, byte order conversion and bounded guest-width fd_set membership"),
+            _ => (U, "No Winsock runtime implementation"),
+        }
     } else if dll.eq_ignore_ascii_case("shell32.dll") {
-        (H, "SHGetKnownFolderPath for current process RoamingAppData, LocalAppData and Profile from the provisioned environment; default flags verify through mounted-volume directories, DONT_VERIFY supported; other tokens, flags and registry folder redirection unsupported; HRESULT and task-allocator ownership")
+        (H, "Current-user RoamingAppData, LocalAppData and Profile paths from the provisioned environment; default flags verify through mounted-volume directories, DONT_VERIFY supported; other tokens, flags and registry folder redirection unsupported")
     } else if dll.eq_ignore_ascii_case("ole32.dll") {
         match name {
-            "CoInitializeEx" | "CoUninitialize" | "CoGetContextToken" =>
+            "CoInitialize" | "CoInitializeEx" | "CoUninitialize" | "CoGetContextToken" =>
                 (L, "SP1 apartment initialization flags, per-thread mode/refcount and balanced cleanup; checked opaque context token shared by MTA participants and private to STA; preserves Win32 LastError; context interfaces, COM activation, RPC, marshalling and message pumping unsupported"),
             _ => (L, "Checked process-owned COM task allocator, including zero-length allocation and reallocation ownership/copy semantics; 1 MiB per allocation bound; preserves Win32 LastError; COM activation and interfaces unsupported"),
         }
+    } else if dll.eq_ignore_ascii_case("oleaut32.dll") {
+        match name {
+            "VariantInit" | "VariantClear" => (L, "VARIANT initialization and clear for scalar values, by-reference values and owned guest BSTRs; owned arrays, records and COM interfaces unsupported"),
+            _ => (L, "Process-owned BSTR allocation and release with a byte-length prefix and UTF-16 terminator"),
+        }
+    } else if dll.eq_ignore_ascii_case("shlwapi.dll") {
+        (L, "Bounded UTF-16 file-spec checks and duplication using the COM task allocator")
     } else if dll.eq_ignore_ascii_case("bcrypt.dll") {
         (H, "BCryptGenRandom with null algorithm and BCRYPT_USE_SYSTEM_PREFERRED_RNG only; bounded output from GuestServices entropy backend; unavailable entropy fails, no provider handles")
     } else if dll.eq_ignore_ascii_case("ntdll.dll") {
@@ -4409,6 +4656,8 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "memchr" | "strstr" | "wcsstr" | "strpbrk" | "wcspbrk"
             | "strspn" | "wcsspn" | "strcspn" | "wcscspn" =>
                 (L, "Checked raw-byte/UTF-16 search and set spans; linear scans with a 1 MiB input bound, no locale or LastError mutation; invalid memory faults, unsupported sizes stop explicitly"),
+            "RtlWow64EnableFsRedirection" | "RtlWow64EnableFsRedirectionEx" =>
+                (L, "Per-thread I386 file view and previous-state tokens 0 and 1; AMD64 returns STATUS_NOT_IMPLEMENTED"),
             "RtlGetLastWin32Error" | "RtlSetLastWin32Error" =>
                 (L, "Last-error DWORD in the current guest TEB, shared with Kernel32/KernelBase without process-global state"),
             "strcpy" | "strncpy" | "strcat" | "strncat"
@@ -4428,6 +4677,10 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             | "NtOpenProcess" | "NtWaitForSingleObject" =>
                 (H, "Guest ABI arguments forwarded to GuestServices; backend determines operation support and NTSTATUS"),
             "RtlInitUnicodeString" => (L, "Guest UNICODE_STRING initialization with checked UTF-16 source and 16-bit lengths"),
+            "RtlSecondsSince1970ToTime" | "RtlSecondsSince1980ToTime" | "RtlTimeToSecondsSince1970" | "RtlTimeToSecondsSince1980" =>
+                (L, "Converts between NT ticks and unsigned elapsed seconds, with checked guest buffers"),
+            "RtlCharToInteger" | "RtlUnicodeStringToInteger" | "RtlIntegerToChar" | "RtlIntegerToUnicodeString" =>
+                (L, "Checked guest integer conversion with SP1 radix, width, and overflow semantics; bounded buffers and unchanged Win32 LastError"),
             "memcpy" | "memmove" | "memset" | "memcmp" => (L, "Checked guest buffers up to 1 MiB; invalid pointers fault and larger operations are unsupported"),
             _ => (U, "No runtime handler; dispatch stops with UnsupportedApi"),
         }
@@ -4446,21 +4699,63 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
         match name {
             "DllGetVersion" | "InitMUILanguage" | "GetMUILanguage" | "ImageList_Create" | "ImageList_Destroy" | "ImageList_GetImageCount" | "ImageList_GetIconSize" | "ImageList_SetIconSize" | "ImageList_SetImageCount" | "ImageList_Remove" => (L, "Checked metadata and bounded process-private image-list storage; no GDI bitmap ingestion or icon rendering"),
             "InitCommonControls" | "InitCommonControlsEx" => (L, "Registers process-private list, tree and toolbar classes for the desktop HWND transport"),
+            "CreateStatusWindowW" => (H, "Creates a single-pane text status control through the desktop window transport"),
             _ => (U, "No runtime handler; dispatch stops with UnsupportedApi"),
         }
     } else if dll.eq_ignore_ascii_case("user32.dll") {
         match name {
             "SetProcessDPIAware" | "IsProcessDPIAware" => (L, "Process-owned DPI awareness for the current fixed 96-DPI session; initial aware state, repeated calls, cross-thread visibility and preserved LastError observed on native unmanifested SP1 EXEs; manifest activation, other DPI settings and coordinate virtualization unsupported"),
-            "LoadStringW" => (L, "Checked mapped-image RT_STRING blocks; UTF-16 copy/truncation and guest-width resource pointer; neutral or single-language resources only; MUI satellites and multilingual selection unsupported"),
+            "LoadStringW" => (H, "Checked UTF-16 RT_STRING resources and associated read-only en-US and zh-CN EXE/DLL satellites, with thread preferences and external fallback"),
+            "LoadImageW" | "LoadIconW" | "LoadCursorW" | "SetCursor" => (L, "Validated module icon/cursor resources and process-owned handles; image rendering and file loading are not connected"),
+            "LoadAcceleratorsW" | "TranslateAcceleratorW" => (L, "Validated module accelerator tables and synchronous command callbacks for matching guest messages; desktop modifier routing and menu-state integration are not connected"),
+            "GetWindowLongW" | "SetWindowLongW" => (L, "Process-owned window metadata and class extra bytes; changes to visual styles and owner relationships are unsupported"),
+            "RegisterWindowMessageW" => (L, "Case-insensitive message registration within the guest process"),
+            "GetAncestor" => (L, "Parent and root lookup on process-owned window records"),
+            "SetScrollPos" => (L, "Process-owned standard scrollbar position in the default range; thumb rendering is unsupported"),
+            "InvalidateRect" => (L, "Coalesced guest WM_PAINT delivery; rectangular clipping and background erasure are unsupported"),
+            "CharNextW" => (L, "Advance one UTF-16 code unit or stay on the terminator"),
             "GetSysColor" => (H, "Captured SP1 Basic default COLORREFs only; invalid indices return zero; guest theme changes and per-user color overrides are not connected"),
             "GetSystemMetrics" => (H, "Captured SP1 Basic 96 DPI metrics for the current single display and 40-pixel bottom taskbar; max-track limits retain session mode-change state; other DPI/themes and configurable work areas are not connected"),
+            "GetDlgItemTextW" | "GetDlgCtrlID" | "SendDlgItemMessageW" => (H,"Direct child control lookup, text and synchronous guest messages"),
+            "SetActiveWindow" | "GetActiveWindow" => (H,"Calling guest thread's top-level windows and foreground client desktop selection"),
+            "GetKeyboardLayout" | "GetKeyboardLayoutList" | "GetKeyboardLayoutNameA" | "GetKeyboardLayoutNameW" => (L, "US English desktop layout for this guest process; checked HKL and KLID output at the guest ABI width"),
+            "GetForegroundWindow" => (H, "Return the selected visible desktop window when owned by this guest process"),
+            "SetForegroundWindow" => (H, "Activate a visible process-owned top-level guest window under desktop foreground rules"),
+            "FindWindowW" => (L, "Case-insensitive class and title matching among this process's top-level windows"),
+            "GetDC" | "ReleaseDC" => (L, "Guest-owned client and display metric contexts with thread-bound release; no desktop client raster target"),
+            "DrawTextExW" => (L, "UTF-16 text layout and measurement using the selected font, with clipped PostScript output on printer contexts"),
+            "GetCursorPos" => (H, "Current pointer on the project desktop in screen pixels"),
+            "ScreenToClient" => (H, "Convert screen pixels using the project desktop geometry of an owned guest window or control"),
+            "ChildWindowFromPoint" => (H, "Hit-test direct children of an owned guest window in parent client coordinates"),
+            "GetMenu" | "GetSubMenu" => (L, "Guest-owned hierarchical menus from localized class resources; desktop menu bar rendering is not connected"),
+            "OpenClipboard" | "CloseClipboard" | "IsClipboardFormatAvailable" => (H, "Desktop clipboard lock and text format availability across guest clients"),
+            "GetSystemMenu" | "GetMenuState" | "EnableMenuItem" | "CheckMenuItem" => (L, "Guest-owned menu state and item queries; system menu Close state is connected to the desktop"),
+            "IsIconic" => (H, "Query the minimized state of an owned desktop window"),
+            "GetFocus" | "SetFocus" => (H, "Query or update focus in a window scene owned by the calling guest thread"),
+            "GetWindowTextLengthW" | "MoveWindow" => (H, "Query UTF-16 text length or move and resize an owned desktop window"),
+            "MessageBeep" => (H, "Queue an installed system sound or simple PCM tone through the desktop audio backend"),
+            "EndDialog" | "DialogBoxParamW" | "CreateDialogParamW" => (L, "Standard and extended localized dialog templates, built-in controls and guest callbacks on the owning thread"),
+            "SetDlgItemTextW" | "EnableWindow" => (H, "Update guest-owned dialog control text or desktop input state"),
+            "GetWindowPlacement" | "SetWindowPlacement" => (H, "Query or update owned top-level windows and their normal desktop geometry"),
+            "CharUpperW" => (L, "Uppercase a UTF-16 unit or writable string using the installed NLS repertoire"),
+            "WinHelpW" => (U, "Legacy Help viewer unavailable; return FALSE with ERROR_CALL_NOT_IMPLEMENTED"),
             _ if (3700..=3729).contains(&find(dll,name).unwrap().id) => (H,"Process-owned HWNDs, direct child controls and copied desktop messages; bounded queues and x86/x64 guest window procedures; unsupported messages fail explicitly"),
             _ => (U,"No runtime handler"),
         }
     } else if dll.eq_ignore_ascii_case("gdi32.dll") {
-        if (3600..=3615).contains(&find(dll,name).unwrap().id) {(H,"PostScript printer DC, document/page lifecycle and basic text/vector drawing; no display DC, bitmap driver or physical printer")}else{(U,"No runtime handler")}
+        if matches!(name, "CreateCompatibleDC" | "GetTextMetricsW" | "DeleteDC") {(H,"Process-owned memory DCs and 60-byte metrics from the native TrueType backend; DeleteDC also supports printer DCs")}
+        else if name == "GetTextExtentPoint32W" {(H,"Counted UTF-16 text advances and height from the native TrueType backend for an owned memory DC")}
+        else if name == "GetTextFaceW" {(H,"UTF-16 face name of the realized font in an owned memory DC")}
+        else if matches!(name, "CreateFontIndirectW" | "SelectObject" | "DeleteObject" | "EnumFontsW") {(L,"Owned memory DCs and logical fonts with installed TrueType family callbacks")}
+        else if name == "SetBkMode" {(H,"Returns the previous background mode on an owned memory DC")}
+        else if name == "LPtoDP" {(H,"Transforms a checked guest POINT array using the owned native memory DC")}
+        else if matches!(name, "SetMapMode" | "SetWindowExtEx" | "SetViewportExtEx") {(H,"Native page mapping and checked previous extents for owned memory DCs")}
+        else if name == "SetAbortProc" {(L,"Registers or clears a guest callback on an owned printer DC; called before submitting the buffered PostScript job")}
+        else if (3600..=3615).contains(&find(dll,name).unwrap().id) {(H,"PostScript printer DC, document/page lifecycle and basic text/vector drawing; no display DC, bitmap driver or physical printer")}else{(U,"No runtime handler")}
     } else if dll.eq_ignore_ascii_case("advapi32.dll") {
         match name {
+            "OpenProcessToken" | "GetTokenInformation" | "AdjustTokenPrivileges" =>
+                (L, "Process-local unelevated primary token for the current-process pseudo-handle; token type, elevation and restricted privilege state; no host authorization changes"),
             "RegisterEventSourceW" | "RegisterEventSourceA" | "DeregisterEventSource" | "ReportEventW" | "ReportEventA" =>
                 (H, "Local Application log only, bounded per-process source handles, full DWORD event IDs, checked ABI-width insertion pointers, UTF-16/CP1252 strings, SID and raw data; success requires backend commit; remote servers unsupported"),
             "SystemFunction036" => (H, "RtlGenRandom BOOLEAN API using the host cryptographic entropy backend, bounded transactional guest output and no LastError mutation; unavailable entropy fails without generated fallback bytes"),
@@ -4480,10 +4775,20 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
                 (L, "SP1 run-once state machine shared with NTDLL; real guest callbacks and contended guest-thread waits; BOOL, pending output and LastError follow original wrappers; foreign keyed-event queues and completion exceptions unsupported"),
             "WerRegisterRuntimeExceptionModule" | "WerUnregisterRuntimeExceptionModule" =>
                 (U, "Explicit E_NOTIMPL HRESULT preserving LastError; no WER service, callback host or registration is implemented"),
-            "CreateDirectoryW" =>
+            "CreateDirectoryA" | "CreateDirectoryW" =>
                 (H, "Creates one directory through the mounted-volume backend with WoW64 path redirection and preserved NTSTATUS errors; null security attributes only; ordinary drive-absolute or current-directory-relative paths; no UNC, drive-relative paths, dot components, trailing-dot/space normalization or explicit ACLs"),
-            "FindFirstFileW" | "FindFirstFileExW" | "FindNextFileW" | "FindClose" =>
+            "FindFirstFileA" | "FindFirstFileW" | "FindFirstFileExW" | "FindNextFileA" | "FindNextFileW" | "FindClose" =>
                 (H, "Process-owned snapshot cursors over mounted NTFS metadata with WoW64 view selection; literal and star patterns including *.*; Western case mapping only; no short-name/reparse capture; Ex supports basic info and directory filtering only"),
+            "GetFileAttributesA" | "GetFileAttributesW" | "SetFileAttributesW" =>
+                (H, "Mounted-volume attributes with scoped Win32 paths and WoW64 view selection; ANSI paths use CP1252"),
+            "GetUserDefaultUILanguage" => (L, "Returns the configured project UI LANGID; defaults to en-US"),
+            "GetUserDefaultLCID" | "GetLocaleInfoW" => (L, "Fixed en-US formatting locale, independent of UI language; supports UTF-16 list separator and buffer queries"),
+            "AreFileApisANSI" => (L, "The runtime uses ANSI file APIs; switching the process to OEM file APIs is unsupported"),
+            "SetThreadPreferredUILanguages" | "GetThreadUILanguage" => (L, "Thread-local en-US and zh-CN language names and LANGID strings for MUI resource lookup"),
+            "FindResourceA" | "FindResourceW" | "FindResourceExA" | "FindResourceExW"
+            | "LoadResource" | "LockResource" | "SizeofResource" => (H, "Bounded numeric or named PE resource lookup with explicit language or validated MUI fallback and module-owned handles"),
+            "Wow64DisableWow64FsRedirection" | "Wow64RevertWow64FsRedirection" | "Wow64EnableWow64FsRedirection" =>
+                (L, "Per-thread I386 file view with nested restore tokens; AMD64 reports ERROR_INVALID_FUNCTION"),
             "GetACP" | "GetCPInfo" | "IsValidCodePage" | "MultiByteToWideChar" | "WideCharToMultiByte" =>
                 (L, "Fixed isolated runtime ACP 1252 and installed UTF-8; real CP1252/UTF-8 conversion, bounded sizing/buffers, strict invalid-input flags; normalization and best-fit tables unsupported; other ANSI APIs retain their documented ASCII limits"),
             "InitializeCriticalSection" | "InitializeCriticalSectionAndSpinCount"
@@ -4492,7 +4797,7 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
                 (L, "Checked x86/x64 critical-section layout, debug-info lifetime and recursive ownership for the isolated single guest thread; foreign-owner blocking explicitly unsupported; no cross-thread scheduler"),
             "GetStartupInfoA" | "GetStartupInfoW" => (L, "Copies this guest process's RTL startup fields, standard handles and optional strings; ANSI strings require ASCII; no child-process creator"),
             "GetFileType" => (H, "Live handle type supplied by GuestServices; console streams and open disk handles supported by IoServices; closed/unknown handles fail"),
-            "Sleep" | "SleepEx" => (H, "DWORD milliseconds converted to NT relative delay; zero yields, INFINITE uses the largest relative interval; host determines alert/APC delivery and returns NTSTATUS"),
+            "Sleep" | "SleepEx" => (H, "NT relative delay or cooperative guest wait; SleepEx dispatches queued user APCs on the calling guest thread when alertable"),
             "QueryPerformanceCounter" | "QueryPerformanceFrequency" | "GetTickCount"
             | "GetTickCount64" | "GetSystemTimeAsFileTime" => (H, "Time converted from GuestServices system-time or performance-counter results; no synthetic success on backend failure"),
             "GlobalMemoryStatus" | "GlobalMemoryStatusEx" => (L, "Memory structures combine checked host physical/paging statistics with a 128 MiB isolated guest allocation budget; unavailable host statistics return failure"),
@@ -4504,24 +4809,43 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "GetSystemDirectoryW" | "GetWindowsDirectoryW" => (L, "Mounted guest Windows paths, UTF-16 length and bounded buffer semantics; System32 access redirection is separate"),
             "SetDllDirectoryW" => (L, "Empty string preserves application/system-only search excluding the current directory; custom directories and resetting the full default search remain unsupported"),
             "SetUnhandledExceptionFilter" => (L, "Process-local filter registration and previous pointer result only; callback dispatch remains unsupported"),
-            "GetStringTypeW" | "LCMapStringW" => (L, "Bounded Western CTYPE1 classification and Latin-1/CP1252 case mapping only; unsupported Unicode and locale modes fail explicitly"),
+            "GetStringTypeW" | "LCMapStringW" | "LCMapStringEx" => (L, "Bounded Western CTYPE1 classification and Latin-1/CP1252 case mapping only; unsupported Unicode and locale modes fail explicitly"),
+            "FindNLSString" => (L, "Bounded invariant and en-US search for ASCII letters, digits and spaces, with direction and case options; general locale collation unsupported"),
+            "FoldStringW" => (L, "Windows 7 SP1 digit folding for UTF-16, including supplementary code points; other folding modes unsupported"),
             "InitializeConditionVariable" | "WakeConditionVariable" | "WakeAllConditionVariable" => (L, "Pointer-sized condition initialization and empty wait queues only; nonempty queues and guest wait scheduling remain unsupported"),
-            "CreateFileA" | "CreateFileW" => (H, "Synchronous read-only OPEN_EXISTING subset forwarded to GuestServices; security, templates and unsupported flags rejected"),
-            "ReadFile" | "WriteFile" => (H, "Synchronous GuestServices I/O up to 64 KiB; OVERLAPPED rejected"),
-            "CreateEventW" | "SetEvent" | "ResetEvent" | "WaitForSingleObject" | "WaitForSingleObjectEx" => (H, "Owned unnamed non-inheritable kernel events with manual/auto-reset signal state, checked private handle translation, non-alertable waits and millisecond/NT timeout conversion; named/security/alertable requests rejected; guest thread joins poll cooperatively; other waitable object types unsupported"),
+            "CreateFileA" | "CreateFileW" => (H, "Synchronous mounted-volume open and NTFS creation or truncation via GuestServices; default security and basic flags"),
+            "SetFileTime" => (H, "Updates NTFS creation, access and write times on owned handles with FILE_WRITE_ATTRIBUTES; omitted and zero values preserve timestamps"),
+            "GetFileSizeEx" | "SetFilePointer" | "SetFilePointerEx" => (H, "64-bit size and cursor for synchronous owned disk handles via GuestServices"),
+            "ReadFile" => (H, "Synchronous disk reads stream through bounded 64 KiB backend requests; OVERLAPPED rejected"),
+            "WriteFile" => (H, "Synchronous GuestServices writes up to 64 KiB; OVERLAPPED rejected"),
+            "CancelIo" => (L, "Checks ownership of a synchronous mounted-volume handle, which cannot have pending overlapped requests"),
+            "CreateMutexA" | "CreateMutexW" | "ReleaseMutex" => (L, "Unnamed guest-owned mutexes with recursive ownership, cooperative waits and abandonment on guest thread exit; custom security and named mutexes are unsupported"),
+            "CreateSemaphoreA" | "CreateSemaphoreW" | "ReleaseSemaphore" => (L, "Unnamed guest-owned counting semaphores with cooperative waits and bounded release; custom security and named semaphores are unsupported"),
+            "CreateEventW" | "SetEvent" | "ResetEvent" | "WaitForSingleObject" | "WaitForSingleObjectEx" => (H, "Owned unnamed non-inheritable kernel events with manual/auto-reset signal state, checked handle translation and NT timeout conversion; guest thread joins poll cooperatively and alertable waits dispatch queued guest APCs"),
+            "WaitForMultipleObjects" | "WaitForMultipleObjectsEx" => (H, "Wait-any index and atomic wait-all across owned events and guest threads; cooperative parking and guest APCs; other dispatcher object types require backend support"),
             "CloseHandle" => (H, "Process-owned thread handles and GuestServices Close operation for owned file/event handles with NTSTATUS-to-Win32 error translation; remaining events closed when the service context exits"),
             "DuplicateHandle" => (L, "Same-process thread handles and current-thread pseudo-handle only; independent handle lifetime and restricted access, SAME_ACCESS and CLOSE_SOURCE options; rights escalation, generic mapping, cross-process and file/event duplication remain unsupported"),
             "SetHandleInformation" => (L, "Owned guest thread handles only; inheritance and protect-from-close flags; other object types unsupported"),
-            "LoadLibraryA" | "LoadLibraryW" | "LoadLibraryExA" | "LoadLibraryExW" => (H, "GuestServices reads same-ISA DLLs; transactional mapping, identity reuse and explicit reference acquisition; no new DllMain/static TLS; Ex accepts zero flags only"),
-            "FreeLibrary" => (L, "Releases explicit references, unmaps unreachable callback-free DLLs and dependencies, preserves imports and pins, invalidates all decode caches; invalid handles report SP1 error 126; DllMain/TLS detach and releasing borrowed handles remain unsupported"),
+            "GetHandleInformation" => (H, "Reads flags of a live guest thread or file handle; result is a DWORD in either guest ABI"),
+            "LoadLibraryA" | "LoadLibraryW" | "LoadLibraryExA" | "LoadLibraryExW" => (H, "Same-ISA mapping with dependency-ordered attach notifications and static TLS for live threads. Attach rejection unwinds callbacks, TLS and new mappings. Ex supports system-only basename search and absolute-path altered dependency search."),
+            "FreeLibrary" => (L, "Releases explicit references, runs detach notifications, and removes TLS and mappings for unreachable DLLs. Preserves imports and pins and invalidates decode caches. Stale handles report error 126."),
+            "FreeLibraryAndExitThread" => (L, "Releases the module reference and runs unload notifications before exiting the calling guest thread without returning to the caller."),
             "ExitProcess" => (L, "Stops the isolated guest process with the supplied exit code"),
             "ExitThread" => (L, "Runs thread detach callbacks and exits only the calling guest thread; the last exiting thread supplies process status"),
             "CreateThread" => (L, "Bounded preemptible same-process guest threads with independent CPU, stack, TEB, static and dynamic TLS, and initial DLL thread callbacks; security/inheritance and dynamic DLL initialization remain unsupported"),
-            "ResumeThread" | "SuspendThread" | "GetThreadId" | "GetExitCodeThread" => (L, "Owned guest thread handles, suspend counts, identity and STILL_ACTIVE/exit status; cross-process handles unsupported"),
+            "ResumeThread" | "SuspendThread" | "GetThreadId" | "GetProcessIdOfThread" | "GetExitCodeThread" => (L, "Owned guest thread handles, suspend counts, identity and STILL_ACTIVE/exit status; cross-process handles unsupported"),
             "GetLastError" | "SetLastError" => (L, "Last-error DWORD stored in the current guest TEB"),
+            "InterlockedExchange" | "InterlockedCompareExchange" | "InterlockedExchangeAdd"
+            | "InterlockedIncrement" | "InterlockedDecrement" => (L, "SP1 I386 exports for serialized 32-bit atomic updates in process-owned guest memory"),
             "GetCurrentProcess" | "GetCurrentThread" => (L, "Guest-bitness pseudo-handle only"),
             "GetCurrentProcessId" => (L, "Single isolated process identity fixed at 1"),
+            "GetPriorityClass" | "SetPriorityClass" => (L, "Current process pseudo-handle, class-relative guest thread scheduling and unprivileged real-time fallback to high. Cross-process and background mode scheduling unavailable."),
+            "QueueUserAPC" => (L, "Process-owned target threads with THREAD_SET_CONTEXT access, FIFO callback delivery on alertable waits and before a new guest thread enters its start routine"),
+            "OpenThread" => (L, "Thread ID lookup within the guest process, explicit thread access mask and independent handle lifetime and inheritance flag"),
+            "SetProcessShutdownParameters" | "GetProcessShutdownParameters" => (L, "Process-local shutdown level and SHUTDOWN_NORETRY flag; session-wide shutdown ordering unavailable"),
             "GetCurrentThreadId" => (L, "Active guest thread identity, distinct for each CreateThread"),
+            "SetThreadPriority" | "GetThreadPriority" => (L, "Relative base priority and checked thread handles within the guest process; equal effective priorities use round robin"),
+            "GetThreadPriorityBoost" | "SetThreadPriorityBoost" => (L, "Per-thread boost control with query/set access checks and a one-quantum boost on guest synchronization wakeup"),
             "IsProcessorFeaturePresent" => (L, "Isolated interpreter capabilities only: NX execution-permission enforcement; incomplete instruction families and unknown DWORD feature IDs report absent; LastError preserved"),
             "IsDebuggerPresent" => (L, "Reports no debugger for the isolated guest; no debugger attachment support"),
             "GetVersion" => (L, "Fixed Windows 6.1 build 7601 compatibility value"),
@@ -4532,8 +4856,9 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "GetStdHandle" => (L, "Known guest standard input/output/error handles only"),
             "GetCommandLineA" | "GetCommandLineW" => (L, "Reads current guest process parameters; ANSI result requires ASCII"),
             "GetEnvironmentStringsW" | "FreeEnvironmentStringsW" => (L, "Owned UTF-16 snapshots of the current guest process environment, bounded to 1 MiB; exact pointer ownership on release; no host environment or mutation APIs"),
+            "GetEnvironmentStrings" | "FreeEnvironmentStringsA" => (L, "Owned guest environment snapshots limited to ASCII, independent of OEM code page; exact pointer ownership on release"),
             "GetEnvironmentVariableA" | "GetEnvironmentVariableW" => (L, "Reads current guest UTF-16 environment with required-size queries, empty/missing value distinction and checked outputs; A uses installed CP1252, unsupported best-fit tables stop explicitly; case folding uses installed NLS repertoire; no host environment or mutation APIs"),
-            "GetTempPathW" => (L, "Selects current guest TMP, TEMP, USERPROFILE, then the installed Windows directory; returns a trailing backslash with UTF-16 required-size queries and checked output; no host environment or directory existence check"),
+            "GetTempPathA" | "GetTempPathW" => (L, "Selects current guest TMP, TEMP, USERPROFILE, then the installed Windows directory; returns a trailing backslash with checked size queries and output; A uses CP1252"),
             "InitializeSRWLock" => (L, "Zero-initialize one guest pointer-sized SRWLOCK; uncontended acquire/release supported; contended acquisition yields to the bounded guest scheduler"),
             "AcquireSRWLockExclusive" | "AcquireSRWLockShared" | "ReleaseSRWLockExclusive" | "ReleaseSRWLockShared"
             | "TryAcquireSRWLockExclusive" | "TryAcquireSRWLockShared" =>
@@ -4547,7 +4872,7 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "VirtualAlloc" | "VirtualFree" | "VirtualProtect" => (L, "Bounded guest private mappings, reserve/commit/decommit/release and page permissions; zero allocation sizes and mapped-view copy-on-write protections rejected; restricted flags and no host virtual-memory allocation"),
             "FlushInstructionCache" => (L, "Current-process guest decoded-code cache invalidation on all guest threads; SP1 empty non-null range bypass and LastError behavior; no cross-process cache backend"),
             "GlobalAlloc" | "GlobalFree" | "GlobalLock" | "GlobalUnlock" => (L,"Process-private stable heap-backed global handles with checked ownership"),
-            "LocalAlloc" | "LocalFree" | "LocalSize" => (L, "Fixed private-heap local memory and size queries only; movable handles and LocalLock are unsupported"),
+            "LocalAlloc" | "LocalReAlloc" | "LocalFree" | "LocalSize" | "LocalLock" | "LocalUnlock" => (L, "Fixed private-heap local memory with resizing, size queries and fixed-block locking semantics; movable handles unsupported"),
             "HeapAlloc" | "HeapReAlloc" | "HeapFree" | "HeapSize" => (L, "Private guest heap allocations with checked ownership and restricted flags"),
             "TlsAlloc" | "TlsFree" | "TlsSetValue" | "TlsGetValue" => (L, "Process-wide allocation of up to 1088 slots with per-thread values; direct TEB dynamic TLS slot access remains unsupported"),
             "EncodePointer" | "DecodePointer" => (L, "Identity mapping; no pointer obfuscation"),

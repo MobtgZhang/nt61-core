@@ -3,10 +3,10 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct State {
-    blocks: Vec<u64>,
+    blocks: Vec<(u64, bool)>,
 }
 
-fn snapshot(image: &mut GuestImage) -> Result<Vec<u8>, ApiError> {
+pub(super) fn snapshot(image: &mut GuestImage) -> Result<Vec<u8>, ApiError> {
     let x86 = image.thread.context.mode == DecodeMode::X86;
     let width = if x86 { 4 } else { 8 };
     let parameters = word(&mut image.memory, image.peb + if x86 { 0x10 } else { 0x20 }, width)?;
@@ -29,14 +29,21 @@ fn snapshot(image: &mut GuestImage) -> Result<Vec<u8>, ApiError> {
     Ok(bytes)
 }
 
-pub(super) fn get(image: &mut GuestImage) -> Result<u64, ApiError> {
-    let bytes = snapshot(image)?;
+pub(super) fn get(image: &mut GuestImage, wide: bool) -> Result<u64, ApiError> {
+    let mut bytes = snapshot(image)?;
+    if !wide {
+        bytes = bytes.chunks_exact(2).map(|unit| {
+            let value = u16::from_le_bytes([unit[0], unit[1]]);
+            u8::try_from(value).ok().filter(u8::is_ascii).ok_or(1113u32)
+        }).collect::<Result<Vec<_>, _>>()?;
+    }
+    image.win32.environment.blocks.try_reserve(1).map_err(|_| 8u32)?;
     let result = allocate(image, 0, bytes.len() as u64, READ | WRITE)?;
     if !image.memory.write_virt(result, &bytes) {
         let _ = free(image, result);
         return Err(NOACCESS.into());
     }
-    image.win32.environment.blocks.push(result);
+    image.win32.environment.blocks.push((result, wide));
     Ok(result)
 }
 
@@ -98,7 +105,7 @@ pub(super) fn lookup(image: &mut GuestImage, name: &[u16]) -> Result<Option<Vec<
 }
 
 
-pub(super) fn temp_path(image: &mut GuestImage, a: &[u64]) -> Result<u64, ApiError> {
+pub(super) fn temp_path(image: &mut GuestImage, a: &[u64], wide: bool) -> Result<u64, ApiError> {
     let mut path = None;
     for name in ["TMP", "TEMP", "USERPROFILE"] {
         let units: Vec<u16> = name.encode_utf16().collect();
@@ -112,13 +119,17 @@ pub(super) fn temp_path(image: &mut GuestImage, a: &[u64]) -> Result<u64, ApiErr
     if units.last() != Some(&(b'\\' as u16)) { units.push(b'\\' as u16); }
     units.push(0);
     if u64::from(a[0] as u32) < units.len() as u64 { return Ok(units.len() as u64); }
-    let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    let bytes = if wide {
+        units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+    } else {
+        units.iter().map(|&unit| nls::encode_ansi(unit).ok_or(1113u32)).collect::<Result<Vec<_>, _>>()?
+    };
     if !image.memory.write_virt(a[1], &bytes) { return Err(NOACCESS.into()); }
     Ok((units.len() - 1) as u64)
 }
 
-pub(super) fn release(image: &mut GuestImage, pointer: u64) -> Result<u64, ApiError> {
-    let index = image.win32.environment.blocks.iter().position(|base| *base == pointer)
+pub(super) fn release(image: &mut GuestImage, pointer: u64, wide: bool) -> Result<u64, ApiError> {
+    let index = image.win32.environment.blocks.iter().position(|&block| block == (pointer, wide))
         .ok_or(INVALID_PARAMETER)?;
     free(image, pointer)?;
     image.win32.environment.blocks.remove(index);

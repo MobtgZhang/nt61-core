@@ -1,15 +1,94 @@
 //! Unnamed backend events and critical sections in one isolated GuestImage.
 //! Event signal/reset/wait state belongs to the kernel dispatcher, with
-//! process-owned guest handles. Named events and alertable waits need guest
-//! namespaces/APC delivery before they can be exposed here.
+//! process-owned guest handles. Named events require a guest namespace.
 //! Recursive ownership uses the active guest thread ID. Contended critical
 //! sections and SRW locks yield to the guest scheduler; unsupported foreign
 //! wait queues are never silently acquired or released.
 use super::*;
 
+const WAIT_HANDLE_BASE: u64 = 0x4900_0000;
+
+enum WaitObject {
+    Mutex { owner: Option<u32>, depth: u32, abandoned: bool },
+    Semaphore { count: i32, maximum: i32 },
+}
+
 #[derive(Default)]
 pub(super) struct State {
     sections: Vec<(u64, u64)>, // guest CRITICAL_SECTION address, owned debug allocation
+    objects: Vec<(u64, WaitObject)>,
+    wait_serial: u64,
+}
+
+pub(in crate::arch::common::btl) fn is_wait_handle(handle: u64) -> bool {
+    (WAIT_HANDLE_BASE..WAIT_HANDLE_BASE + 0x0100_0000).contains(&handle)
+}
+
+fn create_wait_object(image: &mut GuestImage, object: WaitObject) -> Result<u64, ApiError> {
+    let state = &mut image.win32.sync;
+    let handle = WAIT_HANDLE_BASE + state.wait_serial;
+    if !is_wait_handle(handle) || state.objects.len() >= 4096 {
+        return Err(8u32.into());
+    }
+    state.objects.try_reserve(1).map_err(|_| 8u32)?;
+    state.wait_serial += 4;
+    state.objects.push((handle, object));
+    Ok(handle)
+}
+
+fn wait_object_mut(state: &mut State, handle: u64) -> Result<&mut WaitObject, u32> {
+    state.objects.iter_mut().find(|(candidate, _)| *candidate == handle).map(|(_, object)| object).ok_or(6)
+}
+
+pub(in crate::arch::common::btl) fn wait_object_ready(image: &GuestImage, handle: u64, thread: u32) -> Result<bool, u32> {
+    let (_, object) = image.win32.sync.objects.iter().find(|(candidate, _)| *candidate == handle).ok_or(6u32)?;
+    match *object {
+        WaitObject::Mutex { owner, depth, .. } => {
+            if owner == Some(thread) && depth == u32::MAX {
+                return Err(87);
+            }
+            Ok(owner.is_none() || owner == Some(thread))
+        }
+        WaitObject::Semaphore { count, .. } => Ok(count > 0),
+    }
+}
+
+pub(in crate::arch::common::btl) fn acquire_wait_object(image: &mut GuestImage, handle: u64, thread: u32) -> Result<Option<u64>, u32> {
+    match wait_object_mut(&mut image.win32.sync, handle)? {
+        WaitObject::Mutex { owner, depth, abandoned } => {
+            if owner.is_some_and(|owner| owner != thread) {
+                return Ok(None);
+            }
+            *depth = depth.checked_add(1).ok_or(87u32)?;
+            *owner = Some(thread);
+            Ok(Some(if core::mem::take(abandoned) { 0x80 } else { 0 }))
+        }
+        WaitObject::Semaphore { count, .. } if *count > 0 => {
+            *count -= 1;
+            Ok(Some(0))
+        }
+        WaitObject::Semaphore { .. } => Ok(None),
+    }
+}
+
+pub(super) fn close_wait_object(image: &mut GuestImage, handle: u64) -> Result<(), ApiError> {
+    let objects = &mut image.win32.sync.objects;
+    let index = objects.iter().position(|(candidate, _)| *candidate == handle).ok_or(6u32)?;
+    objects.swap_remove(index);
+    Ok(())
+}
+
+pub(super) fn abandon_mutexes(image: &mut GuestImage) {
+    let thread = image.thread_id();
+    for (_, object) in &mut image.win32.sync.objects {
+        if let WaitObject::Mutex { owner, depth, abandoned } = object {
+            if *owner == Some(thread) {
+                *owner = None;
+                *depth = 0;
+                *abandoned = true;
+            }
+        }
+    }
 }
 
 pub(super) fn handles(name: &str) -> bool {
@@ -23,13 +102,66 @@ pub(super) fn handles(name: &str) -> bool {
         | "RtlAcquireSRWLockExclusive" | "RtlAcquireSRWLockShared"
         | "RtlReleaseSRWLockExclusive" | "RtlReleaseSRWLockShared"
         | "CreateEventW" | "SetEvent" | "ResetEvent"
-        | "WaitForSingleObject" | "WaitForSingleObjectEx")
+        | "CreateMutexA" | "CreateMutexW" | "ReleaseMutex"
+        | "CreateSemaphoreA" | "CreateSemaphoreW" | "ReleaseSemaphore"
+        | "WaitForSingleObject" | "WaitForSingleObjectEx"
+        | "WaitForMultipleObjects" | "WaitForMultipleObjectsEx")
 }
 
 pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64], services: &mut dyn GuestServices) -> Result<u64, ApiError> {
     let x86 = image.thread.context.mode == DecodeMode::X86;
     let width = if x86 { 4 } else { 8 };
     match name {
+        "CreateMutexA" | "CreateMutexW" => {
+            if a[0] != 0 || a[2] != 0 {
+                return Err(120u32.into());
+            }
+            let owner = (a[1] as u32 != 0).then(|| image.thread_id());
+            return create_wait_object(image, WaitObject::Mutex {
+                owner,
+                depth: u32::from(owner.is_some()),
+                abandoned: false,
+            });
+        }
+        "ReleaseMutex" => {
+            let thread = image.thread_id();
+            let WaitObject::Mutex { owner, depth, .. } = wait_object_mut(&mut image.win32.sync, a[0])? else {
+                return Err(6u32.into());
+            };
+            if *owner != Some(thread) {
+                return Err(288u32.into());
+            }
+            *depth -= 1;
+            if *depth == 0 {
+                *owner = None;
+            }
+            return Ok(1);
+        }
+        "CreateSemaphoreA" | "CreateSemaphoreW" => {
+            let (count, maximum) = (a[1] as i32, a[2] as i32);
+            if maximum <= 0 || !(0..=maximum).contains(&count) {
+                return Err(87u32.into());
+            }
+            if a[0] != 0 || a[3] != 0 {
+                return Err(120u32.into());
+            }
+            return create_wait_object(image, WaitObject::Semaphore { count, maximum });
+        }
+        "ReleaseSemaphore" => {
+            let release = a[1] as i32;
+            if release <= 0 {
+                return Err(87u32.into());
+            }
+            let WaitObject::Semaphore { count, maximum } = wait_object_mut(&mut image.win32.sync, a[0])? else {
+                return Err(6u32.into());
+            };
+            let next = count.checked_add(release).filter(|next| next <= maximum).ok_or(298u32)?;
+            if a[2] != 0 && !image.memory.write_virt(a[2], &count.to_le_bytes()) {
+                return Err(998u32.into());
+            }
+            *count = next;
+            return Ok(1);
+        }
         "CreateEventW" => {
             if a[0] != 0 { return Err(120u32.into()); }
             if a[3] != 0 {
@@ -43,16 +175,38 @@ pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64], services: &m
             return Ok(1);
         }
         "WaitForSingleObject" | "WaitForSingleObjectEx" => {
-            if name.ends_with("Ex") && a[2] as u32 != 0 { return Err(120u32.into()); }
+            let alertable = name.ends_with("Ex") && a[2] as u32 != 0;
             let milliseconds = a[1] as u32;
-            if image.has_other_threads() || super::super::threads::is_handle(a[0]) {
-                return match super::super::threads::wait(image, a[0], milliseconds, services)? {
+            if image.has_other_threads() || super::super::threads::is_handle(a[0]) || is_wait_handle(a[0])
+                || (alertable && image.has_pending_apc())
+            {
+                return match super::super::threads::wait(image, a[0], milliseconds, alertable, services)? {
                     Ok(value) => Ok(value), Err(wait) => Err(ApiError::Pending(wait)),
                 };
             }
             let timeout = if milliseconds == u32::MAX { None } else { Some(-i64::from(milliseconds) * 10_000) };
             let status = services.wait_event(a[0], timeout).map_err(status_error)?;
             return if matches!(status, 0 | 0x102) { Ok(u64::from(status)) } else { Err(120u32.into()) };
+        }
+        "WaitForMultipleObjects" | "WaitForMultipleObjectsEx" => {
+            let count = a[0] as u32 as usize;
+            if !(1..=64).contains(&count) { return Err(INVALID_PARAMETER.into()); }
+            let mut bytes = [0; 64 * 8];
+            let bytes = &mut bytes[..count * width];
+            if image.memory.read_virt(a[1], bytes) != bytes.len() { return Err(998u32.into()); }
+            let mut handles = [0; 64];
+            for (handle, bytes) in handles.iter_mut().zip(bytes.chunks_exact(width)) {
+                let mut value = [0; 8];
+                value[..width].copy_from_slice(bytes);
+                *handle = u64::from_le_bytes(value);
+            }
+            let alertable = name.ends_with("Ex") && a[4] as u32 != 0;
+            return match super::super::threads::wait_multiple(
+                image, &handles[..count], a[2] as u32 != 0, a[3] as u32, alertable, services,
+            )? {
+                Ok(value) => Ok(value),
+                Err(wait) => Err(ApiError::Pending(wait)),
+            };
         }
         _ => {}
     }

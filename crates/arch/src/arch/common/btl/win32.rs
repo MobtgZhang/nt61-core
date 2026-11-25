@@ -13,10 +13,16 @@ mod gui;
 mod dialogs;
 #[path = "win32/printing.rs"]
 mod printing;
+#[path = "win32/font_enum.rs"]
+mod font_enum;
+#[path = "win32/text_layout.rs"]
+mod text_layout;
 #[path = "win32/user.rs"]
 mod user;
 #[path = "win32/sync.rs"]
-mod sync;
+pub(super) mod sync;
+#[path = "win32/winsock.rs"]
+mod winsock;
 #[path = "win32/runonce.rs"]
 mod runonce;
 #[path = "win32/virtual_memory.rs"]
@@ -25,6 +31,10 @@ mod virtual_memory;
 mod context;
 #[path = "win32/function_table.rs"]
 mod function_table;
+#[path = "win32/rtl_integer.rs"]
+mod rtl_integer;
+#[path = "../../../../../libs/ntdll/src/ntdll/rtl_epoch.rs"]
+mod rtl_epoch;
 #[path = "win32/unwind.rs"]
 mod unwind;
 #[path = "win32/nls.rs"]
@@ -41,16 +51,19 @@ mod resources;
 mod version;
 #[path = "win32/crt.rs"]
 mod crt;
+#[path = "win32/crt_startup.rs"]
+pub(super) mod crt_startup;
 #[path = "win32/library.rs"]
-mod library;
+pub(super) mod library;
 #[path = "win32/catalog.rs"]
 pub mod catalog;
 use crate::arch::common::btl::{
     abi::GuestAbi,
+    io::guest_file_path,
     ir::DecodeMode,
     memory::GuestMemory,
     nt61::{self, GuestServices, Service, ServiceResult},
-    pe::{GuestImage, Region, EXECUTE, PAGE, READ, WRITE},
+    pe::{GuestImage, Region, EXECUTE, MAX_PROCESS_MEMORY, PAGE, READ, WRITE},
     runtime::StopReason,
 };
 use alloc::{string::String, vec, vec::Vec};
@@ -68,6 +81,7 @@ struct VirtualAllocation {
 
 pub struct Runtime {
     pub modules: Vec<(String, u64)>,
+    pub(super) module_paths: Vec<(u64, String)>,
     /// Dependencies retained by the executable's initial import graph.
     pub(super) process_dependencies: Vec<u64>,
     /// Import and resolved forward-export edges owned by mapped DLLs.
@@ -82,30 +96,49 @@ pub struct Runtime {
     virtual_allocations: Vec<VirtualAllocation>,
     tls: Vec<bool>,
     pub(super) local: ThreadLocal,
+    ui_language: u16,
     next_address: u64,
     pub last_api: Option<u32>,
     pub last_arguments: Vec<u64>,
     /// Bounded diagnostics for failed runtime calls; never changes guest results.
     pub failures: Vec<(u32, u32, String)>,
+    pub exit_context: Option<(&'static str, &'static str, u64)>,
     pub last_library_error: Option<String>,
     advapi: advapi::State,
+    tokens: advapi::token::State,
     com: com::State,
     eventlog: eventlog::State,
     directory: directory::State,
+    resources: Vec<resources::Resource>,
     gui: gui::State,
     printing: printing::State,
     user: user::State,
     sync: sync::State,
+    winsock_startups: u32,
+    winsock_address_lists: Vec<u64>,
     environment: environment::State,
     shell: shell::State,
+    crt: crt_startup::State,
+    shutdown_parameters: (u32, u32),
+    terminate_on_heap_corruption: bool,
     /// Process-local top-level filter registration. Exception dispatch remains
     /// unsupported; a registered callback is never called as a host pointer.
     exception_filter: u64,
 }
 impl Runtime {
+    pub fn set_ui_language(&mut self, tag: &str) -> bool {
+        let Some(&(language, _, _)) = nls::UI_LANGUAGES.iter()
+            .find(|(_, candidate, _)| candidate.eq_ignore_ascii_case(tag)) else {
+            return false;
+        };
+        self.ui_language = language;
+        true
+    }
+
     pub(super) fn new(base: u64) -> Self {
         Self {
             modules: vec![(String::new(), base)],
+            module_paths: Vec::new(),
             process_dependencies: Vec::new(),
             module_dependencies: Vec::new(),
             library_loads: Vec::new(),
@@ -115,21 +148,30 @@ impl Runtime {
             virtual_allocations: Vec::new(),
             tls: Vec::new(),
             local: ThreadLocal::default(),
+            ui_language: nls::DEFAULT_UI_LANGUAGE,
             next_address: 0x2000_0000,
             last_api: None,
             last_arguments: Vec::new(),
             failures: Vec::new(),
+            exit_context: None,
             last_library_error: None,
             advapi: advapi::State::new(),
+            tokens: advapi::token::State::default(),
             com: com::State::default(),
             eventlog: eventlog::State::default(),
             directory: directory::State::default(),
+            resources: Vec::new(),
             gui: gui::State::new(),
             printing: printing::State::new(),
             user: user::State::new(),
             sync: sync::State::default(),
+            winsock_startups: 0,
+            winsock_address_lists: Vec::new(),
             environment: environment::State::default(),
             shell: shell::State::default(),
+            crt: crt_startup::State::default(),
+            shutdown_parameters: (0x280, 0),
+            terminate_on_heap_corruption: false,
             exception_filter: 0,
         }
     }
@@ -137,12 +179,15 @@ impl Runtime {
 #[derive(Default)]
 pub(super) struct ThreadLocal {
     pub(super) tls: Vec<u64>,
+    pub(super) fs_redirection_disabled: bool,
+    ui_languages: Vec<u16>,
     user: user::ThreadState,
     com: com::ThreadState,
 }
 
 pub(super) fn cleanup_thread(image: &mut GuestImage) {
     com::cleanup_thread(image);
+    sync::abandon_mutexes(image);
 }
 
 pub enum Outcome {
@@ -171,6 +216,54 @@ fn word(m: &mut dyn GuestMemory, p: u64, n: usize) -> Result<u64, u32> {
     v[..n].copy_from_slice(&b);
     Ok(u64::from_le_bytes(v))
 }
+
+pub fn delay_load_fault(image: &mut GuestImage) -> Option<(String, String)> {
+    let api = catalog::resolve(image.win32.last_api?)?;
+    let [code, _, 1, arguments] = image.win32.last_arguments.as_slice() else {
+        return None;
+    };
+    if api.name != "RaiseException" || !matches!(*code as u32, 0xc06d007e | 0xc06d007f) {
+        return None;
+    }
+
+    let width = match image.thread.context.mode {
+        DecodeMode::X86 => 4,
+        DecodeMode::X64 => 8,
+    };
+    let memory = &mut image.memory;
+    let info = word(memory, *arguments, width).ok()?;
+    if word(memory, info, 4).ok()? != 9 * width as u64 {
+        return None;
+    }
+    let mut field = |index, size| word(memory, info.checked_add(index * width as u64)?, size).ok();
+    let dll = field(3, width)?;
+    let by_name = field(4, 4)?;
+    let symbol = field(5, if by_name == 0 { 4 } else { width })?;
+    let dll = delay_load_name(memory, dll)?;
+    let symbol = if by_name == 0 {
+        alloc::format!("#{}", u16::try_from(symbol).ok()?)
+    } else {
+        delay_load_name(memory, symbol)?
+    };
+    Some((dll, symbol))
+}
+
+fn delay_load_name(memory: &mut dyn GuestMemory, pointer: u64) -> Option<String> {
+    let mut name = String::new();
+    for offset in 0..128 {
+        let mut byte = [0];
+        if memory.read_virt(pointer.checked_add(offset)?, &mut byte) != 1 {
+            return None;
+        }
+        match byte[0] {
+            0 => return (!name.is_empty()).then_some(name),
+            0x21..=0x7e => name.push(char::from(byte[0])),
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn put(m: &mut dyn GuestMemory, p: u64, v: u64, n: usize) -> Result<(), u32> {
     if m.write_virt(p, &v.to_le_bytes()[..n]) {
         Ok(())
@@ -215,6 +308,18 @@ fn write_string(m: &mut dyn GuestMemory, p: u64, s: &str, wide: bool) -> Result<
         return Err(NOACCESS);
     }
     Ok(if wide { b.len() / 2 - 1 } else { b.len() - 1 })
+}
+fn wide_z_bytes(memory: &mut dyn GuestMemory, pointer: u64) -> Result<Vec<u8>, ApiError> {
+    let mut bytes = Vec::new();
+    for offset in (0..65_536).step_by(2) {
+        let address = pointer.checked_add(offset).ok_or(ApiError::MemoryFault)?;
+        let unit = word(memory, address, 2).map_err(|_| ApiError::MemoryFault)? as u16;
+        bytes.extend_from_slice(&unit.to_le_bytes());
+        if unit == 0 {
+            return Ok(bytes);
+        }
+    }
+    Err(ApiError::MemoryFault)
 }
 fn error(image: &mut GuestImage, e: u32) {
     let off = if image.thread.context.mode == DecodeMode::X86 {
@@ -282,14 +387,7 @@ pub(super) fn allocate(image: &mut GuestImage, requested: u64, n: u64, permissio
     if base < 0x10000
         || end > image.user_address_end
         || image.win32.allocations.len() >= 4096
-        || image
-            .memory
-            .regions
-            .iter()
-            .map(|region| region.bytes.len())
-            .sum::<usize>()
-            .saturating_add(len)
-            > 128 * 1024 * 1024
+        || image.memory.mapped_bytes().saturating_add(len) > MAX_PROCESS_MEMORY
     {
         return Err(8);
     }
@@ -401,6 +499,7 @@ fn protect(image: &mut GuestImage, p: u64, n: u64, flags: u32) -> Result<u32, u3
     Ok(old)
 }
 fn heap_allocate(image: &mut GuestImage, n: u64) -> Result<u64, u32> {
+    image.win32.heap_allocations.try_reserve(1).map_err(|_| 8u32)?;
     let p = allocate(image, 0, n.max(1), READ | WRITE)?;
     image.win32.heap_allocations.push((p, n as usize));
     Ok(p)
@@ -419,6 +518,60 @@ fn heap_free(image: &mut GuestImage, p: u64) -> Result<(), u32> {
     image.win32.heap_allocations.remove(index);
     Ok(())
 }
+fn heap_move(image: &mut GuestImage, old: u64, length: usize, size: u64) -> Result<u64, u32> {
+    let destination = heap_allocate(image, size)?;
+    let result = (|| {
+        let count = length.min(size as usize);
+        let mut cursor = 0;
+        while cursor < count {
+            let chunk = (count - cursor).min(MAX_BUFFER);
+            let bytes = read(&mut image.memory, old + cursor as u64, chunk)?;
+            if !image.memory.write_virt(destination + cursor as u64, &bytes) {
+                return Err(NOACCESS);
+            }
+            cursor += chunk;
+        }
+        heap_free(image, old)
+    })();
+    if let Err(error) = result {
+        let _ = heap_free(image, destination);
+        return Err(error);
+    }
+    Ok(destination)
+}
+
+fn local_reallocate(image: &mut GuestImage, address: u64, size: u64, flags: u32) -> Result<u64, u32> {
+    const MOVEABLE: u32 = 0x02;
+    const ZERO_INIT: u32 = 0x40;
+    const MODIFY: u32 = 0x80;
+    const DISCARDABLE: u32 = 0x0f00;
+    if flags & !0x0ff2 != 0 || flags & DISCARDABLE != 0 && flags & MODIFY == 0 {
+        return Err(INVALID_PARAMETER);
+    }
+    let index = image.win32.heap_allocations.iter().position(|entry| entry.0 == address).ok_or(8u32)?;
+    if flags & MODIFY != 0 {
+        return Ok(address);
+    }
+    let previous_size = image.win32.heap_allocations[index].1;
+    let capacity = image.win32.allocations.iter().find(|entry| entry.0 == address).ok_or(8u32)?.1;
+    if size > capacity as u64 {
+        if flags & MOVEABLE == 0 {
+            return Err(8);
+        }
+        return heap_move(image, address, previous_size, size);
+    }
+    let size = size as usize;
+    if flags & ZERO_INIT != 0 && size > previous_size {
+        if !image.memory.probe_write(address + previous_size as u64, size - previous_size) {
+            return Err(NOACCESS);
+        }
+        let region = image.memory.regions.iter_mut().find(|region| region.base == address).ok_or(8u32)?;
+        region.bytes[previous_size..size].fill(0);
+    }
+    image.win32.heap_allocations[index].1 = size;
+    Ok(address)
+}
+
 fn module(image: &GuestImage, name: &str) -> Option<u64> {
     let name = name.rsplit(['\\', '/']).next()?;
     let lower = name.to_ascii_lowercase();
@@ -434,10 +587,19 @@ fn module(image: &GuestImage, name: &str) -> Option<u64> {
         .find(|m| m.0.eq_ignore_ascii_case(&lower))
         .map(|m| m.1)
 }
+#[derive(Clone, Copy)]
+enum LibrarySearch<'a> {
+    Default,
+    System32,
+    AlteredDirectory(&'a str),
+}
+
 fn load_library(
     image: &mut GuestImage,
     name: &str,
     services: &mut dyn GuestServices,
+    search: LibrarySearch<'_>,
+    run_entry_points: bool,
 ) -> Result<u64, u32> {
     // Import descriptors remain restricted to basenames. LoadLibrary accepts
     // paths, however: keep the module identity separate from the path used for
@@ -447,26 +609,40 @@ fn load_library(
         services: &'a mut dyn GuestServices,
         requested: &'a str,
         first: bool,
+        search: LibrarySearch<'a>,
     }
     impl super::ImportResolver for Resolver<'_> {
         fn read_library(&mut self, name: &str, mode: DecodeMode) -> Result<Vec<u8>, u32> {
+            self.resolve_library(name, mode).map(|library| library.bytes)
+        }
+
+        fn resolve_library(&mut self, name: &str, mode: DecodeMode) -> Result<super::ResolvedLibrary, u32> {
             if self.first {
                 self.first = false;
                 if self.requested.contains(['\\', '/']) {
                     let path = if self.requested.rsplit(['\\', '/']).next().is_some_and(|s| !s.contains('.')) {
                         alloc::format!("{}.dll", self.requested)
                     } else { self.requested.into() };
-                    self.services.read_library(&path, mode)
-                } else {
-                    self.services.read_library(name, mode)
+                    return self.services.resolve_library(&path, mode, false);
                 }
-            } else {
-                self.services.read_library(name, mode)
+            }
+            match self.search {
+                LibrarySearch::Default => self.services.resolve_library(name, mode, false),
+                LibrarySearch::System32 => self.services.resolve_library(name, mode, true),
+                LibrarySearch::AlteredDirectory(directory) => {
+                    let path = alloc::format!("{directory}\\{name}");
+                    match self.services.resolve_library(&path, mode, false) {
+                        Err(0xc000_0034 | 0xc000_003a | 0xc000_000f | 0xc000_0135) => {
+                            self.services.resolve_library(name, mode, true)
+                        }
+                        result => result,
+                    }
+                }
             }
         }
     }
-    image
-        .load_library(identity, &mut Resolver { services, requested: name, first: true })
+    let mut resolver = Resolver { services, requested: name, first: true, search };
+    super::link::load_library(image, identity, &mut resolver, matches!(search, LibrarySearch::System32), run_entry_points)
         .map_err(|e| {
             image.win32.last_library_error = Some(alloc::format!("{}: {}", name, e));
             match e.ntstatus() {
@@ -557,10 +733,13 @@ fn proc_address_inner(
     if target >= rva && target < rva + size {
         let f = string(m, base + target, false)?;
         let (dll, symbol) = f.rsplit_once('.').ok_or(127u32)?;
+        let system_only = image.module_metadata.iter()
+            .any(|metadata| metadata.base == base && metadata.system_library_search);
         let b = if let Some(base) = module(image, dll) {
             base
         } else {
-            load_library(image, dll, services)?
+            let search = if system_only { LibrarySearch::System32 } else { LibrarySearch::Default };
+            load_library(image, dll, services, search, false)?
         };
         let result = if let Some(n) = symbol.strip_prefix('#') {
             proc_address_inner(image, b, None, n.parse().map_err(|_| 127u32)?, depth + 1, services)
@@ -604,6 +783,12 @@ fn nt_service(name: &str) -> Option<Service> {
     })
 }
 
+pub(super) fn close_token(image: &mut GuestImage, handle: u64) -> Option<u32> {
+    image.win32.tokens.close(handle).map(|closed| {
+        if closed { 0 } else { 0xc000_0008 }
+    })
+}
+
 pub fn dispatch(
     image: &mut GuestImage,
     number: u32,
@@ -611,6 +796,7 @@ pub fn dispatch(
 ) -> Result<Outcome, StopReason> {
     let id = number & 0xffff;
     if id==user::CALLBACK_RETURN{return user::callback_return(image,services);}
+    if id == user::DIALOG_GATEWAY { return user::poll_dialog(image, services); }
     let api = catalog::resolve(id).ok_or(StopReason::UnsupportedApi { id })?;
     image.win32.last_api = Some(id);
     let abi = if image.thread.context.mode == DecodeMode::X86 {
@@ -629,8 +815,21 @@ pub fn dispatch(
         })?;
     image.win32.last_arguments.clear();
     image.win32.last_arguments.extend_from_slice(&a[..count]);
+    if matches!(api.name, "ExitProcess" | "NtTerminateProcess" | "TerminateProcess")
+        || (api.dll == "msvcrt.dll" && matches!(api.name, "exit" | "_exit" | "_amsg_exit" | "abort"))
+    {
+        let width = if abi == GuestAbi::X86_32 { 4 } else { 8 };
+        let stack = image.thread.context.reg(crate::arch::common::btl::ir::X86Reg::Rsp);
+        let caller = word(&mut image.memory, stack, width).unwrap_or(0);
+        image.win32.exit_context = Some((api.dll, api.name, caller));
+    }
     if api.dll == "ntdll.dll" {
         if let Some(service) = nt_service(api.name) {
+            if service == Service::Close {
+                if let Some(status) = close_token(image, a[0]) {
+                    return Ok(Outcome::Return(u64::from(status)));
+                }
+            }
             return Ok(
                 match services.call(abi, service, &a[..count], &mut image.memory) {
                     ServiceResult::Return(v) => Outcome::Return(v as u64),
@@ -642,6 +841,21 @@ pub fn dispatch(
     }
     if api.name == "ExitProcess" { return Ok(Outcome::Exit(a[0] as u32)); }
     if api.name == "ExitThread" { return Ok(Outcome::ExitThread(a[0] as u32)); }
+    if api.dll == "kernel32.dll" && api.name == "FreeLibraryAndExitThread" {
+        let code = a[1] as u32;
+        return match library::free(image, a[0], Some(code)) {
+            Ok(_) if image.pending_library.is_some() => Ok(Outcome::Continue),
+            Ok(_) | Err(ApiError::Windows(126)) => Ok(Outcome::ExitThread(code)),
+            Err(_) => Err(StopReason::UnsupportedApi { id }),
+        };
+    }
+    if api.dll == "msvcrt.dll" {
+        match api.name {
+            "exit" | "_exit" => return Ok(Outcome::Exit(a[0] as u32)),
+            "_amsg_exit" => return Ok(Outcome::Exit(255)),
+            _ => {}
+        }
+    }
     match invoke(image, api, &a, services) {
         Ok(v) => {
             if let Some((procedure,args))=image.win32.local.user.callback.take(){
@@ -658,15 +872,34 @@ pub fn dispatch(
         }
         Err(ApiError::Windows(e)) => {
             let detail = if api.name.starts_with("LoadLibrary") {
-                image.win32.last_library_error.take().unwrap_or_else(|| {
+                let library = image.win32.last_library_error.take().unwrap_or_else(|| {
                     string(&mut image.memory, a[0], api.name.ends_with('W')).unwrap_or_default()
-                })
+                });
+                if api.name.starts_with("LoadLibraryEx") {
+                    alloc::format!("{library} file={:#x} flags={:#x}", a[1], a[2] as u32)
+                } else {
+                    library
+                }
             } else if matches!(api.name, "CreateFileA" | "CreateFileW") {
-                alloc::format!("{} access={:#x} share={:#x} security={:#x} disposition={} flags={:#x} template={:#x}",
+                let width = if abi == GuestAbi::X86_32 { 4 } else { 8 };
+                let mut attributes = [0; 24];
+                let security = if a[3] != 0 && image.memory.read_virt(a[3], &mut attributes[..width * 3]) == width * 3 {
+                    let length = u32::from_le_bytes(attributes[..4].try_into().unwrap());
+                    let descriptor = attributes[width..width * 2].iter().any(|byte| *byte != 0);
+                    let inherit = attributes[width * 2..width * 2 + 4].iter().any(|byte| *byte != 0);
+                    alloc::format!("length={length} descriptor={descriptor} inherit={inherit}")
+                } else {
+                    alloc::format!("{:#x}", a[3])
+                };
+                alloc::format!("{} access={:#x} share={:#x} security=[{}] disposition={} flags={:#x} template={:#x}",
                     string(&mut image.memory, a[0], api.name.ends_with('W')).unwrap_or_default(),
-                    a[1], a[2], a[3], a[4], a[5], a[6])
-            } else if matches!(api.name, "CreateDirectoryW" | "FindFirstFileW" | "FindFirstFileExW") {
+                    a[1] as u32, a[2] as u32, security, a[4] as u32, a[5] as u32, a[6])
+            } else if matches!(api.name, "CreateDirectoryW" | "FindFirstFileW" | "FindFirstFileExW" | "GetFileAttributesW" | "SetFileAttributesW") {
                 string(&mut image.memory, a[0], true).unwrap_or_default()
+            } else if matches!(api.name, "ReadFile" | "WriteFile") {
+                alloc::format!("length={} overlapped={}", a[2] as u32, a[4] != 0)
+            } else if api.name == "GetTokenInformation" {
+                alloc::format!("information_class={} length={}", a[1] as u32, a[3] as u32)
             } else if api.name == "GetProcAddress" {
                 if a[1] <= 0xffff {
                     alloc::format!("ordinal {}", a[1])
@@ -681,10 +914,19 @@ pub fn dispatch(
             }
             image.win32.failures.push((id, e, detail));
             error(image, e);
+            if api.dll == "ws2_32.dll" {
+                return Ok(Outcome::Return(winsock::failure_value(api.name, e, abi == GuestAbi::X86_32)));
+            }
             Ok(Outcome::Return(match api.name {
-                "TlsAlloc" | "ResumeThread" | "SuspendThread" | "WaitForSingleObject" | "WaitForSingleObjectEx" => u32::MAX as u64,
+                "DialogBoxParamW" => if abi == GuestAbi::X86_32 { u32::MAX as u64 } else { u64::MAX },
+                "GetThreadPriority" => i32::MAX as u64,
+                "SetAbortProc" => u32::MAX as u64,
+                "SetFilePointer" | "GetFileAttributesA" | "GetFileAttributesW" => u32::MAX as u64,
+                "GetMenuState" | "EnableMenuItem" | "CheckMenuItem" => u32::MAX as u64,
+                "TlsAlloc" | "ResumeThread" | "SuspendThread" | "WaitForSingleObject" | "WaitForSingleObjectEx"
+                | "WaitForMultipleObjects" | "WaitForMultipleObjectsEx" | "FindNLSString" => u32::MAX as u64,
                 "GlobalFree" | "LocalFree" | "FreeSid" => a[0],
-                "CreateFileA" | "CreateFileW" | "HeapSize" | "FindFirstFileW" | "FindFirstFileExW" => {
+                "CreateFileA" | "CreateFileW" | "HeapSize" | "FindFirstFileA" | "FindFirstFileW" | "FindFirstFileExW" => {
                     if abi == GuestAbi::X86_32 {
                         u32::MAX as u64
                     } else {
@@ -704,6 +946,7 @@ pub fn dispatch(
         }
         Err(ApiError::Retry) => Ok(Outcome::Retry),
         Err(ApiError::PendingRetry(wait)) => Ok(Outcome::ParkRetry(wait)),
+        Err(ApiError::CorruptHeap) => Ok(Outcome::Exit(0xc000_0374)),
         Err(ApiError::Unsupported) => Err(StopReason::UnsupportedApi { id }),
         Err(ApiError::MemoryFault) => Err(StopReason::DataFault {
             pc: image.thread.context.rip,
@@ -716,6 +959,7 @@ pub(super) enum ApiError {
     Pending(super::threads::Wait),
     Windows(u32),
     Hresult(u32, &'static str),
+    CorruptHeap,
     Unsupported,
     MemoryFault,
 }
@@ -730,6 +974,32 @@ fn invoke(
     a: &[u64],
     services: &mut dyn GuestServices,
 ) -> Result<u64, ApiError> {
+    match (api.dll, api.name) {
+        ("ws2_32.dll", _) => return winsock::invoke(image, services, api.name, a),
+        ("version.dll", _) => return version::invoke(image, api.name, a, services),
+        ("ntdll.dll", "WinSqmAddToStream" | "WinSqmIncrementDWORD") => return Ok(0),
+        ("comctl32.dll", "TaskDialogIndirect") | ("comdlg32.dll", "PrintDlgExW") => {
+            return Err(ApiError::Hresult(0x80004001, "dialog backend unavailable"));
+        }
+        ("comdlg32.dll", "FindTextW" | "ReplaceTextW") => {
+            return gui::unavailable_dialog(image);
+        }
+        ("winspool.drv", "OpenPrinterW") => return Err(1801u32.into()),
+        ("winspool.drv", "ClosePrinter" | "GetPrinterDriverW") => return Err(6u32.into()),
+        ("shell32.dll", "DragAcceptFiles") => return user::accept_file_drops(image, a[0], a[1] != 0),
+        ("shell32.dll", "SHAddToRecentDocs") => return Err(120u32.into()),
+        ("shell32.dll", "DragFinish" | "DragQueryFileW") => return Err(6u32.into()),
+        ("shell32.dll", "ShellAboutW" | "ShellExecuteExW") => return Err(120u32.into()),
+        ("shell32.dll", "SHCreateItemFromParsingName") => {
+            return Err(ApiError::Hresult(0x80004001, "shell-item backend unavailable"));
+        }
+        ("ole32.dll", "CoCreateInstance") => return com::create_instance(image, a),
+        _ => {}
+    }
+    if api.dll == "kernel32.dll" && matches!(api.name, "FindResourceA" | "FindResourceW"
+        | "FindResourceExA" | "FindResourceExW" | "LoadResource" | "LockResource" | "SizeofResource") {
+        return resources::invoke(image, api.name, a, services);
+    }
     if api.dll == "ntdll.dll" && api.name == "RtlCaptureContext" {
         return context::capture(image, a[0]);
     }
@@ -738,6 +1008,30 @@ fn invoke(
     }
     if api.dll == "ntdll.dll" && api.name == "RtlVirtualUnwind" {
         return unwind::unwind(image, a);
+    }
+    if api.dll == "ntdll.dll" && matches!(api.name, "RtlCharToInteger" | "RtlUnicodeStringToInteger"
+        | "RtlIntegerToChar" | "RtlIntegerToUnicodeString") {
+        return rtl_integer::invoke(image, api.name, a);
+    }
+    if api.dll == "ntdll.dll" {
+        match api.name {
+            "RtlTimeToSecondsSince1970" | "RtlTimeToSecondsSince1980" => {
+                let epoch = if api.name == "RtlTimeToSecondsSince1970" { rtl_epoch::EPOCH_1970 } else { rtl_epoch::EPOCH_1980 };
+                let time = word(&mut image.memory, a[0], 8).map_err(|_| ApiError::MemoryFault)? as i64;
+                let Some(seconds) = rtl_epoch::to_seconds(time, epoch) else {
+                    return Ok(0);
+                };
+                put(&mut image.memory, a[1], u64::from(seconds), 4).map_err(|_| ApiError::MemoryFault)?;
+                return Ok(1);
+            }
+            "RtlSecondsSince1970ToTime" | "RtlSecondsSince1980ToTime" => {
+                let epoch = if api.name == "RtlSecondsSince1970ToTime" { rtl_epoch::EPOCH_1970 } else { rtl_epoch::EPOCH_1980 };
+                let time = rtl_epoch::from_seconds(a[0] as u32, epoch);
+                put(&mut image.memory, a[1], time as u64, 8).map_err(|_| ApiError::MemoryFault)?;
+                return Ok(0);
+            }
+            _ => {}
+        }
     }
     if (api.dll == "ntdll.dll" && api.name == "NtQueryVirtualMemory")
         || (api.dll == "kernel32.dll" && matches!(api.name, "VirtualQuery" | "VirtualQueryEx")) {
@@ -749,11 +1043,11 @@ fn invoke(
         // registry allow-list or crash callback host is implemented yet.
         return Err(ApiError::Hresult(0x80004001, "WER out-of-process backend unavailable"));
     }
-    if api.dll == "ole32.dll" && matches!(api.name,
-        "CoInitializeEx" | "CoUninitialize" | "CoGetContextToken") {
+    if api.dll == "oleaut32.dll" || (api.dll == "ole32.dll" && matches!(api.name,
+        "CoInitialize" | "CoInitializeEx" | "CoUninitialize" | "CoGetContextToken")) {
         return com::invoke(image, api.name, a);
     }
-    if matches!(api.dll, "shell32.dll" | "ole32.dll") {
+    if matches!(api.dll, "shell32.dll" | "ole32.dll" | "shlwapi.dll") {
         return shell::invoke(image, api.name, a, services);
     }
     if api.dll == "ntdll.dll" && matches!(api.name, "RtlAllocateHeap" | "RtlReAllocateHeap" | "RtlFreeHeap") {
@@ -802,7 +1096,117 @@ fn invoke(
         return gui::invoke(image, api.dll, api.name, a, services);
     }
     if api.dll == "user32.dll" { return user::invoke(image, api.name, a, services); }
-    if api.dll == "gdi32.dll" { return printing::invoke(image, api.name, a, services); }
+    if api.dll == "msvcrt.dll" { return crt_startup::invoke(image, api.name, a); }
+    if api.dll == "gdi32.dll" {
+        match api.name {
+            "CreateCompatibleDC" => return Ok(services.create_memory_dc(a[0]).unwrap_or(0)),
+            "GetDeviceCaps" if !printing::owns_dc(image, a[0]) => {
+                return Ok(u64::from(services.device_caps(a[0], a[1] as i32).unwrap_or(0)));
+            }
+            "CreateFontIndirectW" => {
+                let mut logical = [0; 92];
+                if image.memory.read_virt(a[0], &mut logical) != logical.len() { return Ok(0); }
+                return Ok(services.create_font_w(&logical).unwrap_or(0));
+            }
+            "SelectObject" => return Ok(services.select_font(a[0], a[1]).unwrap_or(0)),
+            "DeleteObject" => return Ok(u64::from(services.delete_font(a[0])
+                || (!image.win32.user.owns_client_dc(a[0]) && services.delete_memory_dc(a[0])))),
+            "EnumFontsW" => return font_enum::start(image, a, services),
+            "GetTextFaceW" => {
+                let count = a[1] as i32;
+                if count < 0 { return Ok(0); }
+                let Some(face) = services.text_face_w(a[0]) else { return Ok(0); };
+                if a[2] == 0 { return Ok(face.len() as u64 + 1); }
+                if count == 0 { return Ok(0); }
+                let copied = (count as usize).min(face.len() + 1);
+                let mut bytes = Vec::with_capacity(copied * 2);
+                for unit in &face[..copied - 1] {
+                    bytes.extend_from_slice(&unit.to_le_bytes());
+                }
+                bytes.extend_from_slice(&0u16.to_le_bytes());
+                return Ok(if image.memory.probe_write(a[2], bytes.len())
+                    && image.memory.write_virt(a[2], &bytes) { (copied - 1) as u64 } else { 0 });
+            }
+            "GetTextMetricsW" => {
+                let Some(bytes) = services.text_metrics_w(a[0]) else { return Ok(0); };
+                let output = a[1];
+                return Ok(u64::from(image.memory.probe_write(output, bytes.len())
+                    && image.memory.write_virt(output, &bytes)));
+            }
+            "GetTextExtentPoint32W" => {
+                let count = a[2] as i32;
+                if !(0..=65_536).contains(&count) {
+                    return Err(ApiError::Windows(INVALID_PARAMETER));
+                }
+                if !image.memory.probe_write(a[3], 8) {
+                    return Ok(0);
+                }
+                if count == 0 {
+                    return Ok(u64::from(image.memory.write_virt(a[3], &[0; 8])));
+                }
+                let Ok(bytes) = read(&mut image.memory, a[1], count as usize * 2) else {
+                    return Ok(0);
+                };
+                let text: Vec<_> = bytes.chunks_exact(2)
+                    .map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect();
+                let Some([width, height]) = services.text_extent_w(a[0], &text) else {
+                    return Err(ApiError::Windows(INVALID_PARAMETER));
+                };
+                let mut size = [0; 8];
+                size[..4].copy_from_slice(&width.to_le_bytes());
+                size[4..].copy_from_slice(&height.to_le_bytes());
+                return Ok(u64::from(image.memory.write_virt(a[3], &size)));
+            }
+            "SetBkMode" => return services.set_bk_mode(a[0], a[1] as i32)
+                .map(|old| u64::from(old as u32)).ok_or(ApiError::Windows(INVALID_PARAMETER)),
+            "SetMapMode" => {
+                return services.set_map_mode(a[0], a[1] as i32)
+                    .map(|old| u64::from(old as u32))
+                    .ok_or(ApiError::Windows(INVALID_PARAMETER));
+            }
+            "SetWindowExtEx" | "SetViewportExtEx" => {
+                let output = a[3];
+                if output != 0 && !image.memory.probe_write(output, 8) {
+                    return Ok(0);
+                }
+                let kind = if api.name == "SetWindowExtEx" {
+                    nt61::DcExtent::Window
+                } else {
+                    nt61::DcExtent::Viewport
+                };
+                let Some((success, [old_x, old_y])) =
+                    services.set_dc_extent(a[0], kind, [a[1] as i32, a[2] as i32])
+                else {
+                    return Err(ApiError::Windows(INVALID_PARAMETER));
+                };
+                if output != 0 {
+                    let mut bytes = [0; 8];
+                    bytes[..4].copy_from_slice(&old_x.to_le_bytes());
+                    bytes[4..].copy_from_slice(&old_y.to_le_bytes());
+                    if !image.memory.write_virt(output, &bytes) {
+                        return Ok(0);
+                    }
+                }
+                return Ok(u64::from(success));
+            }
+            "LPtoDP" => {
+                let count = a[2] as i32;
+                if count <= 0 { return Ok(1); }
+                let len = count as usize * 8;
+                let address = a[1];
+                if count > 65_536 || !image.memory.probe_write(address, len) { return Ok(0); }
+                let mut points = Vec::new();
+                if points.try_reserve_exact(len).is_err() { return Ok(0); }
+                points.resize(len, 0);
+                return Ok(u64::from(image.memory.read_virt(address, &mut points) == len
+                    && services.logical_to_device(a[0], &mut points)
+                    && image.memory.write_virt(address, &points)));
+            }
+            "DeleteDC" if image.win32.user.owns_client_dc(a[0]) => return Ok(0),
+            "DeleteDC" if services.delete_memory_dc(a[0]) => return Ok(1),
+            _ => return printing::invoke(image, api.name, a, services),
+        }
+    }
     if api.dll == "advapi32.dll" && api.name == "SystemFunction036" {
         let len = a[1] as u32 as usize;
         if len > MAX_BUFFER || (len != 0 && !image.memory.probe_write(a[0], len)) { return Ok(0); }
@@ -815,6 +1219,9 @@ fn invoke(
         return eventlog::invoke(image, api.name, a, services);
     }
     if api.dll == "advapi32.dll" {
+        if let Some(result) = advapi::token::invoke(image, api.name, a) {
+            return result.map_err(ApiError::Windows);
+        }
         return advapi::invoke(image, api.name, a)
             .ok_or(ApiError::Unsupported)?
             .map_err(ApiError::Windows);
@@ -830,7 +1237,9 @@ fn invoke(
     if runonce::handles(name) {
         return runonce::invoke(image, api, a);
     }
-    if api.dll == "kernel32.dll" && matches!(name, "CreateDirectoryW" | "FindFirstFileW" | "FindFirstFileExW" | "FindNextFileW" | "FindClose") {
+    if api.dll == "kernel32.dll" && matches!(name, "CreateDirectoryA" | "CreateDirectoryW" |
+        "FindFirstFileA" | "FindFirstFileW" | "FindFirstFileExW" | "FindNextFileA" | "FindNextFileW" |
+        "FindClose" | "GetFileAttributesA" | "GetFileAttributesW" | "SetFileAttributesW") {
         return directory::invoke(image, name, a, services);
     }
     if api.dll == "kernel32.dll" && nls::handles(name) {
@@ -840,6 +1249,21 @@ fn invoke(
         return sync::invoke(image, name, a, services);
     }
     Ok(match name {
+        "InterlockedExchange" if x86 => image.memory.exchange_u32(a[0], a[1] as u32)
+            .map_err(|_| ApiError::MemoryFault)?,
+        "InterlockedCompareExchange" if x86 => image.memory.locked_compare_exchange(a[0], 4, a[2], a[1])
+            .map_err(|_| ApiError::MemoryFault)?,
+        "InterlockedExchangeAdd" if x86 => image.memory.locked_fetch_add(a[0], 4, a[1])
+            .map_err(|_| ApiError::MemoryFault)?,
+        "InterlockedIncrement" | "InterlockedDecrement" if x86 => {
+            let decrement = name == "InterlockedDecrement";
+            let old = image.memory.locked_inc_dec(a[0], 4, decrement)
+                .map_err(|_| ApiError::MemoryFault)? as u32;
+            u64::from(old.wrapping_add(if decrement { u32::MAX } else { 1 }))
+        }
+        "Wow64DisableWow64FsRedirection" | "Wow64RevertWow64FsRedirection"
+        | "Wow64EnableWow64FsRedirection" | "RtlWow64EnableFsRedirection"
+        | "RtlWow64EnableFsRedirectionEx" => wow64_fs_redirection(image, name, a)?,
         "VerifyVersionInfoW" => version::verify(image, a[0], a[1] as u32, if x86 {a[2] | a[3] << 32} else {a[2]})?,
         "VerSetConditionMask" => {
             let (mask, types, condition) = if x86 {
@@ -901,11 +1325,22 @@ fn invoke(
             }
         }
         "CreateThread" => return super::threads::create(image, a).map_err(ApiError::Windows),
-        "ResumeThread" | "SuspendThread" | "GetThreadId" | "GetExitCodeThread" =>
+        "OpenThread" => return super::threads::open(image, a[0] as u32, a[1] as u32 != 0, a[2] as u32).map_err(ApiError::Windows),
+        "ResumeThread" | "SuspendThread" | "GetThreadId" | "GetProcessIdOfThread" | "GetExitCodeThread" | "SetThreadPriority" | "GetThreadPriority" =>
             return super::threads::invoke(image, name, a).map_err(ApiError::Windows),
-        "Sleep" | "SleepEx" if image.has_other_threads() => {
-            if name == "SleepEx" && a[1] as u32 != 0 { return Err(ApiError::Unsupported); }
-            let wait = super::threads::sleep(image, a[0] as u32, services)?;
+        "GetThreadPriorityBoost" => {
+            let disabled = super::threads::priority_boost_disabled(image, a[0])?;
+            if !image.memory.write_virt(a[1], &u32::from(disabled).to_le_bytes()) {
+                return Err(ApiError::MemoryFault);
+            }
+            1
+        }
+        "SetThreadPriorityBoost" => return super::threads::set_priority_boost_disabled(image, a[0], a[1] as u32 != 0).map_err(ApiError::Windows),
+        "QueueUserAPC" => return super::threads::queue_apc(image, a[0], a[1], a[2]).map_err(ApiError::Windows),
+        "Sleep" | "SleepEx" if image.has_other_threads() ||
+            (name == "SleepEx" && a[1] as u32 != 0 && image.has_pending_apc()) => {
+            let alertable = name == "SleepEx" && a[1] as u32 != 0;
+            let wait = super::threads::sleep(image, a[0] as u32, alertable, services)?;
             return Err(ApiError::Pending(wait));
         }
         "Sleep" | "SleepEx" => {
@@ -973,6 +1408,18 @@ fn invoke(
                 return Err(INVALID_PARAMETER.into());
             }
             heap_allocate(image, a[1])?
+        }
+        "LocalReAlloc" => local_reallocate(image, a[0], a[1], a[2] as u32)?,
+        "LocalLock" | "LocalUnlock" => {
+            let handle = a[0];
+            let movable_bit = if abi == GuestAbi::X86_64 { 8 } else { 4 };
+            if handle & movable_bit != 0 {
+                return Err(6u32.into());
+            }
+            if name == "LocalUnlock" {
+                return Err(158u32.into());
+            }
+            if image.win32.heap_allocations.iter().any(|entry| entry.0 == handle) { handle } else { 0 }
         }
         "LocalFree" => {
             heap_free(image, a[0])?;
@@ -1111,7 +1558,25 @@ fn invoke(
                 u64::MAX - 1
             }
         }
-        "GetCurrentProcessId" => 1,
+        "GetCurrentProcessId" => super::GUEST_PROCESS_ID,
+        "GetPriorityClass" => image.process_priority_class(a[0])?,
+        "SetPriorityClass" => image.set_process_priority_class(a[0], a[1] as u32)?,
+        "SetProcessShutdownParameters" => {
+            let flags = a[1] as u32;
+            if flags & !1 == 0 {
+                image.win32.shutdown_parameters = (a[0] as u32, flags);
+            }
+            1
+        }
+        "GetProcessShutdownParameters" => {
+            if !image.memory.probe_write(a[0], 4) || !image.memory.probe_write(a[1], 4) {
+                return Err(NOACCESS.into());
+            }
+            let (level, flags) = image.win32.shutdown_parameters;
+            put(&mut image.memory, a[0], u64::from(level), 4)?;
+            put(&mut image.memory, a[1], u64::from(flags), 4)?;
+            1
+        }
         "GetCurrentThreadId" => u64::from(image.thread_id()),
         "IsProcessorFeaturePresent" => {
             // Report the isolated interpreter's guarantees, never host CPUID.
@@ -1124,6 +1589,48 @@ fn invoke(
         "GetVersion" => 0x1db10106,
         "GetProcessHeap" => HEAP,
         "GetFileType" => services.file_type(a[0]).map_err(|status| ApiError::Windows(status_error(status)))? as u64,
+        "GetFileSizeEx" => {
+            if !image.memory.probe_write(a[1], 8) { return Err(NOACCESS.into()); }
+            let size = services.file_size(a[0]).map_err(status_error)?;
+            put(&mut image.memory, a[1], size, 8)?;
+            1
+        }
+        "SetFilePointer" => {
+            let high = a[2];
+            let origin = a[3] as u32;
+            let low = a[1] as u32;
+            let (distance, limit) = if high == 0 {
+                (i64::from(low as i32), u64::from(u32::MAX))
+            } else {
+                if !image.memory.probe_write(high, 4) { return Err(NOACCESS.into()); }
+                let upper = word(&mut image.memory, high, 4)?;
+                (((upper << 32) | u64::from(low)) as i64, i64::MAX as u64)
+            };
+            let position = match services.seek_file(a[0], distance, origin, limit) {
+                Ok(position) => position,
+                Err(nt61::FileSeekError::SetStatus(status)) => {
+                    if high != 0 { put(&mut image.memory, high, u64::from(u32::MAX), 4)?; }
+                    return Err(status_error(status).into());
+                }
+                Err(failure) => return Err(file_seek_error(failure).into()),
+            };
+            if high != 0 { put(&mut image.memory, high, position >> 32, 4)?; }
+            if position as u32 == u32::MAX { error(image, 0); }
+            u64::from(position as u32)
+        }
+        "SetFilePointerEx" => {
+            let (distance, output, origin) = if x86 {
+                (a[1] as u32 as u64 | (a[2] << 32), a[3], a[4] as u32)
+            } else {
+                (a[1], a[2], a[3] as u32)
+            };
+            if origin > 2 { return Err(INVALID_PARAMETER.into()); }
+            if output != 0 && !image.memory.probe_write(output, 8) { return Err(NOACCESS.into()); }
+            let position = services.seek_file(a[0], distance as i64, origin, i64::MAX as u64)
+                .map_err(file_seek_error)?;
+            if output != 0 { put(&mut image.memory, output, position, 8)?; }
+            1
+        }
         "GetStdHandle" => match a[0] as u32 {
             0xfffffff6 => crate::arch::common::btl::io::STD_INPUT,
             0xfffffff5 => crate::arch::common::btl::io::STD_OUTPUT,
@@ -1185,10 +1692,10 @@ fn invoke(
             if !image.memory.write_virt(a[0], &header[..size]) { return Err(ApiError::MemoryFault); }
             0
         }
-        "GetEnvironmentStringsW" => environment::get(image)?,
-        "FreeEnvironmentStringsW" => environment::release(image, a[0])?,
+        "GetEnvironmentStrings" | "GetEnvironmentStringsW" => environment::get(image, name.ends_with('W'))?,
+        "FreeEnvironmentStringsA" | "FreeEnvironmentStringsW" => environment::release(image, a[0], name.ends_with('W'))?,
         "GetEnvironmentVariableA" | "GetEnvironmentVariableW" => environment::variable(image, a, name.ends_with('W'))?,
-        "GetTempPathW" => environment::temp_path(image, a)?,
+        "GetTempPathA" | "GetTempPathW" => environment::temp_path(image, a, name.ends_with('W'))?,
         "GetCommandLineA" | "GetCommandLineW" => {
             let p = word(
                 &mut image.memory,
@@ -1215,26 +1722,28 @@ fn invoke(
             base
         }
         "GetModuleFileNameA" | "GetModuleFileNameW" => {
-            if a[0] != 0 && a[0] != image.image_base {
-                if image.module_metadata.iter().any(|m| m.base == a[0]) {
-                    // The loader currently records DLL identities but not
-                    // their resolved full filesystem paths.
-                    return Err(ApiError::Unsupported);
-                }
-                return Err(126.into());
-            }
             let capacity = a[2] as u32 as usize;
-            if capacity == 0 { return Err(122.into()); }
-            let params = word(&mut image.memory, image.peb + if x86 {0x10} else {0x20}, width)?;
-            if params == 0 { return Err(ApiError::MemoryFault); }
-            let descriptor = params + if x86 {0x38} else {0x60};
-            let length = word(&mut image.memory, descriptor, 2)? as usize;
-            if length % 2 != 0 { return Err(ApiError::MemoryFault); }
-            let pointer = word(&mut image.memory, descriptor + width as u64, width)?;
-            let source = read(&mut image.memory, pointer, length)?;
+            let source = if a[0] != 0 && a[0] != image.image_base {
+                let Some((_, path)) = image.win32.module_paths.iter().find(|(base, _)| *base == a[0]) else {
+                    return if image.module_metadata.iter().any(|module| module.base == a[0]) {
+                        Err(ApiError::Unsupported)
+                    } else { Err(126.into()) };
+                };
+                if capacity == 0 { return Err(122.into()); }
+                path.encode_utf16().flat_map(u16::to_le_bytes).collect()
+            } else {
+                if capacity == 0 { return Err(122.into()); }
+                let params = word(&mut image.memory, image.peb + if x86 {0x10} else {0x20}, width)?;
+                if params == 0 { return Err(ApiError::MemoryFault); }
+                let descriptor = params + if x86 {0x38} else {0x60};
+                let length = word(&mut image.memory, descriptor, 2)? as usize;
+                if length % 2 != 0 { return Err(ApiError::MemoryFault); }
+                let pointer = word(&mut image.memory, descriptor + width as u64, width)?;
+                read(&mut image.memory, pointer, length)?
+            };
             let wide = name.ends_with('W');
             let source = if wide { source } else {
-                let mut ansi = Vec::with_capacity(length / 2);
+                let mut ansi = Vec::with_capacity(source.len() / 2);
                 for unit in source.chunks_exact(2) {
                     let unit = u16::from_le_bytes([unit[0], unit[1]]);
                     if unit > 127 { return Err(1113.into()); }
@@ -1259,6 +1768,9 @@ fn invoke(
             let flags = a[0] as u32;
             if flags & !7 != 0 || flags & 3 == 3 {
                 return Err(INVALID_PARAMETER.into());
+            }
+            if image.pending_library.is_some() && flags & 2 == 0 {
+                return Err(120u32.into());
             }
             let base = if flags & 4 != 0 {
                 // Use immutable loader extents, never guest-writable PE
@@ -1290,9 +1802,13 @@ fn invoke(
         }
         "GetModuleHandleA" | "GetModuleHandleW" | "LoadLibraryA" | "LoadLibraryW"
         | "LoadLibraryExA" | "LoadLibraryExW" => {
+            const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x8;
+            const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
             let loading = name.starts_with("LoadLibrary");
             image.win32.last_library_error = None;
-            if name.starts_with("LoadLibraryEx") && (a[1] != 0 || a[2] != 0) {
+            let extended = name.starts_with("LoadLibraryEx");
+            let flags = if extended { a[2] as u32 } else { 0 };
+            if extended && (a[1] != 0 || !matches!(flags, 0 | LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_WITH_ALTERED_SEARCH_PATH)) {
                 return Err(120.into());
             }
             if a[0] == 0 {
@@ -1301,14 +1817,32 @@ fn invoke(
                 }
                 image.image_base
             } else {
-                let n = string(&mut image.memory, a[0], name.ends_with('W'))?;
+                let mut n = string(&mut image.memory, a[0], name.ends_with('W'))?;
+                let search = match flags {
+                    LOAD_LIBRARY_SEARCH_SYSTEM32 => {
+                        if n.contains(['\\', '/', ':']) { return Err(120.into()); }
+                        LibrarySearch::System32
+                    }
+                    LOAD_WITH_ALTERED_SEARCH_PATH => {
+                        if matches!(n.rsplit(['\\', '/']).next(), Some("" | "." | "..")) {
+                            return Err(INVALID_PARAMETER.into());
+                        }
+                        n = guest_file_path(GuestAbi::X86_64, &n.replace('/', "\\"), false)
+                            .map_err(|_| INVALID_PARAMETER)?;
+                        let (directory, leaf) = n.rsplit_once('\\').ok_or(INVALID_PARAMETER)?;
+                        if leaf.is_empty() || n[2..].contains(':') { return Err(INVALID_PARAMETER.into()); }
+                        LibrarySearch::AlteredDirectory(directory)
+                    }
+                    _ => LibrarySearch::Default,
+                };
                 if loading {
+                    if image.pending_library.is_some() { return Err(120u32.into()); }
                     image.win32.library_loads.try_reserve(1).map_err(|_| 8u32)?;
                 }
                 let base = if let Some(base) = module(image, &n) {
                     base
                 } else if loading {
-                    load_library(image, &n, services)?
+                    load_library(image, &n, services, search, true)?
                 } else {
                     return Err(126.into());
                 };
@@ -1347,14 +1881,8 @@ fn invoke(
             let available_commit = stats
                 .physical_available
                 .saturating_add(stats.paging_available);
-            // The isolated process has a documented 128 MiB mapping budget.
-            // Report that real limit, rather than promising unmappable address space.
-            let virtual_total = 128u64 * 1024 * 1024;
-            let mapped = image
-                .memory
-                .regions
-                .iter()
-                .fold(0u64, |sum, r| sum.saturating_add(r.bytes.len() as u64));
+            let virtual_total = MAX_PROCESS_MEMORY as u64;
+            let mapped = image.memory.mapped_bytes() as u64;
             let virtual_available = virtual_total.saturating_sub(mapped);
             let load = (((stats.physical_total - stats.physical_available) as u128 * 100)
                 / stats.physical_total as u128) as u32;
@@ -1465,7 +1993,7 @@ fn invoke(
             module.thread_notifications_disabled = true;
             1
         }
-        "FreeLibrary" => return library::free(image, a[0]),
+        "FreeLibrary" => return library::free(image, a[0], None),
         "GetProcAddress" => {
             let by_ordinal = a[1] <= 0xffff;
             let ordinal_failure = by_ordinal && image.win32.modules.iter().any(|m| m.1 == a[0]);
@@ -1583,53 +2111,34 @@ fn invoke(
             image.thread.invalidate_code();
             1
         }
+        "HeapSetInformation" => {
+            if a[0] != 0 || a[1] as u32 != 1 || a[2] != 0 || a[3] != 0 {
+                return Err(INVALID_PARAMETER.into());
+            }
+            image.win32.terminate_on_heap_corruption = true;
+            1
+        }
         "HeapAlloc" | "HeapReAlloc" => {
             if a[0] != HEAP || a[1] & !8 != 0 {
                 return Err(INVALID_PARAMETER.into());
             }
-            let n = if name == "HeapAlloc" { a[2] } else { a[3] };
-            let old = if name == "HeapReAlloc" {
-                Some(
-                    image
-                        .win32
-                        .heap_allocations
-                        .iter()
-                        .find(|p| p.0 == a[2])
-                        .copied()
-                        .ok_or(INVALID_PARAMETER)?,
-                )
+            if name == "HeapReAlloc" {
+                let (old, length) = image.win32.heap_allocations.iter()
+                    .find(|entry| entry.0 == a[2]).copied().ok_or(INVALID_PARAMETER)?;
+                heap_move(image, old, length, a[3])?
             } else {
-                None
-            };
-            let p = heap_allocate(image, n)?;
-            if let Some((old, length)) = old {
-                let count = length.min(n as usize);
-                let mut cursor = 0;
-                while cursor < count {
-                    let chunk = (count - cursor).min(MAX_BUFFER);
-                    let copied =
-                        read(&mut image.memory, old + cursor as u64, chunk).and_then(|b| {
-                            if image.memory.write_virt(p + cursor as u64, &b) {
-                                Ok(())
-                            } else {
-                                Err(NOACCESS)
-                            }
-                        });
-                    if let Err(e) = copied {
-                        let _ = heap_free(image, p);
-                        return Err(e.into());
-                    }
-                    cursor += chunk;
-                }
-                heap_free(image, old)?;
+                heap_allocate(image, a[2])?
             }
-            p
         }
         "HeapFree" => {
             if a[0] != HEAP || a[1] != 0 {
                 return Err(INVALID_PARAMETER.into());
             }
-            heap_free(image, a[2])?;
+            let tracked = image.win32.terminate_on_heap_corruption
+                && image.win32.heap_allocations.iter().any(|entry| entry.0 == a[2]);
+            heap_free(image, a[2]).map_err(|error| {
+                if tracked { ApiError::CorruptHeap } else { error.into() }
+            })?;
             1
         }
         "HeapSize" => {
@@ -1721,22 +2230,57 @@ fn invoke(
             0
         }
         "CreateFileA" | "CreateFileW" => {
-            if a[3] != 0 || a[4] != 3 || a[6] != 0 {
+            const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            let access = a[1] as u32;
+            let share = a[2] as u32;
+            let disposition = a[4] as u32;
+            let flags = a[5] as u32;
+            let native_disposition = match disposition {
+                1 => 2,
+                2 => 5,
+                3 => 1,
+                4 => 3,
+                5 => 4,
+                _ => return Err(INVALID_PARAMETER.into()),
+            };
+            if a[6] != 0 {
                 return Err(120.into());
             }
-            if a[1] & !(0x8000_0000 | 0x0012_0089) != 0 || a[2] & !7 != 0 {
+            if access & !(0xc000_0000 | 0x0012_019f) != 0 || share & !7 != 0 {
                 return Err(5.into());
             }
-            if a[5] & !0x80 != 0 {
+            if flags & !(0x0000_00a0 | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_BACKUP_SEMANTICS) != 0 {
                 return Err(120.into());
             }
-            let path = string(&mut image.memory, a[0], name.ends_with('W'))?;
+            let options = if flags & FILE_FLAG_BACKUP_SEMANTICS != 0 { 0x4020 } else { 0x60 }
+                | if flags & FILE_FLAG_SEQUENTIAL_SCAN != 0 { 4 } else { 0 };
+            let mut object_attributes = 0x40;
+            if a[3] != 0 {
+                let size = width * 3;
+                let mut attributes = [0; 24];
+                if image.memory.read_virt(a[3], &mut attributes[..size]) != size {
+                    return Err(NOACCESS.into());
+                }
+                if attributes[..4] != (size as u32).to_le_bytes() {
+                    return Err(INVALID_PARAMETER.into());
+                }
+                if attributes[width..width * 2].iter().any(|byte| *byte != 0) {
+                    return Err(120.into());
+                }
+                if attributes[width * 2..width * 2 + 4].iter().any(|byte| *byte != 0) {
+                    object_attributes |= 2;
+                }
+            }
+            let input = string(&mut image.memory, a[0], name.ends_with('W'))?;
+            if input.is_empty() { return Err(123.into()); }
+            let path = directory::path(image, &input)?;
             let utf16: Vec<u16> = path.encode_utf16().collect();
             if utf16.len() > 16000 {
                 return Err(INVALID_PARAMETER.into());
             }
             let scratch = allocate(image, 0, (utf16.len() * 2 + 130) as u64, READ | WRITE)?;
-            let result = (|| -> Result<u64, u32> {
+            let result = (|| -> Result<(u64, u64), u32> {
                 let us = scratch + 64;
                 let buffer = scratch + 128;
                 let iosb = scratch + 48;
@@ -1750,38 +2294,64 @@ fn invoke(
                 put(
                     &mut image.memory,
                     scratch + if x86 { 12 } else { 24 },
-                    0x40,
+                    object_attributes,
                     4,
                 )?;
                 put(&mut image.memory, us, (utf16.len() * 2) as u64, 2)?;
                 put(&mut image.memory, us + 2, (utf16.len() * 2 + 2) as u64, 2)?;
                 put(&mut image.memory, us + width as u64, buffer, width)?;
                 write_string(&mut image.memory, buffer, &path, true)?;
-                let out = scratch + 32; // overlaps zero OA security fields on x64: use separate slot below
-                let out = out + 64;
-                let args = [out, a[1], scratch, iosb, 0, a[5], a[2], 1, 0x60, 0, 0];
+                let out = scratch + 96;
+                let args = [out, u64::from(access), scratch, iosb, 0, u64::from(flags & 0xffff), u64::from(share), native_disposition, options, 0, 0];
                 match services.call(abi, Service::CreateFile, &args, &mut image.memory) {
-                    ServiceResult::Return(0) => word(&mut image.memory, out, width),
+                    ServiceResult::Return(0) => Ok((word(&mut image.memory, out, width)?, word(&mut image.memory, iosb + width as u64, width)?)),
+                    ServiceResult::Return(0xc000_0035) if disposition == 1 => Err(80),
                     ServiceResult::Return(s) => Err(status_error(s)),
                     _ => Err(120),
                 }
             })();
             free(image, scratch)?;
-            result?
+            let (handle, information) = result?;
+            if matches!(disposition, 2 | 4) {
+                error(image, if information == 2 { 0 } else { 183 });
+            }
+            handle
+        }
+        "SetFileTime" => {
+            let mut times = [None; 3];
+            for (index, (time, address)) in times.iter_mut().zip(&a[1..4]).enumerate() {
+                if *address == 0 {
+                    continue;
+                }
+                let value = word(&mut image.memory, *address, 8)?;
+                match value {
+                    0 => {},
+                    u64::MAX if index != 0 => {},
+                    value if value <= i64::MAX as u64 => *time = Some(value),
+                    _ => return Err(INVALID_PARAMETER.into()),
+                }
+            }
+            services.set_file_times(a[0], times).map_err(status_error)?;
+            1
+        }
+        "CancelIo" => {
+            services.cancel_file_io(a[0]).map_err(status_error)?;
+            1
         }
         "ReadFile" | "WriteFile" => {
-            if a[4] != 0 || a[2] > 65536 {
+            let length = a[2] as u32;
+            if a[4] != 0 || (name == "WriteFile" && length > 65536) {
                 return Err(120.into());
             }
             if a[3] == 0 || !image.memory.probe_write(a[3], 4) {
                 return Err(NOACCESS.into());
             }
             put(&mut image.memory, a[3], 0, 4)?;
-            if name == "ReadFile" && a[2] != 0 && !image.memory.probe_write(a[1], a[2] as usize) {
+            if name == "ReadFile" && length != 0 && !image.memory.probe_write(a[1], length as usize) {
                 return Err(NOACCESS.into());
             }
             let scratch = allocate(image, 0, 16, READ | WRITE)?;
-            let args = [a[0], 0, 0, 0, scratch, a[1], a[2], 0, 0];
+            let args = [a[0], 0, 0, 0, scratch, a[1], u64::from(length), 0, 0];
             let result = (|| -> Result<u64, u32> {
                 match services.call(
                     abi,
@@ -1850,16 +2420,37 @@ fn invoke(
                 .map_or(0, |(x, y)| (i32::from(*x) - i32::from(*y)).signum() as u32 as u64)
         }
         "DuplicateHandle" => super::threads::duplicate(image, a)?,
+        "GetHandleInformation" => {
+            let flags = if super::threads::is_handle(a[0]) {
+                super::threads::handle_flags(image, a[0])?
+            } else {
+                services.file_handle_flags(a[0]).map_err(status_error)?
+            };
+            put(&mut image.memory, a[1], u64::from(flags), 4)?;
+            1
+        }
         "SetHandleInformation" if super::threads::is_handle(a[0]) => super::threads::set_handle_information(image, a)?,
+        "CloseHandle" if sync::is_wait_handle(a[0]) => {
+            sync::close_wait_object(image, a[0])?;
+            1
+        }
         "CloseHandle" if super::threads::is_handle(a[0]) => {
             super::threads::close(image, a[0])?;
             1
         }
-        "CloseHandle" => match services.call(abi, Service::Close, &a[..1], &mut image.memory) {
-            ServiceResult::Return(0) => 1,
-            ServiceResult::Return(s) => return Err(status_error(s).into()),
-            _ => return Err(ApiError::Unsupported),
-        },
+        "CloseHandle" => {
+            let status = match close_token(image, a[0]) {
+                Some(status) => status,
+                None => match services.call(abi, Service::Close, &a[..1], &mut image.memory) {
+                    ServiceResult::Return(status) => status,
+                    _ => return Err(ApiError::Unsupported),
+                },
+            };
+            if status != 0 {
+                return Err(status_error(status).into());
+            }
+            1
+        }
         "CryptBinaryToStringA" | "CryptBinaryToStringW" => {
             binary_to_string(&mut image.memory, a, name.ends_with('W'))?
         }
@@ -1887,6 +2478,48 @@ pub(super) fn sleep_counter(
     }
     Ok((counter, frequency))
 }
+fn wow64_fs_redirection(image: &mut GuestImage, name: &str, args: &[u64]) -> Result<u64, ApiError> {
+    let rtl = name.starts_with("Rtl");
+    let status = if image.thread.context.mode != DecodeMode::X86 {
+        nt61::STATUS_NOT_IMPLEMENTED
+    } else {
+        let (next, previous) = match name {
+            "Wow64DisableWow64FsRedirection" => (1, Some(args[0])),
+            "Wow64RevertWow64FsRedirection" => (args[0], None),
+            "RtlWow64EnableFsRedirectionEx" => (args[0], Some(args[1])),
+            _ => (u64::from(args[0] as u8 == 0), None),
+        };
+        if next > 1 {
+            0xc000000d
+        } else if previous.is_some_and(|address| !image.memory.probe_write(address, 4)) {
+            nt61::STATUS_ACCESS_VIOLATION
+        } else {
+            if let Some(address) = previous {
+                put(&mut image.memory, address, u64::from(image.win32.local.fs_redirection_disabled), 4)?;
+            }
+            image.win32.local.fs_redirection_disabled = next != 0;
+            0
+        }
+    };
+    if rtl {
+        return Ok(u64::from(status));
+    }
+    if status == 0 {
+        return Ok(1);
+    }
+    let last_status = if image.thread.context.mode == DecodeMode::X86 { 0xbf4 } else { 0x1250 };
+    put(&mut image.memory, image.teb + last_status, u64::from(status), 4)?;
+    Err(ApiError::Windows(if status == nt61::STATUS_NOT_IMPLEMENTED { 1 } else { status_error(status) }))
+}
+
+fn file_seek_error(error: nt61::FileSeekError) -> u32 {
+    match error {
+        nt61::FileSeekError::Status(status) | nt61::FileSeekError::SetStatus(status) => status_error(status),
+        nt61::FileSeekError::NegativePosition => 131,
+        nt61::FileSeekError::PositionTooLarge => INVALID_PARAMETER,
+    }
+}
+
 pub(super) fn status_error(s: u32) -> u32 {
     match s {
         0xc0000005 => NOACCESS,
@@ -1896,9 +2529,11 @@ pub(super) fn status_error(s: u32) -> u32 {
         0xc000000d => 87,
         0xc0000022 => 5,
         0xc0000034 | 0xc000000f => 2,
+        0xc0000035 => 183,
         0xc000003a => 3,
+        0xc00000ba => 5,
         0xc0000011 => 38,
-        0xc0000002 => 120,
+        0xc0000002 | 0xc00000bb => 120,
         _ => 1,
     }
 }

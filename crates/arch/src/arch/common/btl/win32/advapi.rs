@@ -17,6 +17,8 @@ mod security;
 mod service;
 #[path = "advapi/text.rs"]
 mod text;
+#[path = "advapi/token.rs"]
+pub(super) mod token;
 
 pub(super) struct State {
     registry: registry::State,

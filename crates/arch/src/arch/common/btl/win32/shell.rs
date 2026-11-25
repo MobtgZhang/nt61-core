@@ -27,6 +27,23 @@ fn task_free(image: &mut GuestImage, pointer: u64) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn profile_path(image: &mut GuestImage, variable: &str, verify: bool, services: &mut dyn GuestServices)
+    -> Result<Result<Vec<u16>, u64>, ApiError> {
+    let name: Vec<u16> = variable.encode_utf16().collect();
+    let Some(path) = environment::lookup(image, &name)? else { return Ok(Err(0x80070002)); };
+    if path.len() < 3 || path[1..3] != [b':' as u16, b'\\' as u16] || path.contains(&0) {
+        return Ok(Err(0x80070003));
+    }
+    if verify {
+        let text = String::from_utf16(&path).map_err(|_| ApiError::MemoryFault)?;
+        let abi = if image.thread.context.mode == DecodeMode::X86 { GuestAbi::X86_32 } else { GuestAbi::X86_64 };
+        if let Err(status) = services.directory_entries(abi, &text) {
+            return Ok(Err(0x80070000 | u64::from(status_error(status))));
+        }
+    }
+    Ok(Ok(path))
+}
+
 fn known_folder(image: &mut GuestImage, a: &[u64], services: &mut dyn GuestServices) -> Result<u64, ApiError> {
     let width = if image.thread.context.mode == DecodeMode::X86 { 4 } else { 8 };
     put(&mut image.memory, a[3], 0, width).map_err(|_| ApiError::MemoryFault)?;
@@ -42,26 +59,43 @@ fn known_folder(image: &mut GuestImage, a: &[u64], services: &mut dyn GuestServi
     // CREATE, DEFAULT_PATH, impersonation and redirected folders need the
     // persistent user hive/token backend, rather than an invented path.
     if a[2] != 0 || a[1] as u32 & !0x4000 != 0 { return Ok(0x80004001); }
-    let name: Vec<u16> = variable.encode_utf16().collect();
-    let Some(mut path) = environment::lookup(image, &name)? else { return Ok(0x80070002); };
-    if path.len() < 3 || path[1..3] != [b':' as u16, b'\\' as u16] || path.contains(&0) {
-        return Ok(0x80070003);
-    }
-    if a[1] as u32 & 0x4000 == 0 {
-        let text = String::from_utf16(&path).map_err(|_| ApiError::MemoryFault)?;
-        let abi = if width == 4 { GuestAbi::X86_32 } else { GuestAbi::X86_64 };
-        if let Err(status) = services.directory_entries(abi, &text) {
-            return Ok(0x80070000 | u64::from(status_error(status)));
-        }
-    }
-    path.push(0);
-    let bytes: Vec<u8> = path.into_iter().flat_map(u16::to_le_bytes).collect();
+    let path = match profile_path(image, variable, a[1] as u32 & 0x4000 == 0, services)? {
+        Ok(path) => path,
+        Err(hr) => return Ok(hr),
+    };
+    let bytes: Vec<u8> = path.into_iter().chain([0]).flat_map(u16::to_le_bytes).collect();
+    copy_to_task_block(image, &bytes, a[3], width)
+}
+
+fn copy_to_task_block(image: &mut GuestImage, bytes: &[u8], output: u64, width: usize) -> Result<u64, ApiError> {
     let pointer = match task_alloc(image, bytes.len() as u64) {
         Ok(pointer) => pointer,
-        Err(_) => return Ok(0x8007000e), // E_OUTOFMEMORY
+        Err(_) => return Ok(0x8007000e),
     };
-    if !image.memory.write_virt(pointer, &bytes) || put(&mut image.memory, a[3], pointer, width).is_err() {
+    if !image.memory.write_virt(pointer, bytes) || put(&mut image.memory, output, pointer, width).is_err() {
         task_free(image, pointer)?;
+        return Err(ApiError::MemoryFault);
+    }
+    Ok(0)
+}
+
+fn folder_path(image: &mut GuestImage, a: &[u64], services: &mut dyn GuestServices) -> Result<u64, ApiError> {
+    put(&mut image.memory, a[4], 0, 2).map_err(|_| ApiError::MemoryFault)?;
+    let folder = a[1] as u32;
+    if a[2] != 0 || a[3] as u32 != 0 || folder & !0x40ff != 0 { return Ok(0x80004001); }
+    let variable = match folder & 0xff {
+        0x1a => "APPDATA",
+        0x1c => "LOCALAPPDATA",
+        0x28 => "USERPROFILE",
+        _ => return Ok(0x80070057),
+    };
+    let path = match profile_path(image, variable, folder & 0x4000 == 0, services)? {
+        Ok(path) => path,
+        Err(hr) => return Ok(hr),
+    };
+    if path.len() >= 260 { return Ok(0x800700ce); }
+    let bytes: Vec<u8> = path.into_iter().chain([0]).flat_map(u16::to_le_bytes).collect();
+    if !image.memory.probe_write(a[4], bytes.len()) || !image.memory.write_virt(a[4], &bytes) {
         return Err(ApiError::MemoryFault);
     }
     Ok(0)
@@ -70,6 +104,19 @@ fn known_folder(image: &mut GuestImage, a: &[u64], services: &mut dyn GuestServi
 pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64], services: &mut dyn GuestServices) -> Result<u64, ApiError> {
     match name {
         "SHGetKnownFolderPath" => known_folder(image, a, services),
+        "SHGetFolderPathW" => folder_path(image, a, services),
+        "PathIsFileSpecW" => {
+            if a[0] == 0 { return Ok(0); }
+            let bytes = wide_z_bytes(&mut image.memory, a[0])?;
+            Ok(u64::from(!bytes.chunks_exact(2).any(|unit| matches!(unit, [b':' | b'\\', 0]))))
+        }
+        "SHStrDupW" => {
+            let width = if image.thread.context.mode == DecodeMode::X86 { 4 } else { 8 };
+            put(&mut image.memory, a[1], 0, width).map_err(|_| ApiError::MemoryFault)?;
+            if a[0] == 0 { return Ok(0x80070057); }
+            let bytes = wide_z_bytes(&mut image.memory, a[0])?;
+            copy_to_task_block(image, &bytes, a[1], width)
+        }
         "CoTaskMemAlloc" => Ok(task_alloc(image, a[0]).unwrap_or(0)),
         "CoTaskMemFree" => { task_free(image, a[0])?; Ok(0) }
         "CoTaskMemRealloc" => {
