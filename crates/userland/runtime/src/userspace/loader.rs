@@ -143,6 +143,13 @@ pub fn load_translated_image(image_path: &str, command_line: &str, directory: &s
     let mut image = GuestImage::load_linked(&bytes, &mut resolver).map_err(GuestLoadError::Link)?;
     image.set_process_parameters(image_path, command_line, directory)
         .map_err(|error| GuestLoadError::Link(LinkError::Image(error)))?;
+    if let Ok(bytes) = crate::fs::system_volume::read_at("C:\\Windows\\NT61\\ui-language", 0, 65) {
+        if bytes.len() <= 64 {
+            if let Ok(language) = core::str::from_utf8(&bytes) {
+                image.win32.set_ui_language(language.trim());
+            }
+        }
+    }
     Ok(image)
 }
 
@@ -177,22 +184,43 @@ fn read_guest_pe(path: &str) -> Result<alloc::vec::Vec<u8>, u32> {
 }
 
 pub struct VolumeLibraries<'a> { pub application_directory: &'a str }
+impl VolumeLibraries<'_> {
+    fn system_directory(mode: crate::arch::common::btl::ir::DecodeMode) -> &'static str {
+        use crate::arch::common::btl::ir::DecodeMode;
+        match mode {
+            DecodeMode::X86 => "C:\\Windows\\SysWOW64",
+            DecodeMode::X64 if cfg!(target_arch = "x86_64") => "C:\\Windows\\System32",
+            DecodeMode::X64 => "C:\\Windows\\SysX64",
+        }
+    }
+
+    pub fn resolve_system_library(&self, name: &str, mode: crate::arch::common::btl::ir::DecodeMode)
+        -> Result<crate::arch::common::btl::pe::ResolvedLibrary, u32> {
+        let path = alloc::format!("{}\\{name}", Self::system_directory(mode));
+        let bytes = read_guest_pe(&path)?;
+        Ok(crate::arch::common::btl::pe::ResolvedLibrary { bytes, path: Some(path) })
+    }
+}
 impl crate::arch::common::btl::pe::ImportResolver for VolumeLibraries<'_> {
     fn read_library(&mut self, name: &str, mode: crate::arch::common::btl::ir::DecodeMode)
         -> Result<alloc::vec::Vec<u8>, u32> {
+        self.resolve_library(name, mode).map(|library| library.bytes)
+    }
+
+    fn resolve_library(&mut self, name: &str, mode: crate::arch::common::btl::ir::DecodeMode)
+        -> Result<crate::arch::common::btl::pe::ResolvedLibrary, u32> {
+        use crate::arch::common::btl::pe::ResolvedLibrary;
         // Explicit paths must not be prefixed with the application directory.
         // IoServices already selected the caller's WOW64 filesystem view.
         if name.as_bytes().get(1) == Some(&b':') {
-            return read_guest_pe(name);
+            let bytes = read_guest_pe(name)?;
+            return Ok(ResolvedLibrary { bytes, path: Some(name.into()) });
         }
         // A PE32 program must never bind to the host's 64-bit System32 DLLs.
-        let system = match mode {
-            crate::arch::common::btl::ir::DecodeMode::X86 => "C:\\Windows\\SysWOW64",
-            crate::arch::common::btl::ir::DecodeMode::X64 => if cfg!(target_arch = "x86_64") { "C:\\Windows\\System32" } else { "C:\\Windows\\SysX64" },
-        };
-        for directory in [self.application_directory, system] {
-            match read_guest_pe(&alloc::format!("{directory}\\{name}")) {
-                Ok(bytes) => return Ok(bytes),
+        for directory in [self.application_directory, Self::system_directory(mode)] {
+            let path = alloc::format!("{directory}\\{name}");
+            match read_guest_pe(&path) {
+                Ok(bytes) => return Ok(ResolvedLibrary { bytes, path: Some(path) }),
                 Err(0xc000_0034 | 0xc000_003a | 0xc000_000f) => continue,
                 Err(status) => return Err(status),
             }

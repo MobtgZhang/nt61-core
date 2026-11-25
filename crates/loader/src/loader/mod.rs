@@ -392,12 +392,6 @@ use alloc::vec::Vec;
 /// `IMAGE_ORDINAL_FLAG64` — in a PE32+ import table, an entry with
 /// this bit set is an **ordinal import**; a clear bit means the entry
 /// is a hint/name RVA.
-///
-/// This is the exact inverse of the PE32 convention, where the flag
-/// lives in bit 31 of a 32-bit entry and means "import by ordinal".
-/// The 64-bit flag was moved to bit 63 so that the 32-bit
-/// `IMAGE_ORDINAL_FLAG` and the 64-bit `IMAGE_ORDINAL_FLAG64` could
-/// coexist in the same slot with different meanings.
 pub const IMAGE_ORDINAL_FLAG64: u64 = 1u64 << 63;
 
 /// A loaded PE image, in memory, after relocations and import
@@ -484,18 +478,14 @@ impl LoadedImage {
         true
     }
 
-    /// Look up an export by name and return its absolute address
-    /// (image_base + RVA), or 0 if not found. Parses the export
-    /// directory from the raw PE bytes in this image.
+    /// Look up an export by name in the mapped PE image.
     pub fn find_export(&self, name: &str) -> Option<u64> {
-        // Delegate to the parse_exports helper
-        let entries = parse_exports(self, &self.bytes);
-        for e in entries {
-            if e.name == name {
-                return Some(e.address);
-            }
+        use image_link::{ExportQuery, ExportTarget};
+        let exports = image_link::ImageExports::parse(&self.bytes, self.image_base)?;
+        match exports.get(ExportQuery::Name(name))? {
+            ExportTarget::Address(address) => Some(*address),
+            ExportTarget::Forwarder(_) => None,
         }
-        None
     }
 }
 
@@ -726,6 +716,7 @@ fn read_opt32(image: &[u8], opt_off: usize) -> Option<(u64, u32, u32, u16)> {
 }
 
 mod image_bounds;
+mod image_link;
 
 /// Map a file PE into memory and return a fully loaded image with
 /// all sections copied, base relocations applied, and import
@@ -837,7 +828,7 @@ pub fn load_image_full(
         let sh: SectionHeader = unsafe {
             core::ptr::read_unaligned(bytes.as_ptr().add(sh_off) as *const SectionHeader)
         };
-        if sh.virtual_size == 0 || sh.size_of_raw_data == 0 {
+        if sh.size_of_raw_data == 0 {
             continue;
         }
         let src = sh.pointer_to_raw_data as usize;
@@ -874,21 +865,59 @@ pub fn load_image_full(
         apply_base_relocations(&mut loaded, bytes, delta);
     }
 
-    // Resolve imports. The IAT slots get patched in place; we need
-    // the import directory from the data directories.
-    let (import_rva, import_size) = if magic == 0x10B {
-        read_data_directory_pe32(bytes, opt_off, 1) // 1 = IMPORT
-    } else {
-        read_data_directory_pe32plus(bytes, opt_off, 1) // 1 = IMPORT
-    };
-    if import_rva != 0
-        && import_size != 0
-        && !resolve_imports(&mut loaded, bytes, import_rva, image_db)
-    {
-        return None;
+    image_link::bind_imports(&mut loaded.bytes, image_db).ok()?;
+    Some(loaded)
+}
+
+/// Relocate and bind a PE32+ boot module in the pages assigned to it by Winload.
+pub fn link_boot_image(
+    name: &str,
+    header: nt61_boot_types::boot_image::Header,
+    mapped: &mut [u8],
+    load_base: u64,
+    image_db: &ImageDatabase,
+) -> Result<usize, &'static str> {
+    let mapped = mapped.get_mut(..header.image_size).ok_or("short mapped boot image")?;
+    let imports = image_link::prepare_imports(mapped, image_db)?;
+    let relocations = header.relocate(mapped, load_base)?;
+    imports.apply(mapped);
+    image_db.register_mapped(name, mapped, load_base);
+    Ok(relocations)
+}
+
+pub struct MappedBootImage<'a> {
+    pub name: &'static str,
+    pub header: nt61_boot_types::boot_image::Header,
+    pub bytes: &'a mut [u8],
+    pub load_base: u64,
+}
+
+/// Bind a boot set whose modules may import from one another in either direction.
+pub fn link_boot_images(images: &mut [MappedBootImage<'_>]) -> Result<(), (&'static str, &'static str)> {
+    let database = ImageDatabase::new();
+    for image in images.iter() {
+        let mapped = image.bytes.get(..image.header.image_size)
+            .ok_or((image.name, "short mapped boot image"))?;
+        database.register_mapped(image.name, mapped, image.load_base);
     }
 
-    Some(loaded)
+    let mut bindings = Vec::with_capacity(images.len());
+    for image in images.iter_mut() {
+        let mapped = &mut image.bytes[..image.header.image_size];
+        let imports = image_link::prepare_imports(mapped, &database)
+            .map_err(|reason| (image.name, reason))?;
+        image.header.validate_relocations(mapped, image.load_base)
+            .map_err(|reason| (image.name, reason))?;
+        bindings.push(imports);
+    }
+
+    for (image, imports) in images.iter_mut().zip(bindings) {
+        let mapped = &mut image.bytes[..image.header.image_size];
+        image.header.relocate(mapped, image.load_base)
+            .map_err(|reason| (image.name, reason))?;
+        imports.apply(mapped);
+    }
+    Ok(())
 }
 
 /// Apply the `.reloc` table to the loaded image. Each relocation
@@ -1090,256 +1119,80 @@ pub(crate) fn apply_highadj(current: u16, next: u16, delta: i64) -> u16 {
     (combined >> 16) as u16
 }
 
-/// Resolve the import table. For each DLL, walk the
-/// `IMAGE_THUNK_DATA64` array (RVA + 0), look up the imported
-/// function in the image database by name, and write the
-/// resolved 64-bit address back into the IAT.
-fn resolve_imports(
-    loaded: &mut LoadedImage,
-    raw: &[u8],
-    import_rva: u32,
-    image_db: &ImageDatabase,
-) -> bool {
-    // The import directory RVA points into the file's virtual
-    // address space. Walk the section table to convert it to a
-    // file offset.
-    let (file_hdr, _, _, opt_off) = match parse_headers(raw) {
-        Some(p) => p,
-        None => return false,
-    };
-    let sect_off = opt_off + file_hdr.size_of_optional_header as usize;
-    let mut sects: alloc::vec::Vec<(u32, u32, u32)> = alloc::vec::Vec::new();
-    for i in 0..file_hdr.number_of_sections as usize {
-        let sh_off = sect_off + i * 40;
-        if sh_off + 40 > raw.len() {
-            break;
-        }
-        let sh: SectionHeader =
-            unsafe { core::ptr::read_unaligned(raw.as_ptr().add(sh_off) as *const SectionHeader) };
-        sects.push((
-            sh.virtual_address,
-            sh.pointer_to_raw_data,
-            sh.size_of_raw_data,
-        ));
-    }
-    let rva_to_file = |rva: u32| -> Option<usize> {
-        for &(vaddr, raw_ptr, raw_size) in &sects {
-            if rva >= vaddr && rva < vaddr + raw_size {
-                return Some(raw_ptr as usize + (rva - vaddr) as usize);
-            }
-        }
-        None
-    };
-    let mut off = match rva_to_file(import_rva) {
-        Some(o) => o,
-        None => return false,
-    };
-    loop {
-        if off + 20 > raw.len() {
-            return false;
-        }
-        let ilt_rva = u32::from_le_bytes([raw[off], raw[off + 1], raw[off + 2], raw[off + 3]]);
-        let _ts = u32::from_le_bytes([raw[off + 4], raw[off + 5], raw[off + 6], raw[off + 7]]);
-        let _fwd = u32::from_le_bytes([raw[off + 8], raw[off + 9], raw[off + 10], raw[off + 11]]);
-        let name_rva =
-            u32::from_le_bytes([raw[off + 12], raw[off + 13], raw[off + 14], raw[off + 15]]);
-        let iat_rva =
-            u32::from_le_bytes([raw[off + 16], raw[off + 17], raw[off + 18], raw[off + 19]]);
-        if ilt_rva == 0 && name_rva == 0 && iat_rva == 0 {
-            break;
-        }
-
-        // read DLL name (RVA -> file offset).
-        let dll_name = match rva_to_file(name_rva).and_then(|o| read_cstr(raw, o)) {
-            Some(n) => n,
-            None => return false,
-        };
-
-        // Walk the ILT: each entry is 8 bytes (PE32+). The high
-        // bit selects name (1) vs ordinal (0).
-        let ilt_off_file = match rva_to_file(ilt_rva) {
-            Some(o) => o,
-            None => return false,
-        };
-        let mut ilt_off = ilt_off_file;
-        loop {
-            if ilt_off + 8 > raw.len() {
-                break;
-            }
-            let entry = u64::from_le_bytes([
-                raw[ilt_off],
-                raw[ilt_off + 1],
-                raw[ilt_off + 2],
-                raw[ilt_off + 3],
-                raw[ilt_off + 4],
-                raw[ilt_off + 5],
-                raw[ilt_off + 6],
-                raw[ilt_off + 7],
-            ]);
-            if entry == 0 {
-                break;
-            }
-            let iat_off_in_image = iat_rva + 8 * ((ilt_off - ilt_off_file) as u32 / 8);
-            // `IMAGE_ORDINAL_FLAG64` **set** means "import by
-            // ordinal"; a clear bit means the entry is a hint/name
-            // RVA. This is the exact inverse of the PE32 convention
-            // (where bit 31 of a 32-bit entry means "by ordinal"),
-            // because the 64-bit flag was moved to bit 63 so both
-            // conventions could coexist in the same slot.
-            if entry & IMAGE_ORDINAL_FLAG64 == 0 {
-                // Import by name: the low bits are a hint/name RVA.
-                let hint_rva = (entry & 0x7FFF_FFFF) as u32;
-                let resolved = rva_to_file(hint_rva)
-                    .and_then(|hint_file| read_cstr(raw, hint_file + 2))
-                    .and_then(|func_name| image_db.lookup(&dll_name, &func_name));
-                match resolved {
-                    Some(addr) => {
-                        if !loaded.write_u64(iat_off_in_image, addr) {
-                            return false;
-                        }
-                    }
-                    None => {
-                        // Unresolved import: the loader must not
-                        // install a sentinel address. Report failure
-                        // so the caller can reject the image.
-                        return false;
-                    }
-                }
-            } else {
-                // Import by ordinal: the low 16 bits are the ordinal.
-                let ordinal = (entry & 0xFFFF) as u16;
-                match image_db.lookup_ordinal(&dll_name, ordinal) {
-                    Some(addr) => {
-                        if !loaded.write_u64(iat_off_in_image, addr) {
-                            return false;
-                        }
-                    }
-                    None => {
-                        return false;
-                    }
-                }
-            }
-            ilt_off += 8;
-        }
-        off += 20;
-    }
-    true
-}
-
-/// read a null-terminated ASCII C string at `offset` inside `buf`.
-fn read_cstr(buf: &[u8], offset: usize) -> Option<String> {
-    if offset >= buf.len() {
-        return None;
-    }
-    let mut end = offset;
-    while end < buf.len() && buf[end] != 0 {
-        end += 1;
-    }
-    core::str::from_utf8(&buf[offset..end])
-        .ok()
-        .map(String::from)
-}
-
-// =====================================================================
-//  In-memory image database
-// =====================================================================
-//
-//  Once a PE is loaded we need to be able to find it by name and
-//  resolve exported symbols for other modules' import tables. The
-//  loader therefore maintains a small database that maps
-//  `(dll_name, fn_name) -> address`.
-
 use ntoskrnl::ke::sync::Spinlock;
 
-struct DbEntry {
+struct RegisteredImage {
     name: String,
-    address: u64,
+    base: u64,
+    exports: image_link::ImageExports,
 }
 
 pub struct ImageDatabase {
-    /// image_name -> list of exports
-    images: Spinlock<alloc::vec::Vec<(String, Vec<DbEntry>)>>,
+    images: Spinlock<Vec<RegisteredImage>>,
 }
 
 impl ImageDatabase {
     pub fn new() -> Self {
-        let empty = alloc::vec::Vec::new();
-
-        Self {
-            images: ntoskrnl::ke::sync::Spinlock::new(empty),
-        }
+        Self { images: Spinlock::new(Vec::new()) }
     }
 
-    /// Register `image` in the database. We scan its export table
-    /// (data directory #0) and record every (name, rva) pair so
-    /// other images can resolve them.
-    pub fn register(&self, image: &LoadedImage, raw_pe: &[u8]) {
-        let exports = parse_exports(image, raw_pe);
-        let mut g = self.images.lock();
-        g.push((image.name.clone(), exports));
+    pub fn register(&self, image: &LoadedImage, _raw_pe: &[u8]) {
+        self.register_mapped(&image.name, &image.bytes, image.image_base);
     }
 
-    /// Look up `(dll, fn)` in the database. Returns the absolute
-    /// address of the symbol (image base + RVA) or `None`.
-    pub fn lookup(&self, dll: &str, fn_name: &str) -> Option<u64> {
-        let g = self.images.lock();
-        for (image_name, exports) in g.iter() {
-            if !image_name.eq_ignore_ascii_case(dll) {
-                continue;
-            }
-            for e in exports {
-                if e.name == fn_name {
-                    return Some(e.address);
-                }
-            }
-        }
-        None
+    fn register_mapped(&self, name: &str, mapped: &[u8], base: u64) {
+        let exports = image_link::ImageExports::parse(mapped, base).unwrap_or_default();
+        self.images.lock().push(RegisteredImage { name: String::from(name), base, exports });
     }
 
-    /// Look up an export by ordinal. The PE import format allows
-    /// imports to specify a 1-based ordinal instead of a name when
-    /// the `IMAGE_ORDINAL_FLAG64` bit is clear in the ILT entry.
-    /// Returns the absolute address of the symbol or `None`.
+    pub fn lookup(&self, dll: &str, name: &str) -> Option<u64> {
+        self.resolve(dll, image_link::ExportQuery::Name(name))
+    }
+
     pub fn lookup_ordinal(&self, dll: &str, ordinal: u16) -> Option<u64> {
-        let g = self.images.lock();
-        for (image_name, exports) in g.iter() {
-            if !image_name.eq_ignore_ascii_case(dll) {
-                continue;
-            }
-            // Exports are stored with their ordinal index implicit in
-            // the export directory walk order. The first export has
-            // ordinal `base` (typically 1), the second `base + 1`, etc.
-            // We store exports in directory order, so `ordinal` maps to
-            // `exports[ordinal - 1]` when `base` is 1.
-            let index = ordinal.checked_sub(1)? as usize;
-            return exports.get(index).map(|e| e.address);
-        }
-        None
+        self.resolve(dll, image_link::ExportQuery::Ordinal(ordinal))
     }
 
-    /// Find the load address of an already-registered image by
-    /// name. Used by the kernel to jump to the entry point of
-    /// ntoskrnl.exe or hal.dll after loading.
-    pub fn find_image_base(&self, name: &str) -> Option<u64> {
-        let g = self.images.lock();
-        for (image_name, exports) in g.iter() {
-            if image_name.eq_ignore_ascii_case(name) {
-                // Re-derive the image base from the first export
-                // address (exports are absolute). If the image
-                // has no exports we have no way to know its base,
-                // which is fine because such images cannot be
-                // imported by anyone.
-                if let Some(e) = exports.first() {
-                    return Some(e.address - first_export_rva(exports));
+    fn resolve(&self, dll: &str, query: image_link::ExportQuery<'_>) -> Option<u64> {
+        use image_link::{ExportQuery, ExportTarget};
+
+        let images = self.images.lock();
+        let mut dll = dll;
+        let mut query = query;
+        let mut forwarded = false;
+        for _ in 0..32 {
+            let target = images
+                .iter()
+                .filter(|image| {
+                    image.name.eq_ignore_ascii_case(dll)
+                        || (forwarded && image.name.rsplit_once('.').is_some_and(|(stem, extension)| {
+                            extension.eq_ignore_ascii_case("dll") && stem.eq_ignore_ascii_case(dll)
+                        }))
+                })
+                .find_map(|image| image.exports.get(query))?;
+            match target {
+                ExportTarget::Address(address) => return Some(*address),
+                ExportTarget::Forwarder(target) => {
+                    let (module, symbol) = target.rsplit_once('.')?;
+                    dll = module;
+                    query = match symbol.strip_prefix('#') {
+                        Some(ordinal) => ExportQuery::Ordinal(ordinal.parse().ok()?),
+                        None => ExportQuery::Name(symbol),
+                    };
+                    forwarded = true;
                 }
             }
         }
         None
+    }
+
+    pub fn find_image_base(&self, name: &str) -> Option<u64> {
+        self.images.lock().iter().find(|image| image.name.eq_ignore_ascii_case(name))
+            .map(|image| image.base)
     }
 
     pub fn list(&self) -> Vec<String> {
-        let g = self.images.lock();
-        g.iter().map(|(n, _)| n.clone()).collect()
+        self.images.lock().iter().map(|image| image.name.clone()).collect()
     }
 }
 
@@ -1347,18 +1200,6 @@ impl Default for ImageDatabase {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn first_export_rva(_exports: &[DbEntry]) -> u64 {
-    // We stored the absolute address when registering. To get the
-    // RVA we need a parallel table of RVAs, but we collapsed them
-    // for simplicity. As a workaround, look up the matching image
-    // by name and re-read its export table. For now, the simpler
-    // approximation: the first export's address is the RVA plus
-    // image base, so we store RVAs in a side table. Implementation
-    // is therefore not done here - `find_image_base` is only used
-    // by diagnostics, never by the load path.
-    0
 }
 
 /// `get_self_image_base` — return the base address of the
@@ -1369,140 +1210,6 @@ fn first_export_rva(_exports: &[DbEntry]) -> u64 {
 /// compare.
 pub fn get_self_image_base() -> u64 {
     0xFFFF_8000_0010_0000
-}
-
-/// Walk the export directory (data directory #0) and return a
-/// list of `(name, absolute_address)` pairs.
-fn parse_exports(image: &LoadedImage, raw_pe: &[u8]) -> Vec<DbEntry> {
-    // We need the export directory RVA, which we get by re-parsing
-    // the raw PE bytes. (The in-memory `image.bytes` does not
-    // contain the data directories as written.)
-    let (file_hdr, _opt_size, magic, opt_off) = match parse_headers(raw_pe) {
-        Some(p) => p,
-        None => return Vec::new(),
-    };
-    let (export_rva, _export_size) = if magic == 0x10B {
-        read_data_directory_pe32(raw_pe, opt_off, 0)
-    } else {
-        read_data_directory_pe32plus(raw_pe, opt_off, 0)
-    };
-    if export_rva == 0 {
-        return Vec::new();
-    }
-
-    // Build a list of (rva, raw_offset, raw_size) for every
-    // section so we can translate RVA -> file offset.
-    let sect_off = opt_off + file_hdr.size_of_optional_header as usize;
-    let mut sects: alloc::vec::Vec<(u32, u32, u32)> = alloc::vec::Vec::new();
-    for i in 0..file_hdr.number_of_sections as usize {
-        let sh_off = sect_off + i * 40;
-        if sh_off + 40 > raw_pe.len() {
-            break;
-        }
-        let sh: SectionHeader = unsafe {
-            core::ptr::read_unaligned(raw_pe.as_ptr().add(sh_off) as *const SectionHeader)
-        };
-        sects.push((
-            sh.virtual_address,
-            sh.pointer_to_raw_data,
-            sh.size_of_raw_data,
-        ));
-    }
-    let rva_to_file = |rva: u32| -> Option<usize> {
-        for &(vaddr, raw_ptr, raw_size) in &sects {
-            if rva >= vaddr && rva < vaddr + raw_size {
-                return Some(raw_ptr as usize + (rva - vaddr) as usize);
-            }
-        }
-        None
-    };
-
-    // IMAGE_EXPORT_DIRECTORY (40 bytes).
-    let export_file = match rva_to_file(export_rva) {
-        Some(off) => off,
-        None => return Vec::new(),
-    };
-    if export_file + 40 > raw_pe.len() {
-        return Vec::new();
-    }
-    let number_of_names = u32::from_le_bytes([
-        raw_pe[export_file + 0x18],
-        raw_pe[export_file + 0x19],
-        raw_pe[export_file + 0x1A],
-        raw_pe[export_file + 0x1B],
-    ]);
-    let names_rva = u32::from_le_bytes([
-        raw_pe[export_file + 0x20],
-        raw_pe[export_file + 0x21],
-        raw_pe[export_file + 0x22],
-        raw_pe[export_file + 0x23],
-    ]);
-    let funcs_rva = u32::from_le_bytes([
-        raw_pe[export_file + 0x1C],
-        raw_pe[export_file + 0x1D],
-        raw_pe[export_file + 0x1E],
-        raw_pe[export_file + 0x1F],
-    ]);
-    let ords_rva = u32::from_le_bytes([
-        raw_pe[export_file + 0x24],
-        raw_pe[export_file + 0x25],
-        raw_pe[export_file + 0x26],
-        raw_pe[export_file + 0x27],
-    ]);
-
-    let names_file = match rva_to_file(names_rva) {
-        Some(off) => off,
-        None => return Vec::new(),
-    };
-    let ords_file = match rva_to_file(ords_rva) {
-        Some(off) => off,
-        None => return Vec::new(),
-    };
-    let funcs_file = match rva_to_file(funcs_rva) {
-        Some(off) => off,
-        None => return Vec::new(),
-    };
-
-    let mut out = Vec::new();
-    for i in 0..number_of_names as usize {
-        let name_ptr_off = names_file + i * 4;
-        if name_ptr_off + 4 > raw_pe.len() {
-            break;
-        }
-        let name_rva = u32::from_le_bytes([
-            raw_pe[name_ptr_off],
-            raw_pe[name_ptr_off + 1],
-            raw_pe[name_ptr_off + 2],
-            raw_pe[name_ptr_off + 3],
-        ]);
-        let name_file = match rva_to_file(name_rva) {
-            Some(off) => off,
-            None => continue,
-        };
-        let func_idx_off = ords_file + i * 2;
-        if func_idx_off + 2 > raw_pe.len() {
-            break;
-        }
-        let func_idx =
-            u16::from_le_bytes([raw_pe[func_idx_off], raw_pe[func_idx_off + 1]]) as usize;
-        let func_off = funcs_file + func_idx * 4;
-        if func_off + 4 > raw_pe.len() {
-            break;
-        }
-        let func_rva = u32::from_le_bytes([
-            raw_pe[func_off],
-            raw_pe[func_off + 1],
-            raw_pe[func_off + 2],
-            raw_pe[func_off + 3],
-        ]);
-        if let Some(name) = read_cstr(raw_pe, name_file) {
-            out.push(DbEntry {
-                name,
-                address: image.image_base + func_rva as u64,
-            });
-        }
-    }
-    out
 }
 
 // =====================================================================
