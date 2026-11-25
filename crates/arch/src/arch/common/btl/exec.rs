@@ -5,7 +5,7 @@
 //! it can preserve the same semantics; unsupported instructions stop precisely.
 
 use super::ir::{
-    AluOp, BitAction, BranchCond, ByteOperand, DecodeMode, IROp, IrInst, MemOperand, Segment, SimdOp, SimdSrc, SimdWidth,
+    AluOp, BitAction, BranchCond, ByteOperand, DecodeMode, IROp, IrInst, LockedLogicSource, MemOperand, Segment, SimdOp, SimdShuffle, SimdSrc, SimdWidth,
     X86Reg,
 };
 use super::memory::GuestMemory;
@@ -125,6 +125,16 @@ impl GuestState {
             },
         );
     }
+    fn read_subregister(&self, reg: X86Reg, width: u8, high_byte: bool) -> u64 {
+        (self.reg(reg) >> if high_byte { 8 } else { 0 }) & mask(width)
+    }
+    fn write_subregister(&mut self, reg: X86Reg, value: u64, width: u8, high_byte: bool) {
+        if high_byte {
+            self.set_reg(reg, (self.reg(reg) & !0xff00) | ((value & 0xff) << 8));
+        } else {
+            self.write_reg(reg, value, width);
+        }
+    }
     fn flag(&self, bit: u32) -> bool {
         self.rflags & (1 << bit) != 0
     }
@@ -151,6 +161,7 @@ const FLAG_PF: u32 = 2;
 const FLAG_AF: u32 = 4;
 const FLAG_ZF: u32 = 6;
 const FLAG_SF: u32 = 7;
+const FLAG_DF: u32 = 10;
 const FLAG_OF: u32 = 11;
 fn mask(width: u8) -> u64 {
     if width == 8 {
@@ -163,7 +174,6 @@ fn alu(state: &mut GuestState, op: AluOp, a: u64, b: u64, width: u8) -> u64 {
     let m = mask(width);
     let a = a & m;
     let b = b & m;
-    let sign = 1u64 << (width * 8 - 1);
     let borrow = u64::from(op == AluOp::Sbb && state.flag(FLAG_CF));
     let r = (match op {
         AluOp::Add => a.wrapping_add(b),
@@ -174,26 +184,39 @@ fn alu(state: &mut GuestState, op: AluOp, a: u64, b: u64, width: u8) -> u64 {
         AluOp::Or => a | b,
         AluOp::Xor => a ^ b,
     }) & m;
-    state.set_flag(FLAG_ZF, r == 0);
-    state.set_flag(FLAG_SF, r & sign != 0);
-    state.set_flag(FLAG_PF, (r as u8).count_ones() % 2 == 0);
+    set_alu_flags(state, op, a, b, r, width);
+    r
+}
+
+pub(super) fn set_alu_flags(
+    state: &mut GuestState,
+    op: AluOp,
+    left: u64,
+    right: u64,
+    result: u64,
+    width: u8,
+) {
+    let sign = 1u64 << (width * 8 - 1);
+    let borrow = u64::from(op == AluOp::Sbb && state.flag(FLAG_CF));
+    state.set_flag(FLAG_ZF, result == 0);
+    state.set_flag(FLAG_SF, result & sign != 0);
+    state.set_flag(FLAG_PF, (result as u8).count_ones() % 2 == 0);
     match op {
         AluOp::Add => {
-            state.set_flag(FLAG_CF, r < a);
-            state.set_flag(FLAG_OF, (!(a ^ b) & (a ^ r) & sign) != 0);
-            state.set_flag(FLAG_AF, (a ^ b ^ r) & 16 != 0);
+            state.set_flag(FLAG_CF, result < left);
+            state.set_flag(FLAG_OF, (!(left ^ right) & (left ^ result) & sign) != 0);
+            state.set_flag(FLAG_AF, (left ^ right ^ result) & 16 != 0);
         }
         AluOp::Sub | AluOp::Cmp | AluOp::Sbb => {
-            state.set_flag(FLAG_CF, (a as u128) < b as u128 + borrow as u128);
-            state.set_flag(FLAG_OF, ((a ^ b) & (a ^ r) & sign) != 0);
-            state.set_flag(FLAG_AF, (a ^ b ^ r) & 16 != 0);
+            state.set_flag(FLAG_CF, (left as u128) < right as u128 + borrow as u128);
+            state.set_flag(FLAG_OF, ((left ^ right) & (left ^ result) & sign) != 0);
+            state.set_flag(FLAG_AF, (left ^ right ^ result) & 16 != 0);
         }
         _ => {
             state.set_flag(FLAG_CF, false);
             state.set_flag(FLAG_OF, false);
         }
     }
-    r
 }
 fn adc(s: &mut GuestState, a: u64, b: u64, w: u8) -> u64 {
     let a = a & mask(w);
@@ -513,7 +536,7 @@ fn execute_one(
                 // Reading before writing preserves MOVS overlap ordering.
                 // Only a completed element advances either index or count.
                 if !mem_write(m, target, value, w) { return Err(fault); }
-                let step = if s.flag(10) { (w as u64).wrapping_neg() } else { w as u64 };
+                let step = if s.flag(FLAG_DF) { (w as u64).wrapping_neg() } else { w as u64 };
                 s.write_reg(X86Reg::Rsi, source.wrapping_add(step), aw);
                 s.write_reg(X86Reg::Rdi, target.wrapping_add(step), aw);
                 if repeat {
@@ -531,7 +554,7 @@ fn execute_one(
                 // redirect its destination. Long mode ignores ES base.
                 let ptr = s.reg(X86Reg::Rdi) & mask(aw);
                 if !mem_write(m, ptr, s.reg(X86Reg::Rax), w) { return Err(fault); }
-                let step = if s.flag(10) { (w as u64).wrapping_neg() } else { w as u64 };
+                let step = if s.flag(FLAG_DF) { (w as u64).wrapping_neg() } else { w as u64 };
                 s.write_reg(X86Reg::Rdi, ptr.wrapping_add(step), aw);
                 if repeat {
                     let count = count.wrapping_sub(1) & mask(aw);
@@ -547,7 +570,7 @@ fn execute_one(
                 let ptr = s.reg(X86Reg::Rdi) & mask(aw);
                 let value = mem_read(m, ptr, w).ok_or(fault)?;
                 alu(s, AluOp::Cmp, s.reg(X86Reg::Rax), value, w);
-                let step = if s.flag(10) {
+                let step = if s.flag(FLAG_DF) {
                     (w as u64).wrapping_neg()
                 } else {
                     w as u64
@@ -749,27 +772,70 @@ fn execute_one(
                 s.set_reg(X86Reg::Rsp, sp.wrapping_add((sw * 8) as u64));
             }
         }
-        IROp::LockedCompareExchange { mem, src, high_byte } => {
-            let accumulator = s.reg(X86Reg::Rax) & mask(w);
-            let replacement = (s.reg(src) >> if high_byte { 8 } else { 0 }) & mask(w);
-            let old = m.locked_compare_exchange(effective_address(s, &mem, i, true), w, accumulator, replacement)
-                .map_err(|error| match error {
-                    super::memory::AtomicMemoryError::Unsupported => unsupported,
-                    super::memory::AtomicMemoryError::Fault => fault,
-                })?;
+        IROp::CompareExchange { dst, src, dst_high_byte, src_high_byte, locked } => {
+            let accumulator = s.read_subregister(X86Reg::Rax, w, false);
+            let replacement = s.read_subregister(src, w, src_high_byte);
+            let old = match dst {
+                Ok(reg) => {
+                    let old = s.read_subregister(reg, w, dst_high_byte);
+                    if accumulator == old {
+                        s.write_subregister(reg, replacement, w, dst_high_byte);
+                    }
+                    old
+                }
+                Err(mem) => {
+                    let address = effective_address(s, &mem, i, true);
+                    if locked {
+                        m.locked_compare_exchange(address, w, accumulator, replacement)
+                            .map_err(|error| match error {
+                                super::memory::AtomicMemoryError::Unsupported => unsupported,
+                                super::memory::AtomicMemoryError::Fault => fault,
+                            })?
+                    } else {
+                        let old = mem_read(m, address, w).ok_or(fault)?;
+                        let value = if accumulator == old { replacement } else { old };
+                        if !mem_write(m, address, value, w) {
+                            return Err(fault);
+                        }
+                        old
+                    }
+                }
+            };
             alu(s, AluOp::Cmp, accumulator, old, w);
-            if accumulator != old { s.write_reg(X86Reg::Rax, old, w); }
+            if accumulator != old {
+                s.write_reg(X86Reg::Rax, old, w);
+            }
         }
-        IROp::LockedExchangeAdd { mem, src, high_byte } => {
-            let addend = (s.reg(src) >> if high_byte { 8 } else { 0 }) & mask(w);
-            let old = m.locked_fetch_add(effective_address(s, &mem, i, true), w, addend)
-                .map_err(|error| match error {
-                    super::memory::AtomicMemoryError::Unsupported => unsupported,
-                    super::memory::AtomicMemoryError::Fault => fault,
-                })?;
-            alu(s, AluOp::Add, old, addend, w);
-            if high_byte { s.set_reg(src, (s.reg(src) & !0xff00) | (old << 8)); }
-            else { s.write_reg(src, old, w); }
+        IROp::ExchangeAdd { dst, src, dst_high_byte, src_high_byte, locked } => {
+            let addend = s.read_subregister(src, w, src_high_byte);
+            let old = match dst {
+                Ok(reg) => s.read_subregister(reg, w, dst_high_byte),
+                Err(mem) => {
+                    let address = effective_address(s, &mem, i, true);
+                    if locked {
+                        m.locked_fetch_add(address, w, addend).map_err(|error| match error {
+                            super::memory::AtomicMemoryError::Unsupported => unsupported,
+                            super::memory::AtomicMemoryError::Fault => fault,
+                        })?
+                    } else {
+                        let old = mem_read(m, address, w).ok_or(fault)?;
+                        if !mem_write(m, address, old.wrapping_add(addend), w) {
+                            return Err(fault);
+                        }
+                        old
+                    }
+                }
+            };
+            let sum = alu(s, AluOp::Add, old, addend, w);
+            s.write_subregister(src, old, w, src_high_byte);
+            if let Ok(reg) = dst {
+                s.write_subregister(reg, sum, w, dst_high_byte);
+            }
+        }
+        IROp::ByteSwap { dst } => {
+            let value = s.reg(dst);
+            let swapped = if w == 8 { value.swap_bytes() } else { (value as u32).swap_bytes() as u64 };
+            s.write_reg(dst, swapped, w);
         }
         IROp::LockedAddImmediate { mem, immediate, subtract } => {
             let operand = immediate as u64 & mask(w);
@@ -780,6 +846,18 @@ fn execute_one(
                     super::memory::AtomicMemoryError::Fault => fault,
                 })?;
             alu(s, if subtract { AluOp::Sub } else { AluOp::Add }, old, operand, w);
+        }
+        IROp::LockedLogic { op, mem, src } => {
+            let operand = match src {
+                LockedLogicSource::Register { reg, high_byte } => s.reg(reg) >> (u32::from(high_byte) * 8),
+                LockedLogicSource::Immediate(value) => value as u64,
+            } & mask(w);
+            let old = m.locked_logic(effective_address(s, &mem, i, true), w, op, operand)
+                .map_err(|error| match error {
+                    super::memory::AtomicMemoryError::Unsupported => unsupported,
+                    super::memory::AtomicMemoryError::Fault => fault,
+                })?;
+            alu(s, op, old, operand, w);
         }
         IROp::LockedIncDec { mem, decrement } => {
             let address = effective_address(s, &mem, i, true);
@@ -926,20 +1004,34 @@ fn execute_one(
             s.set_flag(FLAG_CF, overflow);
             s.set_flag(FLAG_OF, overflow);
         }
-        IROp::UnsignedDivide { src, high_byte } => {
+        IROp::Divide { src, high_byte, signed } => {
             let divisor = match src {
                 Ok(reg) => (s.reg(reg) >> if high_byte {8} else {0}) & mask(w),
                 Err(mem) => mem_read(m, effective_address(s, &mem, i, true), w).ok_or(fault)?,
             } as u128;
-            let bits = w * 8;
+            let bits = u32::from(w) * 8;
             let dividend = if w == 1 { (s.reg(X86Reg::Rax) & 0xffff) as u128 }
                 else { (((s.reg(X86Reg::Rdx) & mask(w)) as u128) << bits)
                     | (s.reg(X86Reg::Rax) & mask(w)) as u128 };
-            if divisor == 0 || dividend / divisor > mask(w) as u128 {
-                return Err(ExecOutcome::DivideError { guest_va: i.guest_va });
-            }
-            let quotient = (dividend / divisor) as u64;
-            let remainder = (dividend % divisor) as u64;
+            let divide_error = ExecOutcome::DivideError { guest_va: i.guest_va };
+            let (quotient, remainder) = if signed {
+                let dividend_shift = 128 - 2 * bits;
+                let divisor_shift = 128 - bits;
+                let signed_dividend = ((dividend << dividend_shift) as i128) >> dividend_shift;
+                let signed_divisor = ((divisor << divisor_shift) as i128) >> divisor_shift;
+                let quotient = signed_dividend.checked_div(signed_divisor).ok_or(divide_error)?;
+                let limit = 1i128 << (bits - 1);
+                if !(-limit..limit).contains(&quotient) {
+                    return Err(divide_error);
+                }
+                (quotient as u64 & mask(w), (signed_dividend % signed_divisor) as u64 & mask(w))
+            } else {
+                let quotient = dividend.checked_div(divisor).ok_or(divide_error)?;
+                if quotient > mask(w) as u128 {
+                    return Err(divide_error);
+                }
+                (quotient as u64, (dividend % divisor) as u64)
+            };
             if w == 1 {
                 s.write_reg(X86Reg::Rax, quotient | (remainder << 8), 2);
             } else {
@@ -1014,6 +1106,11 @@ fn execute_one(
                 else {value as u32 as i32 as i64 as u64}
             } else {value};
             s.write_reg(dst, value, w);
+        }
+        IROp::SignExtendAccumulatorPair => {
+            let sign_bit = 1u64 << (w * 8 - 1);
+            let high = if s.reg(X86Reg::Rax) & sign_bit == 0 { 0 } else { u64::MAX };
+            s.write_reg(X86Reg::Rdx, high, w);
         }
         IROp::Load { dst, mem } => {
             let a = effective_address(s, &mem, i, true);
@@ -1115,6 +1212,7 @@ fn execute_one(
             // PUSHF[D/Q] clears RF and VM in the saved image.
             push(s, m, i, s.rflags & !0x30000).ok_or(fault)?;
         }
+        IROp::SetDirectionFlag { set } => s.set_flag(FLAG_DF, set),
         IROp::PopFlags => {
             let sw = s.stack_width(i);
             let sp = s.reg(X86Reg::Rsp);
@@ -1231,6 +1329,13 @@ fn execute_one(
             result[..width as usize].copy_from_slice(&value.to_le_bytes()[..width as usize]);
             s.xmm[dst as usize] = result;
         }
+        IROp::SimdShiftBytes { dst, left, count } => {
+            let register = &mut s.xmm[dst as usize];
+            let value = u128::from_le_bytes(*register);
+            let bits = u32::from(count) * 8;
+            let result = if left { value.checked_shl(bits) } else { value.checked_shr(bits) };
+            *register = result.unwrap_or(0).to_le_bytes();
+        }
         IROp::SimdExtractWord { dst, src, index } => {
             let start = usize::from(index & 7) * 2;
             let value = u16::from_le_bytes(s.xmm[src as usize][start..start + 2].try_into().unwrap());
@@ -1257,15 +1362,22 @@ fn execute_one(
                 s.xmm[dst as usize][..n].copy_from_slice(&v[..n]);
             }
         }
-        IROp::SimdShuffleDwords { dst, src, control } => {
+        IROp::SimdShuffle { dst, src, kind, control } => {
             if let SimdSrc::Mem(mem) = src {
                 if effective_address(s, &mem, i, true) & 15 != 0 { return Err(fault); }
             }
             let source = simd_read(s, m, i, src, 16).ok_or(fault)?;
-            let mut result = [0; 16];
+            let (offset, lane_width) = match kind {
+                SimdShuffle::Dwords => (0, 4),
+                SimdShuffle::LowWords => (0, 2),
+                SimdShuffle::HighWords => (8, 2),
+            };
+            let mut result = source;
             for lane in 0..4 {
                 let selected = usize::from((control >> (lane * 2)) & 3);
-                result[lane * 4..lane * 4 + 4].copy_from_slice(&source[selected * 4..selected * 4 + 4]);
+                let output = offset + lane * lane_width;
+                let input = offset + selected * lane_width;
+                result[output..output + lane_width].copy_from_slice(&source[input..input + lane_width]);
             }
             s.xmm[dst as usize] = result;
         }

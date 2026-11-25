@@ -7,7 +7,7 @@
 //! handles by trapping back to the kernel.
 
 use super::ir::{
-    AluOp, BitAction, BranchCond, ByteOperand, DecodeMode, IROp, IrInst, MemOperand, Segment, SimdOp, SimdSrc, SimdWidth,
+    AluOp, BitAction, BranchCond, ByteOperand, DecodeMode, IROp, IrInst, LockedLogicSource, MemOperand, Segment, SimdOp, SimdShuffle, SimdSrc, SimdWidth,
     X86Reg, X86Xmm,
 };
 
@@ -419,6 +419,14 @@ impl<'a> Decoder<'a> {
 
     fn decode_alu_rm_r(&mut self, op: AluOp) -> Option<IROp> {
         let (src, dst, _) = self.decode_modrm()?;
+        if self.has_lock {
+            return Some(match (op, dst) {
+                (AluOp::Or | AluOp::And | AluOp::Xor, Err(mem)) => IROp::LockedLogic {
+                    op, mem, src: LockedLogicSource::Register { reg: src, high_byte: false },
+                },
+                _ => IROp::Unsupported,
+            });
+        }
         Some(match dst {
             Ok(dst) => IROp::AluReg { op, dst, src },
             Err(mem) => IROp::AluStore { op, mem, src },
@@ -455,7 +463,10 @@ impl<'a> Decoder<'a> {
         }
         let op = self.fetch()?;
         // Only the implemented atomic RMW operations may consume LOCK.
-        if self.has_lock && !matches!(op, 0x0f | 0x80 | 0x81 | 0x83 | 0xfe | 0xff) { return Some(IROp::Unsupported); }
+        if self.has_lock && !matches!(op, 0x08 | 0x20 | 0x30 | OPCODE_OR_RM_R | OPCODE_AND_RM_R
+            | OPCODE_XOR_RM_R | 0x0f | 0x80 | 0x81 | 0x83 | 0xfe | 0xff) {
+            return Some(IROp::Unsupported);
+        }
         // 16-bit addressing is deliberately rejected until its BX/SI forms exist.
         if self.mode == DecodeMode::X86 && self.bytes[start..self.offset].contains(&0x67)
             // LEAVE has no explicit address operand: 67h does not change its
@@ -506,7 +517,13 @@ impl<'a> Decoder<'a> {
                     if raw >> 6 != 3 { return Some(IROp::Unsupported); }
                     Some(IROp::SimdByteMask { dst: X86Reg::from_modrm((raw >> 3) & 7, self.rex_r), src: X86Xmm::from_modrm(raw & 7, self.rex_b) })
                 }
-                0x70 if self.has_66 && !self.has_f2 && !self.has_f3 => {
+                0x70 => {
+                    let kind = match (self.has_66, self.has_f2, self.has_f3) {
+                        (true, false, false) => SimdShuffle::Dwords,
+                        (false, true, false) => SimdShuffle::LowWords,
+                        (false, false, true) => SimdShuffle::HighWords,
+                        _ => return Some(IROp::Unsupported),
+                    };
                     let raw = self.peek()?;
                     let (_, operand, _) = self.decode_modrm()?;
                     let src = match operand {
@@ -514,7 +531,21 @@ impl<'a> Decoder<'a> {
                         Err(mut mem) => { mem.width = 16; SimdSrc::Mem(mem) },
                     };
                     let control = self.fetch()?;
-                    Some(IROp::SimdShuffleDwords { dst: X86Xmm::from_modrm((raw >> 3) & 7, self.rex_r), src, control })
+                    Some(IROp::SimdShuffle {
+                        dst: X86Xmm::from_modrm((raw >> 3) & 7, self.rex_r), src, kind, control,
+                    })
+                }
+                0x73 if self.has_66 && !self.has_f2 && !self.has_f3 => {
+                    let raw = self.fetch()?;
+                    let group = (raw >> 3) & 7;
+                    if raw >> 6 != 3 || !matches!(group, 3 | 7) {
+                        return Some(IROp::Unsupported);
+                    }
+                    Some(IROp::SimdShiftBytes {
+                        dst: X86Xmm::from_modrm(raw & 7, self.rex_b),
+                        left: group == 7,
+                        count: self.fetch()?,
+                    })
                 }
                 0x6e if self.has_66 && !self.has_f2 && !self.has_f3 => {
                     let raw = self.peek()?;
@@ -534,15 +565,26 @@ impl<'a> Decoder<'a> {
                     }
                     Some(operation)
                 }
-                0xb0 | 0xb1 if self.has_lock && !self.has_f2 && !self.has_f3 => {
-                    self.byte_operand = op2 == 0xb0;
+                0xb0 | 0xb1 | 0xc0 | 0xc1 if !self.has_f2 && !self.has_f3 => {
+                    self.byte_operand = op2 & 1 == 0;
                     let raw = self.peek()?;
-                    let (mut src, dst, _) = self.decode_modrm()?;
-                    let high_byte = self.byte_operand && !self.has_rex && (raw >> 3) & 7 >= 4;
-                    if high_byte { src = X86Reg::from_modrm(((raw >> 3) & 7) - 4, false); }
-                    Some(match dst {
-                        Err(mem) => IROp::LockedCompareExchange { mem, src, high_byte },
-                        Ok(_) => IROp::Unsupported,
+                    let (mut src, mut dst, _) = self.decode_modrm()?;
+                    let legacy_byte = self.byte_operand && !self.has_rex;
+                    let src_high_byte = legacy_byte && (raw >> 3) & 7 >= 4;
+                    let dst_high_byte = legacy_byte && dst.is_ok() && raw & 7 >= 4;
+                    if src_high_byte {
+                        src = X86Reg::from_modrm(((raw >> 3) & 7) - 4, false);
+                    }
+                    if dst_high_byte {
+                        dst = Ok(X86Reg::from_modrm((raw & 7) - 4, false));
+                    }
+                    let locked = self.has_lock;
+                    Some(if locked && dst.is_ok() {
+                        IROp::Unsupported
+                    } else if op2 < 0xc0 {
+                        IROp::CompareExchange { dst, src, dst_high_byte, src_high_byte, locked }
+                    } else {
+                        IROp::ExchangeAdd { dst, src, dst_high_byte, src_high_byte, locked }
                     })
                 }
                 0x1f if !self.has_f2 && !self.has_f3 => {
@@ -571,17 +613,8 @@ impl<'a> Decoder<'a> {
                     let (dst, src, _) = self.decode_modrm()?;
                     Some(IROp::ConditionalMove { cond: BranchCond::from_x86_cc(op2), dst, src })
                 }
-                0xc0 | 0xc1 if self.has_lock && !self.has_f2 && !self.has_f3 => {
-                    self.byte_operand = op2 == 0xc0;
-                    let raw = self.peek()?;
-                    let (mut src, dst, _) = self.decode_modrm()?;
-                    let high_byte = self.byte_operand && !self.has_rex && (raw >> 3) & 7 >= 4;
-                    if high_byte { src = X86Reg::from_modrm(((raw >> 3) & 7) - 4, false); }
-                    Some(match dst {
-                        Err(mem) => IROp::LockedExchangeAdd { mem, src, high_byte },
-                        Ok(_) => IROp::Unsupported,
-                    })
-                }
+                0xc8..=0xcf if (!self.has_66 || self.rex_w) && !self.has_f2 && !self.has_f3 =>
+                    Some(IROp::ByteSwap { dst: X86Reg::from_modrm(op2 & 7, self.rex_b) }),
                 0xba if !self.has_f2 && !self.has_f3 => {
                     let raw = self.peek()?;
                     let action = match (raw >> 3) & 7 {
@@ -734,6 +767,7 @@ impl<'a> Decoder<'a> {
             OPCODE_NOP => Some(IROp::Nop),
             0x9c => Some(IROp::PushFlags),
             0x9d => Some(IROp::PopFlags),
+            0xfc | 0xfd => Some(IROp::SetDirectionFlag { set: op == 0xfd }),
             0xa0..=0xa3 => {
                 self.byte_operand = op & 1 == 0;
                 let mut address = 0u64;
@@ -776,6 +810,15 @@ impl<'a> Decoder<'a> {
                     _ => AluOp::Test,
                 };
                 let (reg, rm) = self.decode_byte_operands()?;
+                if self.has_lock {
+                    return Some(match (reg, rm) {
+                        (ByteOperand::Register { reg, high_byte }, ByteOperand::Memory(mem)) =>
+                            IROp::LockedLogic {
+                                op: kind, mem, src: LockedLogicSource::Register { reg, high_byte },
+                            },
+                        _ => IROp::Unsupported,
+                    });
+                }
                 Some(if op == 0x84 || op & 2 != 0 { IROp::ByteAlu { op: kind, dst: reg, src: rm } }
                     else { IROp::ByteAlu { op: kind, dst: rm, src: reg } })
             }
@@ -863,8 +906,8 @@ impl<'a> Decoder<'a> {
                     IROp::UnaryNotNeg { dst, high_byte, negate: group == 3 }
                 } else if group == 4 || group == 5 {
                     IROp::FullMultiply { src: dst, high_byte, signed: group == 5 }
-                } else if group == 6 {
-                    IROp::UnsignedDivide { src: dst, high_byte }
+                } else if group == 6 || group == 7 {
+                    IROp::Divide { src: dst, high_byte, signed: group == 7 }
                 } else { IROp::Unsupported })
             }
             0x40..=0x4f if self.mode == DecodeMode::X86 => Some(IROp::IncDec {
@@ -1043,6 +1086,7 @@ impl<'a> Decoder<'a> {
                 dst: X86Reg::Rax, src: Ok(X86Reg::Rax),
                 source_width: self.operand_width() / 2, signed: true, high_byte: false,
             }),
+            0x99 => Some(IROp::SignExtendAccumulatorPair),
             0x63 if self.mode == DecodeMode::X64 => {
                 let (dst, mut src, _) = self.decode_modrm()?;
                 let source_width = if self.operand_width() == 8 { 4 } else { self.operand_width() };
@@ -1116,6 +1160,11 @@ impl<'a> Decoder<'a> {
                         else { self.fetch()? as i8 as i64 };
                     return Some(match (alu_idx, dst) {
                         (0 | 5, Err(mem)) => IROp::LockedAddImmediate { mem, immediate, subtract: alu_idx == 5 },
+                        (1 | 4 | 6, Err(mem)) => IROp::LockedLogic {
+                            op: match alu_idx { 1 => AluOp::Or, 4 => AluOp::And, _ => AluOp::Xor },
+                            mem,
+                            src: LockedLogicSource::Immediate(immediate),
+                        },
                         _ => IROp::Unsupported,
                     });
                 }
@@ -1127,7 +1176,7 @@ impl<'a> Decoder<'a> {
                     };
                     return Some(match dst {
                         Ok(dst) => IROp::AdcImm { dst, imm },
-                        _ => IROp::Unsupported,
+                        Err(mem) => IROp::AluStoreImm { op: AluOp::Adc, mem, imm },
                     });
                 }
                 let alu_op = match alu_idx {

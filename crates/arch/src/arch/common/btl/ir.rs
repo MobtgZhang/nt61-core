@@ -132,6 +132,13 @@ pub enum SimdWidth {
     PackedI128,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimdShuffle {
+    Dwords,
+    LowWords,
+    HighWords,
+}
+
 /// SIMD arithmetic / data-movement operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SimdOp {
@@ -263,6 +270,12 @@ pub enum ByteOperand {
     Memory(MemOperand),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockedLogicSource {
+    Register { reg: X86Reg, high_byte: bool },
+    Immediate(i64),
+}
+
 /// A single IR operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IROp {
@@ -323,11 +336,26 @@ pub enum IROp {
         decrement: bool,
     },
     LockedIncDec { mem: MemOperand, decrement: bool },
-    LockedExchangeAdd { mem: MemOperand, src: X86Reg, high_byte: bool },
-    LockedCompareExchange { mem: MemOperand, src: X86Reg, high_byte: bool },
+    ExchangeAdd {
+        dst: Result<X86Reg, MemOperand>,
+        src: X86Reg,
+        dst_high_byte: bool,
+        src_high_byte: bool,
+        locked: bool,
+    },
+    CompareExchange {
+        dst: Result<X86Reg, MemOperand>,
+        src: X86Reg,
+        dst_high_byte: bool,
+        src_high_byte: bool,
+        locked: bool,
+    },
+    ByteSwap { dst: X86Reg },
     LockedAddImmediate { mem: MemOperand, immediate: i64, subtract: bool },
+    LockedLogic { op: AluOp, mem: MemOperand, src: LockedLogicSource },
     PushFlags,
     PopFlags,
+    SetDirectionFlag { set: bool },
     AccumulatorMemory { address: u64, store: bool },
     ByteAlu { op: AluOp, dst: ByteOperand, src: ByteOperand },
     ByteAluImmediate { op: AluOp, dst: ByteOperand, immediate: u8 },
@@ -344,7 +372,7 @@ pub enum IROp {
     ConditionalMove { cond: BranchCond, dst: X86Reg, src: Result<X86Reg, MemOperand> },
     /// Stable capabilities of the portable interpreter, independent of host CPU.
     CpuId,
-    UnsignedDivide { src: Result<X86Reg, MemOperand>, high_byte: bool },
+    Divide { src: Result<X86Reg, MemOperand>, high_byte: bool, signed: bool },
     FullMultiply { src: Result<X86Reg, MemOperand>, high_byte: bool, signed: bool },
     SignedMultiply { dst: X86Reg, src: Result<X86Reg, MemOperand>, immediate: Option<i64> },
     /// Immediate bit operations select a bit modulo the operand width.
@@ -376,6 +404,7 @@ pub enum IROp {
         signed: bool,
         high_byte: bool,
     },
+    SignExtendAccumulatorPair,
     Load {
         dst: X86Reg,
         mem: MemOperand,
@@ -459,7 +488,8 @@ pub enum IROp {
         width: SimdWidth,
     },
     SimdMoveInteger { dst: X86Xmm, src: Result<X86Reg, MemOperand>, width: u8 },
-    SimdShuffleDwords { dst: X86Xmm, src: SimdSrc, control: u8 },
+    SimdShuffle { dst: X86Xmm, src: SimdSrc, kind: SimdShuffle, control: u8 },
+    SimdShiftBytes { dst: X86Xmm, left: bool, count: u8 },
     SimdExtractWord { dst: X86Reg, src: X86Xmm, index: u8 },
     SimdStoreInteger { dst: Result<X86Reg, MemOperand>, src: X86Xmm, width: u8 },
     SimdToInteger { dst: X86Reg, src: SimdSrc, double: bool, width: u8 },

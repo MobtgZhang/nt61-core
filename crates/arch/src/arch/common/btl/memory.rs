@@ -41,6 +41,8 @@ pub trait GuestMemory {
     /// Atomic fetch-add with the same exclusion contract as locked_inc_dec.
     fn locked_fetch_add(&mut self, _va: u64, _width: u8, _addend: u64)
         -> Result<u64, AtomicMemoryError> { Err(AtomicMemoryError::Unsupported) }
+    fn locked_logic(&mut self, _va: u64, _width: u8, _op: super::ir::AluOp, _bits: u64)
+        -> Result<u64, AtomicMemoryError> { Err(AtomicMemoryError::Unsupported) }
     /// Atomic compare/exchange; even a failed comparison needs writable memory.
     fn locked_compare_exchange(&mut self, _va: u64, _width: u8, _expected: u64, _replacement: u64)
         -> Result<u64, AtomicMemoryError> { Err(AtomicMemoryError::Unsupported) }
