@@ -1,0 +1,45 @@
+#pragma code_page(65001)
+
+#ifndef SAMPLE_EN_US
+#define SAMPLE_LANG 0x04
+#define SAMPLE_SUBLANG 0x02
+#define SAMPLE_LANGID 0x0804
+#define SAMPLE_TRANSLATION "080404B0"
+#define SAMPLE_STRING "欢迎使用 MUI"
+#else
+#define SAMPLE_LANG 0x09
+#define SAMPLE_SUBLANG 0x01
+#define SAMPLE_LANGID 0x0409
+#define SAMPLE_TRANSLATION "040904B0"
+#define SAMPLE_STRING "Welcome to MUI"
+#endif
+
+LANGUAGE SAMPLE_LANG, SAMPLE_SUBLANG
+
+STRINGTABLE
+BEGIN
+    101 SAMPLE_STRING
+END
+
+1 VERSIONINFO
+ FILEVERSION 1,0,0,0
+ PRODUCTVERSION 1,0,0,0
+ FILEOS 0x00040004
+ FILETYPE 0x00000002
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK SAMPLE_TRANSLATION
+    BEGIN
+      VALUE "FileDescription", "MUI test module"
+      VALUE "FileVersion", "1.0.0.0"
+      VALUE "OriginalFilename", "My App.dll"
+      VALUE "ProductName", "muigen"
+      VALUE "ProductVersion", "1.0.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", SAMPLE_LANGID, 1200
+  END
+END

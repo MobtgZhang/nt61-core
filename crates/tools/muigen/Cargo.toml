@@ -1,0 +1,17 @@
+[package]
+name = "muigen"
+version = "0.1.0"
+edition = "2021"
+description = "Split Win32 PE resources into an LN module and a MUI satellite"
+publish = false
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+roxmltree = "0.20"
+tempfile = "3.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
