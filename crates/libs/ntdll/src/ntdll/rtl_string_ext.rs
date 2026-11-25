@@ -252,25 +252,7 @@ pub unsafe extern "C" fn rtl_char_to_integer(string: *const i8, base: u32, value
         return STATUS_INVALID_PARAMETER;
     }
 
-    let ch = *string as u8;
-    let digit = if ch.is_ascii_digit() {
-        ch - b'0'
-    } else if ch.is_ascii_uppercase() {
-        ch - b'A' + 10
-    } else if ch.is_ascii_lowercase() {
-        ch - b'a' + 10
-    } else {
-        0
-    };
-
-    let actual_base = if base == 0 { 10 } else { base };
-    *value = if (digit as u32) < actual_base {
-        digit as u32
-    } else {
-        0
-    };
-
-    STATUS_SUCCESS
+    unsafe { crate::native_exports::nt61_export_RtlCharToInteger(string.cast(), base, value) as i32 }
 }
 
 /// # Safety

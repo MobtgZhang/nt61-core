@@ -37,6 +37,7 @@
 pub mod ktm;
 pub mod atom;
 pub mod clock;
+mod rtl_epoch;
 pub mod debug;
 pub mod debug_filter;
 pub mod timer_resolution;

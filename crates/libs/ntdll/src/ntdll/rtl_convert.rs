@@ -249,21 +249,15 @@ pub unsafe extern "C" fn rtl_int64_to_unicode_string(
 pub unsafe extern "C" fn rtl_time_to_seconds_since1970(
     time: *const i64,
     elapsed_seconds: *mut u32,
-) -> i32 {
+) -> u8 {
     if time.is_null() || elapsed_seconds.is_null() {
-        return STATUS_INVALID_PARAMETER;
+        return 0;
     }
-
-    const EPOCH_DIFF: i64 = 116444736000000000;
-
-    let ft = *time;
-    if ft < EPOCH_DIFF {
-        *elapsed_seconds = 0;
-    } else {
-        *elapsed_seconds = ((ft - EPOCH_DIFF) / 10000000) as u32;
-    }
-
-    STATUS_SUCCESS
+    let Some(seconds) = super::rtl_epoch::to_seconds(*time, super::rtl_epoch::EPOCH_1970) else {
+        return 0;
+    };
+    *elapsed_seconds = seconds;
+    1
 }
 
 /// # Safety
@@ -272,15 +266,10 @@ pub unsafe extern "C" fn rtl_time_to_seconds_since1970(
 pub unsafe extern "C" fn rtl_seconds_since1970_to_time(
     elapsed_seconds: u32,
     time: *mut i64,
-) -> i32 {
-    if time.is_null() {
-        return STATUS_INVALID_PARAMETER;
+) {
+    if !time.is_null() {
+        *time = super::rtl_epoch::from_seconds(elapsed_seconds, super::rtl_epoch::EPOCH_1970);
     }
-
-    const EPOCH_DIFF: i64 = 116444736000000000;
-    *time = EPOCH_DIFF + (elapsed_seconds as i64) * 10000000;
-
-    STATUS_SUCCESS
 }
 
 #[repr(C)]
