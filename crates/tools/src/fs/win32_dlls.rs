@@ -171,9 +171,11 @@ pub const GDI32_EXPORTS: &[(&str, u32)] = &[
     ("CreateSolidBrush", 1096),
     ("DeleteObject", 1242),
     ("Ellipse", 1249),
+    ("EnumFontsW", 1308),
     ("ExtTextOutW", 1324),
     ("GetStockObject", 1537),
     ("GetTextExtentPoint32W", 1554),
+    ("GetTextFaceW", 1560),
     ("GetTextMetricsW", 1562),
     ("IntersectClipRect", 1572),
     ("LineTo", 1578),
@@ -251,7 +253,9 @@ pub const OLEAUT32_EXPORTS: &[(&str, u32)] = &[
     ("SafeArrayCreate", 15),
     ("SafeArrayDestroy", 16),
     ("SysAllocString", 2),
+    ("SysAllocStringLen", 4),
     ("SysFreeString", 6),
+    ("SysStringLen", 7),
     ("VariantClear", 9),
     ("VariantInit", 8),
 ];
@@ -521,7 +525,7 @@ fn build_dll_image_native(spec: &DllSpec, machine: u16, return_code: &[u8]) -> V
 
 /// DLLs backed by the isolated x86/x64 runtime gateway. Keeping this set
 /// explicit avoids confusing native architecture placeholders with guest code.
-pub const RUNTIME_DLLS: &[&str] = &["kernel32.dll", "ntdll.dll", "crypt32.dll", "advapi32.dll", "comdlg32.dll", "comctl32.dll", "gdi32.dll", "user32.dll", "bcrypt.dll", "shell32.dll", "ole32.dll"];
+pub const RUNTIME_DLLS: &[&str] = &["kernel32.dll", "ntdll.dll", "crypt32.dll", "advapi32.dll", "comdlg32.dll", "comctl32.dll", "gdi32.dll", "user32.dll", "bcrypt.dll", "shell32.dll", "ole32.dll", "oleaut32.dll", "shlwapi.dll", "msvcrt.dll", "version.dll", "winspool.drv", "ws2_32.dll"];
 
 /// A source-owned facade export backed by an existing checked runtime handler.
 /// The ordinal belongs to the original image, independently for each bitness.
@@ -552,6 +556,11 @@ fn foundation_target(dll: &str, name: &str, x64: bool, depth: usize, importer: O
     if let Some(api) = catalog::find(dll, name) { return Some(api); }
     let module = reference_module(dll, x64)?;
     let export = module.exports.iter().find(|e| e.name == name)?;
+    if module.name == "wsock32.dll" && export.forwarder.is_none()
+        && matches!(name, "getsockopt" | "recv" | "recvfrom" | "setsockopt")
+    {
+        return catalog::find("ws2_32.dll", name);
+    }
     // A forwarded Kernel32 import uses the ISO's importer-specific host,
     // commonly KernelBase, rather than the contract's default Kernel32 host.
     // Otherwise valid SP1 forwarding chains loop back into their importer.
@@ -625,10 +634,40 @@ fn kernel32_ordinal(name: &str, x64: bool, private_index: usize) -> u16 {
 }
 
 fn runtime_ordinal(dll: &str, name: &str, x64: bool, private_index: usize) -> u16 {
+    match (dll, name, x64) {
+        ("oleaut32.dll", "SysAllocString", _) => return 2,
+        ("oleaut32.dll", "SysAllocStringLen", _) => return 4,
+        ("oleaut32.dll", "SysFreeString", _) => return 6,
+        ("oleaut32.dll", "SysStringLen", _) => return 7,
+        ("oleaut32.dll", "VariantInit", _) => return 8,
+        ("oleaut32.dll", "VariantClear", _) => return 9,
+        ("shlwapi.dll", "PathIsFileSpecW", false) => return 683,
+        ("shlwapi.dll", "PathIsFileSpecW", true) => return 688,
+        ("shlwapi.dll", "SHStrDupW", false) => return 823,
+        ("shlwapi.dll", "SHStrDupW", true) => return 828,
+        ("comctl32.dll", "TaskDialogIndirect", _) => return 345,
+        ("version.dll", "GetFileVersionInfoExW", _) => return 3,
+        ("version.dll", "GetFileVersionInfoSizeExW", _) => return 5,
+        ("version.dll", "VerQueryValueW", _) => return 15,
+        ("winspool.drv", "ClosePrinter", _) => return 146,
+        ("winspool.drv", "GetPrinterDriverW", _) => return 283,
+        ("winspool.drv", "OpenPrinterW", _) => return 293,
+        _ => {}
+    }
     reference_module(dll, x64)
         .and_then(|m| m.exports.iter().find(|e| e.name == name))
         .map(|e| e.ordinal)
         .unwrap_or(0x1000 + private_index as u16)
+}
+
+fn runtime_apis(x64: bool) -> impl Iterator<Item = &'static catalog::Api> {
+    catalog::APIS.iter().filter(move |api| match api.name {
+        "__C_specific_handler" => x64,
+        "_except_handler4_common" => !x64,
+        "InterlockedExchange" | "InterlockedCompareExchange" | "InterlockedExchangeAdd"
+        | "InterlockedIncrement" | "InterlockedDecrement" => !x64,
+        _ => true,
+    })
 }
 
 fn build_runtime_facade(file_name: &str, x64: bool) -> Option<Vec<u8>> {
@@ -643,11 +682,26 @@ fn build_runtime_facade(file_name: &str, x64: bool) -> Option<Vec<u8>> {
         apply_reference_header(&mut image, module.name, x64);
         image.module_name = module.name.to_string();
         image.entry_point_rva = 0;
+        let mut text = Vec::new();
         for export in exports {
-            let host = export.target.dll.trim_end_matches(".dll");
-            image.export_forwarder(export.name, export.ordinal, &format!("{host}.{}", export.target.name));
+            if module.name == "wsock32.dll"
+                && matches!(export.name, "getsockopt" | "recv" | "recvfrom" | "setsockopt")
+            {
+                let rva = stub_rva((text.len() / STUB_STRIDE as usize) as u32);
+                let thunk = service_thunk(catalog::GATEWAY_BASE | export.target.id,
+                    export.target.x86_arguments, x64);
+                text.extend_from_slice(&thunk);
+                text.resize(text.len() + STUB_STRIDE as usize - thunk.len(), 0xcc);
+                image.export_named(export.name, export.ordinal, rva);
+            } else {
+                let host = export.target.dll.trim_end_matches(".dll");
+                image.export_forwarder(export.name, export.ordinal, &format!("{host}.{}", export.target.name));
+            }
         }
-        image.sections = vec![SectionSpec::rdata(Vec::new())];
+        if !text.is_empty() {
+            image.sections.push(SectionSpec::code(text));
+        }
+        image.sections.push(SectionSpec::rdata(Vec::new()));
         return Some(super::pe::emit(&image).0);
     }
     // No fallback table: a missing SP1 module is not an implicit contract alias.
@@ -700,7 +754,7 @@ fn build_runtime_image(file_name: &str, x64: bool, resources: Option<&[u8]>) -> 
     };
     // Preserve native System32's address plan. crypt32 has its own slot after
     // comctl32, avoiding collisions with user32/gdi32.
-    let slot = [1u64, 0, 10, 11, 12, 9, 3, 2, 13, 4, 5][index];
+    let slot = [1u64, 0, 10, 11, 12, 9, 3, 2, 13, 4, 5, 8, 6, 14, 15, 16, 17][index];
     let base = if x64 {
         0x0000_0700_0000_0000 + slot * 0x1000_0000
     } else {
@@ -715,8 +769,7 @@ fn build_runtime_image(file_name: &str, x64: bool, resources: Option<&[u8]>) -> 
     apply_reference_header(&mut image, RUNTIME_DLLS[index], x64);
     image.module_name = RUNTIME_DLLS[index].to_string();
     image.entry_point_rva = 0;
-    let apis: Vec<_> = catalog::APIS
-        .iter()
+    let apis: Vec<_> = runtime_apis(x64)
         .filter(|api| api.dll.eq_ignore_ascii_case(file_name))
         .collect();
     let mut text = vec![0xcc; apis.len() * STUB_STRIDE as usize];
@@ -777,7 +830,7 @@ fn build_runtime_image(file_name: &str, x64: bool, resources: Option<&[u8]>) -> 
             advapi_ordinals::ordinal(api.name, x64)
                 .expect("ADVAPI32 export absent from the audited Windows 7 SP1 binary")
         } else {
-            runtime_ordinal(file_name, api.name, x64, index)
+            runtime_ordinal(api.dll, api.name, x64, index)
         };
         image.export_named(api.name, ordinal, stub_rva(index as u32));
     }
@@ -822,7 +875,25 @@ fn build_runtime_image(file_name: &str, x64: bool, resources: Option<&[u8]>) -> 
                 &format!("{}.{}", export.target.dll.trim_end_matches(".dll"), export.target.name));
         }
     }
-    image.sections = vec![SectionSpec::code(text), SectionSpec::rdata(Vec::new())];
+    image.sections = vec![SectionSpec::code(text)];
+    if file_name.eq_ignore_ascii_case("msvcrt.dll") {
+        assert!(image.sections[0].data.len() <= (catalog::MSVCRT_DATA_RVA - TEXT_RVA) as usize);
+        let reference = reference_module(file_name, x64)?;
+        for &(name, offset) in catalog::MSVCRT_DATA_EXPORTS {
+            let ordinal = reference.exports.iter().find(|export| export.name == name)?.ordinal;
+            image.export_named(name, ordinal, catalog::MSVCRT_DATA_RVA + offset);
+        }
+        for export in foundation_exports(file_name, x64) {
+            if export.target.dll != "msvcrt.dll" {
+                let host = export.target.dll.trim_end_matches(".dll");
+                image.export_forwarder(export.name, export.ordinal, &format!("{host}.{}", export.target.name));
+            }
+        }
+        let mut data = vec![0; 16];
+        data.extend_from_slice(&catalog::MSVCRT_DATA_TAG);
+        image.sections.push(SectionSpec::data(data));
+    }
+    image.sections.push(SectionSpec::rdata(Vec::new()));
     let mut bytes = super::pe::emit(&image).0;
     if let Some(resources) = resources {
         let source = super::pe_read::parse(resources)?;
@@ -900,14 +971,14 @@ pub fn runtime_manifest(x64: bool) -> String {
         )
     }
     let mut text = format!("{{\"schema\":2,\"machine\":\"{}\",\"provenance\":\"NT61 source-generated guest thunks\",\"limitations\":{},\"exports\":[", if x64 { "AMD64" } else { "I386" }, quoted(catalog::RUNTIME_LIMITATIONS));
-    for (index, api) in catalog::APIS.iter().enumerate() {
+    for (index, api) in runtime_apis(x64).enumerate() {
         if index != 0 {
             text.push(',');
         }
         let ordinal = if api.dll == "advapi32.dll" {
             advapi_ordinals::ordinal(api.name, x64).expect("audited ADVAPI32 ordinal")
         } else {
-            let index = catalog::APIS.iter().filter(|a| a.dll == api.dll)
+            let index = runtime_apis(x64).filter(|a| a.dll == api.dll)
                 .position(|a| a.id == api.id).expect("catalog member");
             runtime_ordinal(api.dll, api.name, x64, index)
         };
@@ -925,7 +996,7 @@ pub fn runtime_manifest(x64: bool) -> String {
         if i != 0 {
             text.push(',');
         }
-        let index = catalog::APIS.iter().filter(|api| api.dll == "kernel32.dll").count() + i;
+        let index = runtime_apis(x64).filter(|api| api.dll == "kernel32.dll").count() + i;
         let ordinal = kernel32_ordinal(name, x64, index);
         text.push_str(&format!(
             "{{\"dll\":\"kernel32.dll\",\"name\":\"{name}\",\"ordinal\":{ordinal},\"ordinal_provenance\":\"{}\",\"target\":\"ntdll.{name}\",{}}}",
@@ -1047,6 +1118,84 @@ mod architecture_tests {
             let image = build_runtime_dll("api-ms-win-core-profile-l1-1-0.dll", x64).expect("profile facade");
             let parsed = super::super::pe_read::parse(&image).expect("valid profile PE");
             assert!(parsed.exports_by_name.contains_key("QueryPerformanceFrequency"));
+        }
+    }
+
+    #[test]
+    fn synchronous_io_and_wait_object_exports_keep_sp1_ordinals() {
+        for (x64, ordinals) in [
+            (false, [68, 157, 160, 1018, 173, 176, 1022]),
+            (true, [67, 156, 159, 1022, 172, 175, 1026]),
+        ] {
+            let bytes = build_runtime_dll("kernel32.dll", x64).unwrap();
+            let library = super::super::pe_read::parse(&bytes).unwrap();
+            let code = library.sections.iter().find(|section| section.name == ".text").unwrap();
+            for (name, ordinal) in ["CancelIo", "CreateMutexA", "CreateMutexW", "ReleaseMutex",
+                "CreateSemaphoreA", "CreateSemaphoreW", "ReleaseSemaphore"].into_iter().zip(ordinals) {
+                let rva = library.exports_by_name[name];
+                assert_eq!(library.exports_by_ordinal[&ordinal], rva);
+                let offset = (code.pointer_to_raw_data + (rva - code.virtual_address)) as usize;
+                let api = catalog::find("kernel32.dll", name).unwrap();
+                assert_eq!(bytes[offset], 0xb8);
+                assert_eq!(&bytes[offset + 1..offset + 5], &(catalog::GATEWAY_BASE | api.id).to_le_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn winsock_legacy_ordinals_resolve_to_checked_runtime_code() {
+        for x64 in [false, true] {
+            let libraries: Vec<_> = runtime_library_names_for_arch(x64).collect();
+            assert!(libraries.contains(&"wsock32.dll"));
+            assert!(libraries.contains(&"ws2_32.dll"));
+            let legacy_bytes = build_runtime_dll("wsock32.dll", x64).unwrap();
+            let runtime_bytes = build_runtime_dll("ws2_32.dll", x64).unwrap();
+            let legacy = super::super::pe_read::parse(&legacy_bytes).unwrap();
+            let runtime = super::super::pe_read::parse(&runtime_bytes).unwrap();
+            let original = reference_module("ws2_32.dll", x64).unwrap();
+            let text = runtime.sections.iter().find(|section| section.name == ".text").unwrap();
+            for (name, legacy_ordinal) in [
+                ("accept", 1), ("bind", 2), ("connect", 4), ("getpeername", 5),
+                ("getsockname", 6), ("getsockopt", 7), ("ioctlsocket", 12), ("listen", 13),
+                ("recv", 16), ("recvfrom", 17), ("select", 18), ("send", 19),
+                ("sendto", 20), ("setsockopt", 21), ("shutdown", 22),
+                ("gethostbyaddr", 51), ("gethostbyname", 52), ("getprotobyname", 53),
+                ("getprotobynumber", 54), ("gethostname", 57),
+                ("closesocket", 3), ("socket", 23),
+                ("htonl", 8), ("htons", 9), ("ntohl", 14), ("ntohs", 15),
+                ("WSAGetLastError", 111), ("WSASetLastError", 112), ("WSAStartup", 115),
+                ("WSACleanup", 116), ("__WSAFDIsSet", 151),
+            ] {
+                let export = original.exports.iter().find(|entry| entry.name == name).unwrap();
+                let runtime_rva = runtime.exports_by_name[name];
+                assert_eq!(runtime.exports_by_ordinal[&export.ordinal], runtime_rva);
+                assert!(!runtime.forwarders_by_rva.contains_key(&runtime_rva));
+                let section_offset = runtime_rva.checked_sub(text.virtual_address).unwrap();
+                assert!(section_offset + 5 <= text.size_of_raw_data);
+                let file_offset = (text.pointer_to_raw_data + section_offset) as usize;
+                let service = catalog::GATEWAY_BASE | catalog::find("ws2_32.dll", name).unwrap().id;
+                assert_eq!(runtime_bytes[file_offset], 0xb8);
+                assert_eq!(&runtime_bytes[file_offset + 1..file_offset + 5], &service.to_le_bytes());
+                assert_eq!(legacy.exports_by_ordinal[&legacy_ordinal], legacy.exports_by_name[name]);
+                if let Some(forwarder) = reference_module("wsock32.dll", x64).unwrap().exports.iter()
+                    .find(|entry| entry.name == name).unwrap().forwarder
+                {
+                    assert_eq!(legacy.forwarders[name], forwarder);
+                } else {
+                    let section = legacy.sections.iter().find(|section| section.name == ".text").unwrap();
+                    let rva = legacy.exports_by_name[name];
+                    assert!(!legacy.forwarders_by_rva.contains_key(&rva));
+                    let offset = (section.pointer_to_raw_data + (rva - section.virtual_address)) as usize;
+                    assert_eq!(&legacy_bytes[offset..offset + 5], &runtime_bytes[file_offset..file_offset + 5]);
+                }
+            }
+            for name in ["WSAIoctl", "WSASocketW", "WSCEnumProtocols", "WSCGetProviderInfo",
+                "WSCGetProviderPath", "freeaddrinfo", "getaddrinfo", "getnameinfo", "inet_ntop",
+                "inet_pton", "inet_addr", "inet_ntoa"] {
+                let export = original.exports.iter().find(|entry| entry.name == name).unwrap();
+                assert_eq!(runtime.exports_by_ordinal.get(&export.ordinal), runtime.exports_by_name.get(name));
+                assert!(runtime.exports_by_name.contains_key(name), "missing {name}, x64={x64}");
+            }
         }
     }
 }

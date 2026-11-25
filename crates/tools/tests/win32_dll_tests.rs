@@ -506,6 +506,21 @@ fn guest_runtime_catalog_preserves_bitness_calling_convention_and_stable_service
     for x64 in [false, true] {
         let user = pe_read::parse(&win32_dlls::build_runtime_dll("user32.dll", x64).unwrap()).unwrap();
         assert!(user.exports_by_name.contains_key("LoadStringW"));
+        assert_eq!(user.exports_by_name["ChildWindowFromPoint"], user.exports_by_ordinal[&1576]);
+        for (export, ordinal) in [
+            ("GetSystemMenu", if x64 { 1892 } else { 1890 }),
+            ("GetMenuState", if x64 { 1853 } else { 1851 }),
+            ("EnableMenuItem", 1723),
+            ("CheckMenuItem", 1572),
+            ("LoadAcceleratorsW", if x64 { 1998 } else { 1994 }),
+            ("LoadCursorW", if x64 { 2008 } else { 2003 }),
+            ("LoadIconW", if x64 { 2010 } else { 2006 }),
+            ("LoadImageW", if x64 { 2012 } else { 2008 }),
+            ("SetCursor", if x64 { 2167 } else { 2161 }),
+            ("TranslateAcceleratorW", if x64 { 2283 } else { 2275 }),
+        ] {
+            assert_eq!(user.exports_by_name[export], user.exports_by_ordinal[&ordinal]);
+        }
         for name in win32_dlls::RUNTIME_DLLS {
             let bytes = win32_dlls::build_runtime_dll(name, x64).unwrap();
             let image = pe_read::parse(&bytes).unwrap();
@@ -515,6 +530,27 @@ fn guest_runtime_catalog_preserves_bitness_calling_convention_and_stable_service
             assert_eq!(image.data_directories[5], (0, 0));
             let section = image.sections.iter().find(|s| s.name == ".text").unwrap();
             for api in win32_dlls::catalog::APIS.iter().filter(|a| a.dll == *name) {
+                if matches!((x64, api.name), (false, "__C_specific_handler") | (true, "_except_handler4_common")) {
+                    assert!(!image.exports_by_name.contains_key(api.name));
+                    continue;
+                }
+                if *name == "kernel32.dll" {
+                    let ordinal = match api.name {
+                        "InterlockedCompareExchange" => Some(748),
+                        "InterlockedDecrement" => Some(749),
+                        "InterlockedExchange" => Some(750),
+                        "InterlockedExchangeAdd" => Some(751),
+                        "InterlockedIncrement" => Some(753),
+                        _ => None,
+                    };
+                    if let Some(ordinal) = ordinal {
+                        if x64 {
+                            assert!(!image.exports_by_name.contains_key(api.name));
+                            continue;
+                        }
+                        assert_eq!(image.exports_by_name[api.name], image.exports_by_ordinal[&ordinal]);
+                    }
+                }
                 let rva = *image.exports_by_name.get(api.name).unwrap();
                 let offset = (rva - section.virtual_address + section.pointer_to_raw_data) as usize;
                 let code = &bytes[offset..offset + 16];
@@ -548,6 +584,34 @@ fn guest_runtime_catalog_preserves_bitness_calling_convention_and_stable_service
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn notepad_runtime_exports_preserve_reference_ordinals() {
+    for x64 in [false, true] {
+        for (library, exports) in [
+            ("comctl32.dll", &[("TaskDialogIndirect", 345)][..]),
+            ("version.dll", &[("GetFileVersionInfoExW", 3), ("GetFileVersionInfoSizeExW", 5), ("VerQueryValueW", 15)]),
+            ("winspool.drv", &[("ClosePrinter", 146), ("GetPrinterDriverW", 283), ("OpenPrinterW", 293)]),
+        ] {
+            let bytes = win32_dlls::build_runtime_dll(library, x64).unwrap();
+            let image = pe_read::parse(&bytes).unwrap();
+            for &(name, ordinal) in exports {
+                assert_eq!(image.exports_by_name[name], image.exports_by_ordinal[&ordinal]);
+            }
+        }
+    }
+}
+
+#[test]
+fn oleaut32_automation_exports_preserve_sp1_ordinals() {
+    for x64 in [false, true] {
+        let bytes = win32_dlls::build_runtime_dll("oleaut32.dll", x64).unwrap();
+        let image = pe_read::parse(&bytes).unwrap();
+        for (name, ordinal) in [("SysAllocStringLen", 4), ("SysStringLen", 7), ("VariantInit", 8), ("VariantClear", 9)] {
+            assert_eq!(image.exports_by_name[name], image.exports_by_ordinal[&ordinal]);
         }
     }
 }
