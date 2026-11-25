@@ -6,19 +6,6 @@ pub fn install_kernel_handoff() -> u64 {
     0
 }
 
-/// Make copied and relocated code visible to instruction fetch on this CPU.
-///
-/// # Safety
-///
-/// The supplied range must describe a live, mapped image.
-pub unsafe fn sync_image_code(_base: u64, _size: u64) {
-    // SAFETY: the loader executes on the current hart in supervisor mode.
-    // Boot payloads run on this hart; secondary harts synchronize at startup.
-    unsafe {
-        core::arch::asm!("fence rw, rw", "fence.i", options(nostack));
-    }
-}
-
 /// Enter the loaded PE kernel after ExitBootServices.
 ///
 /// # Safety

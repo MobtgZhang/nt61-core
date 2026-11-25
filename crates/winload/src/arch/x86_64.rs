@@ -10,16 +10,6 @@ pub fn install_kernel_handoff() -> u64 {
     ntoskrnl::arch::x86_64::ntoskrnl_handoff::install_handoff_pointer()
 }
 
-/// Make copied and relocated code visible to instruction fetch on this CPU.
-///
-/// # Safety
-///
-/// The supplied range must describe a live, mapped image.
-pub unsafe fn sync_image_code(_base: u64, _size: u64) {
-    // x86 instruction and data caches are coherent for newly mapped code.
-    // Prevent the compiler from moving image writes across the entry call.
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-}
 
 /// # Safety
 ///

@@ -107,7 +107,11 @@ mod gop_display;
 pub mod logging;
 pub mod ntfs_boot;
 mod pe;
-mod boot_image;
+#[cfg(target_arch = "x86_64")]
+mod sp1_handoff;
+#[cfg(target_arch = "x86_64")]
+mod sp1_layout;
+use nt61_boot_types::boot_image;
 mod image_integrity;
 mod refs_boot;
 mod refs_discovery;
@@ -291,10 +295,8 @@ const BOOT_DRIVER_PATHS: [&str; MAX_BOOT_DRIVERS] = [
 // `load_boot_drivers()` above (it shares the BOOT_START_IMAGE
 // codepath with the .sys drivers). We re-use that fact instead of
 // loading it twice.
-const KERNEL_IMAGE_PATHS: [&str; 2] = [
-    "\\Windows\\System32\\hal.dll",
-    "\\Windows\\System32\\ntoskrnl.exe",
-];
+const HAL_IMAGE_PATH: &str = "\\Windows\\System32\\hal.dll";
+const KERNEL_IMAGE_PATH: &str = "\\Windows\\System32\\ntoskrnl.exe";
 
 // =====================================================================
 // Persistent boot data
@@ -853,7 +855,20 @@ fn capture_device_tree() {
 /// fallback. The kernel consumes `BootInfo.acpi_rsdp` during
 /// Phase 1 to resolve MCFG / FADT / MADT through `find_table`.
 fn capture_acpi_rsdp() {
-    let rsdp = uefi::system::with_config_table(|entries| {
+    match firmware_acpi_rsdp() {
+        Some(rsdp_phys) => {
+            let persistent = unsafe { &mut *core::ptr::addr_of_mut!(PERSISTENT) };
+            persistent.acpi_rsdp = rsdp_phys;
+            debug_println!("[LOADER] ACPI RSDP captured: 0x{:x}", rsdp_phys);
+        }
+        None => {
+            debug_println!("[LOADER] [WARN] ACPI capture: no RSDP in configuration table");
+        }
+    }
+}
+
+fn firmware_acpi_rsdp() -> Option<u64> {
+    uefi::system::with_config_table(|entries| {
         entries
             .iter()
             .find(|entry| entry.guid == uefi::table::cfg::ConfigTableEntry::ACPI2_GUID)
@@ -863,17 +878,7 @@ fn capture_acpi_rsdp() {
                     .find(|entry| entry.guid == uefi::table::cfg::ConfigTableEntry::ACPI_GUID)
             })
             .map(|entry| entry.address as u64)
-    });
-    match rsdp {
-        Some(rsdp_phys) if rsdp_phys != 0 => {
-            let persistent = unsafe { &mut *core::ptr::addr_of_mut!(PERSISTENT) };
-            persistent.acpi_rsdp = rsdp_phys;
-            debug_println!("[LOADER] ACPI RSDP captured: 0x{:x}", rsdp_phys);
-        }
-        _ => {
-            debug_println!("[LOADER] [WARN] ACPI capture: no RSDP in configuration table");
-        }
-    }
+    }).filter(|&address| address != 0)
 }
 
 // Static to hold the BootInfo struct itself (must be in memory, not register).
@@ -1491,7 +1496,11 @@ fn copy_pe_sections(image: &[u8], dest: u64, image_size: usize) -> usize {
     let Ok(header) = boot_image::Header::parse(image, boot_image_machine()) else { return 0; };
     if image_size < header.image_size { return 0; }
     // SAFETY: the caller owns an IMAGE_BUFFER allocation of image_size bytes.
-    let destination = unsafe { core::slice::from_raw_parts_mut(dest as *mut u8, image_size) };
+    let destination = unsafe {
+        let pointer = dest as *mut u8;
+        pointer.write_bytes(0, header.image_size);
+        core::slice::from_raw_parts_mut(pointer, header.image_size)
+    };
     header.map(image, destination).unwrap_or(0)
 }
 
@@ -1771,84 +1780,68 @@ fn load_system_hive() {
 // print `[NTOSKRNL-HOST] K03: no on-disk ntoskrnl image in BootInfo`
 // and the boot halts in `jump_to_ntoskrnl_kisystemstartup`. There is
 // no in-binary fallback (the `system_image` pipeline is gone).
-fn load_kernel_images() -> (u64, u64, u64, u64, u64) {
-    // (ntoskrnl_base, ntoskrnl_size, hal_base, hal_size)
-    debug_println!("[WINLOAD] L03: loading ntoskrnl.exe + hal.dll from NTFS system partition");
-    let mut ntoskrnl_base: u64 = 0;
-    let mut ntoskrnl_size: u64 = 0;
-    let mut hal_base: u64 = 0;
-    let mut hal_size: u64 = 0;
-    let mut kernel_entry_rva: u64 = 0;
-    let mut image_db = loader::ImageDatabase::new();
+fn map_kernel_image(path: &'static str) -> Result<(Vec<u8>, boot_image::Header, u64), (&'static str, &'static str)> {
+    let (raw, size, _, _) = read_pe_file_from_disk(path).ok_or((path, "cannot read boot image"))?;
+    uefi::println!("[WINLOAD] driver read returned {}", path);
+    let header = boot_image::Header::parse(&raw, boot_image_machine()).map_err(|reason| (path, reason))?;
+    let base = allocate_and_map_image(0, size, &raw).ok_or((path, "cannot map boot image"))?;
+    Ok((raw, header, base))
+}
 
-    for path in &KERNEL_IMAGE_PATHS {
-        let (raw, size_of_image, entry_point_rva, _is_dll) = match read_pe_file_from_disk(path) {
-            Some(t) => t,
-            None => {
-                debug_println!("[WINLOAD] L03: {} not found on NTFS system partition", path);
-                continue;
-            }
-        };
-        uefi::println!("[WINLOAD] driver read returned {}", path);
-        if size_of_image == 0 || raw.len() < 0x40 || &raw[..2] != b"MZ" {
-            debug_println!("[WINLOAD] L03: {}: empty or not a PE", path);
-            continue;
-        }
-        // allocate_and_map_image returns the runtime base inside
-        // the shared IMAGE_BUFFER pool (BOOT_SERVICES_DATA).
-        let dest = match allocate_and_map_image(0, size_of_image, &raw) {
-            Some(p) => p,
-            None => {
-                debug_println!("[WINLOAD] L03: {}: allocate_and_map_image failed", path);
-                continue;
-            }
-        };
-        // Validate the complete mapped relocation stream before the shared
-        // import-resolution pipeline can accept this system module.
-        let Ok(header) = boot_image::Header::parse(&raw, boot_image_machine()) else { continue; };
-        // SAFETY: dest owns this image_size allocation, mapped immediately above.
-        let mapped = unsafe { core::slice::from_raw_parts_mut(dest as *mut u8, header.image_size) };
-        if let Err(reason) = header.validate_relocations(mapped, dest) {
-            uefi::println!("[WINLOAD] {} relocation failed: {}", path, reason);
-            continue;
-        }
-        let image_name = path.rsplit('\\').next().unwrap_or(path);
-        let loaded = match loader::load_image_full(image_name, &raw, &mut image_db, dest) {
-            Some(loaded) => loaded,
-            None => {
-                debug_println!("[WINLOAD] L03: {}: PE pipeline failed", path);
-                continue;
-            }
-        };
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                loaded.bytes.as_ptr(),
-                dest as *mut u8,
-                loaded.bytes.len(),
-            );
-        }
-        image_db.register(&loaded, &raw);
-        finalize_image_protection(*path, dest, &raw);
-        if path.ends_with("ntoskrnl.exe") {
-            ntoskrnl_base = dest;
-            ntoskrnl_size = size_of_image;
-            kernel_entry_rva = entry_point_rva as u64;
-            debug_println!(
-                "[WINLOAD] L03: ntoskrnl.exe loaded at 0x{:x} size={} entry=0x{:x}",
-                dest,
-                size_of_image,
-                entry_point_rva
-            );
-        } else if path.ends_with("hal.dll") {
-            hal_base = dest;
-            hal_size = size_of_image;
-            debug_println!(
-                "[WINLOAD] L03: hal.dll loaded at 0x{:x} size={} private image",
-                dest,
-                size_of_image
-            );
-        }
+#[cfg(target_arch = "x86_64")]
+const SP1_KERNEL_DEPENDENCIES: &[(&str, &str)] = &[
+    ("kdcom.dll", "\\Windows\\System32\\kdcom.dll"),
+    ("pshed.dll", "\\Windows\\System32\\pshed.dll"),
+    ("clfs.sys", "\\Windows\\System32\\clfs.sys"),
+    ("ci.dll", "\\Windows\\System32\\ci.dll"),
+];
+
+fn load_kernel_images() -> Result<(u64, u64, u64, u64, u64), (&'static str, &'static str)> {
+    debug_println!("[WINLOAD] L03: loading ntoskrnl.exe + hal.dll from NTFS system partition");
+    let (hal_raw, hal_header, hal_base) = map_kernel_image(HAL_IMAGE_PATH)?;
+    let (kernel_raw, kernel_header, ntoskrnl_base) = map_kernel_image(KERNEL_IMAGE_PATH)?;
+    if kernel_header.entry_rva == 0 {
+        return Err((KERNEL_IMAGE_PATH, "missing kernel entry point"));
     }
+    let hal_size = hal_header.image_size as u64;
+    let ntoskrnl_size = kernel_header.image_size as u64;
+    let kernel_entry_rva = u64::from(kernel_header.entry_rva);
+    // SAFETY: each base refers to a distinct allocation in the boot image pool.
+    let (hal_bytes, kernel_bytes) = unsafe {
+        (
+            core::slice::from_raw_parts_mut(hal_base as *mut u8, hal_header.image_size),
+            core::slice::from_raw_parts_mut(ntoskrnl_base as *mut u8, kernel_header.image_size),
+        )
+    };
+    let mut mapped = alloc::vec![
+        loader::MappedBootImage { name: "hal.dll", header: hal_header, bytes: hal_bytes, load_base: hal_base },
+        loader::MappedBootImage { name: "ntoskrnl.exe", header: kernel_header, bytes: kernel_bytes, load_base: ntoskrnl_base },
+    ];
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut imports = Vec::new();
+        for (path, raw) in [(HAL_IMAGE_PATH, &hal_raw), (KERNEL_IMAGE_PATH, &kernel_raw)] {
+            let info = pe::parse_image_layout(raw).ok_or((path, "invalid image layout"))?;
+            imports.extend(info.dll_dependencies);
+        }
+        for &(name, path) in SP1_KERNEL_DEPENDENCIES {
+            if !imports.iter().any(|import| import.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            let (_, header, base) = map_kernel_image(path)?;
+            let bytes = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, header.image_size) };
+            mapped.push(loader::MappedBootImage { name, header, bytes, load_base: base });
+        }
+        if mapped.len() > 2 {
+            mapped.swap(0, 1);
+            return sp1_handoff::boot(&mut mapped).map_err(|error| (KERNEL_IMAGE_PATH, error));
+        }
+        loader::link_boot_images(&mut mapped)?;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    loader::link_boot_images(&mut mapped)?;
+    finalize_image_protection(HAL_IMAGE_PATH, hal_base, &hal_raw);
+    finalize_image_protection(KERNEL_IMAGE_PATH, ntoskrnl_base, &kernel_raw);
 
     // Publish into BootInfo so the kernel can find them. The values
     // get re-published (with fresh fields) right after `*bi = bi_value`
@@ -1860,13 +1853,13 @@ fn load_kernel_images() -> (u64, u64, u64, u64, u64) {
         bi.hal_image_base = hal_base;
         bi.hal_image_size = hal_size;
     }
-    (
+    Ok((
         ntoskrnl_base,
         ntoskrnl_size,
         hal_base,
         hal_size,
         kernel_entry_rva,
-    )
+    ))
 }
 
 /// Look up the BOOTVID.DLL slot from `PERSISTENT.boot_drivers[]` and
@@ -2067,7 +2060,7 @@ fn load_boot_drivers() {
             // this project's marker and receives objects with the shared ABI.
             // These stack objects live throughout entry and cannot be retained.
             let driver_entry_status = unsafe {
-                arch::current::sync_image_code(dest_addr, size_of_image);
+                nt61_boot_types::image_cache::sync_image_code(dest_addr, size_of_image);
                 let entry: BootDriverEntry = core::mem::transmute(entry_addr as *const ());
                 entry(&mut driver_object, &registry_path)
             };
@@ -3456,7 +3449,7 @@ fn os_loader_run() -> ! {
     mark_winload_phase(3);
     uefi::println!("[WINLOAD] load kernel begin");
     let (ntoskrnl_base_l03, ntoskrnl_size_l03, hal_base_l03, hal_size_l03, kernel_entry_rva_l03) =
-        load_kernel_images();
+        load_kernel_images().unwrap_or_else(|(image, reason)| panic!("[WINLOAD] {image}: {reason}"));
     uefi::println!("[WINLOAD] load kernel end");
     if ntoskrnl_base_l03 == 0 || ntoskrnl_size_l03 == 0
         || kernel_entry_rva_l03 == 0 || hal_base_l03 == 0 || hal_size_l03 == 0

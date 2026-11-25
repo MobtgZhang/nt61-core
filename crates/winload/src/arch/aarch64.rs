@@ -7,45 +7,7 @@ pub fn install_kernel_handoff() -> u64 {
     0
 }
 
-/// Make copied and relocated code visible to instruction fetch on this CPU.
-///
-/// # Safety
-///
-/// `base..base + size` must be a live, mapped image with a checked extent.
-pub unsafe fn sync_image_code(base: u64, size: u64) {
-    let end = base.checked_add(size).expect("validated image extent");
-    let ctr: u64;
-    // SAFETY: UEFI executes at an exception level permitting cache maintenance.
-    unsafe {
-        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nostack));
-    }
-    let dline = 4u64 << ((ctr >> 16) & 0xf);
-    let iline = 4u64 << (ctr & 0xf);
-    let mut addr = base & !(dline - 1);
-    while addr < end {
-        // SAFETY: addr selects a cache line covering the validated image mapping.
-        unsafe {
-            core::arch::asm!("dc cvau, {addr}", addr = in(reg) addr, options(nostack));
-        }
-        addr += dline;
-    }
-    // SAFETY: finish data writeback before invalidating corresponding I-cache lines.
-    unsafe {
-        core::arch::asm!("dsb ish", options(nostack));
-    }
-    addr = base & !(iline - 1);
-    while addr < end {
-        // SAFETY: addr selects a cache line covering the validated image mapping.
-        unsafe {
-            core::arch::asm!("ic ivau, {addr}", addr = in(reg) addr, options(nostack));
-        }
-        addr += iline;
-    }
-    // SAFETY: complete maintenance before fetching the loaded entry.
-    unsafe {
-        core::arch::asm!("dsb ish", "isb", options(nostack));
-    }
-}
+use nt61_boot_types::image_cache::sync_image_code;
 
 /// Enter the loaded PE kernel after ExitBootServices.
 ///

@@ -10,54 +10,7 @@ pub fn install_kernel_handoff() -> u64 {
     0
 }
 
-/// Make copied and relocated code visible to instruction fetch on this CPU.
-///
-/// # Safety
-///
-/// `base..base + size` must be a live, mapped image with a checked extent.
-pub unsafe fn sync_image_code(base: u64, size: u64) {
-    let end = base.checked_add(size).expect("validated image extent");
-    let dcfg: u64;
-    let icfg: u64;
-    // SAFETY: CPUCFG reads are available at the loader's privilege level.
-    unsafe {
-        core::arch::asm!(
-            "cpucfg {dcfg}, {dindex}",
-            "cpucfg {icfg}, {iindex}",
-            dcfg = out(reg) dcfg,
-            icfg = out(reg) icfg,
-            dindex = in(reg) 0x12u64,
-            iindex = in(reg) 0x11u64,
-            options(nostack),
-        );
-    }
-    let dline = 1u64 << ((dcfg >> 24) & 0x7f).min(12);
-    let iline = 1u64 << ((icfg >> 24) & 0x7f).min(12);
-    let mut addr = base & !(dline - 1);
-    while addr < end {
-        // SAFETY: hit writeback/invalidate of L1 D-cache at a mapped image VA.
-        unsafe {
-            core::arch::asm!("cacop 0x11, {addr}, 0", addr = in(reg) addr, options(nostack));
-        }
-        addr += dline;
-    }
-    // SAFETY: complete data writes before invalidating the instruction cache.
-    unsafe {
-        core::arch::asm!("dbar 0", options(nostack));
-    }
-    addr = base & !(iline - 1);
-    while addr < end {
-        // SAFETY: hit invalidate of L1 I-cache at a mapped image VA.
-        unsafe {
-            core::arch::asm!("cacop 0x10, {addr}, 0", addr = in(reg) addr, options(nostack));
-        }
-        addr += iline;
-    }
-    // SAFETY: complete instruction maintenance before jumping to loaded code.
-    unsafe {
-        core::arch::asm!("dbar 0", "ibar 0", options(nostack));
-    }
-}
+use nt61_boot_types::image_cache::sync_image_code;
 
 /// Enter the loaded PE kernel after ExitBootServices.
 ///
