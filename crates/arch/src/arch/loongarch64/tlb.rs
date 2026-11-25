@@ -40,9 +40,9 @@ pub fn flush_asid(asid: Asid) {
 #[inline]
 pub fn flush_page(vaddr: u64) {
     unsafe {
-        // invtlb op=5: invalidate by VA (all ASIDs)
+        // Match global entries as well as the ASID-zero entries used by the kernel.
         asm!(
-            "invtlb 5, $r0, {addr}",
+            "invtlb 6, $r0, {addr}",
             addr = in(reg) vaddr,
             options(nostack)
         );
@@ -53,9 +53,9 @@ pub fn flush_page(vaddr: u64) {
 #[inline]
 pub fn flush_page_asid(vaddr: u64, asid: Asid) {
     unsafe {
-        // invtlb op=6: invalidate by VA and ASID
+        // Restrict invalidation to non-global entries for this VA and ASID.
         asm!(
-            "invtlb 6, {asid}, {addr}",
+            "invtlb 5, {asid}, {addr}",
             asid = in(reg) asid as u64,
             addr = in(reg) vaddr,
             options(nostack)

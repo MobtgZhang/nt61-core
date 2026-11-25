@@ -100,7 +100,7 @@ fn sync_new_page_table() {
 /// Static, pre-mapped page-table frames. The kernel image already has
 /// translations for these bytes, so installing a new L1/L2/L3 must
 /// never allocate another page-table frame to map its own storage.
-const SPARE_PAGE_TABLE_COUNT: usize = 512;
+const SPARE_PAGE_TABLE_COUNT: usize = 1024;
 const SPARE_PAGE_TABLE_ENTRIES: usize = 512;
 #[repr(C, align(4096))]
 struct SparePageTables([u64; SPARE_PAGE_TABLE_COUNT * SPARE_PAGE_TABLE_ENTRIES]);
@@ -230,6 +230,7 @@ fn map_cross_root_scratch(pa: u64) -> bool {
 fn alloc_page_table_frame() -> Option<(u64, u64)> {
     let index = SPARE_PAGE_TABLE_INDEX.fetch_add(1, Ordering::Relaxed);
     if index >= SPARE_PAGE_TABLE_COUNT {
+        crate::hal::serial::write_string_always("K:a64-page-table-reserve-exhausted\r\n");
         return None;
     }
     let va = unsafe {
@@ -239,6 +240,7 @@ fn alloc_page_table_frame() -> Option<(u64, u64)> {
             .add(index * SPARE_PAGE_TABLE_ENTRIES) as u64
     };
     let Some(pa) = translate_virt(va) else {
+        crate::hal::serial::write_string_always("K:a64-page-table-reserve-unmapped\r\n");
         return None;
     };
     let pa = pa & !0xFFF;
@@ -727,15 +729,19 @@ pub unsafe fn load_page_root(pml4_pfn: u64) {
 /// addresses used by processes unreachable even when their PTEs are
 /// present.
 pub fn init() {
+    const WALK_DISABLED: u64 = 1 << 23;
+    const T1_CONFIG: u64 = (0x3f << 16) | WALK_DISABLED | (0xff << 24);
+    const T1_48_BIT_4_KIB: u64 = (16 << 16) | (0b01 << 24) | (0b01 << 26)
+        | (0b11 << 28) | (0b10 << 30);
     let mut tcr: u64;
+    current_l0_phys();
     unsafe {
         asm!("mrs {}, tcr_el1", out(reg) tcr, options(nostack));
     }
-    tcr = (tcr & !(0x3F)) | 16;
-    tcr = (tcr & !(0x3F << 16)) | (16 << 16);
+    tcr = (tcr & !(0x3f | T1_CONFIG)) | 16 | T1_48_BIT_4_KIB;
     unsafe {
         asm!("msr tcr_el1, {}", in(reg) tcr, options(nostack));
-        asm!("isb", options(nostack));
+        asm!("isb", "tlbi vmalle1", "dsb ish", "isb", options(nostack));
     }
 }
 

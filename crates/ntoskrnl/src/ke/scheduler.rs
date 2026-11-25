@@ -1797,8 +1797,8 @@ pub fn tick_with_mode(user:bool) {
         if let Some(ref mut prcb) = scheduler.prcb_mut(cpu) {
             let current = prcb.current_thread;
             if current.is_null() {
-                irql::lower_irql(previous_irql);
                 drop(scheduler);
+                irql::lower_irql(previous_irql);
                 poll_services();
                 return;
             }
@@ -1813,8 +1813,8 @@ pub fn tick_with_mode(user:bool) {
             }
             let remaining = (*current).kthread.quantum_remaining;
             if remaining == 0 {
-                irql::lower_irql(previous_irql);
                 drop(scheduler);
+                irql::lower_irql(previous_irql);
                 poll_services();
                 return;
             }
@@ -1827,13 +1827,13 @@ pub fn tick_with_mode(user:bool) {
                 (*current).kthread.quantum_remaining = quantum_initial;
                 prcb.quantum_remaining = quantum_initial;
                 prcb.quantum_initial = quantum_initial;
-                drop(scheduler);
                 request_reschedule(cpu);
             } else {
                 check_and_decay_priority(current);
             }
         }
 
+        drop(scheduler);
         irql::lower_irql(previous_irql);
     }
 

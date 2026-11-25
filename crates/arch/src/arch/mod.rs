@@ -200,7 +200,7 @@ pub fn init_hardware() {
         loongarch64::paging::init();
         loongarch64::idt::init();
         loongarch64::serial::serial_init(0);
-        loongarch64::pit::init(0x1FE0_0000);
+        loongarch64::pit::init();
         loongarch64::pic::init(0x1FE0_0000 + 0x1000);
         crate::hal::common::keyboard_unified::enable_serial_rx_irq();
         loongarch64::syscall::init();
@@ -322,7 +322,7 @@ pub unsafe fn init_paging() {
     #[cfg(target_arch = "aarch64")]
     aarch64::paging::init();
     #[cfg(target_arch = "riscv64")]
-    riscv64::paging::init();
+    riscv64::paging::init_bootstrap();
     #[cfg(target_arch = "loongarch64")]
     loongarch64::paging::init();
 }
@@ -1023,6 +1023,8 @@ static INTERRUPTS_ENABLED_ONCE: core::sync::atomic::AtomicBool =
 /// completed their setup. See `enable_interrupts_once`.
 pub fn mark_interrupts_ready() {
     INTERRUPTS_READY.store(true, core::sync::atomic::Ordering::Release);
+    #[cfg(target_arch = "riscv64")]
+    riscv64::pit::arm_next_tick();
 }
 
 /// Returns true if `mark_interrupts_ready()` has been called.
@@ -1478,7 +1480,9 @@ pub unsafe fn swap_context(out_rsp: *mut u64, new_rsp: u64) {
 pub unsafe fn swap_context_address_space(out_rsp: *mut u64, new_rsp: u64, root: u64) {
     #[cfg(target_arch = "x86_64")]
     x86_64::context_switch::swap_context_address_space(out_rsp, new_rsp, root);
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    aarch64::context_switch::swap_context_address_space(out_rsp, new_rsp, root);
+    #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
     {
         // These ports currently keep kernel stacks in shared mappings.
         if root != 0 {

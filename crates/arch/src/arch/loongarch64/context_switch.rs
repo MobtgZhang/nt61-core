@@ -37,7 +37,7 @@
 //! The frame also reserves room for the FPU / LSX / LASX state at
 //! the tail (filled in by `fpu.rs` in Phase 3).
 
-use core::arch::{asm, global_asm};
+use core::arch::{asm, naked_asm};
 
 /// Size in bytes of one `ContextFrame` slot.
 pub const CONTEXT_FRAME_SIZE: usize = 104;
@@ -72,22 +72,12 @@ pub type ContextFramePtr = *mut ContextFrame;
 /// Pointer-sized `*mut ContextFrame`.
 pub type RawContextPtr = usize;
 
-global_asm!(
-    r#"
-    .text
-    .align 2
-    .global __nt61_loongarch_thread_start
-__nt61_loongarch_thread_start:
-    ld.d $t0, $sp, 0
-    ld.d $a0, $sp, 8
-    addi.d $sp, $sp, 32
-    jirl $zero, $t0, 0
-    .size __nt61_loongarch_thread_start, . - __nt61_loongarch_thread_start
-    "#,
-);
-
-extern "C" {
-    static __nt61_loongarch_thread_start: u8;
+#[repr(C)]
+#[derive(Default)]
+struct SwitchFrame {
+    gpr: ContextFrame,
+    float_saved: [u64; 8],
+    fcsr: u64,
 }
 
 /// `swap_context` — swap from the outgoing stack pointer (pointed to
@@ -101,17 +91,14 @@ extern "C" {
 /// # Safety
 ///
 /// `out_rsp_addr` must point at a valid, aligned `usize` that will be
-/// used to publish the saved stack pointer. `new_rsp` must be the top
-/// of a stack containing a `ContextFrame` laid out per the contract
-/// above.
-/// Wrapper that defers to `arch_swap_context` (a non-naked asm
-/// implementation).
-#[no_mangle]
-pub unsafe extern "C" fn swap_context(out_rsp_addr: *mut u64, new_rsp: u64) {
-    asm!(
-        "addi.d $sp, $sp, -104",
+/// used to publish the saved stack pointer. `new_rsp` must point to a stack
+/// initialized by [`seed_thread_frame`] or by a prior switch. Interrupts must
+/// be masked and kernel floating point must be enabled.
+#[unsafe(naked)]
+pub unsafe extern "C" fn swap_context(_out_rsp_addr: *mut u64, _new_rsp: u64) {
+    naked_asm!(
+        "addi.d $sp, $sp, -{frame_size}",
         "st.d $r1, $sp, 8",
-        "st.d $r3, $sp, 16",
         "st.d $r23, $sp, 24",
         "st.d $r24, $sp, 32",
         "st.d $r25, $sp, 40",
@@ -122,10 +109,19 @@ pub unsafe extern "C" fn swap_context(out_rsp_addr: *mut u64, new_rsp: u64) {
         "st.d $r30, $sp, 80",
         "st.d $r31, $sp, 88",
         "st.d $r22, $sp, 96",
-        "st.d $sp, {out}, 0",
-        "or $sp, {new}, $zero",
+        "fst.d $fs0, $sp, 104",
+        "fst.d $fs1, $sp, 112",
+        "fst.d $fs2, $sp, 120",
+        "fst.d $fs3, $sp, 128",
+        "fst.d $fs4, $sp, 136",
+        "fst.d $fs5, $sp, 144",
+        "fst.d $fs6, $sp, 152",
+        "fst.d $fs7, $sp, 160",
+        "movfcsr2gr $t0, $fcsr0",
+        "st.d $t0, $sp, 168",
+        "st.d $sp, $a0, 0",
+        "move $sp, $a1",
         "ld.d $r1, $sp, 8",
-        "ld.d $r3, $sp, 16",
         "ld.d $r23, $sp, 24",
         "ld.d $r24, $sp, 32",
         "ld.d $r25, $sp, 40",
@@ -136,21 +132,32 @@ pub unsafe extern "C" fn swap_context(out_rsp_addr: *mut u64, new_rsp: u64) {
         "ld.d $r30, $sp, 80",
         "ld.d $r31, $sp, 88",
         "ld.d $r22, $sp, 96",
+        "fld.d $fs0, $sp, 104",
+        "fld.d $fs1, $sp, 112",
+        "fld.d $fs2, $sp, 120",
+        "fld.d $fs3, $sp, 128",
+        "fld.d $fs4, $sp, 136",
+        "fld.d $fs5, $sp, 144",
+        "fld.d $fs6, $sp, 152",
+        "fld.d $fs7, $sp, 160",
+        "ld.d $t0, $sp, 168",
+        "movgr2fcsr $fcsr0, $t0",
+        "addi.d $sp, $sp, {frame_size}",
         "jirl $zero, $r1, 0",
-        out = in(reg) out_rsp_addr,
-        new = in(reg) new_rsp,
-        options(noreturn),
+        frame_size = const core::mem::size_of::<SwitchFrame>(),
     );
 }
 
-/// Assembly body for `swap_context`. (Reserved for future hand-tuned
-/// inline asm — `arch_swap_context` is currently implemented in pure
-/// Rust + `asm!`.)
-#[cfg(target_arch = "loongarch64")]
-mod asm_impl {
-    // Intentionally empty: the LA64 toolchain does not yet expose
-    // a stable `naked_asm!` macro, so we route through the asm!
-    // implementation in `arch_swap_context`.
+#[unsafe(naked)]
+unsafe extern "C" fn thread_start() -> ! {
+    naked_asm!(
+        "move $a0, $s0",
+        "ori $t0, $zero, 4",
+        "ori $t1, $zero, 4",
+        "csrxchg $t0, $t1, 0x0",
+        "jirl $ra, $s1, 0",
+        "break 0",
+    );
 }
 
 /// Fill a fresh `ContextFrame` so the thread starts executing
@@ -229,31 +236,21 @@ pub unsafe fn restore_context(frame: *const ContextFrame) {
 ///
 /// # Safety
 ///
-/// `stack_top` must point at writable memory holding at least
-/// `CONTEXT_FRAME_SIZE + 32` bytes below its address.
+/// `stack_top` must be 16-byte aligned, with a writable switch frame below it.
 pub unsafe extern "C" fn seed_thread_frame(stack_top: *mut u64, entry: u64, arg: u64) -> u64 {
-    let frame_addr = stack_top as u64 - CONTEXT_FRAME_SIZE as u64 - 32;
-    let start_data = frame_addr + CONTEXT_FRAME_SIZE as u64;
     unsafe {
-        (start_data as *mut u64).write_unaligned(entry);
-        (start_data as *mut u64).add(1).write_unaligned(arg);
-
-        let frame = frame_addr as *mut ContextFrame;
-        (*frame).r0 = 0;
-        (*frame).ra = core::ptr::addr_of!(__nt61_loongarch_thread_start) as u64;
-        (*frame).sp = start_data;
-        (*frame).s0 = 0;
-        (*frame).s1 = 0;
-        (*frame).s2 = 0;
-        (*frame).s3 = 0;
-        (*frame).s4 = 0;
-        (*frame).s5 = 0;
-        (*frame).s6 = 0;
-        (*frame).s7 = 0;
-        (*frame).s8 = 0;
-        (*frame).fp = 0;
+        let frame = stack_top.cast::<SwitchFrame>().sub(1);
+        frame.write(SwitchFrame {
+            gpr: ContextFrame {
+                ra: thread_start as *const () as u64,
+                s0: arg,
+                s1: entry,
+                ..ContextFrame::default()
+            },
+            ..SwitchFrame::default()
+        });
+        frame as u64
     }
-    frame_addr
 }
 
 /// `KiSwapContext` — full context switch with optional FPU save/restore.

@@ -12,12 +12,10 @@
 //! The on-stack register layout matches [`ContextFrame`] below, which
 //! is what the kernel allocates in every `ETHREAD.kthread.context`.
 
-use core::arch::asm;
+use core::arch::{asm, naked_asm};
 
 /// Minimal context frame stored at the top of each kernel stack when
-/// the thread is not running. The field offsets MUST match the
-/// `save_callee` / `restore_callee` macros in
-/// [`swap_context_rsp`].
+/// the thread is not running. The field offsets match [`swap_context_address_space`].
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ContextFrame {
@@ -33,11 +31,12 @@ pub struct ContextFrame {
     pub x28: u64,
     pub x29: u64, // FP
     pub x30: u64, // LR — for `ret` to land at the saved PC
+    pub d8_to_d15: [u64; 8],
 }
 
 impl ContextFrame {
     /// Size of the frame (in bytes).
-    pub const SIZE: usize = 12 * 8;
+    pub const SIZE: usize = core::mem::size_of::<Self>();
 }
 
 /// RSP-based swap context — the everyday kernel call.
@@ -61,28 +60,40 @@ impl ContextFrame {
 /// - Both stacks must be valid and large enough to hold a
 ///   [`ContextFrame`].
 /// - Interrupts must be disabled.
-#[no_mangle]
-pub unsafe extern "C" fn swap_context(_out_rsp: *mut u64, _new_rsp: u64) {
-    unsafe {
-        asm!(
-            // Save callee-saved registers onto the outgoing kernel
-            // stack, then drop into a fresh context frame. The
-            // first dpc ("downward push") will land *above* the
-            // current SP; we then update SP to point below the
-            // frame.
-            //
-            // We don't have a separate push because the dispatcher
-            // allocates the frame lazily through `seed_thread_frame`.
-            "sub  sp, sp, #96", // 12 * 8
+pub unsafe fn swap_context(out_rsp: *mut u64, new_rsp: u64) {
+    swap_context_address_space(out_rsp, new_rsp, 0);
+}
+
+/// Switch stacks and optionally install the incoming physical page-table root.
+///
+/// # Safety
+/// The requirements of [`swap_context`] apply. Switch code must be mapped in
+/// both roots, with each stack mapped in its own root.
+#[unsafe(naked)]
+pub unsafe extern "C" fn swap_context_address_space(_out_rsp: *mut u64, _new_rsp: u64, _root: u64) {
+    naked_asm!(
+            "sub  sp, sp, #{frame_size}",
             "stp  x19, x20, [sp, #0x00]",
             "stp  x21, x22, [sp, #0x10]",
             "stp  x23, x24, [sp, #0x20]",
             "stp  x25, x26, [sp, #0x30]",
             "stp  x27, x28, [sp, #0x40]",
             "stp  x29, x30, [sp, #0x50]",
+            "stp  d8, d9, [sp, #0x60]",
+            "stp  d10, d11, [sp, #0x70]",
+            "stp  d12, d13, [sp, #0x80]",
+            "stp  d14, d15, [sp, #0x90]",
             "mov  x4, sp",
-            "str  x4, [x0]", // *out_rsp = sp
-            // Restore the incoming frame and `ret` into it.
+            "str  x4, [x0]",
+            "cbz  x2, 2f",
+            "dsb  ishst",
+            "msr  ttbr1_el1, x2",
+            "msr  ttbr0_el1, x2",
+            "isb",
+            "tlbi vmalle1is",
+            "dsb  ish",
+            "isb",
+            "2:",
             "mov  sp, x1",
             "ldp  x19, x20, [sp, #0x00]",
             "ldp  x21, x22, [sp, #0x10]",
@@ -90,13 +101,19 @@ pub unsafe extern "C" fn swap_context(_out_rsp: *mut u64, _new_rsp: u64) {
             "ldp  x25, x26, [sp, #0x30]",
             "ldp  x27, x28, [sp, #0x40]",
             "ldp  x29, x30, [sp, #0x50]",
-            "add  sp, sp, #96",
+            "ldp  d8, d9, [sp, #0x60]",
+            "ldp  d10, d11, [sp, #0x70]",
+            "ldp  d12, d13, [sp, #0x80]",
+            "ldp  d14, d15, [sp, #0x90]",
+            "add  sp, sp, #{frame_size}",
             "ret",
-            // We never return through Rust ABI; the `ret` jumps
-            // into the saved LR of the incoming thread.
-            options(noreturn),
-        );
-    }
+            frame_size = const ContextFrame::SIZE,
+    );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn thread_start() -> ! {
+    naked_asm!("mov x0, x19", "msr daifclr, #2", "blr x20", "brk #0");
 }
 
 /// Seed a brand-new thread's kernel stack with a [`ContextFrame`]
@@ -112,33 +129,13 @@ pub unsafe extern "C" fn swap_context(_out_rsp: *mut u64, _new_rsp: u64) {
 #[no_mangle]
 pub unsafe extern "C" fn seed_thread_frame(stack_top: *mut u64, entry: u64, arg: u64) -> u64 {
     unsafe {
-        // The kernel pushes the frame "downward" by the asm above
-        // (sub sp). The frame's top-of-stack address is therefore
-        // the address `stack_top - ContextFrame::SIZE`. We
-        // pre-populate so that the asm `ldp`/`ret` reads valid
-        // values.
         let frame_addr = stack_top as u64 - ContextFrame::SIZE as u64;
-        // The frame layout (matching the asm above, low-to-high):
-        //   [0]  x19, [1]  x20, ...
-        //   [10] x29, [11] x30  (LR — must point at `entry`)
-        // We pass `arg` in x19 which is where the entry expects it.
-        let frame = frame_addr as *mut u64;
-        frame.add(0).write(0); // x19
-        frame.add(1).write(0); // x20
-        frame.add(2).write(0); // x21
-        frame.add(3).write(0); // x22
-        frame.add(4).write(0); // x23
-        frame.add(5).write(0); // x24
-        frame.add(6).write(0); // x25
-        frame.add(7).write(0); // x26
-        frame.add(8).write(0); // x27
-        frame.add(9).write(0); // x28
-        frame.add(10).write(0); // x29 (FP)
-        frame.add(11).write(entry); // x30 (LR) -> entry
-                                    // Patch x19 in the frame to `arg` after the writes are
-                                    // committed. x19 is the first callee-saved arg register
-                                    // for an `extern "C" fn(u64)` per AAPCS.
-        frame.add(0).write(arg); // x19 = arg
+        (frame_addr as *mut ContextFrame).write(ContextFrame {
+            x19: arg,
+            x20: entry,
+            x30: thread_start as *const () as u64,
+            ..ContextFrame::default()
+        });
         frame_addr
     }
 }

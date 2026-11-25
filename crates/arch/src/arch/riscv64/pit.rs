@@ -39,14 +39,7 @@ pub fn time() -> u64 {
 /// SBI call: set timer.
 pub fn sbi_set_timer(stime_value: u64) {
     unsafe {
-        asm!(
-            "mv a0, {v}",
-            "li a7, 0",
-            "li a6, 0",
-            "ecall",
-            v = in(reg) stime_value,
-            options(nostack),
-        );
+        super::sbi::set_timer(stime_value);
     }
 }
 

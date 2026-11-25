@@ -1,35 +1,37 @@
-//! LoongArch 64 PIT (timer)
+//! LoongArch64 constant timer.
 use core::arch::asm;
-use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-static TIMER_BASE: AtomicU64 = AtomicU64::new(0);
-
-pub fn init(base: u64) {
-    crate::arch::loongarch64::paging::vector_page_check("pit_init");
-    let mapped_base = if crate::arch::loongarch64::paging::paging_enabled() {
-        crate::arch::loongarch64::paging::mmio_virt(base)
-    } else {
-        base
+pub fn init() {
+    const ENABLE_PERIODIC: u64 = 0b11;
+    let base_frequency = cpu_config(4) as u64;
+    let ratio = cpu_config(5);
+    let multiplier = u64::from(ratio & 0xffff);
+    let divisor = u64::from(ratio >> 16);
+    let Some(frequency) = (base_frequency * multiplier).checked_div(divisor) else {
+        return;
     };
-    TIMER_BASE.store(mapped_base, Ordering::Release);
+    let interval = (frequency / u64::from(crate::ke::time::TICKS_PER_SECOND)) & !0b11;
+    if interval == 0 {
+        return;
+    }
+    unsafe {
+        asm!("csrwr {value}, 0x44", value = inout(reg) 1u64 => _, options(nostack));
+        asm!("csrwr {value}, 0x41", value = inout(reg) interval | ENABLE_PERIODIC => _, options(nostack));
+    }
 }
 
-pub fn set_compare(deadline: u64) {
-    let b = TIMER_BASE.load(Ordering::Acquire);
-    if b != 0 {
-        unsafe {
-            ptr::write_volatile((b + 0x40) as *mut u64, deadline);
-        }
+fn cpu_config(index: u32) -> u32 {
+    let value: u64;
+    unsafe {
+        asm!("cpucfg {value}, {index}", value = out(reg) value, index = in(reg) u64::from(index), options(nostack));
     }
+    value as u32
 }
 
 pub fn read_count() -> u64 {
-    let b = TIMER_BASE.load(Ordering::Acquire);
-    if b == 0 {
-        return 0;
-    }
-    unsafe { ptr::read_volatile(b as *const u64) }
+    let value: u64;
+    unsafe { asm!("rdtime.d {value}, $zero", value = out(reg) value, options(nostack)); }
+    value
 }
 
 /// Approximate busy-wait loop used by Phase-1 syscalls.
@@ -45,11 +47,4 @@ pub fn busy_wait_100ns(intervals: u64) {
     for _ in 0..iters {
         core::hint::spin_loop();
     }
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-unsafe fn _keep() {
-    let _ = asm!("nop");
 }

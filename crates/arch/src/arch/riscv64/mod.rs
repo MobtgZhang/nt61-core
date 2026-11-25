@@ -64,16 +64,6 @@ pub const PAGE_SHIFT: usize = 12;
 /// exception vector (so any subsequent code path is protected),
 /// then trap glue, then the rest of the platform.
 pub fn init() {
-    // The firmware may leave `satp` in Sv48/Sv39 while the kernel is
-    // running with a physical/identity address layout. Reset to Bare
-    // before any subsystem reads MMIO. The memory manager installs
-    // Sv39 later, and RISC-V paging keeps identity mappings for
-    // bootstrap MMIO.
-    unsafe {
-        asm!("csrw satp, {}", in(reg) 0u64, options(nostack));
-        asm!("sfence.vma", options(nostack));
-    }
-
     // Interrupts must remain globally disabled until the trap stack
     // and `sscratch` are installed. Individual `sie` bits may still
     // be programmed later without making them deliverable.
@@ -124,8 +114,6 @@ pub fn init() {
 
     unsafe {
         crate::boot_debug_println!("[RISCV] csr init start");
-        crate::boot_debug_println!("[RISCV] satp reset done");
-
         // Enable the supervisor timer and external interrupts at
         // the `sie` level. The `sstatus.SIE` global enable is left
         // off (handled by `enable_interrupts`).

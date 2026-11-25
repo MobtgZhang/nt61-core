@@ -58,7 +58,7 @@
 //!
 //! This matches the call site at `ke/scheduler.rs:1395`.
 
-use core::arch::asm;
+use core::arch::{asm, naked_asm};
 
 /// Size in bytes of one [`ContextFrame`] slot.
 pub const CONTEXT_FRAME_SIZE: usize = 128;
@@ -101,6 +101,15 @@ pub type ContextFramePtr = *mut ContextFrame;
 /// Pointer-sized `*mut ContextFrame`.
 pub type RawContextPtr = usize;
 
+#[repr(C)]
+#[derive(Default)]
+struct SwitchFrame {
+    ra: u64,
+    saved: [u64; 12],
+    float_saved: [u64; 12],
+    fcsr: u64,
+}
+
 /// `swap_context` — swap from the outgoing stack pointer (pointed to
 /// by `out_rsp_addr`) to the incoming stack pointer (`new_rsp`).
 ///
@@ -113,61 +122,77 @@ pub type RawContextPtr = usize;
 ///
 /// `out_rsp_addr` must point at a valid, aligned `usize` that will
 /// be used to publish the saved stack pointer. `new_rsp` must be
-/// the top of a stack containing a [`ContextFrame`] laid out per
-/// the contract above. Interrupts must be disabled at the call
-/// site.
-#[no_mangle]
+/// the top of a stack initialized by [`seed_thread_frame`] or by a prior switch.
+/// Interrupts must be masked and supervisor floating point must be enabled.
+#[unsafe(naked)]
 pub unsafe extern "C" fn swap_context(_out_rsp_addr: *mut u64, _new_rsp: u64) {
-    asm!(
-        // ---- Save the outgoing thread ----
-        // Allocate 128 bytes (= CONTEXT_FRAME_SIZE) on the outgoing
-        // stack and store the callee-saved registers at fixed
-        // offsets.
-        "addi  sp, sp, -128",
+    naked_asm!(
+        "addi  sp, sp, -{frame_size}",
         "sd    ra,   0(sp)",
-        "sd    sp,   8(sp)", // sp here is *decremented* sp
-        "sd    gp,   16(sp)",
-        "sd    tp,   24(sp)",
-        "sd    s0,   32(sp)",
-        "sd    s1,   40(sp)",
-        "sd    s2,   48(sp)",
-        "sd    s3,   56(sp)",
-        "sd    s4,   64(sp)",
-        "sd    s5,   72(sp)",
-        "sd    s6,   80(sp)",
-        "sd    s7,   88(sp)",
-        "sd    s8,   96(sp)",
-        "sd    s9,   104(sp)",
-        "sd    s10,  112(sp)",
-        "sd    s11,  120(sp)",
-        // Publish the saved sp to *out_rsp_addr.
-        "mv    t0, sp",
-        "sd    t0, 0(a0)",
-        // ---- Restore the incoming thread ----
-        // Switch to the new stack and load the callee-saved set.
+        "sd    s0,   8(sp)",
+        "sd    s1,   16(sp)",
+        "sd    s2,   24(sp)",
+        "sd    s3,   32(sp)",
+        "sd    s4,   40(sp)",
+        "sd    s5,   48(sp)",
+        "sd    s6,   56(sp)",
+        "sd    s7,   64(sp)",
+        "sd    s8,   72(sp)",
+        "sd    s9,   80(sp)",
+        "sd    s10,  88(sp)",
+        "sd    s11,  96(sp)",
+        "fsd   fs0,  104(sp)",
+        "fsd   fs1,  112(sp)",
+        "fsd   fs2,  120(sp)",
+        "fsd   fs3,  128(sp)",
+        "fsd   fs4,  136(sp)",
+        "fsd   fs5,  144(sp)",
+        "fsd   fs6,  152(sp)",
+        "fsd   fs7,  160(sp)",
+        "fsd   fs8,  168(sp)",
+        "fsd   fs9,  176(sp)",
+        "fsd   fs10, 184(sp)",
+        "fsd   fs11, 192(sp)",
+        "frcsr t0",
+        "sd    t0, 200(sp)",
+        "sd    sp, 0(a0)",
         "mv    sp, a1",
         "ld    ra,   0(sp)",
-        "ld    sp,   8(sp)", // sp is restored *from* the frame
-        "ld    gp,   16(sp)",
-        "ld    tp,   24(sp)",
-        "ld    s0,   32(sp)",
-        "ld    s1,   40(sp)",
-        "ld    s2,   48(sp)",
-        "ld    s3,   56(sp)",
-        "ld    s4,   64(sp)",
-        "ld    s5,   72(sp)",
-        "ld    s6,   80(sp)",
-        "ld    s7,   88(sp)",
-        "ld    s8,   96(sp)",
-        "ld    s9,   104(sp)",
-        "ld    s10,  112(sp)",
-        "ld    s11,  120(sp)",
-        "addi  sp, sp, 128",
+        "ld    s0,   8(sp)",
+        "ld    s1,   16(sp)",
+        "ld    s2,   24(sp)",
+        "ld    s3,   32(sp)",
+        "ld    s4,   40(sp)",
+        "ld    s5,   48(sp)",
+        "ld    s6,   56(sp)",
+        "ld    s7,   64(sp)",
+        "ld    s8,   72(sp)",
+        "ld    s9,   80(sp)",
+        "ld    s10,  88(sp)",
+        "ld    s11,  96(sp)",
+        "fld   fs0,  104(sp)",
+        "fld   fs1,  112(sp)",
+        "fld   fs2,  120(sp)",
+        "fld   fs3,  128(sp)",
+        "fld   fs4,  136(sp)",
+        "fld   fs5,  144(sp)",
+        "fld   fs6,  152(sp)",
+        "fld   fs7,  160(sp)",
+        "fld   fs8,  168(sp)",
+        "fld   fs9,  176(sp)",
+        "fld   fs10, 184(sp)",
+        "fld   fs11, 192(sp)",
+        "ld    t0, 200(sp)",
+        "fscsr t0",
+        "addi  sp, sp, {frame_size}",
         "ret",
-        // The `ret` jumps to the saved `ra` of the incoming thread.
-        // We never return through the Rust ABI.
-        options(noreturn),
+        frame_size = const core::mem::size_of::<SwitchFrame>(),
     );
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn thread_start() -> ! {
+    naked_asm!("mv a0, s0", "csrsi sstatus, 2", "jalr s1", "unimp");
 }
 
 /// Fill a fresh [`ContextFrame`] so the thread starts executing
@@ -369,33 +394,23 @@ unsafe fn restore_context_from_cpu_context(incoming: *const super::context::CpuC
     );
 }
 
-/// Seed a brand-new thread's kernel stack with a [`ContextFrame`]
-/// that will run `entry(arg)`.
-///
-/// The frame is placed at `*stack_top` (which is then advanced
-/// downward by [`ContextFrame::SIZE`]) so the next `swap_context`
-/// to that thread will switch into `entry(arg)`.
+/// Seed a new kernel stack so its first switch runs `entry(arg)`.
 ///
 /// # Safety
 ///
-/// `stack_top` must point at writable memory holding at least
-/// [`ContextFrame::SIZE`] bytes of stack space.
+/// `stack_top` must be 16-byte aligned, with a writable switch frame below it.
 #[no_mangle]
 pub unsafe extern "C" fn seed_thread_frame(stack_top: *mut u64, entry: u64, arg: u64) -> u64 {
     unsafe {
-        // The kernel `swap_context` pushes the frame downward by
-        // `CONTEXT_FRAME_SIZE`, so the frame's top-of-stack address
-        // is `stack_top - CONTEXT_FRAME_SIZE`. We pre-populate so
-        // that the asm `ld`/`ret` reads valid values.
-        let frame_addr = stack_top as u64 - ContextFrame::SIZE as u64;
-        let frame = frame_addr as *mut u64;
-        // CpuContext field offsets used by save/restore above.
-        frame.add(1).write(entry); // ra  -> entry
-        frame.add(2).write(stack_top as u64); // sp = stack_top
-        frame.add(3).write(0); // gp
-        frame.add(4).write(arg); // tp -> arg
-                                 // s0..s11 are callee-saved, init to 0
-        frame_addr
+        let frame = stack_top.cast::<SwitchFrame>().sub(1);
+        let mut initial = SwitchFrame {
+            ra: thread_start as *const () as u64,
+            ..SwitchFrame::default()
+        };
+        initial.saved[0] = arg;
+        initial.saved[1] = entry;
+        frame.write(initial);
+        frame as u64
     }
 }
 

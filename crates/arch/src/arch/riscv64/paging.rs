@@ -30,6 +30,7 @@ use crate::mm::pte::pfn_to_phys;
 pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_SHIFT: u64 = 12;
 pub const PAGE_MASK: u64 = !(PAGE_SIZE - 1);
+const SATP_MODE_SV39: u64 = 8 << 60;
 
 pub type VirtAddr = u64;
 pub type PhysAddr = u64;
@@ -878,10 +879,7 @@ pub unsafe fn load_page_root(pml4_pfn: u64) {
     // existing guard only fills invalid windows, so run it on every
     // switch to fill those missing pages without replacing valid ones.
     prepare_switch_mappings_if_needed(pml4_pfn);
-    let switch_pa = pa;
-    // satp = MODE (from sv48::choose_mode) << 60 | ASID (0) << 44 | PPN
-    let mode = crate::arch::riscv64::sv48::choose_mode();
-    let satp: u64 = mode | (switch_pa >> 12);
+    let satp = SATP_MODE_SV39 | (pa >> PAGE_SHIFT);
     let saved_sstatus: u64;
     asm!(
         "csrr {}, sstatus",
@@ -1269,10 +1267,16 @@ pub fn identity_map_region(pa: u64, size: u64) -> bool {
     true
 }
 
-/// Architecture init hook for paging. Phase 1 leaves `satp` in
-/// bare mode; Phase 2 installs a real Sv39 (or Sv48) page table.
-///
-/// `mm::vm::init` calls this via the `paging_impl::init` alias.
+/// Start building the kernel's Sv39 tables from the identity-mapped handoff.
+pub fn init_bootstrap() {
+    super::idt::install_vector();
+    unsafe {
+        asm!("csrci sstatus, 2", "csrw satp, zero", "sfence.vma", options(nostack));
+    }
+    init();
+}
+
+/// Use the active kernel root or initialise the bootstrap table in Bare mode.
 pub fn init() {
     unsafe {
         // If the MMU is already translating (firmware Sv39), adopt the

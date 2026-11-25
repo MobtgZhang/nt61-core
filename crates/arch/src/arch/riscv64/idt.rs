@@ -212,12 +212,18 @@ pub fn trap_entry_addr() -> u64 {
     stvec_trap as *const () as u64
 }
 
-/// Install the `stvec` handler.
-pub fn init() {
+pub(super) fn install_vector() {
     unsafe {
         let v = stvec_trap as *const () as u64;
         asm!("csrw stvec, {}", in(reg) v, options(nostack));
         asm!("csrw sscratch, zero", options(nostack));
+    }
+}
+
+/// Install the `stvec` handler and enable supervisor software interrupts.
+pub fn init() {
+    install_vector();
+    unsafe {
         // Every AP installs this vector. Enable SBI software interrupts here
         // before its idle loop can wait with global interrupts enabled.
         asm!("csrsi sie, 2", options(nostack));
