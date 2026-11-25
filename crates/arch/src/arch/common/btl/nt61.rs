@@ -188,17 +188,65 @@ pub struct DirectoryEntry {
     pub write_time: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DcExtent {
+    Window,
+    Viewport,
+}
+
+pub type FontEnumeration = ([u8; 92], [u8; 60]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketKind {
+    TcpV4,
+    UdpV4,
+}
+
 pub trait GuestServices {
+    fn select_file_view(&mut self, _redirection_enabled: bool) {}
+    fn resolve_ipv4(&mut self, _name: &str) -> Result<[u8; 4], u32> { Err(11003) }
+    fn open_socket(&mut self, _kind: SocketKind) -> Result<u64, u32> { Err(10050) }
+    fn close_socket(&mut self, _handle: u64) -> Result<(), u32> { Err(10038) }
+    fn connect_tcp(&mut self, _handle: u64, _ip: [u8; 4], _port: u16) -> Result<(), u32> { Err(10045) }
+    fn send_tcp(&mut self, _handle: u64, _bytes: &[u8]) -> Result<usize, u32> { Err(10045) }
+    fn recv_tcp(&mut self, _handle: u64, _bytes: &mut [u8]) -> Result<usize, u32> { Err(10045) }
+    fn close_sockets(&mut self) {}
     /// Unnamed, non-inheritable events owned by this guest context. Handles
     /// returned here must not expose a backend/kernel handle to guest code.
     fn create_event(&mut self, _manual: bool, _signaled: bool) -> Result<u64, u32> { Err(STATUS_NOT_IMPLEMENTED) }
     fn change_event(&mut self, _handle: u64, _signaled: bool) -> Result<(), u32> { Err(STATUS_NOT_IMPLEMENTED) }
     /// Non-alertable NT wait, with a captured optional 100-ns deadline.
     fn wait_event(&mut self, _handle: u64, _timeout: Option<i64>) -> Result<u32, u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn validate_wait_event(&self, _handle: u64) -> Result<(), u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn poll_events(&mut self, _handles: &[u64], _all: bool) -> Result<u32, u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn create_memory_dc(&mut self, _source: u64) -> Option<u64> { None }
+    fn delete_memory_dc(&mut self, _handle: u64) -> bool { false }
+    fn device_caps(&mut self, _handle: u64, _index: i32) -> Option<u32> { None }
+    fn draw_text_layout(&mut self, _handle: u64, _clip: Option<[i32; 4]>, _lines: &[(i32, i32, &[u16])]) -> bool { false }
+    fn create_font_w(&mut self, _description: &[u8; 92]) -> Option<u64> { None }
+    fn select_font(&mut self, _dc: u64, _font: u64) -> Option<u64> { None }
+    fn delete_font(&mut self, _font: u64) -> bool { false }
+    fn enumerate_fonts_w(&mut self, _dc: u64, _family: Option<&str>) -> Option<alloc::vec::Vec<FontEnumeration>> { None }
+    fn text_metrics_w(&mut self, _handle: u64) -> Option<[u8; 60]> { None }
+    fn text_face_w(&mut self, _handle: u64) -> Option<alloc::vec::Vec<u16>> { None }
+    fn text_extent_w(&mut self, _handle: u64, _text: &[u16]) -> Option<[i32; 2]> { None }
+    fn set_bk_mode(&mut self, _handle: u64, _mode: i32) -> Option<i32> { None }
+    fn set_map_mode(&mut self, _handle: u64, _mode: i32) -> Option<i32> { None }
+    fn set_dc_extent(&mut self, _handle: u64, _kind: DcExtent, _extent: [i32; 2]) -> Option<(bool, [i32; 2])> { None }
+    fn logical_to_device(&mut self, _handle: u64, _points: &mut [u8]) -> bool { false }
     fn create_directory(&mut self, _abi: GuestAbi, _path: &str) -> Result<(), u32> {
         Err(STATUS_NOT_IMPLEMENTED)
     }
     fn directory_entries(&mut self, _abi: GuestAbi, _path: &str) -> Result<Vec<DirectoryEntry>, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn file_attributes(&mut self, _abi: GuestAbi, _path: &str) -> Result<u32, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn set_file_attributes(&mut self, _abi: GuestAbi, _path: &str, _attributes: u32) -> Result<(), u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn set_file_times(&mut self, _handle: u64, _times: [Option<u64>; 3]) -> Result<(), u32> {
         Err(STATUS_NOT_IMPLEMENTED)
     }
     /// Local Application log backend availability; no remote RPC support.
@@ -218,8 +266,15 @@ pub trait GuestServices {
     fn random_bytes(&mut self, _bytes: &mut [u8]) -> Result<(), u32> { Err(STATUS_NOT_IMPLEMENTED) }
     /// Win32 FILE_TYPE_* of a live handle in this guest service context.
     fn file_type(&mut self, _handle: u64) -> Result<u32, u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn file_handle_flags(&mut self, _handle: u64) -> Result<u32, u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn cancel_file_io(&mut self, _handle: u64) -> Result<(), u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn file_size(&mut self, _handle: u64) -> Result<u64, u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn seek_file(&mut self, _handle: u64, _distance: i64, _origin: u32, _limit: u64) -> Result<u64, FileSeekError> {
+        Err(FileSeekError::Status(STATUS_NOT_IMPLEMENTED))
+    }
     fn printer_available(&mut self) -> bool { false }
     fn print_document(&mut self, _data: &[u8]) -> Result<u32,u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn message_beep(&mut self, _kind: u32) -> bool { false }
 
     /// Copied private desktop protocol. Never accepts a guest process pointer.
     fn desktop_dialog(&mut self, _request: &[u8]) -> Result<alloc::vec::Vec<u8>, u32> {
@@ -242,6 +297,18 @@ pub trait GuestServices {
     ) -> Result<alloc::vec::Vec<u8>, u32> {
         Err(0xc000_0135)
     }
+    fn read_system_library(
+        &mut self,
+        _name: &str,
+        _mode: super::ir::DecodeMode,
+    ) -> Result<alloc::vec::Vec<u8>, u32> {
+        Err(0xc000_0135)
+    }
+    fn resolve_library(&mut self, name: &str, mode: super::ir::DecodeMode, system: bool)
+        -> Result<super::pe::ResolvedLibrary, u32> {
+        let bytes = if system { self.read_system_library(name, mode) } else { self.read_library(name, mode) }?;
+        Ok(super::pe::ResolvedLibrary { bytes, path: None })
+    }
     /// Guest pointers remain addresses in `memory`; handlers must convert
     /// structures by guest bitness rather than cast them to native pointers.
     fn call(
@@ -251,6 +318,13 @@ pub trait GuestServices {
         args: &[u64],
         memory: &mut dyn GuestMemory,
     ) -> ServiceResult;
+}
+
+pub enum FileSeekError {
+    Status(u32),
+    SetStatus(u32),
+    NegativePosition,
+    PositionTooLarge,
 }
 
 pub fn dispatch(

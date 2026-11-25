@@ -547,7 +547,7 @@ pub(crate) fn calculate_tcp_checksum(src_ip: u32, dst_ip: u32, tcp_data: &[u8]) 
         if chunk.len() == 2 {
             sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
         } else {
-            sum += chunk[0] as u32;
+            sum += u32::from(chunk[0]) << 8;
         }
     }
 
@@ -872,11 +872,14 @@ fn handle_tcp_segment(
             }
 
             // handle FIN
-            if flags & tcp_flags::FIN != 0
-                && header.seq.wrapping_add(payload_len as u32) == tcb.rcv_nxt
-            {
-                tcb.rcv_nxt += 1;
+            let fin_received = flags & tcp_flags::FIN != 0
+                && header.seq.wrapping_add(payload_len as u32) == tcb.rcv_nxt;
+            if fin_received {
+                tcb.rcv_nxt = tcb.rcv_nxt.wrapping_add(1);
                 tcb.state = TcpState::CloseWait;
+                crate::netstack::socket::signal_readiness();
+            }
+            if fin_received || payload_len != 0 {
                 send_segment(tcb, tcp_flags::ACK, tcb.snd_nxt, tcb.rcv_nxt, None);
             }
         }
@@ -1114,7 +1117,7 @@ pub fn send(socket_id: u32, data: &[u8]) -> Option<usize> {
         .position(|tcb| tcb.socket_id == socket_id)?;
     let tcb = &mut connections[idx];
 
-    if tcb.state != TcpState::Established {
+    if !matches!(tcb.state, TcpState::Established | TcpState::CloseWait) {
         return None;
     }
 
@@ -1149,17 +1152,26 @@ pub fn send(socket_id: u32, data: &[u8]) -> Option<usize> {
 
 /// Receive data from a connection
 pub fn receive(socket_id: u32, buffer: &mut [u8]) -> Option<usize> {
+    receive_stream(socket_id, buffer).ok()
+}
+
+pub(super) enum StreamReceiveError {
+    Pending,
+    Reset,
+}
+
+pub(super) fn receive_stream(socket_id: u32, buffer: &mut [u8]) -> Result<usize, StreamReceiveError> {
     let mut connections = TCP_CONNECTIONS.lock();
     let tcb = connections
         .iter_mut()
-        .find(|tcb| tcb.socket_id == socket_id)?;
+        .find(|tcb| tcb.socket_id == socket_id).ok_or(StreamReceiveError::Reset)?;
 
     if tcb.state != TcpState::Established && tcb.state != TcpState::CloseWait {
-        return None;
+        return Err(StreamReceiveError::Reset);
     }
 
     if tcb.rx_buf.is_empty() {
-        return Some(0);
+        return if tcb.state == TcpState::CloseWait { Ok(0) } else { Err(StreamReceiveError::Pending) };
     }
 
     let copy_len = buffer.len().min(tcb.rx_buf.len());
@@ -1168,7 +1180,7 @@ pub fn receive(socket_id: u32, buffer: &mut [u8]) -> Option<usize> {
     // Remove received data from buffer
     tcb.rx_buf.drain(..copy_len);
 
-    Some(copy_len)
+    Ok(copy_len)
 }
 
 /// Get TCP statistics

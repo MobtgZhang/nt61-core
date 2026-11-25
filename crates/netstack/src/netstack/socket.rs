@@ -512,7 +512,10 @@ pub fn recv(socket_id: u32, buffer: &mut [u8]) -> Result<usize, SocketError> {
             SocketType::Stream => {
                 if let Some(tcp_id) = s.tcp_socket_id {
                     drop(sockets);
-                    tcp::receive(tcp_id, buffer).ok_or(SocketError::WouldBlock)
+                    tcp::receive_stream(tcp_id, buffer).map_err(|error| match error {
+                        tcp::StreamReceiveError::Pending => SocketError::WouldBlock,
+                        tcp::StreamReceiveError::Reset => SocketError::ConnectionReset,
+                    })
                 } else {
                     Err(SocketError::NotConnected)
                 }
@@ -632,6 +635,12 @@ pub fn close(socket_id: u32) -> Result<(), SocketError> {
         tcp::close_listen(local_ip, local_port);
     }
 
+    Ok(())
+}
+
+pub fn close_owned(socket_id: u32) -> Result<(), SocketError> {
+    close(socket_id)?;
+    remove(socket_id);
     Ok(())
 }
 

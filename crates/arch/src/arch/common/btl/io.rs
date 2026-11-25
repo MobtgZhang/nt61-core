@@ -1,9 +1,9 @@
-//! Checked NT 6.1 console and read-only file services for isolated PE guests.
+//! Checked NT 6.1 console and synchronous file services for isolated PE guests.
 //! All nested guest structures are copied by ABI; no address becomes a host pointer.
 use super::{
     abi::GuestAbi,
     memory::GuestMemory,
-    nt61::{self, BasicServices, GuestServices, Service, ServiceResult},
+    nt61::{self, BasicServices, GuestServices, Service, ServiceResult, SocketKind},
 };
 use alloc::{string::String, vec, vec::Vec};
 const INVALID_PARAMETER: u32 = 0xc000_000d;
@@ -11,22 +11,55 @@ const INVALID_HANDLE: u32 = 0xc000_0008;
 const ACCESS_DENIED: u32 = 0xc000_0022;
 const EOF: u32 = 0xc000_0011;
 const MAX_IO: usize = 65536;
+const FILE_WRITE_ATTRIBUTES: u64 = 0x100;
+const GENERIC_WRITE: u64 = 0x4000_0000;
 pub const STD_INPUT: u64 = 0x10;
 pub const STD_OUTPUT: u64 = 0x14;
 pub const STD_ERROR: u64 = 0x18;
 
 /// Host operations receive owned, validated values rather than guest pointers.
 pub trait IoHost {
+    fn resolve_ipv4(&mut self, _name: &str) -> Result<[u8; 4], u32> { Err(11003) }
+    fn open_socket(&mut self, _kind: SocketKind) -> Result<u32, u32> { Err(10050) }
+    fn close_socket(&mut self, _socket: u32) -> Result<(), u32> { Err(10038) }
+    fn connect_tcp(&mut self, _socket: u32, _ip: [u8; 4], _port: u16) -> Result<(), u32> { Err(10045) }
+    fn send_tcp(&mut self, _socket: u32, _bytes: &[u8]) -> Result<usize, u32> { Err(10045) }
+    fn recv_tcp(&mut self, _socket: u32, _bytes: &mut [u8]) -> Result<usize, u32> { Err(10045) }
     /// Backend event identifiers are private to IoServices and never guest
     /// handles. The creator retains ownership until close_event succeeds.
     fn create_event(&mut self, _manual: bool, _signaled: bool) -> Result<u64, u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
     fn change_event(&mut self, _event: u64, _signaled: bool) -> Result<(), u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
     fn wait_event(&mut self, _event: u64, _timeout: Option<i64>) -> Result<u32, u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn poll_events(&mut self, _events: &[u64], _all: bool) -> Result<u32, u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
     fn close_event(&mut self, _event: u64) -> Result<(), u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn create_memory_dc(&mut self, _source: u64) -> Option<u64> { None }
+    fn delete_memory_dc(&mut self, _dc: u64) -> bool { false }
+    fn device_caps(&mut self, _dc: u64, _index: i32) -> Option<u32> { None }
+    fn draw_text_layout(&mut self, _dc: u64, _clip: Option<[i32; 4]>, _lines: &[(i32, i32, &[u16])]) -> bool { false }
+    fn create_font_w(&mut self, _description: &[u8; 92]) -> Option<u64> { None }
+    fn select_font(&mut self, _dc: u64, _font: u64) -> Option<u64> { None }
+    fn delete_font(&mut self, _font: u64) -> bool { false }
+    fn enumerate_fonts_w(&mut self, _dc: u64, _family: Option<&str>) -> Option<Vec<nt61::FontEnumeration>> { None }
+    fn text_metrics_w(&mut self, _dc: u64) -> Option<[u8; 60]> { None }
+    fn text_face_w(&mut self, _dc: u64) -> Option<Vec<u16>> { None }
+    fn text_extent_w(&mut self, _dc: u64, _text: &[u16]) -> Option<[i32; 2]> { None }
+    fn set_bk_mode(&mut self, _dc: u64, _mode: i32) -> Option<i32> { None }
+    fn set_map_mode(&mut self, _dc: u64, _mode: i32) -> Option<i32> { None }
+    fn set_dc_extent(&mut self, _dc: u64, _kind: nt61::DcExtent, _extent: [i32; 2]) -> Option<(bool, [i32; 2])> { None }
+    fn logical_to_device(&mut self, _dc: u64, _points: &mut [u8]) -> bool { false }
     fn create_directory(&mut self, _path: &str) -> Result<(), u32> {
         Err(nt61::STATUS_NOT_IMPLEMENTED)
     }
     fn directory_entries(&mut self, _path: &str) -> Result<Vec<nt61::DirectoryEntry>, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn file_attributes(&mut self, _path: &str) -> Result<u32, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn set_file_attributes(&mut self, _path: &str, _attributes: u32) -> Result<(), u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn set_file_times(&mut self, _path: &str, _times: [Option<u64>; 3]) -> Result<(), u32> {
         Err(nt61::STATUS_NOT_IMPLEMENTED)
     }
     fn application_log_available(&mut self) -> bool { false }
@@ -40,6 +73,7 @@ pub trait IoHost {
     fn random_bytes(&mut self, _bytes: &mut [u8]) -> Result<(), u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
     fn printer_available(&mut self) -> bool { false }
     fn print_document(&mut self, _data: &[u8]) -> Result<u32,u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn message_beep(&mut self, _kind: u32) -> bool { false }
 
     /// Copied private desktop protocol. Never accepts a guest process pointer.
     fn desktop_dialog(&mut self, _request: &[u8]) -> Result<alloc::vec::Vec<u8>, u32> {
@@ -55,8 +89,27 @@ pub trait IoHost {
     fn read_library(&mut self, _name: &str, _mode: super::ir::DecodeMode) -> Result<Vec<u8>, u32> {
         Err(0xc000_0135)
     }
+    fn read_system_library(&mut self, _name: &str, _mode: super::ir::DecodeMode) -> Result<Vec<u8>, u32> {
+        Err(0xc000_0135)
+    }
+    fn resolve_library(&mut self, name: &str, mode: super::ir::DecodeMode, system: bool)
+        -> Result<super::pe::ResolvedLibrary, u32> {
+        let bytes = if system { self.read_system_library(name, mode) } else { self.read_library(name, mode) }?;
+        Ok(super::pe::ResolvedLibrary { bytes, path: None })
+    }
     fn open_read(&mut self, path: &str) -> Result<(), u32>;
+    fn open_file(&mut self, path: &str, disposition: u32, writable: bool, directory: bool) -> Result<(u64, bool), u32> {
+        if disposition != 1 || writable || directory {
+            return Err(nt61::STATUS_NOT_IMPLEMENTED);
+        }
+        self.open_read(path)?;
+        Ok((1, false))
+    }
+    fn file_size(&mut self, _path: &str) -> Result<u64, u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
     fn read_at(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>, u32>;
+    fn write_at(&mut self, _path: &str, _offset: u64, _bytes: &[u8]) -> Result<usize, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
     fn console_write(&mut self, bytes: &[u8]) -> Result<(), u32>;
     /// NT wall time and monotonic uptime in 100-ns units respectively.
     fn clocks(&mut self) -> Result<(u64, u64), u32> {
@@ -69,13 +122,29 @@ pub trait IoHost {
 }
 struct File {
     handle: u64,
+    inheritable: bool,
     path: String,
     position: u64,
+    readable: bool,
+    writable: bool,
+    write_attributes: bool,
+    directory: bool,
 }
+struct GuestSocket {
+    handle: u64,
+    backend: u32,
+    kind: SocketKind,
+    connected: bool,
+}
+
 pub struct IoServices<H: IoHost> {
     pub host: H,
     files: Vec<File>,
     events: Vec<(u64, u64)>, // guest handle, backend-owned event identifier
+    sockets: Vec<GuestSocket>,
+    memory_dcs: Vec<(u64, u64)>,
+    fonts: Vec<(u64, u64)>,
+    stock_font: Option<(u64, u64)>,
     next_handle: u64,
     fs_redirection: bool,
 }
@@ -85,6 +154,10 @@ impl<H: IoHost> IoServices<H> {
             host,
             files: Vec::new(),
             events: Vec::new(),
+            sockets: Vec::new(),
+            memory_dcs: Vec::new(),
+            fonts: Vec::new(),
+            stock_font: None,
             next_handle: 0x100,
             fs_redirection: true,
         }
@@ -94,6 +167,19 @@ impl<H: IoHost> IoServices<H> {
     pub fn set_fs_redirection(&mut self, enabled: bool) -> bool {
         core::mem::replace(&mut self.fs_redirection, enabled)
     }
+
+    fn tcp_index(&self, handle: u64) -> Result<usize, u32> {
+        let index = self.sockets.iter().position(|socket| socket.handle == handle).ok_or(10038u32)?;
+        if self.sockets[index].kind != SocketKind::TcpV4 { return Err(10045); }
+        Ok(index)
+    }
+
+    fn connected_tcp(&self, handle: u64) -> Result<u32, u32> {
+        let socket = &self.sockets[self.tcp_index(handle)?];
+        if !socket.connected { return Err(10057); }
+        Ok(socket.backend)
+    }
+
     fn invoke(
         &mut self,
         abi: GuestAbi,
@@ -127,15 +213,19 @@ impl<H: IoHost> IoServices<H> {
                 Ok(0)
             }
             Service::CreateFile => {
-                // FILE_OPEN, synchronous read-only file, no EA or allocation hint.
-                if a[7] != 1 || a[4] != 0 || a[9] != 0 || a[10] != 0 {
+                if !(1..=5).contains(&a[7]) || a[4] != 0 || a[9] != 0 || a[10] != 0 {
                     return Err(nt61::STATUS_NOT_IMPLEMENTED);
                 }
-                if a[1] & !(0x8000_0000 | 0x0012_0089) != 0 {
+                if a[1] & !(0xc000_0000 | 0x0012_019f) != 0 {
                     return Err(ACCESS_DENIED);
                 }
-                if a[8] & !0x60 != 0 || a[8] & 0x30 == 0 || a[6] & !7 != 0 {
+                if a[8] & !0x0000_4074 != 0 || !matches!(a[8] & 0x30, 0x10 | 0x20) || a[6] & !7 != 0 {
                     return Err(nt61::STATUS_NOT_IMPLEMENTED);
+                }
+                let readable = a[1] & 0x8000_0001 != 0;
+                let can_write = a[1] & 0x4000_0002 != 0;
+                if matches!(a[7], 4 | 5) && !can_write {
+                    return Err(ACCESS_DENIED);
                 }
                 writable(m, a[0], width)?;
                 writable(m, a[3], width * 2)?;
@@ -148,7 +238,7 @@ impl<H: IoHost> IoServices<H> {
                 let attributes = word(&oa, if width == 4 { 12 } else { 24 }, 4);
                 let sd = word(&oa, if width == 4 { 16 } else { 32 }, width);
                 let sqos = word(&oa, if width == 4 { 20 } else { 40 }, width);
-                if root != 0 || sd != 0 || sqos != 0 || attributes & !0x40 != 0 {
+                if root != 0 || sd != 0 || sqos != 0 || attributes & !0x42 != 0 {
                     return Err(nt61::STATUS_NOT_IMPLEMENTED);
                 }
                 let us = read(m, name, if width == 4 { 8 } else { 16 })?;
@@ -175,18 +265,23 @@ impl<H: IoHost> IoServices<H> {
                     return Err(0xc000_011f);
                 }
                 let path = guest_file_path(abi, path, self.fs_redirection)?;
-                self.host.open_read(&path)?;
                 let handle = self.next_handle;
                 let next = handle
                     .checked_add(4)
                     .filter(|n| *n <= u32::MAX as u64)
                     .ok_or(0xc000_011fu32)?;
+                let (information, directory) = self.host.open_file(&path, a[7] as u32, can_write, a[8] & 0x4040 == 0x4000)?;
                 put(m, a[0], handle, width)?;
-                iosb(m, a[3], width, 0, 1)?; // FILE_OPENED
+                iosb(m, a[3], width, 0, information)?;
                 self.files.push(File {
                     handle,
+                    inheritable: attributes & 2 != 0,
                     path,
                     position: 0,
+                    readable,
+                    writable: can_write,
+                    write_attributes: a[1] & (GENERIC_WRITE | FILE_WRITE_ATTRIBUTES) != 0,
+                    directory,
                 });
                 self.next_handle = next;
                 Ok(0)
@@ -218,14 +313,11 @@ impl<H: IoHost> IoServices<H> {
                     return Err(nt61::STATUS_NOT_IMPLEMENTED);
                 }
                 let len = usize::try_from(a[6]).map_err(|_| INVALID_PARAMETER)?;
-                if len > MAX_IO {
+                if service == Service::WriteFile && len > MAX_IO {
                     return Err(INVALID_PARAMETER);
                 }
                 writable(m, a[4], width * 2)?;
-                if service == Service::WriteFile {
-                    if a[0] != STD_OUTPUT && a[0] != STD_ERROR {
-                        return Err(INVALID_HANDLE);
-                    }
+                if service == Service::WriteFile && matches!(a[0], STD_OUTPUT | STD_ERROR) {
                     if a[7] != 0 {
                         return Err(INVALID_PARAMETER);
                     }
@@ -239,7 +331,10 @@ impl<H: IoHost> IoServices<H> {
                     .iter_mut()
                     .find(|f| f.handle == a[0])
                     .ok_or(INVALID_HANDLE)?;
-                writable(m, a[5], len)?;
+                if file.directory || (service == Service::WriteFile && !file.writable)
+                    || (service == Service::ReadFile && !file.readable) {
+                    return Err(ACCESS_DENIED);
+                }
                 let offset = if a[7] == 0 {
                     file.position
                 } else {
@@ -253,18 +348,39 @@ impl<H: IoHost> IoServices<H> {
                         raw
                     }
                 };
-                let bytes = self.host.read_at(&file.path, offset, len)?;
-                if bytes.len() > len {
-                    return Err(0xc000_0185);
+                if service == Service::WriteFile {
+                    offset.checked_add(len as u64).filter(|end| *end <= i64::MAX as u64)
+                        .ok_or(INVALID_PARAMETER)?;
+                    let bytes = if len == 0 { Vec::new() } else { read(m, a[5], len)? };
+                    let count = self.host.write_at(&file.path, offset, &bytes)?;
+                    if count > len { return Err(0xc000_0185); }
+                    iosb(m, a[4], width, 0, count as u64)?;
+                    file.position = offset + count as u64;
+                    return Ok(0);
+                }
+                writable(m, a[5], len)?;
+                let mut transferred = 0;
+                while transferred < len {
+                    let count = (len - transferred).min(MAX_IO);
+                    let chunk_offset = offset.checked_add(transferred as u64).ok_or(INVALID_PARAMETER)?;
+                    let address = a[5].checked_add(transferred as u64).ok_or(INVALID_PARAMETER)?;
+                    let bytes = self.host.read_at(&file.path, chunk_offset, count)?;
+                    if bytes.len() > count {
+                        return Err(0xc000_0185);
+                    }
+                    if !bytes.is_empty() && !m.write_virt(address, &bytes) {
+                        return Err(nt61::STATUS_ACCESS_VIOLATION);
+                    }
+                    transferred += bytes.len();
+                    if bytes.len() < count {
+                        break;
+                    }
                 }
                 let end = offset
-                    .checked_add(bytes.len() as u64)
+                    .checked_add(transferred as u64)
                     .ok_or(INVALID_PARAMETER)?;
-                if !m.write_virt(a[5], &bytes) {
-                    return Err(nt61::STATUS_ACCESS_VIOLATION);
-                }
-                let status = if len != 0 && bytes.is_empty() { EOF } else { 0 };
-                iosb(m, a[4], width, status, bytes.len() as u64)?;
+                let status = if len != 0 && transferred == 0 { EOF } else { 0 };
+                iosb(m, a[4], width, status, transferred as u64)?;
                 file.position = end;
                 Ok(status)
             }
@@ -274,10 +390,65 @@ impl<H: IoHost> IoServices<H> {
 }
 impl<H: IoHost> Drop for IoServices<H> {
     fn drop(&mut self) {
+        self.close_sockets();
         for (_, event) in self.events.drain(..) { let _ = self.host.close_event(event); }
+        for (_, dc) in self.memory_dcs.drain(..) { self.host.delete_memory_dc(dc); }
+        for (_, font) in self.fonts.drain(..) { self.host.delete_font(font); }
     }
 }
 impl<H: IoHost> GuestServices for IoServices<H> {
+    fn select_file_view(&mut self, redirection_enabled: bool) {
+        self.set_fs_redirection(redirection_enabled);
+    }
+
+    fn resolve_ipv4(&mut self, name: &str) -> Result<[u8; 4], u32> {
+        self.host.resolve_ipv4(name)
+    }
+
+    fn open_socket(&mut self, kind: SocketKind) -> Result<u64, u32> {
+        if self.sockets.len() >= 256 { return Err(10024); }
+        let handle = self.next_handle;
+        let next = handle.checked_add(4).filter(|next| *next <= u64::from(u32::MAX)).ok_or(10024u32)?;
+        self.sockets.try_reserve(1).map_err(|_| 10055u32)?;
+        let backend = self.host.open_socket(kind)?;
+        self.sockets.push(GuestSocket { handle, backend, kind, connected: false });
+        self.next_handle = next;
+        Ok(handle)
+    }
+
+    fn close_socket(&mut self, handle: u64) -> Result<(), u32> {
+        let index = self.sockets.iter().position(|socket| socket.handle == handle).ok_or(10038u32)?;
+        self.host.close_socket(self.sockets[index].backend)?;
+        self.sockets.swap_remove(index);
+        Ok(())
+    }
+
+    fn connect_tcp(&mut self, handle: u64, ip: [u8; 4], port: u16) -> Result<(), u32> {
+        let index = self.tcp_index(handle)?;
+        let socket = &mut self.sockets[index];
+        if socket.connected { return Err(10056); }
+        self.host.connect_tcp(socket.backend, ip, port)?;
+        socket.connected = true;
+        Ok(())
+    }
+
+    fn send_tcp(&mut self, handle: u64, bytes: &[u8]) -> Result<usize, u32> {
+        let socket = self.connected_tcp(handle)?;
+        if bytes.is_empty() { return Ok(0); }
+        self.host.send_tcp(socket, bytes)
+    }
+
+    fn recv_tcp(&mut self, handle: u64, bytes: &mut [u8]) -> Result<usize, u32> {
+        let socket = self.connected_tcp(handle)?;
+        self.host.recv_tcp(socket, bytes)
+    }
+
+    fn close_sockets(&mut self) {
+        for socket in self.sockets.drain(..) {
+            let _ = self.host.close_socket(socket.backend);
+        }
+    }
+
     fn create_event(&mut self, manual: bool, signaled: bool) -> Result<u64, u32> {
         if self.events.len() >= 256 { return Err(0xc000011f); }
         let handle = self.next_handle;
@@ -295,6 +466,128 @@ impl<H: IoHost> GuestServices for IoServices<H> {
         let event = self.events.iter().find(|event| event.0 == handle).ok_or(INVALID_HANDLE)?.1;
         self.host.wait_event(event, timeout)
     }
+    fn validate_wait_event(&self, handle: u64) -> Result<(), u32> {
+        self.events.iter().any(|event| event.0 == handle).then_some(()).ok_or(INVALID_HANDLE)
+    }
+    fn poll_events(&mut self, handles: &[u64], all: bool) -> Result<u32, u32> {
+        let mut events = [0; 64];
+        let events = events.get_mut(..handles.len()).ok_or(INVALID_PARAMETER)?;
+        for (event, handle) in events.iter_mut().zip(handles) {
+            *event = self.events.iter().find(|event| event.0 == *handle).ok_or(INVALID_HANDLE)?.1;
+        }
+        self.host.poll_events(events, all)
+    }
+
+    fn create_memory_dc(&mut self, source: u64) -> Option<u64> {
+        let source = if source == 0 { 0 } else {
+            self.memory_dcs.iter().find(|(handle, _)| *handle == source)?.1
+        };
+        let handle = self.next_handle;
+        let next = handle.checked_add(4).filter(|value| *value <= u64::from(u32::MAX))?;
+        self.memory_dcs.try_reserve(1).ok()?;
+        let dc = self.host.create_memory_dc(source)?;
+        self.memory_dcs.push((handle, dc));
+        self.next_handle = next;
+        Some(handle)
+    }
+
+    fn delete_memory_dc(&mut self, handle: u64) -> bool {
+        let Some(index) = self.memory_dcs.iter().position(|(guest, _)| *guest == handle) else {
+            return false;
+        };
+        if !self.host.delete_memory_dc(self.memory_dcs[index].1) {
+            return false;
+        }
+        self.memory_dcs.swap_remove(index);
+        true
+    }
+
+    fn text_metrics_w(&mut self, handle: u64) -> Option<[u8; 60]> {
+        let dc = self.memory_dcs.iter().find(|(guest, _)| *guest == handle)?.1;
+        self.host.text_metrics_w(dc)
+    }
+
+    fn text_face_w(&mut self, handle: u64) -> Option<Vec<u16>> {
+        let dc = self.memory_dcs.iter().find(|(guest, _)| *guest == handle)?.1;
+        self.host.text_face_w(dc)
+    }
+
+    fn create_font_w(&mut self, description: &[u8; 92]) -> Option<u64> {
+        let guest = self.next_handle;
+        let next = guest.checked_add(4).filter(|next| *next <= u32::MAX.into())?;
+        self.fonts.try_reserve(1).ok()?;
+        let font = self.host.create_font_w(description)?;
+        self.fonts.push((guest, font));
+        self.next_handle = next;
+        Some(guest)
+    }
+
+    fn select_font(&mut self, dc: u64, font: u64) -> Option<u64> {
+        let dc = self.memory_dcs.iter().find(|(guest, _)| *guest == dc)?.1;
+        let font = self.fonts.iter().copied().chain(self.stock_font)
+            .find(|(guest, _)| *guest == font)?.1;
+        let reserved = if self.stock_font.is_none() {
+            Some(self.next_handle.checked_add(4).filter(|next| *next <= u32::MAX.into())?)
+        } else { None };
+        let previous = self.host.select_font(dc, font)?;
+        if let Some((guest, _)) = self.fonts.iter().copied().chain(self.stock_font)
+            .find(|(_, native)| *native == previous) {
+            return Some(guest);
+        }
+        let next = reserved?;
+        let guest = self.next_handle;
+        self.stock_font = Some((guest, previous));
+        self.next_handle = next;
+        Some(guest)
+    }
+
+    fn delete_font(&mut self, handle: u64) -> bool {
+        if self.stock_font.is_some_and(|(guest, _)| guest == handle) { return true; }
+        let Some(index) = self.fonts.iter().position(|(guest, _)| *guest == handle) else {
+            return false;
+        };
+        if !self.host.delete_font(self.fonts[index].1) { return false; }
+        self.fonts.swap_remove(index);
+        true
+    }
+
+    fn enumerate_fonts_w(&mut self, dc: u64, family: Option<&str>) -> Option<Vec<nt61::FontEnumeration>> {
+        let dc = self.memory_dcs.iter().find(|(guest, _)| *guest == dc)?.1;
+        self.host.enumerate_fonts_w(dc, family)
+    }
+    fn text_extent_w(&mut self, handle: u64, text: &[u16]) -> Option<[i32; 2]> {
+        let dc = self.memory_dcs.iter().find(|(guest, _)| *guest == handle)?.1;
+        self.host.text_extent_w(dc, text)
+    }
+
+    fn device_caps(&mut self, handle: u64, index: i32) -> Option<u32> {
+        let dc = self.memory_dcs.iter().find(|(guest, _)| *guest == handle)?.1;
+        self.host.device_caps(dc, index)
+    }
+
+    fn draw_text_layout(&mut self, handle: u64, clip: Option<[i32; 4]>, lines: &[(i32, i32, &[u16])]) -> bool {
+        self.memory_dcs.iter().find(|(guest, _)| *guest == handle)
+            .is_some_and(|&(_, dc)| self.host.draw_text_layout(dc, clip, lines))
+    }
+
+    fn set_bk_mode(&mut self, handle: u64, mode: i32) -> Option<i32> {
+        let dc = self.memory_dcs.iter().find(|(guest, _)| *guest == handle)?.1;
+        self.host.set_bk_mode(dc, mode)
+    }
+
+    fn set_map_mode(&mut self, handle: u64, mode: i32) -> Option<i32> {
+        let dc = self.memory_dcs.iter().find(|(guest, _)| *guest == handle)?.1;
+        self.host.set_map_mode(dc, mode)
+    }
+
+    fn set_dc_extent(&mut self, handle: u64, kind: nt61::DcExtent, extent: [i32; 2]) -> Option<(bool, [i32; 2])> {
+        let dc = self.memory_dcs.iter().find(|(guest, _)| *guest == handle)?.1;
+        self.host.set_dc_extent(dc, kind, extent)
+    }
+    fn logical_to_device(&mut self, handle: u64, points: &mut [u8]) -> bool {
+        self.memory_dcs.iter().find(|(guest, _)| *guest == handle)
+            .is_some_and(|&(_, dc)| self.host.logical_to_device(dc, points))
+    }
     fn create_directory(&mut self, abi: GuestAbi, path: &str) -> Result<(), u32> {
         let path = guest_file_path(abi, path, self.fs_redirection)?;
         self.host.create_directory(&path)
@@ -302,6 +595,24 @@ impl<H: IoHost> GuestServices for IoServices<H> {
     fn directory_entries(&mut self, abi: GuestAbi, path: &str) -> Result<Vec<nt61::DirectoryEntry>, u32> {
         let path = guest_file_path(abi, path, self.fs_redirection)?;
         self.host.directory_entries(&path)
+    }
+    fn file_attributes(&mut self, abi: GuestAbi, path: &str) -> Result<u32, u32> {
+        let path = guest_file_path(abi, path, self.fs_redirection)?;
+        self.host.file_attributes(&path)
+    }
+    fn set_file_attributes(&mut self, abi: GuestAbi, path: &str, attributes: u32) -> Result<(), u32> {
+        let path = guest_file_path(abi, path, self.fs_redirection)?;
+        self.host.set_file_attributes(&path, attributes)
+    }
+    fn set_file_times(&mut self, handle: u64, times: [Option<u64>; 3]) -> Result<(), u32> {
+        let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
+        if !file.write_attributes {
+            return Err(ACCESS_DENIED);
+        }
+        if times == [None; 3] {
+            return Ok(());
+        }
+        self.host.set_file_times(&file.path, times)
     }
     fn application_log_available(&mut self) -> bool { self.host.application_log_available() }
     fn report_application_event(&mut self, event: nt61::ApplicationEvent) -> Result<(), u32> {
@@ -321,8 +632,39 @@ impl<H: IoHost> GuestServices for IoServices<H> {
             _ => Err(INVALID_HANDLE),
         }
     }
+    fn file_handle_flags(&mut self, handle: u64) -> Result<u32, u32> {
+        self.files.iter().find(|file| file.handle == handle)
+            .map(|file| u32::from(file.inheritable)).ok_or(INVALID_HANDLE)
+    }
+    fn cancel_file_io(&mut self, handle: u64) -> Result<(), u32> {
+        self.files.iter().any(|file| file.handle == handle).then_some(()).ok_or(INVALID_HANDLE)
+    }
+    fn file_size(&mut self, handle: u64) -> Result<u64, u32> {
+        let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
+        self.host.file_size(&file.path)
+    }
+    fn seek_file(&mut self, handle: u64, distance: i64, origin: u32, limit: u64) -> Result<u64, nt61::FileSeekError> {
+        use nt61::FileSeekError::{NegativePosition, PositionTooLarge, SetStatus, Status};
+        let file_index = self.files.iter().position(|file| file.handle == handle);
+        let base = match origin {
+            0 => 0,
+            1 => self.files[file_index.ok_or(Status(INVALID_HANDLE))?].position,
+            2 => {
+                let path = &self.files[file_index.ok_or(Status(INVALID_HANDLE))?].path;
+                self.host.file_size(path).map_err(Status)?
+            }
+            _ => return Err(Status(INVALID_PARAMETER)),
+        };
+        let position = (base as i64).wrapping_add(distance);
+        if position < 0 { return Err(NegativePosition); }
+        if position as u64 > limit { return Err(PositionTooLarge); }
+        let file = &mut self.files[file_index.ok_or(SetStatus(INVALID_HANDLE))?];
+        file.position = position as u64;
+        Ok(file.position)
+    }
     fn printer_available(&mut self) -> bool { self.host.printer_available() }
     fn print_document(&mut self, data: &[u8]) -> Result<u32,u32> { self.host.print_document(data) }
+    fn message_beep(&mut self, kind: u32) -> bool { self.host.message_beep(kind) }
 
     fn desktop_dialog(&mut self, request: &[u8]) -> Result<Vec<u8>, u32> { self.host.desktop_dialog(request) }
 
@@ -339,6 +681,19 @@ impl<H: IoHost> GuestServices for IoServices<H> {
             self.host.read_library(&path, mode)
         } else {
             self.host.read_library(name, mode)
+        }
+    }
+    fn read_system_library(&mut self, name: &str, mode: super::ir::DecodeMode) -> Result<Vec<u8>, u32> {
+        self.host.read_system_library(name, mode)
+    }
+    fn resolve_library(&mut self, name: &str, mode: super::ir::DecodeMode, system: bool)
+        -> Result<super::pe::ResolvedLibrary, u32> {
+        if !system && name.as_bytes().get(1) == Some(&b':') {
+            let abi = if mode == super::ir::DecodeMode::X86 { GuestAbi::X86_32 } else { GuestAbi::X86_64 };
+            let path = guest_file_path(abi, name, self.fs_redirection)?;
+            self.host.resolve_library(&path, mode, false)
+        } else {
+            self.host.resolve_library(name, mode, system)
         }
     }
     fn call(
