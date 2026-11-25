@@ -37,6 +37,9 @@ pub fn read_image_file(
         return Err(LoadError::InvalidImage.into());
     }
     let tables = read_exact(&mut read_at, pe + 24, optional + count * 40)?;
+    if u32_at(&tables, 56)? as usize > MAX_IMAGE {
+        return Err(LoadError::ImageTooLarge.into());
+    }
     let headers = u32_at(&tables, 60)? as usize;
     if headers < pe + 24 + tables.len() || headers > 1024 * 1024 {
         return Err(LoadError::InvalidImage.into());

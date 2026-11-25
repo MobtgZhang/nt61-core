@@ -4,12 +4,14 @@
 //! function pointers. Static TLS and process-attach callbacks execute on the
 //! initial guest thread in dependency order. Images use their preferred bases.
 
-use super::{ir::DecodeMode, memory::GuestMemory, runtime::GuestThread};
+use super::{ir::DecodeMode, memory::{AtomicMemoryError, GuestMemory}, runtime::GuestThread};
 use alloc::{vec, vec::Vec};
 
 #[path = "pe/link.rs"]
 mod link;
-pub use link::{ImportResolver, ImportSymbol, LinkError};
+pub use link::{ImportResolver, ImportSymbol, LinkError, ResolvedLibrary};
+#[path = "pe/reloc.rs"]
+mod reloc;
 #[path = "pe/source.rs"]
 mod source;
 pub use source::{read_image_file, ImageReadError};
@@ -21,10 +23,14 @@ pub mod threads;
 pub mod win32;
 
 const PAGE: usize = 4096;
+const GUEST_PROCESS_ID: u64 = 1;
 const READ: u8 = 1;
 const WRITE: u8 = 2;
 const EXECUTE: u8 = 4;
-const MAX_IMAGE: usize = 64 * 1024 * 1024;
+const MAX_IMAGE: usize = 128 * 1024 * 1024;
+const MAX_PROCESS_MEMORY: usize = 256 * 1024 * 1024;
+const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
+const IMAGE_FILE_LARGE_ADDRESS_AWARE: u16 = 0x0020;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadError {
@@ -128,38 +134,18 @@ impl Region {
 pub struct ImageMemory {
     regions: Vec<Region>,
 }
-impl GuestMemory for ImageMemory {
-    fn locked_compare_exchange(&mut self, va: u64, width: u8, expected: u64, replacement: u64)
-        -> Result<u64, super::memory::AtomicMemoryError> {
-        use super::memory::AtomicMemoryError::Fault;
-        if !matches!(width, 1 | 2 | 4 | 8) { return Err(Fault); }
-        let len = width as usize;
-        let mut bytes = [0; 8];
-        if !self.probe_write(va, len) || self.read_virt(va, &mut bytes[..len]) != len { return Err(Fault); }
-        let old = u64::from_le_bytes(bytes);
-        let mask = u64::MAX >> ((8 - len) * 8);
-        // Owned Vec storage has no shared mappings; the exclusive borrow
-        // excludes every observer for the complete comparison and write cycle.
-        let value = if old == expected & mask { replacement } else { old };
-        if !self.write_virt(va, &value.to_le_bytes()[..len]) { return Err(Fault); }
-        Ok(old)
+impl ImageMemory {
+    fn mapped_bytes(&self) -> usize {
+        self.regions.iter().map(|region| region.bytes.len()).sum()
     }
-    fn locked_fetch_add(&mut self, va: u64, width: u8, addend: u64)
-        -> Result<u64, super::memory::AtomicMemoryError> {
-        use super::memory::AtomicMemoryError::Fault;
-        if !matches!(width, 1 | 2 | 4 | 8) { return Err(Fault); }
-        // Vec-backed regions are owned without shared aliases. This exclusive
-        // borrow excludes all observers for the complete read-modify-write.
-        let mut bytes = [0; 8];
-        let len = width as usize;
-        if !self.probe_write(va, len) || self.read_virt(va, &mut bytes[..len]) != len { return Err(Fault); }
-        let old = u64::from_le_bytes(bytes);
-        if !self.write_virt(va, &old.wrapping_add(addend).to_le_bytes()[..len]) { return Err(Fault); }
-        Ok(old)
+
+    pub(super) fn exchange_u32(&mut self, va: u64, replacement: u32) -> Result<u64, AtomicMemoryError> {
+        self.locked_update(va, 4, |_| u64::from(replacement))
     }
-    fn locked_inc_dec(&mut self, va: u64, width: u8, decrement: bool)
-        -> Result<u64, super::memory::AtomicMemoryError> {
-        use super::memory::AtomicMemoryError::Fault;
+
+    fn locked_update(&mut self, va: u64, width: u8, update: impl FnOnce(u64) -> u64)
+        -> Result<u64, AtomicMemoryError> {
+        use AtomicMemoryError::Fault;
         if !matches!(width, 1 | 2 | 4 | 8) { return Err(Fault); }
         // These mappings own Vec storage with no shared aliases. The exclusive
         // borrow covers read, arithmetic and write; no guest can interleave or
@@ -168,9 +154,34 @@ impl GuestMemory for ImageMemory {
         let len = width as usize;
         if !self.probe_write(va, len) || self.read_virt(va, &mut bytes[..len]) != len { return Err(Fault); }
         let old = u64::from_le_bytes(bytes);
-        let new = if decrement {old.wrapping_sub(1)} else {old.wrapping_add(1)};
+        let new = update(old);
         if !self.write_virt(va, &new.to_le_bytes()[..len]) { return Err(Fault); }
         Ok(old)
+    }
+}
+impl GuestMemory for ImageMemory {
+    fn locked_compare_exchange(&mut self, va: u64, width: u8, expected: u64, replacement: u64)
+        -> Result<u64, AtomicMemoryError> {
+        self.locked_update(va, width, |old| {
+            let mask = u64::MAX >> ((8 - width) * 8);
+            if old == expected & mask { replacement } else { old }
+        })
+    }
+    fn locked_fetch_add(&mut self, va: u64, width: u8, addend: u64) -> Result<u64, AtomicMemoryError> {
+        self.locked_update(va, width, |old| old.wrapping_add(addend))
+    }
+    fn locked_logic(&mut self, va: u64, width: u8, op: super::ir::AluOp, bits: u64)
+        -> Result<u64, AtomicMemoryError> {
+        use super::ir::AluOp;
+        match op {
+            AluOp::Or => self.locked_update(va, width, |old| old | bits),
+            AluOp::And => self.locked_update(va, width, |old| old & bits),
+            AluOp::Xor => self.locked_update(va, width, |old| old ^ bits),
+            _ => Err(AtomicMemoryError::Unsupported),
+        }
+    }
+    fn locked_inc_dec(&mut self, va: u64, width: u8, decrement: bool) -> Result<u64, AtomicMemoryError> {
+        self.locked_fetch_add(va, width, if decrement { u64::MAX } else { 1 })
     }
     fn probe_write(&mut self, va: u64, len: usize) -> bool {
         self.regions
@@ -206,6 +217,10 @@ impl GuestMemory for ImageMemory {
     }
 }
 
+fn teb_size(mode: DecodeMode) -> usize {
+    if mode == DecodeMode::X86 { PAGE } else { 2 * PAGE }
+}
+
 pub struct GuestImage {
     pub thread: GuestThread,
     pub memory: ImageMemory,
@@ -213,12 +228,15 @@ pub struct GuestImage {
     pub peb: u64,
     pub teb: u64,
     startup: Option<tls::Startup>,
+    pending_library: Option<win32::library::Pending>,
     initialization: tls::InitialThread,
     threads: threads::State,
     stack_reserve: usize,
     terminal: Option<ImageRunResult>,
     pub win32: win32::Runtime,
     module_metadata: Vec<ModuleMetadata>,
+    process_image_path: alloc::string::String,
+    resource_satellites: Vec<(u64, u16, ModuleMetadata)>,
     /// Exclusive application allocation boundary for the SP1 address model.
     /// WOW64 LARGEADDRESSAWARE is an executable property, not a DLL property.
     user_address_end: u64,
@@ -237,6 +255,24 @@ impl GuestImage {
         &mut self,
         quantum: u64,
         services: &mut dyn super::nt61::GuestServices,
+    ) -> ImageRunResult {
+        self.run_inner(quantum, services, None)
+    }
+
+    pub fn run_with_jit(
+        &mut self,
+        quantum: u64,
+        services: &mut dyn super::nt61::GuestServices,
+        jit: &mut super::runtime::jit::Jit<'_>,
+    ) -> ImageRunResult {
+        self.run_inner(quantum, services, Some(jit))
+    }
+
+    fn run_inner(
+        &mut self,
+        quantum: u64,
+        services: &mut dyn super::nt61::GuestServices,
+        mut jit: Option<&mut super::runtime::jit::Jit<'_>>,
     ) -> ImageRunResult {
         use super::{abi::GuestAbi, ir::X86Reg, nt61::ServiceResult, runtime::StopReason};
         if let Some(result) = self.terminal {
@@ -258,7 +294,20 @@ impl GuestImage {
                 Ok(false) => return ImageRunResult::Yielded,
                 Err(reason) => { let result = ImageRunResult::Fault(reason); self.terminal = Some(result); return result; }
             }
-            if let Some(startup) = &mut self.startup {
+            if self.pending_library.is_some() {
+                match win32::library::start_next(self) {
+                    Ok(Some(code)) => {
+                        self.exit_thread(code);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(reason) => {
+                        let result = ImageRunResult::Fault(reason);
+                        self.terminal = Some(result);
+                        return result;
+                    }
+                }
+            } else if let Some(startup) = &mut self.startup {
                 if !startup.active() {
                     if let Err(reason) = startup.begin(&mut self.thread, &mut self.memory) {
                         let result = ImageRunResult::Fault(reason);
@@ -271,14 +320,29 @@ impl GuestImage {
                 }
             }
             if self.startup.is_none() && self.detaching() { continue; }
+            if let Err(reason) = self.begin_apc() {
+                let result = ImageRunResult::Fault(reason);
+                self.terminal = Some(result);
+                return result;
+            }
             // A bounded interpreter slice provides preemption even when a
             // worker spins without calling an API.
             let slice = remaining.min(self.thread_slice());
-            let outcome = self.thread.run(&mut self.memory, slice);
+            let outcome = match jit.as_deref_mut() {
+                Some(jit) => self.thread.run_with_jit(&mut self.memory, slice, jit),
+                None => self.thread.run(&mut self.memory, slice),
+            };
             remaining -= outcome.retired;
             self.account_thread_slice(outcome.retired);
-            if let Some(startup) = &mut self.startup {
-                match startup.complete(&mut self.thread, outcome.reason) {
+            if self.complete_apc(outcome.reason) { continue; }
+            let completed = if self.pending_library.is_some() {
+                win32::library::complete(self, outcome.reason)
+            } else if let Some(startup) = &mut self.startup {
+                startup.complete(&mut self.thread, outcome.reason)
+            } else {
+                Ok(false)
+            };
+            match completed {
                     Ok(true) => continue,
                     Ok(false) => {}
                     Err(reason) => {
@@ -286,7 +350,6 @@ impl GuestImage {
                         self.terminal = Some(result);
                         return result;
                     }
-                }
             }
             match outcome.reason {
                 StopReason::SystemCall { number } => {
@@ -295,6 +358,7 @@ impl GuestImage {
                     } else {
                         GuestAbi::X86_64
                     };
+                    services.select_file_view(!self.win32.local.fs_redirection_disabled);
                     if number & 0xffff_0000 == win32::catalog::GATEWAY_BASE {
                         match win32::dispatch(self, number, services) {
                             Ok(win32::Outcome::Return(value)) => self.thread.context.set_reg(X86Reg::Rax, if abi == GuestAbi::X86_32 { value as u32 as u64 } else { value }),
@@ -312,7 +376,12 @@ impl GuestImage {
                                 self.yield_thread();
                                 return ImageRunResult::Yielded;
                             },
-                            Ok(win32::Outcome::ExitThread(code)) => self.exit_thread(code),
+                            Ok(win32::Outcome::ExitThread(code)) if self.pending_library.is_none() => self.exit_thread(code),
+                            Ok(win32::Outcome::ExitThread(_)) => {
+                                let result = ImageRunResult::Fault(StopReason::UnsupportedApi { id: number });
+                                self.terminal = Some(result);
+                                return result;
+                            }
                             Ok(win32::Outcome::Exit(code)) => {
                                 let result = ImageRunResult::Exited(code);
                                 self.terminal = Some(result);
@@ -326,6 +395,16 @@ impl GuestImage {
                         }
                         continue;
                     }
+                    if super::nt61::resolve(abi, number) == Some(super::nt61::Service::Close) {
+                        if let Ok(args) = super::nt61::capture_arguments(
+                            abi, &self.thread.context.regs, 1, &mut self.memory,
+                        ) {
+                            if let Some(status) = win32::close_token(self, args[0]) {
+                                self.thread.context.set_reg(X86Reg::Rax, u64::from(status));
+                                continue;
+                            }
+                        }
+                    }
                     match super::nt61::dispatch(
                         abi,
                         number,
@@ -336,7 +415,12 @@ impl GuestImage {
                         ServiceResult::Return(status) => {
                             self.thread.context.set_reg(X86Reg::Rax, status as u64)
                         }
-                        ServiceResult::ExitThread(status) => self.terminate_thread(status),
+                        ServiceResult::ExitThread(status) if self.pending_library.is_none() => self.terminate_thread(status),
+                        ServiceResult::ExitThread(_) => {
+                            let result = ImageRunResult::Fault(StopReason::SystemCall { number });
+                            self.terminal = Some(result);
+                            return result;
+                        }
                         ServiceResult::ExitProcess(status) => {
                             let result = ImageRunResult::Exited(status);
                             self.terminal = Some(result);
@@ -366,6 +450,9 @@ impl GuestImage {
     ) -> Result<(), LoadError> {
         let base = 0x7ffc_0000u64;
         let length = 0x10000usize;
+        if self.memory.mapped_bytes().saturating_add(length) > MAX_PROCESS_MEMORY {
+            return Err(LoadError::ImageTooLarge);
+        }
         if self
             .memory
             .regions
@@ -443,13 +530,15 @@ impl GuestImage {
             return Err(LoadError::InvalidImage);
         }
         self.memory.regions.push(params);
+        self.process_image_path = image_path.into();
+        win32::crt_startup::initialize_data(self, command_line).map_err(|_| LoadError::InvalidImage)?;
         Ok(())
     }
 
     /// Load a same-ISA guest DLL transactionally. New libraries with DLL
     /// initialization or static TLS remain explicitly unsupported here.
     pub fn load_library(&mut self, name: &str, resolver: &mut dyn ImportResolver) -> Result<u64, LinkError> {
-        link::load_library(self, name, resolver)
+        link::load_library(self, name, resolver, false, false)
     }
 
     /// Construct an isolated guest with no unresolved imports.
@@ -470,7 +559,7 @@ impl GuestImage {
 
     fn from_mapped(mapped: MappedImage, libraries: Vec<MappedImage>) -> Result<Self, LoadError> {
         let bad = LoadError::InvalidImage;
-        let user_address_end = mapped.user_address_end()?;
+        let user_address_end = mapped.user_address_end();
         if core::iter::once(&mapped).chain(libraries.iter()).any(|image|
             image.region.base.checked_add(image.region.bytes.len() as u64)
                 .is_none_or(|end| end > user_address_end)) {
@@ -502,7 +591,7 @@ impl GuestImage {
             (
                 0x0000_0000_0100_0000,
                 0x0000_0000_7ffd_f000,
-                0x0000_0000_7ffd_e000,
+                0x0000_0000_7ffd_d000,
             )
         };
         let stack_top = stack_base + 0x10_0000;
@@ -510,7 +599,7 @@ impl GuestImage {
             image,
             Region::new(stack_base, 0x10_0000, READ | WRITE)?,
             Region::new(peb, PAGE, READ | WRITE)?,
-            Region::new(teb, PAGE, READ | WRITE)?,
+            Region::new(teb, teb_size(mode), READ | WRITE)?,
         ];
         regions.sort_by_key(|region| region.base);
         if regions
@@ -542,7 +631,7 @@ impl GuestImage {
                 (4, stack_top),
                 (8, stack_base),
                 (0x18, teb),
-                (0x20, 1),
+                (0x20, GUEST_PROCESS_ID),
                 (0x24, 1),
                 (0x30, peb),
             ] {
@@ -560,7 +649,7 @@ impl GuestImage {
             }
         } else {
             thread.context.gs_base = teb;
-            for (offset, value) in [(8, stack_top), (0x10, stack_base), (0x30, teb), (0x40, 1), (0x48, 1), (0x60, peb)] {
+            for (offset, value) in [(8, stack_top), (0x10, stack_base), (0x30, teb), (0x40, GUEST_PROCESS_ID), (0x48, 1), (0x60, peb)] {
                 if !put(teb + offset, value, 8) {
                     return Err(bad);
                 }
@@ -574,7 +663,7 @@ impl GuestImage {
                 return Err(bad);
             }
         }
-        let startup = initialization.clone().install(&mut memory, &thread, teb)?;
+        let (startup, tls_base) = initialization.install(&mut memory, &thread, teb, user_address_end)?;
         Ok(Self {
             thread,
             memory,
@@ -582,12 +671,15 @@ impl GuestImage {
             peb,
             teb,
             startup,
+            pending_library: None,
             initialization,
-            threads: threads::State::new(),
+            threads: threads::State::new(tls_base),
             stack_reserve,
             terminal: None,
             win32: win32::Runtime::new(base),
             module_metadata,
+            process_image_path: alloc::string::String::new(),
+            resource_satellites: Vec::new(),
             user_address_end,
         })
     }
@@ -600,31 +692,20 @@ struct ModuleMetadata {
     base: u64,
     size: usize,
     mode: DecodeMode,
-    entry: usize,
     directories: [(u32, u32); 16],
     /// Loader-owned state for DLL_THREAD_ATTACH/DLL_THREAD_DETACH policy.
     /// Initial process attachment and TLS initialization are unaffected.
     thread_notifications_disabled: bool,
+    system_library_search: bool,
 }
 impl ModuleMetadata {
     fn from_image(image: &MappedImage) -> Self {
-        Self { base: image.region.base, size: image.region.bytes.len(), mode: image.mode,
-            entry: image.entry, directories: image.directories,
-            thread_notifications_disabled: false }
+        Self { base: image.region.base, size: image.region.bytes.len(), mode: image.mode, directories: image.directories,
+            thread_notifications_disabled: false, system_library_search: false }
     }
-    fn snapshot(&self, memory: &ImageMemory) -> Result<MappedImage, LoadError> {
-        let source = memory.regions.iter().find(|r| r.base == self.base && r.bytes.len() == self.size)
-            .ok_or(LoadError::InvalidImage)?;
-        let mut bytes = zeroed(source.bytes.len())?;
-        bytes.copy_from_slice(&source.bytes);
-        let mut permissions = zeroed(source.permissions.len())?;
-        permissions.copy_from_slice(&source.permissions);
-        let mut protections = Vec::new();
-        protections.try_reserve_exact(source.protections.len()).map_err(|_| LoadError::OutOfMemory)?;
-        protections.extend_from_slice(&source.protections);
-        Ok(MappedImage { region: Region { base: self.base, bytes, permissions,
-            protections, allocation_protection: source.allocation_protection, image: source.image },
-            mode: self.mode, entry: self.entry, directories: self.directories })
+    fn mapped_region<'a>(&self, memory: &'a ImageMemory) -> Result<&'a Region, LoadError> {
+        memory.regions.iter().find(|region| region.base == self.base && region.bytes.len() == self.size)
+            .ok_or(LoadError::InvalidImage)
     }
 }
 
@@ -633,6 +714,7 @@ struct MappedImage {
     region: Region,
     mode: DecodeMode,
     entry: usize,
+    characteristics: u16,
     directories: [(u32, u32); 16],
 }
 impl MappedImage {
@@ -643,13 +725,15 @@ impl MappedImage {
         else if large_address { 0xffff_0000 } else { 0x7fff_0000 }
     }
 
-    fn user_address_end(&self) -> Result<u64, LoadError> {
-        let characteristics = u16_at(&self.region.bytes,
-            u32_at(&self.region.bytes, 0x3c)? as usize + 22)?;
-        Ok(Self::address_end(self.mode, characteristics & 0x20 != 0))
+    fn user_address_end(&self) -> u64 {
+        Self::address_end(self.mode, self.characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE != 0)
     }
 
     fn parse(file: &[u8], dll: bool) -> Result<Self, LoadError> {
+        Self::parse_with_limit(file, dll, MAX_IMAGE)
+    }
+
+    fn parse_with_limit(file: &[u8], dll: bool, remaining: usize) -> Result<Self, LoadError> {
         let bad = LoadError::InvalidImage;
         if file.get(..2) != Some(b"MZ") {
             return Err(bad);
@@ -682,7 +766,7 @@ impl MappedImage {
         let entry = u32_at(header, 16)? as usize;
         let section_alignment = u32_at(header, 32)? as usize;
         let file_alignment = u32_at(header, 36)? as usize;
-        if size > MAX_IMAGE {
+        if size > MAX_IMAGE.min(remaining) {
             return Err(LoadError::ImageTooLarge);
         }
         if size == 0
@@ -705,7 +789,7 @@ impl MappedImage {
         let image_end = base.checked_add(size as u64).ok_or(bad)?;
         // DLLs inherit the executable's narrower limit at link time. Their
         // own LAA bit must neither enlarge nor restrict that process limit.
-        let limit = Self::address_end(mode, dll || characteristics & 0x20 != 0);
+        let limit = Self::address_end(mode, dll || characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE != 0);
         if image_end > limit {
             return Err(bad);
         }
@@ -794,6 +878,7 @@ impl MappedImage {
             region: image,
             mode,
             entry,
+            characteristics,
             directories,
         })
     }
