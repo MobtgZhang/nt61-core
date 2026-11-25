@@ -4040,6 +4040,51 @@ pub fn create_file(
     create_file_in_parent(ntfs, parent_record, &name, initial_data)
 }
 
+fn file_attribute_offset(record: &[u8]) -> Result<usize, NTSTATUS> {
+    let standard = parse_attribute(record, AttributeHeader::TYPE_STANDARD_INFO)
+        .ok_or(STATUS_UNSUCCESSFUL)?;
+    let flags = standard.get(32..36).ok_or(STATUS_UNSUCCESSFUL)?;
+    Ok(flags.as_ptr() as usize - record.as_ptr() as usize)
+}
+
+pub fn file_attributes(ntfs: &NtfsFileSystem, number: u64) -> Result<u32, NTSTATUS> {
+    let record = read_mft_record(&ntfs.ntfs_data, number).ok_or(STATUS_UNSUCCESSFUL)?;
+    let offset = file_attribute_offset(&record)?;
+    Ok(u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap()))
+}
+
+pub fn set_file_attributes(ntfs: &NtfsFileSystem, number: u64, mask: u32, attributes: u32) -> Result<(), NTSTATUS> {
+    let mut record = read_mft_record(&ntfs.ntfs_data, number).ok_or(STATUS_UNSUCCESSFUL)?;
+    let offset = file_attribute_offset(&record)?;
+    let field = &mut record[offset..offset + 4];
+    let original = u32::from_le_bytes(field.try_into().unwrap());
+    field.copy_from_slice(&((original & !mask & !0x80) | (attributes & mask)).to_le_bytes());
+    write_mft_record(&ntfs.ntfs_data, number, &record)
+}
+
+pub fn set_file_times(ntfs: &NtfsFileSystem, number: u64, times: [Option<u64>; 3]) -> Result<(), NTSTATUS> {
+    let mut record = read_mft_record(&ntfs.ntfs_data, number).ok_or(STATUS_UNSUCCESSFUL)?;
+    let attribute = find_attribute_in_record(&record, AttributeHeader::TYPE_STANDARD_INFO)
+        .ok_or(STATUS_UNSUCCESSFUL)?;
+    let header = record.get(attribute..attribute + 24).ok_or(STATUS_UNSUCCESSFUL)?;
+    let length = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    let value_length = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    let value_offset = u16::from_le_bytes(header[20..22].try_into().unwrap()) as usize;
+    if header[8] != 0 || value_offset < header.len() || value_length < 32
+        || value_offset.checked_add(value_length).is_none_or(|end| end > length)
+    {
+        return Err(STATUS_UNSUCCESSFUL);
+    }
+    let offset = attribute + value_offset;
+    for (field, time) in [0, 24, 8].into_iter().zip(times) {
+        if let Some(time) = time {
+            let start = offset + field;
+            record[start..start + 8].copy_from_slice(&time.to_le_bytes());
+        }
+    }
+    write_mft_record(&ntfs.ntfs_data, number, &record)
+}
+
 /// Replace the unnamed data stream using fresh clusters. A failed data write
 /// leaves the previous stream intact. This is not an NTFS journal transaction.
 pub fn replace_file_contents(ntfs: &mut NtfsFileSystem, path: &[u16], data: &[u8]) -> Result<(), NTSTATUS> {

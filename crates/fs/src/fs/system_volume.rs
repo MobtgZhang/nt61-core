@@ -11,6 +11,9 @@ const INVALID: u32 = 0xC000_000D;
 const NOT_FOUND: u32 = 0xC000_0034;
 const UNSUPPORTED: u32 = 0xC000_00BB;
 const IO_ERROR: u32 = 0xC000_0001;
+const PATH_NOT_FOUND: u32 = 0xC000_003A;
+const ACCESS_DENIED: u32 = 0xC000_0022;
+const MUTABLE_FILE_ATTRIBUTES: u32 = 0x3127;
 static BUSY: AtomicBool = AtomicBool::new(false);
 #[path = "volume_lock.rs"]
 mod volume_lock;
@@ -166,6 +169,160 @@ pub fn read(path:&str)->Result<Vec<u8>,u32>{
     super::read_file_from_disk_limited(&path,4 * 1024 * 1024).ok_or(NOT_FOUND)
 }
 
+fn refs_file_extent(path: &str) -> Result<(u64, u64), u32> {
+    let mut header = [0; 512];
+    if super::sys_ramdisk_read(0x1000, &mut header) != 512 { return Err(IO_ERROR); }
+    let table_size = u64::from_le_bytes(header[88..96].try_into().unwrap());
+    if !(272..=16 * 1024 * 1024).contains(&table_size) { return Err(IO_ERROR); }
+    let mut table = alloc::vec![0; table_size as usize];
+    if super::sys_ramdisk_read(0x2000, &mut table) != table.len() { return Err(IO_ERROR); }
+    let name = path[3..].replace('\\', "/");
+    let entry = table.chunks_exact(272).find(|entry| {
+        let length = entry[..256].iter().position(|byte| *byte == 0).unwrap_or(256);
+        entry[..length].eq_ignore_ascii_case(name.as_bytes())
+    }).ok_or(NOT_FOUND)?;
+    Ok((u64::from_le_bytes(entry[256..264].try_into().unwrap()),
+        u64::from_le_bytes(entry[264..272].try_into().unwrap())))
+}
+
+pub fn file_attributes(path: &str) -> Result<u32, u32> {
+    const DIRECTORY: u32 = 0x10;
+    const NORMAL: u32 = 0x80;
+    let path = normalize(path)?;
+    let _guard = VolumeGuard::acquire()?;
+    let attributes = match super::detect_system_partition_type() {
+        FsType::Ntfs => {
+            let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+            let handle = ntfs_file(fs, &path)?;
+            let flags = ntfs::file_attributes(fs, handle.mft_record).map_err(|status| status as u32)?;
+            (flags & 0x0003_ffff & !DIRECTORY) | if handle.is_directory { DIRECTORY } else { 0 }
+        }
+        FsType::Fat32 => {
+            let fs = fat32::get_mounted_fs().ok_or(NOT_FOUND)?;
+            if path == "C:\\" {
+                DIRECTORY
+            } else {
+                let (parent, _) = parent_leaf(&path)?;
+                fat_directory(fs, parent).map_err(|_| PATH_NOT_FOUND)?;
+                let entry = fat32::find_file_at_path(fs, &path).ok_or(NOT_FOUND)?;
+                u32::from(entry.attributes & 0x37)
+            }
+        }
+        _ => return Err(UNSUPPORTED),
+    };
+    Ok(match attributes & !NORMAL {
+        0 => NORMAL,
+        flags => flags,
+    })
+}
+
+fn ntfs_file(fs: &ntfs::NtfsFileSystem, path: &str) -> Result<ntfs::NtfsHandle, u32> {
+    let record = if path == "C:\\" {
+        5
+    } else {
+        let (parent, leaf) = parent_leaf(path)?;
+        let parent_record = if parent == "C:\\" {
+            5
+        } else {
+            ntfs::open_file(fs, &utf16(parent), None)
+                .filter(|handle| handle.is_directory).ok_or(PATH_NOT_FOUND)?.mft_record
+        };
+        ntfs::find_file_in_directory(fs, parent_record, &utf16(leaf)).ok_or(NOT_FOUND)?
+    };
+    ntfs::get_file_by_record(fs, record).ok_or(IO_ERROR)
+}
+
+pub fn set_file_attributes(path: &str, attributes: u32) -> Result<(), u32> {
+    let path = normalize(path)?;
+    let _guard = VolumeGuard::acquire()?;
+    if super::detect_system_partition_type() != FsType::Ntfs { return Err(UNSUPPORTED); }
+    let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+    let handle = ntfs_file(fs, &path)?;
+    ntfs::set_file_attributes(fs, handle.mft_record, MUTABLE_FILE_ATTRIBUTES, attributes)
+        .map_err(|status| status as u32)
+}
+
+pub fn set_file_times(path: &str, times: [Option<u64>; 3]) -> Result<(), u32> {
+    let path = normalize(path)?;
+    let _guard = VolumeGuard::acquire()?;
+    if super::detect_system_partition_type() != FsType::Ntfs {
+        return Err(UNSUPPORTED);
+    }
+    let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+    let handle = ntfs_file(fs, &path)?;
+    ntfs::set_file_times(fs, handle.mft_record, times).map_err(|status| status as u32)
+}
+
+pub fn open_guest_file(path: &str, disposition: u32, writable: bool, allow_directory: bool) -> Result<(u64, bool), u32> {
+    let path = normalize(path)?;
+    if super::detect_system_partition_type() != FsType::Ntfs {
+        if disposition != 1 || writable || allow_directory { return Err(UNSUPPORTED); }
+        return file_size(&path).map(|_| (1, false));
+    }
+    let _guard = VolumeGuard::acquire()?;
+    let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+    match ntfs_file(fs, &path) {
+        Ok(handle) => {
+            if disposition == 2 { return Err(0xC000_0035); }
+            if handle.is_directory {
+                return if disposition == 1 && allow_directory { Ok((1, true)) } else { Err(0xC000_00BA) };
+            }
+            if writable && ntfs::file_attributes(fs, handle.mft_record).map_err(|status| status as u32)? & 1 != 0 {
+                return Err(ACCESS_DENIED);
+            }
+            if matches!(disposition, 4 | 5) {
+                if !writable { return Err(ACCESS_DENIED); }
+                ntfs::replace_file_contents(fs, &utf16(&path), &[]).map_err(|status| status as u32)?;
+                return Ok((3, false));
+            }
+            Ok((1, false))
+        }
+        Err(NOT_FOUND) if matches!(disposition, 2 | 3 | 5) => {
+            ntfs::create_file(fs, &utf16(&path), &[]).map_err(|status| status as u32)?;
+            Ok((2, false))
+        }
+        Err(status) => Err(status),
+    }
+}
+
+pub fn write_at(path: &str, offset: u64, bytes: &[u8]) -> Result<usize, u32> {
+    if bytes.len() > 65536 || offset.checked_add(bytes.len() as u64).is_none() { return Err(INVALID); }
+    let path = normalize(path)?;
+    let _guard = VolumeGuard::acquire()?;
+    if super::detect_system_partition_type() != FsType::Ntfs { return Err(UNSUPPORTED); }
+    let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+    let mut handle = ntfs_file(fs, &path)?;
+    if handle.is_directory { return Err(ACCESS_DENIED); }
+    if bytes.is_empty() { return Ok(0); }
+    if offset > handle.file_size { return Err(UNSUPPORTED); }
+    handle.current_position = offset;
+    ntfs::write_file(fs, &mut handle, bytes).map_err(|status| status as u32)
+}
+
+pub fn file_size(path: &str) -> Result<u64, u32> {
+    let path = normalize(path)?;
+    let _guard = VolumeGuard::acquire()?;
+    match super::detect_system_partition_type() {
+        FsType::Ntfs => {
+            let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+            ntfs::open_file(fs, &utf16(&path), None).filter(|handle| !handle.is_directory)
+                .map(|handle| handle.file_size).ok_or(NOT_FOUND)
+        }
+        FsType::Fat32 => {
+            let fs = fat32::get_mounted_fs().ok_or(NOT_FOUND)?;
+            fat32::find_file_at_path(fs, &path).filter(|entry| !entry.is_directory())
+                .map(|entry| u64::from(entry.file_size())).ok_or(NOT_FOUND)
+        }
+        FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => {
+            let fs = super::ext2::get_mounted_fs().ok_or(NOT_FOUND)?;
+            unsafe { super::ext2::open_file(fs, path.as_bytes()) }.filter(|handle| !handle.is_directory)
+                .map(|handle| handle.file_size).ok_or(NOT_FOUND)
+        }
+        FsType::Refs => refs_file_extent(&path).map(|(_, size)| size),
+        _ => Err(UNSUPPORTED),
+    }
+}
+
 /// Read a bounded range from the mounted volume, including RAM-backed images.
 pub fn read_at(path:&str,offset:u64,length:usize)->Result<Vec<u8>,u32>{
     if length>65536{return Err(INVALID);}
@@ -188,17 +345,10 @@ pub fn read_at(path:&str,offset:u64,length:usize)->Result<Vec<u8>,u32>{
             unsafe{super::ext2::read_file(fs,&mut handle,&mut bytes)}
         },
         FsType::Refs=>{
-            let mut header=[0;512];
-            if super::sys_ramdisk_read(0x1000,&mut header)!=512{return Err(IO_ERROR);}
-            let size=u64::from_le_bytes(header[88..96].try_into().unwrap())as usize;
-            if !(272..=16*1024*1024).contains(&size){return Err(IO_ERROR);}
-            let mut table=alloc::vec![0;size];
-            if super::sys_ramdisk_read(0x2000,&mut table)!=size{return Err(IO_ERROR);}
-            let name=path[3..].replace('\\',"/");
-            let entry=table.chunks_exact(272).find(|e|{let n=e[..256].iter().position(|b|*b==0).unwrap_or(256);e[..n].eq_ignore_ascii_case(name.as_bytes())}).ok_or(NOT_FOUND)?;
-            let size=u64::from_le_bytes(entry[264..272].try_into().unwrap());
-            let count=length.min(size.saturating_sub(offset)as usize);
-            let start=u64::from_le_bytes(entry[256..264].try_into().unwrap()).checked_mul(512).and_then(|s|s.checked_add(offset)).ok_or(INVALID)?;
+            let (sector, size) = refs_file_extent(&path)?;
+            let count = (length as u64).min(size.saturating_sub(offset)) as usize;
+            if count == 0 { return Ok(Vec::new()); }
+            let start=sector.checked_mul(512).and_then(|s|s.checked_add(offset)).ok_or(INVALID)?;
             if count!=0 && super::sys_ramdisk_read(start,&mut bytes[..count])!=count{return Err(IO_ERROR);}count
         },
         _=>return Err(UNSUPPORTED),
