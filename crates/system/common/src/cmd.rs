@@ -686,9 +686,13 @@ fn process_command(cmd: &[u8; CMD_BUFFER_SIZE], mode: &ShellMode, cwd: &mut Cwd)
 
 /// Process a command chain with redirection support
 fn process_command_chain(cmd_str: &str, mode: &ShellMode, cwd: &mut Cwd) -> bool {
+    execute_command_chain(cmd_str, mode, cwd).exit
+}
+
+fn execute_command_chain(cmd_str: &str, mode: &ShellMode, cwd: &mut Cwd) -> CommandResult {
     let Ok(parts) = split_command_chain(cmd_str) else {
         serial_print(b"Invalid or unsupported command chain.\r\n");
-        return false;
+        return CommandResult { exit: false, error_level: 1 };
     };
     let mut error_level = 0;
     for (operator, part) in parts {
@@ -706,9 +710,11 @@ fn process_command_chain(cmd_str: &str, mode: &ShellMode, cwd: &mut Cwd) -> bool
             let output = take_output_capture().unwrap_or_default();
             if !write_command_output(&path, &output, append, cwd) { error_level = 1; }
         }
-        if result.exit { return true; }
+        if result.exit {
+            return CommandResult { exit: true, error_level };
+        }
     }
-    false
+    CommandResult { exit: false, error_level }
 }
 
 fn write_command_output(path: &str, output: &[u8], append: bool, cwd: &Cwd) -> bool {
@@ -2466,7 +2472,7 @@ impl BatchExecutor for CmdBatchExecutor {
         // reach the complete Windows command surface, not just the
         // restricted Safe Mode shell subset.
         let mode = ShellMode::Ring3;
-        let result = execute_single_command(command, &mode, &mut self.cwd);
+        let result = execute_command_chain(command, &mode, &mut self.cwd);
         self.error_level = result.error_level;
         Ok(result.error_level)
     }

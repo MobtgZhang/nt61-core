@@ -188,24 +188,15 @@ impl BatchParser {
                     false_branch,
                 } => {
                     let cond = self.evaluate_condition(&condition, executor)?;
-                    // The lowered block-IF puts a GOTO in the true branch
-                    // (e.g. `IF "%A%" == "%B%" GOTO :__IF_THEN_1__`). If
-                    // condition is true we just run the GOTO; if false,
-                    // control falls through to the next line (which the
-                    // lowering emitted as `GOTO :__IF_ELSE_1__` for the
-                    // else-branch case).
-                    if cond && !true_branch.is_empty() {
-                        let upper_branch = true_branch.to_uppercase();
-                        if upper_branch.starts_with("GOTO ") {
-                            let label = true_branch[4..].trim().to_string();
-                            self.handle_goto(&label)?;
-                        } else {
-                            self.execute_command(&true_branch, executor)?;
-                        }
-                    } else if !cond {
-                        if let Some(fb) = false_branch {
-                            if !fb.is_empty() {
-                                self.execute_command(&fb, executor)?;
+                    let branch = if cond { Some(true_branch) } else { false_branch };
+                    if let Some(branch) = branch.filter(|branch| !branch.is_empty()) {
+                        match self.classify_line(&branch) {
+                            LineType::Goto(label) => self.handle_goto(&label)?,
+                            LineType::Exit { batch_only, code } => {
+                                self.handle_exit(batch_only, code)?;
+                            }
+                            _ => {
+                                self.execute_command(&branch, executor)?;
                             }
                         }
                     }
@@ -247,18 +238,7 @@ impl BatchParser {
                     // that contain it don't error out.
                 }
                 LineType::Exit { batch_only, code } => {
-                    if batch_only {
-                        if let Some(saved_pos) = self.call_stack.pop() {
-                            self.current = saved_pos;
-                            continue;
-                        }
-                        self.running = false;
-                        return Ok(());
-                    } else {
-                        // Exit the entire CMD
-                        self.running = false;
-                        return Err(BatError::Exit(code.unwrap_or(0)));
-                    }
+                    self.handle_exit(batch_only, code)?;
                 }
                 LineType::Command(cmd) => {
                     if self.echo {
@@ -325,6 +305,23 @@ impl BatchParser {
     /// Stop execution
     pub fn stop(&mut self) {
         self.running = false;
+    }
+
+    fn handle_exit(&mut self, batch_only: bool, code: Option<i32>) -> Result<(), BatError> {
+        if let Some(code) = code {
+            self.error_level = code;
+        }
+        if batch_only {
+            if let Some(saved_pos) = self.call_stack.pop() {
+                self.current = saved_pos;
+            } else {
+                self.running = false;
+            }
+            Ok(())
+        } else {
+            self.running = false;
+            Err(BatError::Exit(self.error_level))
+        }
     }
 
     /// Check if still running
@@ -816,15 +813,7 @@ impl BatchParser {
 
     /// Classify IF statement
     fn classify_if(&self, line: &str) -> LineType {
-        let _upper = line.to_uppercase();
-        // Strip leading "IF ".
-        let body = if let Some(rest) = line.trim_start().strip_prefix("IF ") {
-            rest.to_string()
-        } else if let Some(rest) = line.trim_start().strip_prefix("IF") {
-            rest.trim_start().to_string()
-        } else {
-            line.to_string()
-        };
+        let body = line[2..].trim_start();
         let upper_body = body.to_uppercase();
 
         // IF [... ] GOTO :label — the canonical lowered form from
@@ -866,7 +855,8 @@ impl BatchParser {
 
         // IF ERRORLEVEL n [cmd]
         if upper_body.contains("ERRORLEVEL ") {
-            let (condition, command) = split_condition_command(&body, "ERRORLEVEL ", 1);
+            let (_, command) = split_condition_command(body, "ERRORLEVEL ", 1);
+            let condition = body[..body.len() - command.len()].trim_end().to_string();
             return LineType::If {
                 condition,
                 true_branch: command,
@@ -1059,7 +1049,12 @@ impl BatchParser {
                 for (i, part) in parts.iter().enumerate() {
                     if part.to_uppercase() == "ERRORLEVEL" && i + 1 < parts.len() {
                         if let Ok(level) = parts[i + 1].parse::<i32>() {
-                            return Ok(self.error_level >= level);
+                            let matches = self.error_level >= level;
+                            return Ok(if parts[0].eq_ignore_ascii_case("NOT") {
+                                !matches
+                            } else {
+                                matches
+                            });
                         }
                     }
                 }
@@ -1632,7 +1627,59 @@ fn eval_int_expr(expr: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::BatchParser;
+    use super::{BatError, BatchExecutor, BatchParser};
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    struct Script<'a> {
+        source: &'a str,
+        commands: Vec<String>,
+    }
+
+    impl BatchExecutor for Script<'_> {
+        fn read_file(&self, _filename: &str) -> Result<String, BatError> {
+            Ok(self.source.to_string())
+        }
+
+        fn execute_command(&mut self, command: &str) -> Result<u32, BatError> {
+            self.commands.push(command.to_string());
+            Ok(if command == "fail" { 5 } else { 0 })
+        }
+
+        fn echo_line(&self, _line: &str) {}
+
+        fn file_exists(&self, _path: &str) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn exit_b_status_propagates_to_the_batch_caller() {
+        for (source, commands, status) in [
+            ("exit /b 37\necho unreachable", &[][..], 37),
+            ("fail\nexit /b\necho unreachable", &["fail"][..], 5),
+            (
+                "call :sub\nif errorlevel 37 exit /b %errorlevel%\necho unreachable\n:sub\nexit /b 37",
+                &[][..],
+                37,
+            ),
+            (
+                "fail\nif errorlevel 5 exit /b 31\necho unreachable",
+                &["fail"][..],
+                31,
+            ),
+        ] {
+            let mut script = Script {
+                source,
+                commands: Vec::new(),
+            };
+            let mut parser = BatchParser::new();
+            parser.execute("probe.bat", &mut script).unwrap();
+            assert_eq!(parser.get_error_level(), status, "{source}");
+            assert_eq!(script.commands, commands, "{source}");
+            assert!(!parser.is_running(), "{source}");
+        }
+    }
 
     #[test]
     fn autoexec_batch_parses_and_collects_labels() {
