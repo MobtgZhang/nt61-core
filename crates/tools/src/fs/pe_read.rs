@@ -41,6 +41,8 @@ pub struct PeImage {
     pub exports_by_ordinal: BTreeMap<u16, u32>,
     /// The forwarder targets, keyed by name.
     pub forwarders: BTreeMap<String, String>,
+    /// Forwarder targets keyed by RVA, including unnamed exports.
+    pub forwarders_by_rva: BTreeMap<u32, String>,
     /// The import modules and their symbols.
     pub imports: Vec<PeImport>,
     /// The base relocation entries, as RVAs.
@@ -177,6 +179,7 @@ pub fn parse(bytes: &[u8]) -> Option<PeImage> {
     let mut exports_by_name = BTreeMap::new();
     let mut exports_by_ordinal = BTreeMap::new();
     let mut forwarders = BTreeMap::new();
+    let mut forwarders_by_rva = BTreeMap::new();
 
     if let Some(&(export_rva, export_size)) = data_directories.first() {
         if export_rva != 0 && export_size != 0 {
@@ -195,8 +198,16 @@ pub fn parse(bytes: &[u8]) -> Option<PeImage> {
                         None => break,
                     };
                     let rva = read_u32(bytes, at);
-                    let ordinal = (ordinal_base as usize + index) as u16;
+                    let Ok(ordinal) = u16::try_from(ordinal_base as usize + index) else { break };
+                    if rva == 0 {
+                        continue;
+                    }
                     exports_by_ordinal.insert(ordinal, rva);
+                    if rva >= export_rva && rva - export_rva < export_size {
+                        if let Some(target) = read_cstr(rva) {
+                            forwarders_by_rva.insert(rva, target);
+                        }
+                    }
                 }
 
                 // The named exports.
@@ -214,17 +225,13 @@ pub fn parse(bytes: &[u8]) -> Option<PeImage> {
                     let Some(name) = read_cstr(name_rva) else {
                         continue;
                     };
-                    let Some(&rva) = exports_by_ordinal.get(&(ordinal_base as u16 + slot)) else {
+                    let Ok(ordinal) = u16::try_from(ordinal_base as usize + usize::from(slot)) else { continue };
+                    let Some(&rva) = exports_by_ordinal.get(&ordinal) else {
                         continue;
                     };
                     exports_by_name.insert(name.clone(), rva);
-                    // A forwarder points inside the export directory.
-                    if (rva as usize) >= export_rva as usize
-                        && (rva as usize) < (export_rva + export_size) as usize
-                    {
-                        if let Some(target) = read_cstr(rva) {
-                            forwarders.insert(name, target);
-                        }
+                    if let Some(target) = forwarders_by_rva.get(&rva) {
+                        forwarders.insert(name, target.clone());
                     }
                 }
             }
@@ -340,6 +347,7 @@ pub fn parse(bytes: &[u8]) -> Option<PeImage> {
         exports_by_name,
         exports_by_ordinal,
         forwarders,
+        forwarders_by_rva,
         imports,
         relocations,
     })

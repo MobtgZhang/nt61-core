@@ -150,7 +150,7 @@ fn relocation_append_rejects_duplicate_append_without_mutation() {
     assert_eq!(pe, before);
 }
 
-#[path = "../../winload/src/boot_image.rs"]
+#[path = "../../boot-types/src/boot_image.rs"]
 #[allow(dead_code)]
 mod boot_image;
 

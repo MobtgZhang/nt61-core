@@ -435,8 +435,198 @@ fn the_loader_sees_the_exported_names() {
         .expect("GetLastError must be exported");
     assert_eq!(address, 0x0000_0001_8000_0000 + 0x1010);
 
-    // The forwarder is exported under its own name too.
-    assert!(db.lookup("user32.dll", "MessageBoxW").is_some());
+    assert_eq!(db.lookup("user32.dll", "MessageBoxW"), None);
+}
+
+#[test]
+fn boot_linker_rebases_and_binds_sparse_exports_in_place() {
+    use nt61_boot_types::boot_image::Header;
+    use nt61_loader::loader::{link_boot_image, ImageDatabase};
+
+    let preferred = 0x1_8000_0000u64;
+    let actual = preferred + 0x20000;
+    let mut provider = sample_dll();
+    provider.imports.clear();
+    provider.exports.clear();
+    provider
+        .export_named("Zulu", 731, 0x1010)
+        .export_named("Alpha", 733, 0x1020)
+        .export_ordinal(736, 0x1030)
+        .export_forwarder("Forwarded", 739, "USER32.#736");
+    provider.relocations = vec![0x1018];
+    let (raw, _) = pe::emit(&provider);
+    let header = Header::parse(&raw, MACHINE_AMD64).unwrap();
+    let mut mapped = vec![0; header.image_size];
+    header.map(&raw, &mut mapped).unwrap();
+    let database = ImageDatabase::new();
+    assert_eq!(
+        link_boot_image("user32.dll", header, &mut mapped, actual, &database),
+        Ok(1)
+    );
+    assert_eq!(database.find_image_base("USER32.DLL"), Some(actual));
+    assert_eq!(database.lookup("user32.dll", "Zulu"), Some(actual + 0x1010));
+    assert_eq!(
+        database.lookup("user32.dll", "Alpha"),
+        Some(actual + 0x1020)
+    );
+    assert_eq!(database.lookup_ordinal("user32.dll", 732), None);
+    assert_eq!(
+        database.lookup_ordinal("user32.dll", 736),
+        Some(actual + 0x1030)
+    );
+    assert_eq!(
+        database.lookup("user32.dll", "Forwarded"),
+        Some(actual + 0x1030)
+    );
+
+    let mut consumer = sample_dll();
+    consumer.exports.clear();
+    consumer.imports.clear();
+    consumer.relocations = vec![0x1018];
+    consumer.sections[0].data[0x18..0x20].copy_from_slice(&(preferred + 0x1010).to_le_bytes());
+    consumer.import(
+        "user32.dll",
+        vec![
+            ImportSymbol::ByName("Alpha".into()),
+            ImportSymbol::ByOrdinal(732),
+        ],
+    );
+    let (raw, _) = pe::emit(&consumer);
+    let header = Header::parse(&raw, MACHINE_AMD64).unwrap();
+    let mut mapped = vec![0; header.image_size];
+    header.map(&raw, &mut mapped).unwrap();
+    let before = mapped.clone();
+    let lower_base = preferred - 0x20000;
+    assert!(link_boot_image("consumer.dll", header, &mut mapped, lower_base, &database).is_err());
+    assert_eq!(mapped, before);
+    assert_eq!(database.find_image_base("consumer.dll"), None);
+
+    consumer.imports[0].symbols[1] = ImportSymbol::ByOrdinal(739);
+    let (raw, _) = pe::emit(&consumer);
+    let header = Header::parse(&raw, MACHINE_AMD64).unwrap();
+    header.map(&raw, &mut mapped).unwrap();
+    let (_, _, _, optional) = nt61_loader::loader::parse_headers(&mapped).unwrap();
+    let (imports, _) = nt61_loader::loader::read_data_directory_pe32plus(&mapped, optional, 1);
+    let imports = imports as usize;
+    let iat = u32::from_le_bytes(mapped[imports + 16..imports + 20].try_into().unwrap()) as usize;
+    mapped[imports..imports + 4].fill(0);
+    assert_eq!(
+        link_boot_image("consumer.dll", header, &mut mapped, lower_base, &database),
+        Ok(1)
+    );
+    assert_eq!(
+        &mapped[0x1018..0x1020],
+        &(lower_base + 0x1010).to_le_bytes()
+    );
+    assert_eq!(&mapped[iat..iat + 8], &(actual + 0x1020).to_le_bytes());
+    assert_eq!(&mapped[iat + 8..iat + 16], &(actual + 0x1030).to_le_bytes());
+    assert_eq!(&mapped[iat + 16..iat + 24], &[0; 8]);
+}
+
+#[test]
+fn boot_set_links_mutual_kernel_and_hal_imports_before_publishing() {
+    use nt61_boot_types::boot_image::Header;
+    use nt61_loader::loader::{link_boot_images, read_data_directory_pe32plus, MappedBootImage};
+
+    let preferred = 0x1_8000_0000u64;
+    let hal_base = preferred + 0x10000;
+    let kernel_base = preferred - 0x10000;
+    for machine in [MACHINE_AMD64, 0xaa64, 0x5064, 0x6264] {
+        let mut hal = sample_dll();
+        hal.machine = machine;
+        hal.module_name = "hal.dll".into();
+        hal.imports.clear();
+        hal.exports.clear();
+        hal.export_named("HalRoutine", 4, 0x1010);
+        hal.import("ntoskrnl.exe", vec![ImportSymbol::ByName("KernelRoutine".into())]);
+        hal.relocations = vec![0x1018];
+        hal.sections[0].data[0x18..0x20].copy_from_slice(&(preferred + 0x1010).to_le_bytes());
+
+        let mut kernel = hal.clone();
+        kernel.module_name = "ntoskrnl.exe".into();
+        kernel.imports.clear();
+        kernel.exports.clear();
+        kernel.export_named("KernelRoutine", 10, 0x1030);
+        kernel.import("HAL.dll", vec![ImportSymbol::ByOrdinal(4)]);
+
+        let map = |spec: &PeImageSpec| {
+            let (raw, _) = pe::emit(spec);
+            let header = Header::parse(&raw, machine).unwrap();
+            let mut mapped = vec![0; header.image_size];
+            header.map(&raw, &mut mapped).unwrap();
+            (header, mapped)
+        };
+        let (hal_header, mut hal_bytes) = map(&hal);
+        let (kernel_header, mut kernel_bytes) = map(&kernel);
+        let link = |hal_bytes: &mut [u8], kernel_bytes: &mut [u8]| {
+            link_boot_images(&mut [
+                MappedBootImage { name: "hal.dll", header: hal_header, bytes: hal_bytes, load_base: hal_base },
+                MappedBootImage { name: "ntoskrnl.exe", header: kernel_header, bytes: kernel_bytes, load_base: kernel_base },
+            ])
+        };
+
+        let hal_before = hal_bytes.clone();
+        let (reloc_rva, _) = read_data_directory_pe32plus(&kernel_bytes, kernel_header.optional_offset, 5);
+        let block_size = reloc_rva as usize + 4;
+        let valid_size: [u8; 4] = kernel_bytes[block_size..block_size + 4].try_into().unwrap();
+        kernel_bytes[block_size..block_size + 4].fill(0);
+        let malformed = kernel_bytes.clone();
+        assert_eq!(link(&mut hal_bytes, &mut kernel_bytes), Err(("ntoskrnl.exe", "invalid relocation block size")));
+        assert_eq!(hal_bytes, hal_before);
+        assert_eq!(kernel_bytes, malformed);
+
+        kernel_bytes[block_size..block_size + 4].copy_from_slice(&valid_size);
+        link(&mut hal_bytes, &mut kernel_bytes).unwrap();
+        for (header, mapped, base, target) in [
+            (hal_header, hal_bytes, hal_base, kernel_base + 0x1030),
+            (kernel_header, kernel_bytes, kernel_base, hal_base + 0x1010),
+        ] {
+            let (imports, _) = read_data_directory_pe32plus(&mapped, header.optional_offset, 1);
+            let slot = imports as usize + 16;
+            let iat = u32::from_le_bytes(mapped[slot..slot + 4].try_into().unwrap()) as usize;
+            assert_eq!(&mapped[iat..iat + 8], &target.to_le_bytes());
+            assert_eq!(&mapped[iat + 8..iat + 16], &[0; 8]);
+            assert_eq!(&mapped[0x1018..0x1020], &(base + 0x1010).to_le_bytes());
+        }
+    }
+}
+
+#[test]
+fn native_pe32_linker_binds_four_byte_thunks() {
+    use nt61_loader::loader::{
+        load_image_full, parse_headers, read_data_directory_pe32, ImageDatabase,
+    };
+
+    let mut provider = sample_dll();
+    provider.machine = 0x14c;
+    provider.image_base = 0x6000_0000;
+    provider.imports.clear();
+    let (raw, _) = pe::emit(&provider);
+    let mut database = ImageDatabase::new();
+    let dll = load_image_full("user32.dll", &raw, &mut database, 0).unwrap();
+    database.register(&dll, &raw);
+    let mut consumer = provider;
+    consumer.exports.clear();
+    consumer.image_base = 0x5000_0000;
+    consumer.import(
+        "user32.dll",
+        vec![
+            ImportSymbol::ByName("SetLastError".into()),
+            ImportSymbol::ByOrdinal(3),
+        ],
+    );
+    let (raw, _) = pe::emit(&consumer);
+    let image = load_image_full("consumer.dll", &raw, &mut database, 0).unwrap();
+    let (_, _, _, optional) = parse_headers(&image.bytes).unwrap();
+    let (imports, _) = read_data_directory_pe32(&image.bytes, optional, 1);
+    let slot = imports as usize + 16;
+    let iat = u32::from_le_bytes(image.bytes[slot..slot + 4].try_into().unwrap()) as usize;
+    assert_eq!(&image.bytes[iat..iat + 4], &0x6000_1020u32.to_le_bytes());
+    assert_eq!(
+        &image.bytes[iat + 4..iat + 8],
+        &0x6000_1030u32.to_le_bytes()
+    );
+    assert_eq!(&image.bytes[iat + 8..iat + 12], &[0; 4]);
 }
 
 #[test]
