@@ -4,6 +4,8 @@
 #![allow(dead_code)]
 
 pub mod boot_types;
+pub mod boot_image;
+pub mod image_cache;
 
 pub mod boot_options;
 

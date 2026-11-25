@@ -17,14 +17,12 @@ fn bcd_timeout_roundtrips_through_the_kernel_hive_parser() {
                 "Objects",
                 "{9dea862c-5cdd-4e70-acc1-f32b344d4795}",
                 "Elements",
-                "15000011",
+                "25000004",
             ])
             .unwrap()
             .expect("boot-manager timeout");
-        assert_eq!(
-            hive.find_value(&element, "Element").unwrap().unwrap().as_u32(),
-            Some(timeout)
-        );
+        let value = hive.find_value(&element, "Element").unwrap().unwrap();
+        assert_eq!(value.data, u64::from(timeout).to_le_bytes());
         if timeout == 5 {
             assert_eq!(bytes, nt61_tools::hive_gen::build_bcd());
         }

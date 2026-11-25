@@ -25,16 +25,6 @@ pub fn write_com1_marker(bytes: &[u8]) {
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-pub unsafe fn write_halt_stub(stack_top: u64) -> u64 {
-    let halt_addr = stack_top - 4;
-    core::ptr::write_volatile(halt_addr as *mut u32, 0x147f_0000);
-    core::ptr::write_volatile((stack_top - 16) as *mut u64, halt_addr);
-    halt_addr
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 pub unsafe fn launch_efi_main(
     image_handle: u64,
     system_table: u64,
@@ -44,6 +34,7 @@ pub unsafe fn launch_efi_main(
     core::arch::asm!(
         "move $sp, $t1",
         "jirl $ra, $t0, 0",
+        "break 0",
         in("$r4") image_handle,
         in("$r5") system_table,
         in("$r13") stack_top,

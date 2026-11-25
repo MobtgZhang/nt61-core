@@ -16,19 +16,6 @@ pub fn write_com1_marker(bytes: &[u8]) {
 /// # Safety
 ///
 /// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Write the architecture's halt loop immediately below `stack_top`.
-pub unsafe fn write_halt_stub(stack_top: u64) -> u64 {
-    let halt_addr = stack_top - 8;
-    core::ptr::write_volatile(halt_addr as *mut u8, 0xF4);
-    core::ptr::write_volatile((halt_addr + 1) as *mut u8, 0xEB);
-    core::ptr::write_volatile((halt_addr + 2) as *mut u8, 0xFE);
-    core::ptr::write_volatile((stack_top - 16) as *mut u64, halt_addr);
-    halt_addr
-}
-
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
 /// Load `efiapi` argument registers and jump to the target image
 /// with a private stack. The target is expected not to return.
 ///
@@ -41,20 +28,16 @@ pub unsafe fn launch_efi_main(
     entry_vma: u64,
 ) -> ! {
     core::arch::asm!(
-        "xor r8d, r8d",
-        "xor r9d, r9d",
-        "mov rsp, {sp}",
-        "jmp {entry}",
-        // Bind the UEFI entry arguments straight to their ABI
-        // registers. Going through in(reg) + explicit mov made LLVM
-        // assign both values to the same register (observed as
-        // 'mov %rdx,%rcx; mov %rcx,%rdx' in the shipped binary), so
-        // winload received the image handle where the system table
-        // belongs and faulted on its first boot-services call.
+        "mov rsp, r10",
+        "sub rsp, 32",
+        "call rax",
+        "cli",
+        "2: hlt",
+        "jmp 2b",
         in("rcx") image_handle,
         in("rdx") system_table,
-        sp = in(reg) stack_top,
-        entry = in(reg) entry_vma,
+        in("r10") stack_top,
+        in("rax") entry_vma,
         options(noreturn),
     )
 }

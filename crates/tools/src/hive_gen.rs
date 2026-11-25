@@ -103,8 +103,8 @@ fn ensure_path<'a>(root: &'a mut Node, path: &str) -> &'a mut Node {
 ///   - 12000002: FilePath (string) - Application path
 ///   - 12000004: Description (string)
 ///   - 12000005: Locale (string)
-///   - 14000006: DisplayOrder (string-list, REG_MULTI_SZ)
-///   - 15000011: Timeout (DWORD stored as binary)
+///   - 24000001: Boot Manager DisplayOrder (REG_MULTI_SZ)
+///   - 25000004: Boot Manager Timeout (64-bit little-endian binary)
 ///   - 21000001: OsDevice (binary device path)
 ///   - 22000001: OsLoadOptions (string)
 ///   - 22000002: SystemRoot (string)
@@ -211,15 +211,17 @@ pub fn build_bcd_with_timeout(timeout: u32) -> Vec<u8> {
             }
             {
                 let mut ee = node("Elements");
-                // The project's boot manager reads this DWORD timeout element.
-                ee.subkeys.push(element_subkey_dword("15000011", timeout));
+                ee.subkeys.push(element_subkey_binary(
+                    "25000004",
+                    &u64::from(timeout).to_le_bytes(),
+                ));
                 ee.subkeys.push(element_subkey_string("23000003", "{9dea862d-5cdd-4e70-acc1-f32b344d4795}"));
                 ee.subkeys
                     .push(element_subkey_string("12000004", "Windows Boot Manager"));
                 ee.subkeys.push(element_subkey_string("12000005", "en-US"));
                 // DisplayOrder: list of boot loader GUIDs
                 ee.subkeys.push(element_subkey_string_list(
-                    "14000006",
+                    "24000001",
                     &[
                         "{9dea862d-5cdd-4e70-acc1-f32b344d4795}",
                         "{b2721d66-7dbf-4e50-ae7c-d27f2d90ce20}",

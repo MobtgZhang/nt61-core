@@ -268,15 +268,14 @@ fn read_directory_chain(
             let cluster = (u32::from(high) << 16) | u32::from(low);
             let size = u32::from_le_bytes(entry_bytes[28..32].try_into().ok()?);
             let sfn_checksum = lfn_checksum(raw_name);
-            let lfn_parts = lfn_parts
-                .iter()
+            let mut matching_parts = core::mem::take(&mut lfn_parts)
+                .into_iter()
                 .filter(|(_, checksum, _)| *checksum == sfn_checksum)
-                .cloned()
                 .collect::<Vec<_>>();
-            let mut name = if lfn_parts.is_empty() {
+            let mut name = if matching_parts.is_empty() {
                 decode_sfn(raw_name)?
             } else {
-                decode_lfn(&mut lfn_parts.clone())?
+                decode_lfn(&mut matching_parts)?
             };
             while name.ends_with(' ') {
                 name.pop();
@@ -310,7 +309,7 @@ fn parse_lfn(entry: &[u8; 32]) -> Option<(u8, u8, Vec<u16>)> {
         let value = u16::from_le_bytes([entry[offset], entry[offset + 1]]);
         chars.push(value);
     }
-    for offset in (28..30usize).step_by(2) {
+    for offset in (28..32usize).step_by(2) {
         let value = u16::from_le_bytes([entry[offset], entry[offset + 1]]);
         chars.push(value);
     }
@@ -336,7 +335,7 @@ fn decode_lfn(parts: &mut Vec<(u8, u8, Vec<u16>)>) -> Option<String> {
 fn lfn_checksum(raw_name: &[u8]) -> u8 {
     let mut checksum: u8 = 0;
     for byte in raw_name.iter().take(11) {
-        checksum = checksum.wrapping_mul(2).wrapping_add(*byte);
+        checksum = checksum.rotate_right(1).wrapping_add(*byte);
     }
     checksum
 }
@@ -448,6 +447,20 @@ mod tests {
             file.read_exact(&mut buffer).ok()?;
             Some(buffer)
         }
+    }
+
+    #[test]
+    fn decodes_fat_long_name_and_matches_its_short_alias_checksum() {
+        let entry = [
+            0x41, b'A', 0, b'B', 0, b'C', 0, b'D', 0, b'E', 0, 0x0f, 0, 0xd8, b'F', 0, b'G', 0,
+            b'H', 0, b'I', 0, b'J', 0, b'K', 0, 0, 0, b'L', 0, b'M', 0,
+        ];
+        let part = parse_lfn(&entry).expect("long filename entry");
+        assert_eq!(part.1, lfn_checksum(b"MICROS~1   "));
+        assert_eq!(
+            decode_lfn(&mut alloc::vec![part]).as_deref(),
+            Some("ABCDEFGHIJKLM")
+        );
     }
 
     #[test]

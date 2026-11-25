@@ -118,9 +118,14 @@ pub struct Value {
     pub name: String,
     pub value_type: u32,
     pub data: Vec<u8>,
+    data_offset: Option<usize>,
 }
 
 impl Value {
+    pub fn data_offset(&self) -> Option<usize> {
+        self.data_offset
+    }
+
     /// Decode a UTF-16LE string value.
     pub fn as_string(&self) -> Option<String> {
         // Support REG_SZ (type 1), REG_EXPAND_SZ (type 2), and REG_LINK (type 6)
@@ -211,6 +216,10 @@ impl<'a> Hive<'a> {
     /// Get the root key node.
     pub fn root(&self) -> Result<KeyNode, HiveError> {
         self.read_nk(self.root_offset)
+    }
+
+    pub fn has_clean_header(&self) -> bool {
+        self.data[4..8] == self.data[8..12]
     }
 
     /// Convert a HBIN-relative offset to absolute file offset
@@ -492,13 +501,13 @@ impl<'a> Hive<'a> {
         let inline = (data_size_raw & VK_DATA_INLINE_FLAG) != 0;
         let data_len = (data_size_raw & !VK_DATA_INLINE_FLAG) as usize;
 
-        let data = if inline {
+        let (data, data_offset) = if inline {
             if data_len > 4 {
                 return Err(HiveError::Truncated);
             }
-            data_offset_raw.to_le_bytes()[..data_len].to_vec()
+            (data_offset_raw.to_le_bytes()[..data_len].to_vec(), Some(offset + VK_DATA_OFFSET))
         } else if data_len == 0 {
-            Vec::new()
+            (Vec::new(), None)
         } else {
             // Like SYSTEM hives, BCD vk offsets address the allocated cell
             // header. The actual data starts four bytes after that header.
@@ -513,13 +522,14 @@ impl<'a> Hive<'a> {
             {
                 return Err(HiveError::Truncated);
             }
-            self.data[data_off..data_off + data_len].to_vec()
+            (self.data[data_off..data_off + data_len].to_vec(), Some(data_off))
         };
 
         Ok(Value {
             name,
             value_type: data_type,
             data,
+            data_offset,
         })
     }
 

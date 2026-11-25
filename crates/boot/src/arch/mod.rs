@@ -1,19 +1,5 @@
 //! Architecture policy for the boot manager.
 
-/// # Safety
-///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
-/// Probe a physical page by writing and reading a marker through
-/// volatile memory. Returns the read-back byte so the caller can
-/// reject firmware allocations that are not actually mapped.
-///
-/// SAFETY: `address` must point to mapped, writable memory.
-pub unsafe fn probe_memory(address: u64) -> u8 {
-    let pointer = address as *mut u8;
-    pointer.write_volatile(0xAA);
-    pointer.read_volatile()
-}
-
 /// Architecture-specific boot dispatch surface.
 ///
 /// Callers may only use this facade; machine encodings and register

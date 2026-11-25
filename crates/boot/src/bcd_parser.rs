@@ -11,8 +11,9 @@
 //!   - 12000002: FilePath (string) - Application path
 //!   - 12000004: Description (string)
 //!   - 12000005: Locale (string)
-//!   - 14000006: DisplayOrder (string list)
-//!   - 15000011: Timeout (DWORD)
+//!   - 14000006: Inherited objects (string list)
+//!   - 24000001: Boot Manager DisplayOrder (string list)
+//!   - 25000004: Boot Manager Timeout (binary integer)
 //!   - 15000013: BootMenuPolicy (DWORD)
 //!   - 15000014: BootStatusPolicy (QWORD)
 //!   - 21000001: OsDevice (device path binary)
@@ -37,7 +38,26 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::bcd_registry::{Hive, HiveError, REG_DWORD};
+use crate::bcd_registry::{Hive, HiveError, KeyNode, REG_DWORD};
+
+static BOOT_MANAGER_WINDOWS_GUID: [u8; 16] = [
+    0x2c, 0x86, 0xea, 0x9d, 0xdd, 0x5c, 0x70, 0x4e, 0xac, 0xc1, 0xf3, 0x2b, 0x34, 0x4d, 0x47, 0x95,
+];
+
+#[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+pub const MEMORY_DIAGNOSTIC_GUID: [u8; 16] = [
+    0xb2, 0x72, 0x1d, 0x73, 0x1d, 0xb4, 0x4c, 0x62, 0xbf, 0x78, 0xc5, 0x48, 0xa8, 0x80, 0x14, 0x2d,
+];
+
+#[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+const MEMORY_DIAGNOSTIC_NAME: &str = "{b2721d73-1db4-4c62-bf78-c548a880142d}";
+
+pub(crate) fn windows_guid(mut guid: [u8; 16]) -> [u8; 16] {
+    guid[..4].reverse();
+    guid[4..6].reverse();
+    guid[6..8].reverse();
+    guid
+}
 
 /// BCD parsing errors
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +67,7 @@ pub enum BcdError {
     InvalidVersion,
     Truncated,
     MissingObject,
+    UnsafeInPlaceUpdate,
 }
 
 impl From<HiveError> for BcdError {
@@ -106,6 +127,8 @@ fn aliases_for(type_id: &str) -> &'static [&'static str] {
 
 /// Object type: Windows Boot Loader
 pub const OBJECT_TYPE_WINDOWS_BOOT_LOADER: u32 = 0x1020_0003;
+#[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+const OBJECT_TYPE_WINDOWS_RESUME: u32 = 0x1020_0004;
 /// Object type: BootApp (EFI application)
 
 /// Top-level BCD hive wrapper.
@@ -120,29 +143,269 @@ impl<'a> BcdHive<'a> {
         Ok(Self { hive })
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    pub fn memory_diagnostic(&self) -> BcdResult<Option<([u8; 16], String)>> {
+        let Some(manager) = self.try_open_boot_manager() else {
+            return Ok(None);
+        };
+        let Ok(order) = self.hive.open_at(&manager, "Elements/24000010") else {
+            return Ok(None);
+        };
+        let value = self.hive.get_value(&order, "Element")?.ok_or(BcdError::MissingObject)?;
+        if value.value_type != 7 || value.data.len() % 2 != 0 {
+            return Err(BcdError::Truncated);
+        }
+        let words: Vec<u16> = value.data.chunks_exact(2)
+            .map(|word| u16::from_le_bytes([word[0], word[1]]))
+            .collect();
+        let listed = words.split(|&word| word == 0).any(|name| {
+            String::from_utf16(name)
+                .is_ok_and(|name| name.eq_ignore_ascii_case(MEMORY_DIAGNOSTIC_NAME))
+        });
+        if !listed {
+            return Ok(None);
+        }
+        Ok(Some((MEMORY_DIAGNOSTIC_GUID, self.memory_diagnostic_path()?)))
+    }
+
+    #[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+    fn memory_diagnostic_path(&self) -> BcdResult<String> {
+        let objects = self.try_open_objects().ok_or(BcdError::MissingObject)?;
+        let object = self.hive.open_at(&objects, MEMORY_DIAGNOSTIC_NAME)?;
+        self.get_element_string(&object, "12000002")
+            .ok_or(BcdError::MissingObject)
+    }
+
+    #[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+    pub fn scheduled_memory_diagnostic(&self) -> BcdResult<Option<(String, usize, Vec<u8>)>> {
+        let Some(manager) = self.try_open_boot_manager() else {
+            return Ok(None);
+        };
+        let Ok(sequence) = self.hive.open_at(&manager, "Elements/24000002") else {
+            return Ok(None);
+        };
+        let value = self.hive.get_value(&sequence, "Element")?.ok_or(BcdError::MissingObject)?;
+        if value.value_type != 7 || value.data.len() != (MEMORY_DIAGNOSTIC_NAME.len() + 2) * 2
+            || !value.data.ends_with(&[0; 4])
+            || !decode_utf16(&value.data)
+                .is_some_and(|name| name.eq_ignore_ascii_case(MEMORY_DIAGNOSTIC_NAME))
+        {
+            return Ok(None);
+        }
+        let offset = value.data_offset().ok_or(BcdError::Truncated)?;
+        let guid_length = MEMORY_DIAGNOSTIC_NAME.len() * 2;
+        if !self.hive.has_clean_header() || offset / 512 != (offset + guid_length - 1) / 512 {
+            return Err(BcdError::UnsafeInPlaceUpdate);
+        }
+        Ok(Some((self.memory_diagnostic_path()?, offset, value.data)))
+    }
+
+    #[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+    pub fn scheduled_resume(&self) -> BcdResult<Option<([u8; 16], String, usize)>> {
+        let Some(manager) = self.try_open_boot_manager() else { return Ok(None) };
+        let Ok(request) = self.hive.open_at(&manager, "Elements/26000005") else { return Ok(None) };
+        let Some(value) = self.hive.get_value(&request, "Element")? else { return Ok(None) };
+        if value.value_type != 3 || value.data != [1] {
+            return Ok(None);
+        }
+        let mut guid = [0; 16];
+        let Some(target) = self.get_element_string(&manager, "23000006")
+            .and_then(|name| parse_guid_braced(&name, &mut guid))
+            .and_then(|_| self.try_open_objects())
+            .and_then(|objects| self.find_object(&objects, guid))
+        else { return Ok(None) };
+        if self.get_object_type(&target) != OBJECT_TYPE_WINDOWS_RESUME {
+            return Ok(None);
+        }
+        let Some(path) = self.get_element_string(&target, "12000002").filter(|path| !path.is_empty()) else {
+            return Ok(None);
+        };
+        if !self.hive.has_clean_header() {
+            return Err(BcdError::UnsafeInPlaceUpdate);
+        }
+        let offset = value.data_offset().ok_or(BcdError::Truncated)?;
+        Ok(Some((guid, path, offset)))
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+    pub fn windows_application(
+        &self,
+        guid: [u8; 16],
+    ) -> Option<crate::windows_boot_application::Application> {
+        let objects = self.try_open_objects()?;
+        let node = self.find_object(&objects, guid)?;
+        let mut options = Vec::new();
+        self.collect_application_options(&objects, &node, &mut options, &mut Vec::new())?;
+        if ![0x11000001, 0x12000002].iter().all(|required| {
+            options.iter().any(|(id, _)| id == required)
+        }) {
+            return None;
+        }
+        options.sort_by_key(|(id, _)| *id);
+
+        let ramdisk_options = options.iter()
+            .find(|(kind, _)| *kind == 0x1100_0001)
+            .and_then(|(_, device)| self.windows_ramdisk_options(device));
+        let boot_device = self.windows_boot_manager_device().or_else(|| {
+            let options = ramdisk_options.as_ref()?;
+            let (_, sdi_device) = options.iter().find(|(kind, _)| *kind == 0x3100_0003)?;
+            let device = sdi_device.get(16..)?;
+            crate::windows_boot_application::is_boot_partition(device).then(|| device.to_vec())
+        })?;
+        let guid = windows_guid(guid);
+        let resume = self.get_object_type(&node) == OBJECT_TYPE_WINDOWS_RESUME;
+        Some(crate::windows_boot_application::Application { guid, options, boot_device, ramdisk_options, resume })
+    }
+
+    #[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+    pub fn windows_ramdisk_options(&self, device: &[u8]) -> Option<Vec<(u32, Vec<u8>)>> {
+        if device.get(16..20)? != 0u32.to_le_bytes() || device.get(32..36)? != 3u32.to_le_bytes() {
+            return None;
+        }
+        let guid = windows_guid(device.get(..16)?.try_into().ok()?);
+        if guid == [0; 16] {
+            return None;
+        }
+        let objects = self.try_open_objects()?;
+        let node = self.find_object(&objects, guid)?;
+        let mut options = Vec::new();
+        self.collect_application_options(&objects, &node, &mut options, &mut Vec::new())?;
+        options.retain(|(kind, _)| matches!(kind, 0x1200_0004 | 0x3100_0003 | 0x3200_0004));
+        if ![0x3100_0003, 0x3200_0004].iter().all(|required| {
+            options.iter().any(|(kind, _)| kind == required)
+        }) {
+            return None;
+        }
+        options.sort_by_key(|(kind, _)| *kind);
+        Some(options)
+    }
+
+    #[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+    pub fn windows_recovery_entries(&self, guid: [u8; 16], automatic: bool) -> Option<Vec<([u8; 16], String)>> {
+        self.windows_boot_manager_device()?;
+        let mut entries = Vec::new();
+        let Some(objects) = self.try_open_objects() else { return Some(entries) };
+        let Some(loader) = self.find_object(&objects, guid) else { return Some(entries) };
+        if automatic && self.get_object_type(&loader) != OBJECT_TYPE_WINDOWS_BOOT_LOADER {
+            return Some(entries);
+        }
+        let mut options = Vec::new();
+        if self.collect_application_options(&objects, &loader, &mut options, &mut Vec::new()).is_none() {
+            return Some(entries);
+        }
+        if automatic && !options.iter().any(|(kind, data)| *kind == 0x1600_0009 && data == &[1, 0]) {
+            return Some(entries);
+        }
+        let Some((_, sequence)) = options.iter().find(|(kind, _)| *kind == 0x1400_0008) else {
+            return Some(entries);
+        };
+        for id in sequence.chunks_exact(16) {
+            let target_guid = windows_guid(id.try_into().ok()?);
+            if guid == target_guid || entries.iter().any(|(id, _)| *id == target_guid) {
+                continue;
+            }
+            let Some(target) = self.find_object(&objects, target_guid) else { continue };
+            if self.get_object_type(&target) != OBJECT_TYPE_WINDOWS_BOOT_LOADER {
+                continue;
+            }
+            if let Some(path) = self.get_element_string(&target, "12000002").filter(|path| !path.is_empty()) {
+                entries.push((target_guid, path));
+            }
+        }
+        Some(entries)
+    }
+
+    #[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+    fn windows_boot_manager_device(&self) -> Option<Vec<u8>> {
+        let manager = self.try_open_boot_manager()?;
+        let device = self.hive.open_at(&manager, "Elements/11000001").ok()?;
+        let device = self.hive.get_value(&device, "Element").ok()??;
+        let size = u32::from_le_bytes(device.data.get(24..28)?.try_into().ok()?) as usize;
+        if device.value_type != 3 || size < 16 {
+            return None;
+        }
+        Some(device.data.get(16..16usize.checked_add(size)?)?.to_vec())
+    }
+
+    #[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+    fn find_object(&self, objects: &KeyNode, guid: [u8; 16]) -> Option<KeyNode> {
+        self.hive.subkeys(objects).ok()?.into_iter().find(|node| {
+            let mut raw = [0; 16];
+            parse_guid_braced(&node.name, &mut raw).is_some() && raw == guid
+        })
+    }
+
+    #[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+    fn collect_application_options(
+        &self,
+        objects: &crate::bcd_registry::KeyNode,
+        node: &crate::bcd_registry::KeyNode,
+        options: &mut Vec<(u32, Vec<u8>)>,
+        visited: &mut Vec<String>,
+    ) -> Option<()> {
+        if visited.iter().any(|name| name.eq_ignore_ascii_case(&node.name)) {
+            return Some(());
+        }
+        if visited.len() == 32 {
+            return None;
+        }
+        visited.push(node.name.clone());
+        let elements = self.hive.open_at(node, "Elements").ok()?;
+        let mut inherits = Vec::new();
+        for element in self.hive.subkeys(&elements).ok()? {
+            let Ok(kind) = u32::from_str_radix(&element.name, 16) else { continue };
+            let Some(value) = self.hive.get_value(&element, "Element").ok()? else { continue };
+            let mut data = value.data;
+            match (kind >> 24) & 0xf {
+                3 => {
+                    let name = decode_utf16(&data)?;
+                    let mut guid = [0; 16];
+                    parse_guid_braced(&name, &mut guid)?;
+                    guid[..4].reverse();
+                    guid[4..6].reverse();
+                    guid[6..8].reverse();
+                    data = guid.to_vec();
+                }
+                4 => {
+                    let words: Vec<u16> = data.chunks_exact(2)
+                        .map(|part| u16::from_le_bytes([part[0], part[1]])).collect();
+                    data.clear();
+                    for name in words.split(|&word| word == 0).filter(|name| !name.is_empty()) {
+                        let name = String::from_utf16(name).ok()?;
+                        let mut guid = [0; 16];
+                        parse_guid_braced(&name, &mut guid)?;
+                        if kind == 0x14000006 {
+                            inherits.push(name);
+                        }
+                        guid[..4].reverse();
+                        guid[4..6].reverse();
+                        guid[6..8].reverse();
+                        data.extend_from_slice(&guid);
+                    }
+                }
+                6 if data.len() == 1 => data.push(0),
+                _ => {}
+            }
+            if !options.iter().any(|(existing, _)| *existing == kind) {
+                options.push((kind, data));
+            }
+        }
+        for name in inherits {
+            if let Ok(parent) = self.hive.open_at(objects, &name) {
+                self.collect_application_options(objects, &parent, options, visited)?;
+            }
+        }
+        Some(())
+    }
+
     /// Try to open the Boot Manager object, supporting both "NewStoreRoot" and "System" root keys.
     fn try_open_boot_manager(&self) -> Option<crate::bcd_registry::KeyNode> {
-        // Try NewStoreRoot (Windows 8+ style)
-        if let Ok(bm) = self
-            .hive
-            .open("NewStoreRoot/Objects/{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
-        {
-            return Some(bm);
-        }
-        if let Ok(bm) = self
-            .hive
-            .open("Objects/{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
-        {
-            return Some(bm);
-        }
-        // Try System (Windows 7 style)
-        if let Ok(bm) = self
-            .hive
-            .open("System/Objects/{9dea862c-5cdd-4e70-acc1-f32b344d4795}")
-        {
-            return Some(bm);
-        }
-        None
+        let manager_id = core::hint::black_box(&BOOT_MANAGER_WINDOWS_GUID);
+        let objects = self.try_open_objects()?;
+        self.hive.subkeys(&objects).ok()?.into_iter().find(|node| {
+            let mut guid = [0; 16];
+            parse_guid_braced(&node.name, &mut guid).is_some() && windows_guid(guid) == *manager_id
+        })
     }
 
     /// Try to open the Objects key, supporting both "NewStoreRoot" and "System" root keys.
@@ -374,6 +637,14 @@ impl<'a> BcdHive<'a> {
     /// Look up the boot manager timeout, defaulting to five seconds.
     pub fn timeout_seconds(&self) -> u32 {
         if let Some(bm) = self.try_open_boot_manager() {
+            if let Ok(timeout) = self.hive.open_at(&bm, "Elements/25000004") {
+                return self.hive.get_value(&timeout, "Element").ok().flatten()
+                    .filter(|value| value.value_type == 3)
+                    .and_then(|value| value.data.as_slice().try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .map(|seconds| u32::try_from(seconds).unwrap_or(u32::MAX))
+                    .unwrap_or(5);
+            }
             if let Some(timeout) = self.get_element_dword(&bm, "15000011") {
                 return timeout;
             }
@@ -396,7 +667,9 @@ impl<'a> BcdHive<'a> {
                 let mut raw = [0; 16];
                 parse_guid_braced(&s, &mut raw).map(|_| crate::bcd::Guid(raw))
             });
-            if let Ok(order) = self.hive.open_at(&bm, "Elements/14000006") {
+            let order = self.hive.open_at(&bm, "Elements/24000001");
+            let legacy_order = order.is_err();
+            if let Ok(order) = order.or_else(|_| self.hive.open_at(&bm, "Elements/14000006")) {
                 if let Ok(Some(value)) = self.hive.get_value(&order, "Element") {
                     let mut guids = Vec::new();
                     if value.value_type == 7 && value.data.len() % 2 == 0 {
@@ -415,7 +688,7 @@ impl<'a> BcdHive<'a> {
                             guids.push(guid);
                         }
                     }
-                    if !guids.is_empty() {
+                    if !guids.is_empty() && (!legacy_order || entries.iter().any(|entry| guids.contains(&entry.guid))) {
                         entries.retain(|entry| guids.contains(&entry.guid));
                         entries.sort_by_key(|entry| guids.iter().position(|g| g == &entry.guid).unwrap_or(usize::MAX));
                     }
@@ -483,6 +756,17 @@ fn parse_guid_braced(s: &str, out: &mut [u8; 16]) -> Option<()> {
     out[14] = p6[4];
     out[15] = p6[5];
     Some(())
+}
+
+#[cfg(any(test, all(target_arch = "x86_64", target_os = "uefi")))]
+fn decode_utf16(bytes: &[u8]) -> Option<String> {
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let words: Vec<u16> = bytes.chunks_exact(2)
+        .map(|part| u16::from_le_bytes([part[0], part[1]]))
+        .take_while(|word| *word != 0).collect();
+    String::from_utf16(&words).ok()
 }
 
 fn hex_to_bytes_4(s: &str) -> Option<[u8; 4]> {

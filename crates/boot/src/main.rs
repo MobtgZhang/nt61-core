@@ -110,6 +110,18 @@ mod acpi;
 mod arch;
 mod bcd;
 mod bcd_parser;
+#[cfg(target_arch = "x86_64")]
+mod windows_boot_application;
+#[cfg(target_arch = "x86_64")]
+mod windows_boot_paging;
+#[cfg(target_arch = "x86_64")]
+mod windows_boot_return;
+#[cfg(target_arch = "x86_64")]
+mod windows_boot_status;
+#[cfg(target_arch = "x86_64")]
+mod windows_wim;
+#[cfg(target_arch = "x86_64")]
+mod windows_wim_lzx;
 mod bcd_registry;
 mod ext4_boot;
 mod fat32_boot;
@@ -117,7 +129,6 @@ mod fat_lfn;
 mod font;
 mod graphics;
 mod input;
-mod loader;
 mod memory_test;
 mod memory_diagnostic;
 #[path = "../../boot-types/src/memory_diagnostic.rs"]
@@ -325,6 +336,7 @@ enum GraphicsScreen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdvancedAction {
     Repair,
+    AutomaticRepair,
     SafeMode,
     SafeModeNetworking,
     SafeModeCommandPrompt,
@@ -339,6 +351,38 @@ enum AdvancedAction {
 }
 
 impl AdvancedAction {
+    fn is_recovery(self) -> bool {
+        matches!(self, Self::Repair | Self::AutomaticRepair)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn apply_windows_options(self, application: &mut windows_boot_application::Application) -> Result<(), &'static str> {
+        match self {
+            Self::SafeMode | Self::SafeModeNetworking | Self::SafeModeCommandPrompt => {
+                let mode = u64::from(self == Self::SafeModeNetworking);
+                application.set_option(0x2500_0080, &mode.to_le_bytes());
+                application.set_option(0x2600_0081, &[u8::from(self == Self::SafeModeCommandPrompt), 0]);
+                application.set_option(0x2600_0090, &[1, 0]);
+                application.set_option(0x2600_0091, &[1, 0]);
+                application.set_option(0x2600_0041, &[1, 0]);
+                application.set_option(0x2500_0100, &1u64.to_le_bytes());
+            }
+            Self::DirectoryServices => {
+                application.set_option(0x2500_0080, &2u64.to_le_bytes());
+                application.set_option(0x2600_0091, &[1, 0]);
+            }
+            Self::BootLogging => application.set_option(0x2600_0090, &[1, 0]),
+            Self::LowResolution => application.set_option(0x2600_0040, &[1, 0]),
+            Self::LastKnownGood => application.set_option(0x2600_0025, &[1, 0]),
+            Self::DisableAutoRestart => application.set_option(0x2600_0024, &[1, 0]),
+            Self::Debugging => application.set_option(0x2600_00a0, &[1, 0]),
+            Self::DisableDriverSignature => return Err("selected option is unavailable for this Windows boot application"),
+            Self::AutomaticRepair => application.set_option(0x1600_0020, &[1, 0]),
+            Self::Repair | Self::StartNormally => {}
+        }
+        Ok(())
+    }
+
     fn boot_options(self) -> Option<&'static str> {
         match self {
             AdvancedAction::SafeMode => Some("/safeboot:minimal"),
@@ -370,6 +414,35 @@ const ADV_OPTIONS: [(AdvancedAction, &str, &str); 12] = [
         (AdvancedAction::DisableDriverSignature, "Disable Driver Signature Enforcement", "Allows drivers containing improper signatures to be installed."),
         (AdvancedAction::StartNormally, "Start Windows Normally", "Start the normal Windows desktop without advanced boot switches."),
     ];
+
+type WindowsRecoveryEntries = Vec<([u8; 16], alloc::string::String)>;
+
+fn selected_windows_recovery(_menu: &BootMenu) -> Option<WindowsRecoveryEntries> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return windows_recovery_entries(_menu.select()?.guid.0, false);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn windows_recovery_entries(guid: [u8; 16], automatic: bool) -> Option<WindowsRecoveryEntries> {
+    for path in BCD_PATHS {
+        let Ok(data) = read_boot_file(path) else { continue };
+        let Ok(hive) = bcd_parser::BcdHive::parse(&data) else { continue };
+        return hive.windows_recovery_entries(guid, automatic);
+    }
+    None
+}
+
+fn advanced_options(recovery: Option<&WindowsRecoveryEntries>) -> &'static [(AdvancedAction, &'static str, &'static str)] {
+    if recovery.is_some_and(Vec::is_empty) {
+        &ADV_OPTIONS[1..]
+    } else {
+        &ADV_OPTIONS
+    }
+}
 
 mod colors {
     use crate::renderer::Color;
@@ -920,11 +993,6 @@ fn draw_gop_advanced_screen(
 /// that needs the typed value).
 pub static mut BOOT_IMAGE_HANDLE_PTR: *mut core::ffi::c_void = core::ptr::null_mut();
 
-/// Boot options string (e.g. "/safeboot:minimal") set by the F8 advanced
-/// boot menu and written into the BCD mailbox by write_bcd_mailbox().
-/// UEFI boot is single-threaded so a plain static is safe here.
-static mut BOOT_OPTIONS_OVERRIDE: Option<&'static str> = None;
-
 /// Firmware-supplied UEFI system-table pointer. Same rationale as
 /// `BOOT_IMAGE_HANDLE_PTR`. The pointer is opaque to us — we just
 /// hand it back to winload unmodified so winload can dereference the
@@ -973,6 +1041,11 @@ fn efi_main_inner() -> Status {
     match acpi::parse_firmware_tables() {
         Some(summary) => debug_println!("[ACPI] {}", summary.describe()),
         None => debug_println!("[ACPI] firmware did not publish a valid RSDP"),
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if let Err(error) = run_scheduled_windows_application() {
+        debug_println!("[BCD] Scheduled Windows application did not take over: {}", error);
     }
 
     // Expose bootx64.efi through the EFI_LOAD_FILE_PROTOCOL so bootmgfw
@@ -1155,7 +1228,8 @@ fn efi_main_inner() -> Status {
     // instead of relying on its menu position. Unsupported recovery paths
     // return to the menu with a clear notice rather than booting a normal OS
     // entry by mistake.
-    let adv_options = ADV_OPTIONS;
+    let mut windows_recovery = None;
+    let mut adv_options = advanced_options(None);
 
     let mut screen = GraphicsScreen::Main {
         tools_selected: false,
@@ -1226,8 +1300,10 @@ fn efi_main_inner() -> Status {
                 },
                 Key::Special(ScanCode::FUNCTION_8) => match screen {
                     GraphicsScreen::Main { .. } => {
+                        windows_recovery = selected_windows_recovery(&menu);
+                        adv_options = advanced_options(windows_recovery.as_ref());
                         screen = GraphicsScreen::Advanced { selected: 0 };
-                        draw_gop_advanced_screen(&mut fb, &mut font, &adv_options, 0);
+                        draw_gop_advanced_screen(&mut fb, &mut font, adv_options, 0);
                     }
                     GraphicsScreen::Advanced { .. } => {
                         screen = GraphicsScreen::Main {
@@ -1350,77 +1426,44 @@ fn efi_main_inner() -> Status {
                         GraphicsScreen::Advanced { selected } => {
                             let action = adv_options[*selected].0;
                             match action {
-                                AdvancedAction::Repair => run_recovery_tools(
+                                AdvancedAction::Repair => run_selected_recovery(
                                     &mut fb,
                                     &mut font,
                                     con_in.as_mut(),
                                     &bcd_store,
+                                    windows_recovery.as_ref(),
                                 ),
-                                AdvancedAction::DirectoryServices => {
-                                    show_advanced_notice(&mut fb, &mut font, con_in.as_mut(),
-                                        "Active Directory restore requires a domain controller; Windows 7 is a client OS.");
-                                }
                                 _ => {
-                                    if action == AdvancedAction::LowResolution {
-                                        // Change hardware GOP mode before publishing the handoff.
-                                        if let Some(mode) = gop
+                                    let mut set_project_video_mode = || {
+                                        let mode = gop
                                             .modes()
                                             .find(|mode| mode.info().resolution() == (640, 480))
-                                        {
-                                            if gop.set_mode(&mode).is_ok() {
-                                                fb = if gop.current_mode_info().pixel_format()
-                                                    == PixelFormat::BltOnly
-                                                {
-                                                    // SAFETY: scoped GOP remains open, no concurrent access.
-                                                    unsafe { Framebuffer::with_blt(&mut gop) }
-                                                } else {
-                                                    let info = gop.current_mode_info();
-                                                    let ptr = gop.frame_buffer().as_mut_ptr();
-                                                    Framebuffer::with_ptr(
-                                                        FramebufferInfo {
-                                                            base: ptr as u64,
-                                                            size: gop.frame_buffer().size() as u64,
-                                                            width: 640,
-                                                            height: 480,
-                                                            stride: info.stride() as u32 * 4,
-                                                        },
-                                                        ptr,
-                                                    )
-                                                };
-                                                write_fb_mailbox(&fb.info());
-                                            } else {
-                                                show_advanced_notice(
-                                                    &mut fb,
-                                                    &mut font,
-                                                    con_in.as_mut(),
-                                                    "Firmware rejected 640x480 video mode.",
-                                                );
-                                                continue;
-                                            }
+                                            .ok_or("Firmware does not provide 640x480 video mode.")?;
+                                        gop.set_mode(&mode).map_err(|_| "Firmware rejected 640x480 video mode.")?;
+                                        fb = if gop.current_mode_info().pixel_format() == PixelFormat::BltOnly {
+                                            unsafe { Framebuffer::with_blt(&mut gop) }
                                         } else {
-                                            show_advanced_notice(
-                                                &mut fb,
-                                                &mut font,
-                                                con_in.as_mut(),
-                                                "Firmware does not provide 640x480 video mode.",
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                    // F8 switches apply to the selected OS entry. They must
-                                    // not silently pick a different shell or BCD object.
-                                    let requested = if action == AdvancedAction::StartNormally {
-                                        bcd::wellknown::ENTRY_WINDOWS_7
-                                    } else {
-                                        menu.select()
-                                            .map(|entry| entry.guid)
-                                            .unwrap_or(bcd::wellknown::ENTRY_WINDOWS_7)
+                                            let info = gop.current_mode_info();
+                                            let ptr = gop.frame_buffer().as_mut_ptr();
+                                            Framebuffer::with_ptr(
+                                                FramebufferInfo {
+                                                    base: ptr as u64,
+                                                    size: gop.frame_buffer().size() as u64,
+                                                    width: 640,
+                                                    height: 480,
+                                                    stride: info.stride() as u32 * 4,
+                                                },
+                                                ptr,
+                                            )
+                                        };
+                                        write_fb_mailbox(&fb.info());
+                                        Ok(())
                                     };
-                                    if let Err(error) = launch_advanced_action(
-                                        &bcd_store,
-                                        requested,
-                                        action.boot_options(),
-                                    ) {
+                                    let mut state = BootApplicationState {
+                                        project_low_resolution: Some(&mut set_project_video_mode),
+                                        ..BootApplicationState::default()
+                                    };
+                                    if let Err(error) = launch_selected_with_state(&menu, Some(action), &mut state) {
                                         show_advanced_notice(
                                             &mut fb,
                                             &mut font,
@@ -1455,7 +1498,7 @@ fn efi_main_inner() -> Status {
                     );
                 }
                 GraphicsScreen::Advanced { selected } => {
-                    draw_gop_advanced_screen(&mut fb, &mut font, &adv_options, *selected);
+                    draw_gop_advanced_screen(&mut fb, &mut font, adv_options, *selected);
                 }
             }
         } else if auto_boot {
@@ -1946,14 +1989,21 @@ fn device_has_simple_filesystem(handle: uefi::Handle) -> bool {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn read_loaded_volume_file(path: &str) -> Result<Vec<u8>, &'static str> {
+    let volume = boot::get_image_file_system(boot::image_handle())
+        .map_err(|_| "Windows boot application volume is unavailable")?;
+    let path = uefi::CString16::try_from(path).map_err(|_| "invalid Windows boot media path")?;
+    uefi::fs::FileSystem::new(volume).read(path.as_ref())
+        .map_err(|_| "Windows boot application file is unavailable on its media")
+}
+
 /// Some OVMF FAT32 drivers do not properly resolve long filenames (LFN)
 /// when using `EFI_FILE_PROTOCOL.Open()`. The UEFI spec says `open()` should
 /// match by LFN, but OVMF sometimes only matches by the 8.3 short name.
 /// To work around this, when `open()` fails with NOT_FOUND, we enumerate
 /// the directory entries and find the canonical (LFN) name, then re-open with it.
 fn read_boot_file(rel_path: &str) -> Result<Vec<u8>, &'static str> {
-    use core::mem::ManuallyDrop;
-
     // Prefer the in-tree readers for system partitions (NTFS/ext4/refs).
     // Optical RAM-backed media keeps EFI and Windows on one FAT boot volume,
     // so failure to find a separate partition must still fall through to SFS.
@@ -2000,7 +2050,7 @@ fn read_boot_file(rel_path: &str) -> Result<Vec<u8>, &'static str> {
         // expose a block geometry that the GPT partition probe cannot classify.
         debug_println!("[FILE] Trying SFS handle {}...", idx);
         let mut sfs = match boot::open_protocol_exclusive::<SimpleFileSystem>(*handle) {
-            Ok(s) => ManuallyDrop::new(s),
+            Ok(s) => s,
             Err(_) => continue,
         };
 
@@ -2329,6 +2379,141 @@ fn open_file_component(current_dir: &mut Directory, file_name: &str) -> Option<R
 /// (e.g. the BCD file is missing or corrupt) the caller falls back
 /// to an in-memory default store so the UI is still usable for
 /// debugging.
+const BCD_PATHS: [&str; 3] = ["EFI/Microsoft/Boot/BCD", "BCD", "EFI/Boot/BCD"];
+
+#[cfg(target_arch = "x86_64")]
+fn open_windows_boot_directory(device: Handle) -> Result<Option<Directory>, &'static str> {
+    let mut filesystem = boot::open_protocol_exclusive::<SimpleFileSystem>(device)
+        .map_err(|error| {
+            debug_println!("[FILE] Cannot open the loaded image's filesystem: {:?}", error.status());
+            "cannot open the loaded image's filesystem"
+        })?;
+    let mut directory = filesystem.open_volume().map_err(|_| "cannot open the loaded image's volume")?;
+    for component in ["EFI", "Microsoft", "Boot"] {
+        let Some(next) = open_dir_component(&mut directory, component) else {
+            return Ok(None);
+        };
+        directory = next;
+    }
+    Ok(Some(directory))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn log_windows_automatic_recovery(failed_path: &str, recovery_guid: [u8; 16], recovery_path: &str) -> Result<(), &'static str> {
+    use windows_boot_status::{automatic_recovery_log, is_v2_header, CAPACITY, FILE_HEADER_SIZE};
+
+    let device = chain_loaded_device_handle().ok_or("loaded image device is unavailable")?;
+    let mut directory = open_windows_boot_directory(device)?.ok_or("Windows boot directory is unavailable")?;
+    let mut file = directory.open(uefi::cstr16!("BOOTSTAT.DAT"), FileMode::ReadWrite, FileAttribute::empty())
+        .map_err(|_| "cannot open Windows boot status log")?
+        .into_regular_file().ok_or("Windows boot status log is not a regular file")?;
+    let size = file.get_boxed_info::<FileInfo>().map_err(|_| "boot status log size is unavailable")?.file_size();
+    let mut header = [0; FILE_HEADER_SIZE];
+    if size != CAPACITY as u64
+        || file.read(&mut header).map_err(|_| "cannot read boot status log header")? != header.len()
+        || !is_v2_header(&header)
+    {
+        return Err("unsupported Windows boot status log format");
+    }
+
+    let time = uefi::runtime::get_time().map_err(|_| "cannot read firmware clock")?;
+    let timestamp = [time.year(), time.month().into(), time.day().into(), time.hour().into(),
+        time.minute().into(), time.second().into(), (time.nanosecond() / 1_000_000) as u16];
+    let log = automatic_recovery_log(timestamp, failed_path, recovery_guid, recovery_path)
+        .ok_or("cannot encode automatic recovery event")?;
+    file.set_position(0).map_err(|_| "cannot seek Windows boot status log")?;
+    file.write(&log).map_err(|_| "cannot write Windows boot status log")?;
+    file.flush().map_err(|_| "cannot flush Windows boot status log")?;
+    debug_println!("[WINDOWS-BOOT] Logged loader failure and automatic recovery to ESP");
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_scheduled_bcd(file: &mut RegularFile) -> Result<Vec<u8>, &'static str> {
+    let size = file.get_boxed_info::<FileInfo>().map_err(|_| "BCD file size unavailable")?.file_size();
+    if size > 8 * 1024 * 1024 {
+        return Err("BCD exceeds the one-time application update limit");
+    }
+    let mut bytes = try_alloc_zeroed(size as usize).ok_or("cannot allocate BCD buffer")?;
+    read_exact_bcd(file, &mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn open_bcd_for_update(directory: &mut Directory) -> Result<RegularFile, &'static str> {
+    directory.open(uefi::cstr16!("BCD"), FileMode::ReadWrite, FileAttribute::empty())
+        .map_err(|_| "cannot open BCD for write")?.into_regular_file().ok_or("BCD is not a regular file")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn clear_bcd_request(file: &mut RegularFile, offset: usize, expected: &[u8], clear_len: usize) -> Result<(), &'static str> {
+    let mut current = alloc::vec![0; expected.len()];
+    file.set_position(offset as u64).map_err(|_| "cannot seek to BCD request")?;
+    read_exact_bcd(file, &mut current)?;
+    if current != expected {
+        return Err("BCD request changed before it could be cleared");
+    }
+    current[..clear_len].fill(0);
+    file.set_position(offset as u64).map_err(|_| "cannot seek to BCD request")?;
+    file.write(&current[..clear_len]).map_err(|_| "cannot clear BCD request")?;
+    file.flush().map_err(|_| "cannot flush BCD request")
+}
+
+#[cfg(target_arch = "x86_64")]
+fn run_scheduled_windows_application() -> Result<(), &'static str> {
+    let Some(device) = chain_loaded_device_handle() else { return Ok(()) };
+    let Some(mut directory) = open_windows_boot_directory(device)? else { return Ok(()) };
+    let Some(mut reader) = open_file_component(&mut directory, "BCD") else { return Ok(()) };
+    let bytes = read_scheduled_bcd(&mut reader)?;
+    drop(reader);
+    let hive = bcd_parser::BcdHive::parse(&bytes).map_err(|_| "invalid BCD hive")?;
+    if let Some((path, offset, expected)) = hive.scheduled_memory_diagnostic()
+        .map_err(|_| "scheduled diagnosis cannot be updated safely")?
+    {
+        let mut writer = Some(open_bcd_for_update(&mut directory)?);
+        drop(directory);
+        let consume = &mut || {
+            let mut file = writer.take().ok_or("BCD request was already consumed")?;
+            clear_bcd_request(&mut file, offset, &expected, expected.len() - 4)?;
+            debug_println!("[BCD] Consumed one-time Windows application request: {}", path);
+            Ok(())
+        };
+        return launch_memory_diagnostic_and_resume(bcd_parser::MEMORY_DIAGNOSTIC_GUID, &path, Some(consume));
+    }
+    let Some((guid, path, _)) = hive.scheduled_resume()
+        .map_err(|_| "scheduled resume cannot be updated safely")?
+    else { return Ok(()) };
+    drop(bytes);
+    drop(directory);
+    let result = launch_application(guid, &path, "", None, None, &mut BootApplicationState::default());
+    if let Some(mut directory) = open_windows_boot_directory(device)? {
+        let mut file = open_bcd_for_update(&mut directory)?;
+        let bytes = read_scheduled_bcd(&mut file)?;
+        let hive = bcd_parser::BcdHive::parse(&bytes).map_err(|_| "invalid BCD after resume")?;
+        if let Some((current_guid, current_path, offset)) = hive.scheduled_resume()
+            .map_err(|_| "returned resume request cannot be updated safely")?
+        {
+            if current_guid == guid && current_path == path {
+                clear_bcd_request(&mut file, offset, &[1], 1)?;
+                debug_println!("[BCD] Cleared resume request after Windows returned: {}", path);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_exact_bcd(file: &mut RegularFile, mut bytes: &mut [u8]) -> Result<(), &'static str> {
+    while !bytes.is_empty() {
+        let length = file.read(bytes).map_err(|_| "cannot read BCD")?;
+        if length == 0 {
+            return Err("unexpected end of BCD");
+        }
+        bytes = &mut bytes[length..];
+    }
+    Ok(())
+}
+
 fn load_bcd_from_esp() -> core::result::Result<BcdStore, &'static str> {
     // Try several paths for the BCD store. The boot manager is loaded
     // by UEFI and may set the current directory to the volume root or
@@ -2338,8 +2523,6 @@ fn load_bcd_from_esp() -> core::result::Result<BcdStore, &'static str> {
     //   ESP/EFI/Microsoft/Boot/BCD <- standard Windows path (PRIORITY!)
     //   ESP/BCD                   <- BCD at volume root (fallback)
     //   ESP/EFI/Boot/BCD          <- BCD next to boot manager (fallback)
-    const BCD_PATHS: [&str; 3] = ["EFI/Microsoft/Boot/BCD", "BCD", "EFI/Boot/BCD"];
-
     for bcd_path in BCD_PATHS {
         debug_println!("[BCD] Trying path: {}", bcd_path);
         if let Ok(bytes) = read_boot_file(bcd_path) {
@@ -2425,18 +2608,12 @@ impl Drop for BootClock {
 fn launch_advanced_action(
     bcd_store: &BcdStore,
     requested_guid: bcd::Guid,
-    boot_options: Option<&'static str>,
+    action: AdvancedAction,
 ) -> Result<(), &'static str> {
     let mut menu = BootMenu::new(bcd_store);
     for _ in 0..bcd_store.entry_count {
         if menu.select().map(|entry| entry.guid) == Some(requested_guid) {
-            // Store the boot options so write_bcd_mailbox can pick them up
-            // when launch_selected writes the mailbox before loading the
-            // target image.
-            unsafe { BOOT_OPTIONS_OVERRIDE = boot_options };
-            let result = launch_selected(&menu);
-            unsafe { BOOT_OPTIONS_OVERRIDE = None };
-            return result;
+            return launch_selected_with_action(&menu, Some(action));
         }
         menu.move_down();
     }
@@ -2449,6 +2626,54 @@ fn launch_advanced_action(
         requested_guid.0[3]
     );
     Err("Selected BCD boot entry is missing.")
+}
+
+fn run_selected_recovery(
+    fb: &mut Framebuffer,
+    font: &mut BitmapFont,
+    input: Option<&mut crate::input::Keyboard>,
+    bcd_store: &BcdStore,
+    windows_recovery: Option<&WindowsRecoveryEntries>,
+) {
+    let Some(entries) = windows_recovery else {
+        run_recovery_tools(fb, font, input, bcd_store);
+        return;
+    };
+    if let Err(error) = launch_recovery_sequence(entries, None) {
+        show_advanced_notice(fb, font, input, error);
+    }
+}
+
+fn launch_recovery_sequence(entries: &WindowsRecoveryEntries, failed_path: Option<&str>) -> Result<(), &'static str> {
+    let action = if failed_path.is_some() { AdvancedAction::AutomaticRepair } else { AdvancedAction::Repair };
+    let mut error = "The selected BCD entry has no Windows recovery application.";
+    for (guid, path) in entries {
+        #[cfg(target_arch = "x86_64")]
+        let mut log_recovery = || {
+            if let Some(failed_path) = failed_path {
+                if let Err(reason) = log_windows_automatic_recovery(failed_path, *guid, path) {
+                    debug_println!("[WINDOWS-BOOT] Could not log automatic recovery: {}", reason);
+                }
+            }
+            Ok(())
+        };
+        #[cfg(target_arch = "x86_64")]
+        let before_handoff = failed_path.map(|_| &mut log_recovery as &mut dyn FnMut() -> Result<(), &'static str>);
+        #[cfg(not(target_arch = "x86_64"))]
+        let before_handoff = None;
+        match launch_application(
+            *guid,
+            path,
+            "",
+            Some(action),
+            before_handoff,
+            &mut BootApplicationState::default(),
+        ) {
+            Ok(()) => return Ok(()),
+            Err(reason) => error = reason,
+        }
+    }
+    Err(error)
 }
 
 /// Boot-environment recovery tools operate on the actual boot volume.
@@ -2575,7 +2800,7 @@ fn run_recovery_tools(
                     if let Err(error) = launch_advanced_action(
                         bcd,
                         bcd::wellknown::ENTRY_WINDOWS_7,
-                        Some("/safeboot:minimal /safeboot:shell"),
+                        AdvancedAction::SafeModeCommandPrompt,
                     ) {
                         show_advanced_notice(fb, font, input.as_deref_mut(), error);
                     }
@@ -2651,6 +2876,31 @@ fn run_memory_diagnostic(
     font: &mut BitmapFont,
     con_in: Option<&mut crate::input::Keyboard>,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(data) = BCD_PATHS.iter().find_map(|path| read_boot_file(path).ok()) {
+        if let Ok(hive) = bcd_parser::BcdHive::parse(&data) {
+            let error = match hive.memory_diagnostic() {
+                Ok(Some((guid, path))) => {
+                    let run = || launch_memory_diagnostic_and_resume(guid, &path, None);
+                    let mut con_in = con_in;
+                    let result = match con_in.as_deref_mut() {
+                        Some(keyboard) => keyboard.with_released_protocols(run),
+                        None => run(),
+                    };
+                    if let Err(error) = result {
+                        show_advanced_notice(fb, font, con_in, error);
+                    }
+                    return;
+                }
+                Ok(None) => None,
+                Err(_) => Some("invalid BCD memory diagnostic entry"),
+            };
+            if let Some(error) = error {
+                show_advanced_notice(fb, font, con_in, error);
+                return;
+            }
+        }
+    }
     let size = font.size();
     memory_diagnostic::run(fb, font, con_in);
     font.set_size(size);
@@ -2687,79 +2937,175 @@ fn diagnostic_screen(
 ///
 /// UEFI's LoadImage cannot load from NTFS partitions (no SimpleFileSystem).
 fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
+    launch_selected_with_action(menu, None)
+}
+
+fn launch_selected_with_action(menu: &BootMenu, action: Option<AdvancedAction>) -> Result<(), &'static str> {
+    launch_selected_with_state(menu, action, &mut BootApplicationState::default())
+}
+
+#[derive(Default)]
+struct BootApplicationState<'a> {
+    project_low_resolution: Option<&'a mut dyn FnMut() -> Result<(), &'static str>>,
+    #[cfg(target_arch = "x86_64")]
+    persistent: windows_boot_application::PersistentData,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn launch_memory_diagnostic_and_resume(
+    guid: [u8; 16],
+    path: &str,
+    before_handoff: Option<&mut dyn FnMut() -> Result<(), &'static str>>,
+) -> Result<(), &'static str> {
+    let mut state = BootApplicationState::default();
+    launch_application(guid, path, "", None, before_handoff, &mut state)?;
+    let resume = load_bcd_from_esp()
+        .and_then(|store| launch_selected_with_state(&BootMenu::new(&store), None, &mut state));
+    if let Err(error) = resume {
+        debug_println!("[WINDOWS-BOOT] Cannot resume the default entry after memory diagnosis: {}", error);
+    }
+    uefi::runtime::reset(uefi::runtime::ResetType::COLD, uefi::Status::SUCCESS, None)
+}
+
+fn launch_selected_with_state(
+    menu: &BootMenu,
+    action: Option<AdvancedAction>,
+    state: &mut BootApplicationState<'_>,
+) -> Result<(), &'static str> {
     debug_println!("[LAUNCH] launch_selected() - using manual PE loader");
     let entry = menu.select().ok_or("no entry selected")?;
     crate::arch::current::write_com1_marker(
         alloc::format!("[BOOT-MENU] selected index={}\r\n", menu.selected_index()).as_bytes(),
     );
     let path = ucs2_to_string(entry.application.as_slice());
+    let options = ucs2_to_string(entry.load_options.as_slice());
+    launch_application(entry.guid.0, &path, &options, action, None, state)
+}
+
+struct ApplicationImagePages(core::ptr::NonNull<u8>, usize);
+
+impl Drop for ApplicationImagePages {
+    fn drop(&mut self) {
+        let _ = unsafe { boot::free_pages(self.0, self.1) };
+    }
+}
+
+fn launch_application(
+    guid: [u8; 16],
+    path: &str,
+    load_options: &str,
+    action: Option<AdvancedAction>,
+    before_windows_handoff: Option<&mut dyn FnMut() -> Result<(), &'static str>>,
+    state: &mut BootApplicationState<'_>,
+) -> Result<(), &'static str> {
     debug_println!("[LAUNCH] Selected entry: {}", path);
     if path.is_empty() {
         return Err("entry has no application path");
     }
-    debug_println!("[LAUNCH] Reading file...");
-    let bytes = match read_boot_file(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            debug_println!("[LAUNCH] Read failed: {}", e);
-            return Err(e);
+    let recovery = action.is_some_and(AdvancedAction::is_recovery);
+    #[cfg(target_arch = "x86_64")]
+    let mut windows_application = BCD_PATHS.iter().find_map(|path| {
+        let data = read_boot_file(path).ok()?;
+        bcd_parser::BcdHive::parse(&data).ok()?.windows_application(guid)
+    });
+    #[cfg(target_arch = "x86_64")]
+    let mut recovery_ramdisk = None;
+    #[cfg(target_arch = "x86_64")]
+    let qualified_image = match &windows_application {
+        Some(application) if recovery || application.has_ramdisk() => {
+            let (image, ramdisk) = application.read_recovery_image(path)?;
+            recovery_ramdisk = ramdisk;
+            Some(image)
         }
+        Some(application) => match application.read_qualified_image(path) {
+            Ok(image) => image,
+            Err(error) => {
+                if matches!(&error, windows_boot_application::ApplicationImageError::FileUnavailable)
+                    && before_windows_handoff.is_none()
+                    && matches!(action, None | Some(AdvancedAction::StartNormally))
+                {
+                    if let Some(entries) = windows_recovery_entries(guid, true).filter(|entries| !entries.is_empty()) {
+                        debug_println!("[WINDOWS-BOOT] Loader unavailable; launching automatic recovery for {}", path);
+                        match launch_recovery_sequence(&entries, Some(path)) {
+                            Ok(()) => return Ok(()),
+                            Err(reason) => debug_println!("[WINDOWS-BOOT] Automatic recovery failed: {}", reason),
+                        }
+                    }
+                }
+                return Err(error.message());
+            }
+        },
+        None => None,
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let qualified_image: Option<Vec<u8>> = None;
+
+    if recovery && qualified_image.is_none() {
+        return Err("Windows recovery requires a supported BCD application and device.");
+    }
+
+    debug_println!("[LAUNCH] Reading file...");
+    let bytes = match qualified_image {
+        Some(bytes) => bytes,
+        None => read_boot_file(path)?,
     };
     debug_println!("[LAUNCH] Read {} bytes from {}", bytes.len(), path);
 
-    debug_println!("[LAUNCH] Writing BCD mailbox...");
-    // Write BCD mailbox first
-    write_bcd_mailbox(
-        &entry.guid.0,
-        &ucs2_to_string(entry.load_options.as_slice()),
-    );
-    debug_println!("[LAUNCH] BCD mailbox written");
-
-    // Now use manual PE loader
-    use loader::{read_section_headers, PeHeaderInfo, SECTION_ALIGNMENT};
-
-    debug_println!("[LAUNCH] Parsing PE headers...");
-    let opt = match PeHeaderInfo::parse(&bytes) {
-        Some(o) => o,
-        None => {
-            debug_println!("[LAUNCH] ERROR: Invalid PE image - PeHeaderInfo::parse returned None");
-            return Err("invalid PE image");
-        }
+    let machine = if cfg!(target_arch = "x86_64") {
+        0x8664
+    } else if cfg!(target_arch = "aarch64") {
+        0xaa64
+    } else if cfg!(target_arch = "riscv64") {
+        0x5064
+    } else {
+        0x6264
     };
+    let header = nt61_boot_types::boot_image::Header::parse(&bytes, machine)?;
+    if header.entry_rva == 0 || header.is_dll {
+        return Err("boot application has no executable entry point");
+    }
+
+    let native = match header.subsystem {
+        10 => false,
+        16 if cfg!(target_arch = "x86_64") => true,
+        16 => return Err("unsupported Windows boot application architecture"),
+        _ => return Err("unsupported boot application subsystem"),
+    };
+    if !native && recovery {
+        return Err("BCD recovery entry is not a Windows boot application");
+    }
+    #[cfg(target_arch = "x86_64")]
+    let windows_resume = windows_application.as_ref().is_some_and(|application| application.resume);
+    #[cfg(not(target_arch = "x86_64"))]
+    let windows_resume = false;
+    if !native && (before_windows_handoff.is_some() || windows_resume) {
+        return Err("scheduled entry is not a Windows boot application");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if native {
+        let application = windows_application.as_mut().ok_or("missing Windows boot application BCD options")?;
+        if let Some(action) = action {
+            action.apply_windows_options(application)?;
+        }
+    }
+    if !native {
+        if action == Some(AdvancedAction::DirectoryServices) {
+            return Err("Directory Services Restore Mode requires a Windows boot application.");
+        }
+        if action == Some(AdvancedAction::LowResolution) {
+            state.project_low_resolution.as_mut()
+                .ok_or("640x480 requires a GOP graphics device for this boot application.")?()?;
+        }
+        write_bcd_mailbox(&guid, action.and_then(AdvancedAction::boot_options).unwrap_or(load_options));
+    }
 
     debug_println!(
-        "[LAUNCH] PE32+ image: base=0x{:016x} entry=0x{:08x} sections={}",
-        opt.image_base,
-        opt.entry_point_rva,
-        opt.number_of_sections
+        "[LAUNCH] PE32+ image: base=0x{:016x} entry=0x{:08x} size={}",
+        header.image_base,
+        header.entry_rva,
+        header.image_size
     );
-
-    // Read section headers
-    let sections = read_section_headers(&bytes, &opt);
-    debug_println!("[LAUNCH] Got {} sections", sections.len());
-    for (i, sec) in sections.iter().enumerate() {
-        let name = sec.name_str();
-        debug_println!(
-            "[LAUNCH]   Section {}: {} VAddr=0x{:08x} VSize=0x{:08x} RPtr=0x{:08x} RSize=0x{:08x}",
-            i,
-            name,
-            sec.virtual_address,
-            sec.virtual_size,
-            sec.pointer_to_raw_data,
-            sec.size_of_raw_data
-        );
-    }
-
-    // Calculate total image size
-    let mut total_size = opt.size_of_headers;
-    for sec in &sections {
-        let end = sec.virtual_address + sec.virtual_size;
-        if end > total_size {
-            total_size = end;
-        }
-    }
-    let aligned_size = (total_size + SECTION_ALIGNMENT - 1) & !(SECTION_ALIGNMENT - 1);
-    debug_println!("[LAUNCH] Total image size: 0x{:08x} bytes", aligned_size);
 
     // Use the PE header's preferred image_base so all RIP-relative
     // references resolve correctly. If the firmware cannot honor it,
@@ -2767,12 +3113,12 @@ fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
     // OVMF's default QEMU profile rejects executable allocations
     // above 4 GiB. Keep the PE ImageBase as the relocation reference,
     // but load the image into conventional memory and apply .reloc.
-    let load_base: u64 = if opt.image_base >= 0x1_0000_0000 {
+    let load_base: u64 = if header.image_base >= 0x1_0000_0000 {
         0x0400_0000
     } else {
-        opt.image_base
+        header.image_base
     };
-    let image_size = aligned_size as usize;
+    let image_size = header.image_size;
 
     debug_println!(
         "[LAUNCH] Loading image to 0x{:016x} ({} bytes)",
@@ -2780,343 +3126,66 @@ fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
         image_size
     );
 
-    // CRITICAL: the PE's preferred ImageBase (0x180000000 for our
-    // winload.efi) is in the high half of the address space and is
-    // *never* allocated by the firmware by default. We must call
-    // allocate_pages to create a writable mapping there BEFORE we
-    // try to copy headers/sections into it — otherwise every write
-    // silently goes to a non-existent page, the entry point stays
-    // all-zeros (0x00 0x00 = ADD [RAX], AL on most encodings or HLT
-    // on the rare alignment), and winload's "WINL>" banner never
-    // appears in the serial log.
-    //
-    // The catch: the OVMF firmware has a hard cap on how many pages
-    // it will hand back in a single allocate_pages call (around
-    // 256 KiB / 64 pages in our testing — anything beyond that
-    // returns "success" but only maps the first N pages and the
-    // remaining pages stay not-present). We therefore allocate in
-    // small chunks and re-verify after each one.
-    use uefi::boot as ub;
     use uefi::boot::{AllocateType, MemoryType};
     const EFI_PAGE_SIZE: usize = 4096;
-    const CHUNK_PAGES: usize = 16; // 64 KiB per chunk — safely under OVMF's cap.
     let total_pages = image_size.div_ceil(EFI_PAGE_SIZE);
-    let mut allocated_base_holder: Option<u64> = None;
-    // Use BOOT_SERVICES_DATA: the firmware reserves this memory for our
-    // exclusive use until ExitBootServices.  We deliberately do NOT use
-    // LOADER_DATA because the firmware is allowed to reclaim LOADER_DATA
-    // pages and reuse them for other boot-services allocations — and in
-    // practice OVMF DOES reclaim them, stomping the bytes we just wrote
-    // into the winload image (we observed `fb ff ff 0f` overwriting our
-    // carefully-written `66 ba f8 03` bytes).
-    //
-    // We try AllocateType::Address first so the winload image lands at
-    // its preferred ImageBase (0x180000000); if the firmware rejects
-    // that, we fall back to AnyPages and apply relocations later.
-    // The OS loader is executable, so it must live in a UEFI code
-    // allocation. Data allocations are mapped non-executable on AArch64,
-    // which makes the first instruction fetch fault as a permission
-    // error.
-    let mem_type = MemoryType::LOADER_CODE;
-    debug_println!(
-        "[LAUNCH] Allocating {} pages ({} bytes) at 0x{:016x}, in chunks of {}",
-        total_pages,
-        total_pages * EFI_PAGE_SIZE,
-        load_base,
-        CHUNK_PAGES
-    );
-    let mut chunk_base = load_base;
-    let mut remaining = total_pages;
-    let mut address_alloc_ok = true;
-    while remaining > 0 {
-        let this_chunk = core::cmp::min(remaining, CHUNK_PAGES);
-        match ub::allocate_pages(AllocateType::Address(chunk_base), mem_type, this_chunk) {
-            Ok(p) => {
-                let allocated = p.as_ptr() as u64;
-                if allocated != chunk_base {
-                    debug_println!(
-                        "[LAUNCH] WARN: Address allocate returned 0x{:016x} (asked 0x{:016x})",
-                        allocated,
-                        chunk_base
-                    );
-                    address_alloc_ok = false;
-                    break;
-                }
-                // Verify the *last* page of the chunk is actually writable
-                // — the firmware may say OK but only map the first page.
-                let verify_addr = allocated + (this_chunk as u64 - 1) * EFI_PAGE_SIZE as u64;
-                let probe = unsafe { arch::probe_memory(verify_addr) };
-                debug_println!(
-                    "[LAUNCH]   chunk at 0x{:016x}..0x{:016x} last-page probe = 0x{:02x}",
-                    chunk_base,
-                    chunk_base + (this_chunk as u64) * EFI_PAGE_SIZE as u64,
-                    probe
-                );
-                if probe != 0xAA {
-                    debug_println!(
-                        "[LAUNCH] FATAL: chunk last-page write/readback failed (got 0x{:02x})",
-                        probe
-                    );
-                    return Err("allocate_pages phantom chunk");
-                }
-                chunk_base += this_chunk as u64 * EFI_PAGE_SIZE as u64;
-                remaining -= this_chunk;
-            }
-            Err(e) => {
-                debug_println!(
-                    "[LAUNCH] Address allocation at 0x{:016x} rejected: {:?}",
-                    chunk_base,
-                    e
-                );
-                address_alloc_ok = false;
-                break;
-            }
-        }
-    }
-    if !address_alloc_ok {
-        // Fall back to AnyPages allocation. We'll need to apply relocations.
-        debug_println!("[LAUNCH] Falling back to AnyPages allocation for winload image");
-        // Allocate the entire image as ONE big chunk. Some firmwares return
-        // non-contiguous chunks when we ask for many small ones, but a single
-        // big allocate_pages call is honoured.
-        let new_base = match ub::allocate_pages(AllocateType::AnyPages, mem_type, total_pages) {
-            Ok(p) => p.as_ptr() as u64,
-            Err(e) => {
-                debug_println!("[LAUNCH] FATAL: AnyPages allocate failed: {:?}", e);
-                return Err("AnyPages allocate failed");
-            }
-        };
-        let verify_addr = new_base + (total_pages as u64 - 1) * EFI_PAGE_SIZE as u64;
-        let probe = unsafe { arch::probe_memory(verify_addr) };
-        debug_println!(
-            "[LAUNCH]   AnyPages chunk at 0x{:016x}..0x{:016x} probe = 0x{:02x}",
-            new_base,
-            new_base + (total_pages as u64) * EFI_PAGE_SIZE as u64,
-            probe
-        );
-        if probe != 0xAA {
-            debug_println!(
-                "[LAUNCH] FATAL: AnyPages chunk last-page write/readback failed (got 0x{:02x})",
-                probe
-            );
-            return Err("AnyPages phantom chunk");
-        }
-        allocated_base_holder = Some(new_base);
-        debug_println!(
-            "[LAUNCH] AnyPages allocation succeeded at 0x{:016x}",
-            new_base
-        );
-    }
-    let load_base = allocated_base_holder.unwrap_or(load_base);
-    let relocation_delta = (load_base as i128) - (opt.image_base as i128);
-    let needs_relocation = load_base != opt.image_base;
-    debug_println!(
-        "[LAUNCH] load_base = 0x{:016x}, delta = {}, relocations = {}",
-        load_base,
-        relocation_delta,
-        if needs_relocation {
-            "REQUIRED"
-        } else {
-            "NOT REQUIRED"
-        }
-    );
+    let allocation = boot::allocate_pages(AllocateType::Address(load_base), MemoryType::LOADER_CODE, total_pages)
+        .or_else(|_| boot::allocate_pages(AllocateType::AnyPages, MemoryType::LOADER_CODE, total_pages))
+        .map_err(|_| "cannot allocate executable image pages")?;
+    let _image_pages = ApplicationImagePages(allocation, total_pages);
+    let load_base = allocation.as_ptr() as u64;
+    let mapped = unsafe {
+        allocation.as_ptr().write_bytes(0, image_size);
+        core::slice::from_raw_parts_mut(allocation.as_ptr(), image_size)
+    };
+    header.map(&bytes, mapped)?;
+    let relocations = header.relocate(mapped, load_base)?;
+    debug_println!("[LAUNCH] Applied {} base relocations", relocations);
 
-    // Copy the PE headers to the base of the image (these contain the
-    // section table the loader itself consults in its own prologue,
-    // plus the import-directory pointer).
-    let header_size = (opt.size_of_headers as usize).min(bytes.len());
-    unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), load_base as *mut u8, header_size);
-    }
-    debug_println!("[LAUNCH] Copied headers ({} bytes)", header_size);
-
-    // Probe the source bytes at offset 0x466a0 (where efi_main body lives)
-    // to verify the read data is correct.
-    debug_println!("[LAUNCH] Source bytes at offset 0x466a0: {:02x} {:02x} {:02x} {:02x} (expected 66 ba f8 03)",
-        bytes[0x466a0], bytes[0x466a1], bytes[0x466a2], bytes[0x466a3]);
-
-    // Copy sections. Two things to remember:
-    //   1. raw data lives in `bytes[pointer_to_raw_data ..
-    //      pointer_to_raw_data + size_of_raw_data]`
-    //      and should be copied to `load_base + virtual_address`
-    //   2. the area between the end of the raw data and the end
-    //      of `virtual_size` is *uninitialised* — i.e. it is
-    //      **BSS** and MUST be zero-filled before any code in the
-    //      new image is allowed to run. Without the BSS zero-fill,
-    //      any `static mut X: u32 = 0` in winload.efi reads random
-    //      garbage from the freshly allocated LOADER_DATA pages,
-    //      and any early function that touches one of those statics
-    //      faulted the very first call after `efi_main` returned.
-    for sec in &sections {
-        let src_off = sec.pointer_to_raw_data as usize;
-        let rsize = sec.size_of_raw_data as usize;
-        let vsize = sec.virtual_size as usize;
-        let dst_off = sec.virtual_address as usize;
-
-        if src_off + rsize > bytes.len() || dst_off + vsize > image_size {
-            debug_println!(
-                "[LAUNCH]   skip section '{}': rsize/range out of bounds",
-                sec.name_str()
-            );
-            continue;
-        }
-
-        // 1. Copy the on-disk raw data (may be zero-length for BSS-only
-        //    sections — skip the rep movsb).
-        let dst_raw_ptr = unsafe { (load_base as *mut u8).add(dst_off) };
-        if rsize > 0 {
-            let src_ptr = unsafe { bytes.as_ptr().add(src_off) };
-            unsafe { core::ptr::copy_nonoverlapping(src_ptr, dst_raw_ptr, rsize) };
-            debug_println!(
-                "[LAUNCH]   section '{}': copied {} bytes of raw data to 0x{:016x}",
-                sec.name_str(),
-                rsize,
-                dst_raw_ptr as u64
-            );
-        }
-
-        // 2. Zero-fill BSS: the area from raw size to virtual size.
-        //    PE convention is to zero up to the next file-aligned boundary
-        //    of the *next* section, but in practice zeroing exactly
-        //    `vsize - rsize` bytes is sufficient and self-contained.
-        if vsize > rsize {
-            let bss_size = vsize - rsize;
-            let bss_dst = unsafe { (load_base as *mut u8).add(dst_off + rsize) };
-            unsafe { bss_dst.write_bytes(0, bss_size) };
-            debug_println!(
-                "[LAUNCH]   section '{}': zero-filled {} bytes of BSS at 0x{:016x}",
-                sec.name_str(),
-                bss_size,
-                bss_dst as u64
-            );
-        }
-    }
-
-    // Apply base relocations if the image was loaded somewhere other
-    // than its preferred base. Without this step, every absolute
-    // address inside winload still points at `image_base + offset`,
-    // which is unmapped memory when we allocated via AnyPages, and
-    // the very first `movabs $imm64, %reg` or `mov %rsp, %rbx`
-    // reads back a garbage pointer and faults.
-    if needs_relocation {
-        debug_println!(
-            "[LAUNCH] Applying base relocations: rva=0x{:x} size=0x{:x} delta=0x{:x}",
-            opt.base_reloc_rva,
-            opt.base_reloc_size,
-            relocation_delta
-        );
-        match loader::apply_relocations_in_place(
-            &bytes,
-            &sections,
-            &opt,
-            load_base as *mut u8,
-            opt.image_base,
-            load_base,
-        ) {
-            Ok(n) => debug_println!("[LAUNCH] Applied {} DIR64 relocations", n),
-            Err(e) => {
-                debug_println!("[LAUNCH] FATAL: relocation apply failed: {}", e);
-                return Err("relocation apply failed");
-            }
-        }
-    }
-
-    // Calculate entry point
-    let entry_point = load_base + opt.entry_point_rva as u64;
+    let entry_point = load_base + u64::from(header.entry_rva);
     debug_println!("[LAUNCH] Entry point: 0x{:016x}", entry_point);
+    unsafe { nt61_boot_types::image_cache::sync_image_code(load_base, image_size as u64) };
 
-    // The PE's `AddressOfEntryPoint` already points straight at the body
-    // of `efi_main` (the linker script groups .text.efi_main and uses
-    // ENTRY(efi_main)). So we don't need a hardcoded VMA constant that
-    // breaks every time the surrounding code shifts the `WINL>` prologue
-    // — we read it straight out of the parsed PE entry-point RVA.
-    let efi_main_vma: u64 = entry_point;
-
-    // Verify the entry point really has the expected opcode (0x53 = push %rbx).
-    // If it is still zero, the allocate_pages / copy failed silently.
-    unsafe {
-        let p = entry_point as *const u8;
-        let b0 = core::ptr::read_volatile(p);
-        let b1 = core::ptr::read_volatile(p.add(1));
-        let b2 = core::ptr::read_volatile(p.add(2));
-        let b3 = core::ptr::read_volatile(p.add(3));
-        debug_println!(
-            "[LAUNCH] Entry-point probe bytes: {:02x} {:02x} {:02x} {:02x}",
-            b0,
-            b1,
-            b2,
-            b3
-        );
-    }
-    // Also probe the efi_main body VMA that we're actually going to jmp to.
-    unsafe {
-        let p = efi_main_vma as *const u8;
-        let b0 = core::ptr::read_volatile(p);
-        let b1 = core::ptr::read_volatile(p.add(1));
-        let b2 = core::ptr::read_volatile(p.add(2));
-        let b3 = core::ptr::read_volatile(p.add(3));
-        debug_println!(
-            "[LAUNCH] efi_main-body probe bytes: {:02x} {:02x} {:02x} {:02x}",
-            b0,
-            b1,
-            b2,
-            b3
-        );
-    }
-    let probe_byte = unsafe { *(entry_point as *const u8) };
-    debug_println!(
-        "[LAUNCH] Entry-point probe byte = 0x{:02x} (expected 0x53)",
-        probe_byte
-    );
-    if probe_byte == 0x00 {
-        debug_println!("[LAUNCH] FATAL: entry point is still zero — memory not mapped");
-        return Err("entry point not mapped");
-    }
-
-    // Probe RIGHT BEFORE the jmp: read 4 bytes at efi_main body.
-    unsafe {
-        let p = efi_main_vma as *const u8;
-        let b0 = core::ptr::read_volatile(p);
-        let b1 = core::ptr::read_volatile(p.add(1));
-        let b2 = core::ptr::read_volatile(p.add(2));
-        let b3 = core::ptr::read_volatile(p.add(3));
-        debug_println!(
-            "[LAUNCH] PRE-JMP probe at 0x{:x}: {:02x} {:02x} {:02x} {:02x}",
-            efi_main_vma,
-            b0,
-            b1,
-            b2,
-            b3
-        );
-    }
-
-    // For UEFI PE32+, the entry point is called with:
-    //   RCX = ImageHandle
-    //   RDX = SystemTable*
-    // Both registers are passed by the firmware when the boot manager
-    // was launched. We re-use those values by reading them with inline
-    // asm and then jumping to winload.efi's entry point directly.
-    debug_println!("[LAUNCH] Jumping to winload.efi entry point...");
-    debug_println!("[LAUNCH] =========================================");
-    debug_println!("[LAUNCH] Winload should now take over boot!");
-    debug_println!("[LAUNCH] =========================================");
-
-    // Jump to the entry point. The UEFI calling convention for an
-    // EFI image's entry point is:
-    //     RCX = EFI_HANDLE ImageHandle
-    //     RDX = EFI_SYSTEM_TABLE *SystemTable
-    // winload.efi expects these to be the *firmware-supplied* values,
-    // not the values left over from boot's own bookkeeping — otherwise
-    // it dereferences random pointers and crashes before printing its
-    // banner. We captured the firmware values in
-    // `BOOT_IMAGE_HANDLE_PTR` / `BOOT_SYSTEM_TABLE` at the start of
-    // `efi_main`; restore them here and then tail-call the entry
-    // point.
     let image_handle: u64;
     let system_table: u64;
     unsafe {
         image_handle = BOOT_IMAGE_HANDLE_PTR as u64;
         system_table = BOOT_SYSTEM_TABLE;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if let Some(mut application) = windows_application.filter(|_| native) {
+        if let Some(device) = chain_loaded_device_handle() {
+            application.resolve_boot_partition(device);
+        }
+        let diagnostic = guid == bcd_parser::MEMORY_DIAGNOSTIC_GUID;
+        let (mut parameters, result) = application.parameters(
+            load_base,
+            header.image_size as u32,
+            image_handle,
+            system_table,
+            &state.persistent,
+            recovery_ramdisk.as_ref(),
+        );
+        if let Some(before_handoff) = before_windows_handoff {
+            before_handoff()?;
+        }
+        debug_println!("[WINDOWS-BOOT] entry={:#x} block={:p}", entry_point, parameters.as_ptr());
+        let (status, before) = unsafe {
+            windows_boot_application::start(entry_point, &mut parameters, diagnostic)
+        }?;
+        let returned = u32::from_le_bytes(parameters[result + 4..result + 8].try_into().unwrap());
+        debug_println!("[WINDOWS-BOOT] returned status={:#010x} arguments={:#010x}", status, returned);
+        if diagnostic && status == 0 && returned == 0 {
+            let capture = before.ok_or("cannot get the firmware memory map before the diagnostic")
+                .and_then(|map| windows_boot_application::PersistentData::capture(&parameters[result..], &map));
+            match capture {
+                Ok(persistent) => state.persistent = persistent,
+                Err(error) => debug_println!("[WINDOWS-BOOT] Cannot preserve memory diagnostic results: {}", error),
+            }
+            return Ok(());
+        }
+        return Err("Windows boot application returned");
     }
     debug_println!("[LAUNCH] Restoring UEFI calling convention:");
     debug_println!("[LAUNCH]   ImageHandle  = 0x{:016x}", image_handle);
@@ -3126,36 +3195,7 @@ fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
     // reached this code.
     arch::current::write_com1_marker(b"KL\r\n");
 
-    // The PE entry point at 0x180001000 is a UEFI startup stub:
-    //     mov [%rdi], %rsp   ; save old RSP → [ImageHandle]
-    //     mov %rsi, %rsp     ; new RSP = RSI value (firmware tricks)
-    //     <pop 6 regs>
-    //     ret
-    // The stub expects RSI to be the SystemTable pointer AND a freshly
-    // allocated stack with the right return layout. When we manually
-    // jump into the loaded image, the stub's RSI-as-stack assumption
-    // is what panics the second `uefi::println!` — there is no valid
-    // stack frame for the image's efi_main to inherit.
-    //
-    // SOLUTION: skip the entry stub entirely and jump straight into
-    // the body of `efi_main` at VMA 0x1800472a0 (the second `mov
-    // $0x3f8,%dx; mov $0x57,%al; out %dx` pattern — see the file
-    // offset 0x466a4 the disassembly confirms). This body uses the
-    // System V AMD64 ABI (rdi / rsi) and only touches serial I/O
-    // before any TLS / panic-personality access, so a bare jump is
-    // safe as long as we hand it a proper stack.
-    //
-    // The body itself reads image_handle/SystemTable from the
-    // caller-saved registers (rdi/rsi in System V) so we just need
-    // to provide a private stack with a halt-address on top — and
-    // because efi_main is `-> !` it never returns.
     use uefi::boot as ub2;
-
-    // The PE's `AddressOfEntryPoint` already points straight at the body
-    // of `efi_main` (the linker script groups .text.efi_main and uses
-    // ENTRY(efi_main)). So we don't need a hardcoded VMA constant that
-    // breaks every time the surrounding code shifts the `WINL>` prologue
-    // — `efi_main_vma` was already computed above from the parsed PE.
 
     // Allocate 16 MiB of stack space for winload.efi. The loader and
     // kernel driver bring-up use recursive-looking allocations and
@@ -3168,36 +3208,13 @@ fn launch_selected(menu: &BootMenu) -> core::result::Result<(), &'static str> {
     )
     .map_err(|_e| -> &'static str { "allocate winload stack" })?;
     let stack_top = stack_base.as_ptr() as u64 + 16 * 1024 * 1024;
-    // Reserve one 16-byte slot below the nominal top so the first
-    // push cannot overwrite the halt stub written immediately below.
-    let stack_top = stack_top - 16;
-
-    // Write a tiny halt stub at (stack_top - 16). If efi_main ever
-    // returns (it shouldn't, since it's `-> !`), control goes here
-    // and the machine simply halts.
-    //
-    // Encoding: `hlt; jmp $-2` = `0xF4 0xEB 0xFE`.
-    let halt_addr = unsafe { arch::current::write_halt_stub(stack_top) };
 
     debug_println!(
-        "[LAUNCH] Winload stack base=0x{:x} top=0x{:x} halt=0x{:x}",
+        "[LAUNCH] Winload stack base=0x{:x} top=0x{:x}",
         stack_base.as_ptr() as u64,
-        stack_top,
-        halt_addr
+        stack_top
     );
-    debug_println!("[LAUNCH] efi_main body VMA = 0x{:x}", efi_main_vma);
-    debug_println!("[LAUNCH] =========================================");
-    debug_println!("[LAUNCH] Winload should now take over boot!");
-    debug_println!("[LAUNCH] =========================================");
-
-    // Jump to efi_main. The body itself uses the Microsoft x64 ABI:
-    // RCX = ImageHandle, RDX = SystemTable (per UEFI calling convention
-    // for EFI image entry points). R8, R9 are free to clobber.
-    //
-    // Jump to efi_main. The body itself uses the Microsoft x64 ABI:
-    // RCX = ImageHandle, RDX = SystemTable (per UEFI calling convention
-    // for EFI image entry points). R8, R9 are free to clobber.
-    unsafe { arch::current::launch_efi_main(image_handle, system_table, stack_top, efi_main_vma) }
+    unsafe { arch::current::launch_efi_main(image_handle, system_table, stack_top, entry_point) }
 }
 
 /// Text-mode boot menu used when no GOP handle is available
@@ -3213,6 +3230,8 @@ fn text_mode_auto_boot(
 ) -> Status {
     let mut menu = BootMenu::new(bcd_store);
     let mut advanced: Option<usize> = None;
+    let mut windows_recovery = None;
+    let mut adv_options = advanced_options(None);
     let mut tools = false;
     let mut redraw = true;
     let mut clock = BootClock::new(bcd_store.timeout);
@@ -3227,7 +3246,7 @@ fn text_mode_auto_boot(
             uefi::println!("Windows Boot Manager\n");
             if let Some(selected) = advanced {
                 uefi::println!("Advanced Boot Options\n");
-                for (index, (_, title, _)) in ADV_OPTIONS.iter().enumerate() {
+                for (index, (_, title, _)) in adv_options.iter().enumerate() {
                     uefi::println!("{} {}", if index == selected { ">" } else { " " }, title);
                 }
                 uefi::println!("\nUP/DOWN: select  ENTER: continue  ESC: return");
@@ -3272,25 +3291,25 @@ fn text_mode_auto_boot(
                 }
                 Key::Special(ScanCode::DOWN) => {
                     if let Some(ref mut selected) = advanced {
-                        *selected = (*selected + 1).min(ADV_OPTIONS.len() - 1);
+                        *selected = (*selected + 1).min(adv_options.len() - 1);
                     } else {
                         menu.move_down();
                     }
                 }
-                Key::Special(ScanCode::FUNCTION_8) => advanced = Some(0),
+                Key::Special(ScanCode::FUNCTION_8) => {
+                    windows_recovery = selected_windows_recovery(&menu);
+                    adv_options = advanced_options(windows_recovery.as_ref());
+                    advanced = Some(0);
+                }
                 Key::Special(ScanCode::ESCAPE) => advanced = None,
                 Key::Printable(c) if u16::from(c) == 9 => tools = !tools,
                 Key::Printable(c) if u16::from(c) == 13 || u16::from(c) == 10 => {
                     if let Some(selected) = advanced {
-                        let action = ADV_OPTIONS[selected].0;
+                        let action = adv_options[selected].0;
                         match action {
-                            AdvancedAction::Repair => run_recovery_tools(&mut text_fb, &mut font, input.as_mut(), bcd_store),
-                            AdvancedAction::DirectoryServices => show_advanced_notice(&mut text_fb, &mut font, input.as_mut(),
-                                "Active Directory restore requires a domain controller; Windows 7 is a client OS."),
-                            AdvancedAction::LowResolution => show_advanced_notice(&mut text_fb, &mut font, input.as_mut(),
-                                "640x480 requires a GOP graphics device; this firmware provides only a text console."),
-                            _ => if let Some(entry) = menu.select() {
-                                if let Err(error) = launch_advanced_action(bcd_store, if action == AdvancedAction::StartNormally { bcd::wellknown::ENTRY_WINDOWS_7 } else { entry.guid }, action.boot_options()) {
+                            AdvancedAction::Repair => run_selected_recovery(&mut text_fb, &mut font, input.as_mut(), bcd_store, windows_recovery.as_ref()),
+                            _ => {
+                                if let Err(error) = launch_selected_with_action(&menu, Some(action)) {
                                     show_advanced_notice(&mut text_fb, &mut font, input.as_mut(), error);
                                 }
                             },
@@ -3359,20 +3378,10 @@ fn write_bcd_mailbox(guid: &[u8; 16], load_options: &str) {
         core::ptr::copy_nonoverlapping(guid.as_ptr(), mailbox.add(0x0C), 16);
         // Write boot options (e.g. "/safeboot:minimal") or clear the area.
         // The area is 224 bytes from offset 0x1C, NUL-terminated.
-        let opts = Some(BOOT_OPTIONS_OVERRIDE.unwrap_or(load_options));
-        if let Some(opts_str) = opts {
-            let bytes = opts_str.as_bytes();
-            let len = core::cmp::min(bytes.len(), 223);
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), mailbox.add(0x1C), len);
-            core::ptr::write_volatile(mailbox.add(0x1C + len), 0);
-            for i in (len + 1)..224 {
-                core::ptr::write_volatile(mailbox.add(0x1C + i), 0);
-            }
-        } else {
-            for i in 0..224 {
-                core::ptr::write_volatile(mailbox.add(0x1C + i), 0);
-            }
-        }
+        let bytes = load_options.as_bytes();
+        let len = bytes.len().min(223);
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), mailbox.add(0x1C), len);
+        core::ptr::write_bytes(mailbox.add(0x1C + len), 0, 224 - len);
     }
 
     if use_allocated {

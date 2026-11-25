@@ -90,7 +90,20 @@ enum ActiveKeyboard {
 }
 
 impl Keyboard {
-    pub fn new() -> Option<Self> {
+    #[cfg(target_arch = "x86_64")]
+    pub fn with_released_protocols<Output>(&mut self, run: impl FnOnce() -> Output) -> Output {
+        self.extended.clear();
+        self.basic.clear();
+        self.active = None;
+        Self::connect_controllers();
+        let result = run();
+        if let Some(keyboard) = Self::new() {
+            *self = keyboard;
+        }
+        result
+    }
+
+    fn connect_controllers() {
         // Some firmware installs keyboard protocols only after its USB/HID
         // driver is connected to the controller. Recursively connecting every
         // controller is the documented way to ensure keyboard handles exist.
@@ -101,7 +114,10 @@ impl Keyboard {
                 let _ = uefi::boot::connect_controller(handle, None, None, true);
             }
         }
+    }
 
+    pub fn new() -> Option<Self> {
+        Self::connect_controllers();
         let mut extended = match uefi::boot::find_handles::<InputEx>() {
             Ok(handles) => handles
                 .into_iter()
