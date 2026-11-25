@@ -35,6 +35,11 @@ impl State {
     }
 }
 
+pub(super) fn unavailable_dialog(image: &mut GuestImage) -> Result<u64, ApiError> {
+    image.win32.gui.dialog_error = CDERR_DIALOGFAILURE;
+    Ok(0)
+}
+
 fn structure_size(name: &str, x86: bool) -> (usize, Option<usize>) {
     let size = if name.starts_with("GetOpenFileName") || name.starts_with("GetSaveFileName") {
         return if x86 {
@@ -214,6 +219,9 @@ pub(super) fn invoke(
                 }}
             }
         });
+    }
+    if name == "CreateStatusWindowW" {
+        return super::user::invoke(image, name, a, services);
     }
     let state = &mut image.win32.gui;
     Ok(match name {

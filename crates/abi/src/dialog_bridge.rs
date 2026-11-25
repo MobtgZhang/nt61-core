@@ -61,3 +61,21 @@ pub const SYSTEM_METRICS: u32 = 10;
 
 /// WINDOW action for a read-only default system color (signed index in value 6).
 pub const SYSTEM_COLOR: u32 = 11;
+
+pub const ACTIVATE_WINDOW: u32 = 12;
+pub const FOREGROUND_WINDOW: u32 = 13;
+pub const IS_ICONIC: u32 = 14;
+pub const FOCUS: u32 = 15;
+pub const ENABLE_WINDOW: u32 = 16;
+pub const GET_WINDOW_PLACEMENT: u32 = 17;
+pub const SET_WINDOW_PLACEMENT: u32 = 18;
+pub const CURSOR_POSITION: u32 = 19;
+pub const SCREEN_TO_CLIENT: u32 = 20;
+pub const CHILD_WINDOW_FROM_POINT: u32 = 21;
+pub const SET_SYSTEM_CLOSE_ENABLED: u32 = 22;
+pub const OPEN_CLIPBOARD: u32 = 23;
+pub const CLOSE_CLIPBOARD: u32 = 24;
+pub const CLIPBOARD_FORMAT_AVAILABLE: u32 = 25;
+pub const WINDOW_PLACEMENT_FIELDS: core::ops::Range<usize> = 20..30;
+pub const EDIT_CONTROL: u32 = 7;
+pub const STATUS_CONTROL: u32 = 8;

@@ -4,6 +4,8 @@ use crate::arch::common::btl::dialog_wire as w;
 use core::fmt::Write as _;
 struct Dc {
     handle: u64,
+    abort_proc: u64,
+    job: u64,
     document: Option<String>,
     page: bool,
     pages: u32,
@@ -55,7 +57,41 @@ pub(super) fn inputs(image:&mut GuestImage,address:u64,x86:bool,wide:bool)->Resu
 }
 fn create(image:&mut GuestImage,settings:Settings)->Result<u64,u32>{
     let state=&mut image.win32.printing;if state.dcs.len()>=64{return Err(8);}let handle=state.next;state.next+=1;
-    state.dcs.push(Dc{handle,document:None,page:false,pages:0,color:0,x:0,y:0,settings});Ok(handle)
+    state.dcs.push(Dc{handle,abort_proc:0,job:0,document:None,page:false,pages:0,color:0,x:0,y:0,settings});Ok(handle)
+}
+
+fn submit(dc: &mut Dc, services: &mut dyn GuestServices) -> Result<u64, u32> {
+    if dc.page || dc.pages == 0 { return Err(1906); }
+    let doc = dc.document.as_mut().ok_or(1906u32)?;
+    let length = doc.len();
+    let _ = write!(doc, "%%Trailer\n%%Pages: {}\n%%EOF\n", dc.pages);
+    match services.print_document(doc.as_bytes()) {
+        Ok(id) => {
+            dc.document = None;
+            Ok(u64::from(id))
+        }
+        Err(error) => {
+            doc.truncate(length);
+            Err(error)
+        }
+    }
+}
+
+pub(super) fn complete(image: &mut GuestImage, handle: u64, job: u64, proceed: bool, services: &mut dyn GuestServices) -> u64 {
+    let result = match image.win32.printing.dcs.iter_mut().find(|dc| dc.handle == handle) {
+        None => Err(6),
+        Some(dc) if dc.job != job || dc.document.is_none() => Err(63),
+        Some(dc) if !proceed => {
+            dc.document = None;
+            dc.page = false;
+            Err(63)
+        }
+        Some(dc) => submit(dc, services),
+    };
+    result.unwrap_or_else(|code| {
+        error(image, code);
+        0
+    })
 }
 pub(super) fn dialog_result(image:&mut GuestImage,address:u64,x86:bool,wide:bool,p:&w::Packet)->Result<(),u32>{
     let mut settings=inputs(image,address,x86,wide)?;
@@ -109,6 +145,9 @@ pub(super) fn invoke(
         };
         state.dcs.remove(i);
         return Ok(1);
+    }
+    if name == "EndDoc" && image.win32.local.user.calling_print_callback(a[0]) {
+        return Err(1906u32.into());
     }
     let text = if matches!(name, "TextOutW" | "TextOutA") {
         let count = usize::try_from(a[4]).map_err(|_| ApiError::Windows(87))?;
@@ -176,7 +215,12 @@ pub(super) fn invoke(
                 return Err(1906u32.into());
             }
             let(w,h)=dc.settings.mm();dc.document=Some(alloc::format!("%!PS-Adobe-3.0\n%%Creator: NT61 guest printer\n%%Pages: (atend)\n%%EndComments\n<< /PageSize [{:.2} {:.2}] /NumCopies {} /Collate {} >> setpagedevice\n",w*72.0/25.4,h*72.0/25.4,dc.settings.copies,dc.settings.collate));
+            dc.job += 1;
             dc.pages = 0;
+            1
+        }
+        "SetAbortProc" => {
+            dc.abort_proc = a[1];
             1
         }
         "AbortDoc" => {
@@ -206,22 +250,18 @@ pub(super) fn invoke(
             1
         }
         "EndDoc" => {
-            if dc.page || dc.pages == 0 {
+            if dc.page || dc.pages == 0 || dc.document.is_none() {
                 return Err(1906u32.into());
             }
-            let doc = dc.document.as_mut().ok_or(ApiError::Windows(1906))?;
-            let length = doc.len();
-            let _ = write!(doc, "%%Trailer\n%%Pages: {}\n%%EOF\n", dc.pages);
-            match services.print_document(doc.as_bytes()) {
-                Ok(id) => {
-                    dc.document = None;
-                    id as u64
-                }
-                Err(e) => {
-                    doc.truncate(length);
-                    return Err(e.into());
-                }
+            if dc.abort_proc == 0 {
+                return Ok(submit(dc, services)?);
             }
+            if image.memory.fetch_virt(dc.abort_proc, &mut [0]) != 1 {
+                return Err(NOACCESS.into());
+            }
+            image.win32.local.user.completion = Some(user::Completion::Print { handle: dc.handle, job: dc.job });
+            image.win32.local.user.callback = Some((dc.abort_proc, [dc.handle, 0, 0, 0]));
+            0
         }
         "SetTextColor" => {
             let old = dc.color;
@@ -255,18 +295,7 @@ pub(super) fn invoke(
                     a[1] as i32,
                     a[2] as i32
                 );
-                for byte in text.bytes() {
-                    match byte {
-                        b'(' | b')' | b'\\' => {
-                            doc.push('\\');
-                            doc.push(char::from(byte));
-                        }
-                        32..=126 => doc.push(char::from(byte)),
-                        _ => {
-                            let _ = write!(doc, "\\{byte:03o}");
-                        }
-                    }
-                }
+                postscript_string(doc, text.bytes());
                 doc.push_str(") show\n");
             } else if name == "LineTo" {
                 let _ = writeln!(
@@ -295,4 +324,64 @@ pub(super) fn invoke(
         _ => return Err(ApiError::Unsupported),
     };
     Ok(result)
+}
+
+pub(super) fn owns_dc(image: &GuestImage, handle: u64) -> bool {
+    image.win32.printing.dcs.iter().any(|dc| dc.handle == handle)
+}
+
+pub(super) fn draw_layout(
+    image: &mut GuestImage,
+    handle: u64,
+    clip: Option<[i32; 4]>,
+    lines: &[(i32, i32, &[u16])],
+) -> Result<(), u32> {
+    let dc = image.win32.printing.dcs.iter_mut().find(|dc| dc.handle == handle).ok_or(6u32)?;
+    if !dc.page {
+        return Err(1906);
+    }
+    let document = dc.document.as_mut().ok_or(1906u32)?;
+    let mut commands = String::new();
+    if let Some([left, top, right, bottom]) = clip {
+        let _ = writeln!(commands, "gsave {left} {top} {} {} rectclip",
+            right.saturating_sub(left).max(0), bottom.saturating_sub(top).max(0));
+    }
+    let _ = writeln!(commands, "{:.4} {:.4} {:.4} setrgbcolor",
+        (dc.color & 255) as f32 / 255.0,
+        ((dc.color >> 8) & 255) as f32 / 255.0,
+        ((dc.color >> 16) & 255) as f32 / 255.0);
+    for &(x, y, units) in lines {
+        let _ = write!(commands, "{x} {y} moveto (");
+        let mut text = Vec::new();
+        text.try_reserve_exact(units.len()).map_err(|_| 8u32)?;
+        for &unit in units {
+            let byte = u8::try_from(unit).map_err(|_| 120u32)?;
+            text.push(byte);
+        }
+        postscript_string(&mut commands, text);
+        commands.push_str(") show\n");
+    }
+    if clip.is_some() {
+        commands.push_str("grestore\n");
+    }
+    if document.len().saturating_add(commands.len()) > 1024 * 1024 - 4096 {
+        return Err(8);
+    }
+    document.push_str(&commands);
+    Ok(())
+}
+
+fn postscript_string(document: &mut String, bytes: impl IntoIterator<Item = u8>) {
+    for byte in bytes {
+        match byte {
+            b'(' | b')' | b'\\' => {
+                document.push('\\');
+                document.push(char::from(byte));
+            }
+            32..=126 => document.push(char::from(byte)),
+            _ => {
+                let _ = write!(document, "\\{byte:03o}");
+            }
+        }
+    }
 }

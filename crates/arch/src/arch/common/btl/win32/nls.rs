@@ -4,10 +4,29 @@
 //! classification covers Latin-1 and the additional CP1252 characters only.
 use super::*;
 
+#[path = "nls/fold_digits.rs"]
+mod fold_digits;
+
 const ANSI_CODE_PAGE: u32 = 1252;
 const UTF8_CODE_PAGE: u32 = 65001;
+const DEFAULT_FORMAT_LOCALE: u32 = 0x0409;
+const LOCALE_SLIST: u32 = 0x000d;
+const LOCALE_USE_CP_ACP: u32 = 0x4000_0000;
+const LOCALE_NOUSEROVERRIDE: u32 = 0x8000_0000;
+pub(super) const DEFAULT_UI_LANGUAGE: u16 = 0x0409;
+pub(super) const UI_LANGUAGES: [(u16, &str, &str); 2] = [
+    (DEFAULT_UI_LANGUAGE, "en-US", "0409"),
+    (0x0804, "zh-CN", "0804"),
+];
 const INVALID_FLAGS: u32 = 1004;
 const NO_UNICODE_TRANSLATION: u32 = 1113;
+const FIND_STARTSWITH: u32 = 0x0010_0000;
+const FIND_ENDSWITH: u32 = 0x0020_0000;
+const FIND_FROMSTART: u32 = 0x0040_0000;
+const FIND_FROMEND: u32 = 0x0080_0000;
+const FIND_DIRECTION: u32 = FIND_STARTSWITH | FIND_ENDSWITH | FIND_FROMSTART | FIND_FROMEND;
+const NORM_IGNORECASE: u32 = 1;
+const FIND_FILTERS: u32 = 0x0803_0077;
 const CP1252_HIGH: [u16; 32] = [
     0x20ac, 0x81, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021,
     0x2c6, 0x2030, 0x160, 0x2039, 0x152, 0x8d, 0x17d, 0x8f,
@@ -16,15 +35,59 @@ const CP1252_HIGH: [u16; 32] = [
 ];
 
 pub(super) fn handles(name: &str) -> bool {
-    matches!(name, "GetACP" | "GetCPInfo" | "IsValidCodePage"
-        | "MultiByteToWideChar" | "WideCharToMultiByte" | "GetStringTypeW" | "LCMapStringW")
+    matches!(name, "GetUserDefaultUILanguage" | "GetACP" | "GetCPInfo" | "IsValidCodePage"
+        | "AreFileApisANSI" | "GetLocaleInfoW" | "GetUserDefaultLCID"
+        | "MultiByteToWideChar" | "WideCharToMultiByte" | "GetStringTypeW" | "LCMapStringW" | "FindNLSString"
+        | "FoldStringW" | "LCMapStringEx" | "SetThreadPreferredUILanguages" | "GetThreadUILanguage")
+}
+
+fn set_thread_ui_languages(image: &mut GuestImage, args: &[u64]) -> Result<u64, ApiError> {
+    let flags = args[0] as u32;
+    if !matches!(flags, 4 | 8) || args[1] == 0 || args[2] == 0 {
+        return Err(INVALID_PARAMETER.into());
+    }
+    let mut languages = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+        let mut tag = String::new();
+        loop {
+            if cursor >= 512 || tag.len() > 85 {
+                return Err(INVALID_PARAMETER.into());
+            }
+            let address = args[1].checked_add(cursor).ok_or(NOACCESS)?;
+            let unit = word(&mut image.memory, address, 2)? as u16;
+            cursor += 2;
+            if unit == 0 {
+                break;
+            }
+            if unit > 0x7f {
+                return Err(INVALID_PARAMETER.into());
+            }
+            tag.push(char::from(unit as u8));
+        }
+        if tag.is_empty() {
+            if cursor == 2 && word(&mut image.memory, args[1].checked_add(2).ok_or(NOACCESS)?, 2)? != 0 {
+                return Err(INVALID_PARAMETER.into());
+            }
+            break;
+        }
+        let language = UI_LANGUAGES.iter().find(|(_, name, langid)|
+            tag.eq_ignore_ascii_case(if flags == 8 { name } else { langid }))
+            .map(|(language, _, _)| *language).ok_or(INVALID_PARAMETER)?;
+        if !languages.contains(&language) {
+            languages.push(language);
+        }
+    }
+    put(&mut image.memory, args[2], languages.len() as u64, 4)?;
+    image.win32.local.ui_languages = languages;
+    Ok(1)
 }
 
 // Windows CTYPE1 flags for the installed Western repertoire. Keep the table
 // independent of Rust's evolving Unicode version. In particular Windows marks
 // superscript digits as DIGIT and symbols such as '+' and the euro as PUNCT.
 // Other UTF-16 units need the Windows Unicode tables; do not guess their type.
-fn ctype1(unit: u16) -> Result<u16, ApiError> {
+pub(super) fn ctype1(unit: u16) -> Result<u16, ApiError> {
     let kind = match unit {
         9 => 0x68,                           // space, control, blank
         0xa..=0xd | 0x85 => 0x28,            // space, control
@@ -108,6 +171,21 @@ fn source(image: &mut GuestImage, address: u64, count: u64, width: usize) -> Res
     Err(INVALID_PARAMETER)
 }
 
+pub(super) fn uppercase_in_place(image: &mut GuestImage, address: u64) -> Result<u64, ApiError> {
+    if let Ok(unit) = u16::try_from(address) {
+        return Ok(u64::from(map_case(unit, true)?));
+    }
+    let mut bytes = source(image, address, u32::MAX.into(), 2)?;
+    for unit in bytes.chunks_exact_mut(2) {
+        let uppercase = map_case(u16::from_le_bytes([unit[0], unit[1]]), true)?;
+        unit.copy_from_slice(&uppercase.to_le_bytes());
+    }
+    if !image.memory.write_virt(address, &bytes) {
+        return Err(NOACCESS.into());
+    }
+    Ok(address)
+}
+
 fn destination(image: &mut GuestImage, address: u64, capacity: u64, data: &[u8], width: usize) -> Result<u64, u32> {
     let capacity = capacity as u32 as i32;
     if capacity < 0 || (capacity != 0 && address == 0) { return Err(INVALID_PARAMETER); }
@@ -118,16 +196,115 @@ fn destination(image: &mut GuestImage, address: u64, capacity: u64, data: &[u8],
     Ok(units as u64)
 }
 
+fn locale_info_w(image: &mut GuestImage, args: &[u64]) -> Result<u64, ApiError> {
+    if !matches!(args[0] as u32, 0x400 | 0x800 | DEFAULT_FORMAT_LOCALE) {
+        return Err(INVALID_PARAMETER.into());
+    }
+    let value = match args[1] as u32 & !(LOCALE_USE_CP_ACP | LOCALE_NOUSEROVERRIDE) {
+        LOCALE_SLIST => [b',', 0, 0, 0],
+        _ => return Err(INVALID_FLAGS.into()),
+    };
+    destination(image, args[2], args[3], &value, 2).map_err(Into::into)
+}
+
+fn search_text(image: &mut GuestImage, address: u64, count: u64, ignore_case: bool) -> Result<String, ApiError> {
+    let bytes = source(image, address, count, 2)?;
+    let length = bytes.len() - if count as u32 == u32::MAX { 2 } else { 0 };
+    let mut text = String::with_capacity(length / 2);
+    for unit in bytes[..length].chunks_exact(2) {
+        let character = unit[0];
+        if unit[1] != 0 || !(character.is_ascii_alphanumeric() || character == b' ') {
+            return Err(ApiError::Unsupported);
+        }
+        text.push(char::from(if ignore_case { character.to_ascii_lowercase() } else { character }));
+    }
+    Ok(text)
+}
+
+fn find_nls_string(image: &mut GuestImage, a: &[u64]) -> Result<u64, ApiError> {
+    let flags = a[1] as u32;
+    let direction = flags & FIND_DIRECTION;
+    if direction.count_ones() > 1 || flags & !(FIND_DIRECTION | FIND_FILTERS) != 0 {
+        return Err(INVALID_FLAGS.into());
+    }
+    if !matches!(a[0] as u32, 0x7f | 0x400 | 0x800 | 0x409)
+        || flags & !(FIND_DIRECTION | NORM_IGNORECASE) != 0 {
+        return Err(ApiError::Unsupported);
+    }
+    let ignore_case = flags & NORM_IGNORECASE != 0;
+    let text = search_text(image, a[2], a[3], ignore_case)?;
+    let value = search_text(image, a[4], a[5], ignore_case)?;
+    if value.is_empty() {
+        return Err(INVALID_PARAMETER.into());
+    }
+    let found = match direction {
+        FIND_FROMEND => text.rfind(value.as_str()),
+        FIND_STARTSWITH => text.starts_with(value.as_str()).then_some(0),
+        FIND_ENDSWITH => text.strip_suffix(value.as_str()).map(str::len),
+        _ => text.find(value.as_str()),
+    };
+    let Some(offset) = found else {
+        error(image, 0);
+        return Ok(u64::from(u32::MAX));
+    };
+    if a[6] != 0 {
+        put(&mut image.memory, a[6], value.len() as u64, 4)?;
+    }
+    Ok(offset as u64)
+}
+
+fn fold_string(image: &mut GuestImage, args: &[u64]) -> Result<u64, ApiError> {
+    let [flags, input, count, output, capacity, ..] = *args else {
+        return Err(INVALID_PARAMETER.into());
+    };
+    let count = count as i32;
+    let capacity = capacity as i32;
+    if input == 0 || count == 0 || capacity < 0 || (capacity > 0 && output == 0) || input == output {
+        return Err(INVALID_PARAMETER.into());
+    }
+    match flags as u32 {
+        0x80 => (),
+        0x10 | 0x20 | 0x30 | 0x40 | 0x50 | 0x90 | 0xa0 | 0xb0 | 0xc0 | 0xd0
+        | 0x2000 | 0x2010 | 0x2080 | 0x2090 => return Err(ApiError::Unsupported),
+        _ => return Err(INVALID_FLAGS.into()),
+    }
+    if capacity == 0 && count > 0 {
+        return Ok(count as u64);
+    }
+    if capacity > 0 && count > capacity {
+        return Err(122.into());
+    }
+    let bytes = source(image, input, if count < 0 { u32::MAX as u64 } else { count as u64 }, 2)?;
+    let units = bytes.len() / 2;
+    if capacity == 0 {
+        return Ok(units as u64);
+    }
+    if (capacity as usize) < units {
+        return Err(122.into());
+    }
+    let folded = fold_digits::fold(&bytes);
+    destination(image, output, capacity as u64, &folded, 2).map_err(Into::into)
+}
+
 pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Result<u64, ApiError> {
     Ok(match name {
-        "LCMapStringW" => {
+        "LCMapStringW" | "LCMapStringEx" => {
             let flags = a[1] as u32;
             if flags == 0 || flags & 0x300 == 0x300 { return Err(INVALID_FLAGS.into()); }
+            let installed_locale = if name == "LCMapStringEx" {
+                if a[7] != 0 { return Err(INVALID_PARAMETER.into()); }
+                if a[6] != 0 || a[8] != 0 { return Err(ApiError::Unsupported); }
+                a[0] == 0 || {
+                    let locale = string(&mut image.memory, a[0], true)?;
+                    locale.is_empty() || locale.eq_ignore_ascii_case("en-US")
+                }
+            } else {
+                matches!(a[0] as u32, 0 | 0x7f | 0x400 | 0x800 | 0x409)
+            };
             // The runtime's user/system default locale is Western English.
             // Other locales, sort keys, kana/width and linguistic casing need
             // locale data which is not installed in this runtime profile.
-            if !matches!(a[0] as u32, 0 | 0x7f | 0x400 | 0x800 | 0x409)
-                || !matches!(flags, 0x100 | 0x200) {
+            if !installed_locale || !matches!(flags, 0x100 | 0x200) {
                 return Err(ApiError::Unsupported);
             }
             let bytes = source(image, a[2], a[3], 2)?;
@@ -152,6 +329,15 @@ pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Result<u6
             if !image.memory.write_virt(a[3], &output) { return Err(NOACCESS.into()); }
             1
         }
+        "FindNLSString" => find_nls_string(image, a)?,
+        "FoldStringW" => fold_string(image, a)?,
+        "GetUserDefaultUILanguage" => u64::from(image.win32.ui_language),
+        "GetThreadUILanguage" => u64::from(image.win32.local.ui_languages.first()
+            .copied().unwrap_or(image.win32.ui_language)),
+        "SetThreadPreferredUILanguages" => set_thread_ui_languages(image, a)?,
+        "GetLocaleInfoW" => locale_info_w(image, a)?,
+        "GetUserDefaultLCID" => u64::from(DEFAULT_FORMAT_LOCALE),
+        "AreFileApisANSI" => 1,
         "GetACP" => u64::from(ANSI_CODE_PAGE),
         "IsValidCodePage" => u64::from(matches!(a[0] as u32, ANSI_CODE_PAGE | UTF8_CODE_PAGE)),
         "GetCPInfo" => {

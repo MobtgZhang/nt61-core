@@ -3,7 +3,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use nt61_abi::{desktop_bridge::*, dialog_bridge as wire};
 use crate::ke::sync::Spinlock;
 
-struct Pending { id:u64, packet:wire::Packet, dispatched:bool, done:bool }
+struct Pending { id:u64, packet:Box<wire::Packet>, dispatched:bool, done:bool }
 struct Broker { next:u64, pending:Vec<Pending>, heartbeat:u64 }
 static BROKER:Spinlock<Broker>=Spinlock::new(Broker{next:1,pending:Vec::new(),heartbeat:0});
 fn clock()->u64 { crate::ke::time::get_interrupt_time() }
@@ -17,14 +17,17 @@ pub fn bytes(packet:&wire::Packet)->&[u8] {
     // SAFETY: Packet is repr(C), has no padding, references or uninitialized fields.
     unsafe {core::slice::from_raw_parts(core::ptr::from_ref(packet).cast(),wire::PACKET_SIZE)}
 }
-pub fn decode(data:&[u8])->Result<wire::Packet,u32>{
-    if data.len()!=wire::PACKET_SIZE{return Err(STATUS_INVALID_PARAMETER);}
-    let mut packet=wire::EMPTY;
-    // SAFETY: all Packet bit patterns are valid; destination has exactly data.len bytes.
-    unsafe {core::ptr::copy_nonoverlapping(data.as_ptr(),core::ptr::from_mut(&mut packet).cast(),data.len());}
-    Ok(packet)
+pub fn decode(data: &[u8]) -> Result<Box<wire::Packet>, u32> {
+    if data.len() != wire::PACKET_SIZE {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let mut packet = Box::<wire::Packet>::new_uninit();
+    unsafe {
+        core::ptr::copy_nonoverlapping(data.as_ptr(), packet.as_mut_ptr().cast(), data.len());
+        Ok(packet.assume_init())
+    }
 }
-pub fn request(packet:wire::Packet)->Result<wire::Packet,u32>{
+pub fn request(packet: Box<wire::Packet>) -> Result<Box<wire::Packet>, u32> {
     let id={let mut broker=BROKER.lock();
         if clock().saturating_sub(broker.heartbeat)>50_000_000 || broker.heartbeat==0{return Err(STATUS_NOT_SUPPORTED);}
         if broker.pending.len()>=32{return Err(0xc000009a);}
@@ -48,7 +51,7 @@ pub fn poll()->Result<Vec<u8>,u32>{
     p.dispatched=true;
     let mut output=p.id.to_le_bytes().to_vec();output.extend_from_slice(bytes(&p.packet));Ok(output)
 }
-pub fn complete(id:u64,packet:wire::Packet)->Result<(),u32>{
+pub fn complete(id: u64, packet: Box<wire::Packet>) -> Result<(), u32> {
     if !desktop_caller(){return Err(STATUS_ACCESS_DENIED);}
     if !matches!(packet.values[1],wire::ACCEPTED|wire::CANCELLED|wire::FAILED){return Err(STATUS_INVALID_PARAMETER);}
     let mut broker=BROKER.lock();
@@ -94,10 +97,19 @@ extern "C" fn command_worker(context:u64){
     crate::ps::thread::ps_exit_system_thread(0)
 }
 pub fn command_poll(id:u64)->Result<(Vec<u8>,bool),u32>{
-    if !desktop_caller(){return Err(STATUS_ACCESS_DENIED);}
-    let mut commands=COMMANDS.lock();let index=commands.iter().position(|c|c.id==id).ok_or(STATUS_NOT_FOUND)?;
-    if commands[index].result.is_none(){return Ok((Vec::new(),false));}
-    let command=commands.remove(index);Ok((command.result.ok_or(STATUS_NOT_FOUND)??,command.exit))
+    if !desktop_caller() {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    let command = {
+        let mut commands = COMMANDS.lock();
+        let index = commands.iter().position(|command| command.id == id).ok_or(STATUS_NOT_FOUND)?;
+        commands[index].result.is_some().then(|| commands.remove(index))
+    };
+    if let Some(command) = command {
+        return Ok((command.result.ok_or(STATUS_NOT_FOUND)??, command.exit));
+    }
+    crate::ke::scheduler::yield_();
+    Ok((Vec::new(), false))
 }
 
 /// Publish a complete PostScript job in the system-volume RAM mirror before
