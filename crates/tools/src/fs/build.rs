@@ -215,7 +215,7 @@ pub fn build_kernel(target: &str) -> Result<PathBuf> {
             cmd.env(
                 "RUSTFLAGS",
                 format!(
-                    "-C link-arg=-T{}/crates/boot/linker-rv64.ld -C link-arg=-no-gc-sections -C link-arg=--emit-relocs -C link-arg=-e -C link-arg=kernel_entry",
+                    "-C link-arg=--defsym=NT61_IMAGE_BASE=0x88000000 -C link-arg=-T{}/crates/init/linker-native.ld -C link-arg=-no-gc-sections -C link-arg=--emit-relocs",
                     manifest_dir.display()
                 ),
             );
@@ -224,7 +224,7 @@ pub fn build_kernel(target: &str) -> Result<PathBuf> {
             cmd.env(
                 "RUSTFLAGS",
                 format!(
-                    "-C linker=loongarch64-linux-gnu-ld -C link-arg=-T{}/crates/boot/linker-la64.ld -C link-arg=-no-gc-sections -C link-arg=--emit-relocs -C link-arg=-e -C link-arg=kernel_entry -C link-arg=-nostdlib -C link-arg=-L{}/crates/tools/loongarch64/lib",
+                    "-C linker=loongarch64-linux-gnu-ld -C link-arg=--defsym=NT61_IMAGE_BASE=0x1000000 -C link-arg=-T{}/crates/init/linker-native.ld -C link-arg=-no-gc-sections -C link-arg=--emit-relocs -C link-arg=-nostdlib -C link-arg=-L{}/crates/tools/loongarch64/lib",
                     manifest_dir.display(), manifest_dir.display()
                 ),
             );
@@ -2854,18 +2854,18 @@ pub fn build_userland_images(arch: &str) -> Result<()> {
     Ok(())
 }
 
-/// Refresh the staged kernel and loader after an incremental kernel build.
-/// Use the same ELF-to-PE conversion and checksum as the full image build;
-/// packaging an image must never silently retain the previous kernel.
+/// Refresh the staged kernel, HAL and loader using the full image build's PE metadata.
 pub fn stage_kernel_and_loader(arch: &str, system_dir: &Path, winload: &Path) -> Result<()> {
     set_pe_arch(arch);
-    let kernel = refresh_pe_checksum(real_pe("nt61-kernel.efi"));
+    let kernel = native_system_image(real_pe("nt61-kernel.efi"), false);
+    let hal = native_system_image(real_pe("hal_dll.efi"), true);
     let loader = std::fs::read(winload).map_err(BuildError::Io)?;
     let system32 = system_dir.join("Windows").join("System32");
     std::fs::create_dir_all(&system32).map_err(BuildError::Io)?;
     std::fs::write(system32.join("ntoskrnl.exe"), kernel).map_err(BuildError::Io)?;
+    std::fs::write(system32.join("hal.dll"), hal).map_err(BuildError::Io)?;
     std::fs::write(system32.join("winload.efi"), loader).map_err(BuildError::Io)?;
-    log::success(&format!("Kernel and loader staged: {}", system32.display()));
+    log::success(&format!("Kernel, HAL and loader staged: {}", system32.display()));
     Ok(())
 }
 
@@ -3309,6 +3309,21 @@ fn wrap_elf_to_pe(elf_path: &Path, arch: TargetArch, artifact_name: &str) -> Opt
     Some(pe)
 }
 
+fn native_system_image(mut bytes: Vec<u8>, is_hal: bool) -> Vec<u8> {
+    let pe_off = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    let opt = pe_off + 24;
+    bytes[opt + 0x44..opt + 0x46].copy_from_slice(&1u16.to_le_bytes());
+    for field in [0x28, 0x30] {
+        bytes[opt + field..opt + field + 2].copy_from_slice(&6u16.to_le_bytes());
+        bytes[opt + field + 2..opt + field + 4].copy_from_slice(&1u16.to_le_bytes());
+    }
+    if is_hal {
+        let flags = u16::from_le_bytes(bytes[pe_off + 22..pe_off + 24].try_into().unwrap());
+        bytes[pe_off + 22..pe_off + 24].copy_from_slice(&(flags | 0x2000).to_le_bytes());
+    }
+    refresh_pe_checksum(bytes)
+}
+
 pub fn build_system_images() -> Vec<SystemImage> {
     let mut images=vec![
         SystemImage {
@@ -3465,18 +3480,7 @@ pub fn build_system_images() -> Vec<SystemImage> {
         if image.name == "ntoskrnl.exe" || image.name == "hal.dll"
             || image.name.to_ascii_lowercase().ends_with(".sys")
         {
-            let pe_off = u32::from_le_bytes(image.bytes[0x3C..0x40].try_into().unwrap()) as usize;
-            let opt = pe_off + 24;
-            image.bytes[opt + 0x44..opt + 0x46].copy_from_slice(&1u16.to_le_bytes());
-            for field in [0x28, 0x30] {
-                image.bytes[opt + field..opt + field + 2].copy_from_slice(&6u16.to_le_bytes());
-                image.bytes[opt + field + 2..opt + field + 4].copy_from_slice(&1u16.to_le_bytes());
-            }
-            if image.name == "hal.dll" {
-                let flags = u16::from_le_bytes(image.bytes[pe_off + 22..pe_off + 24].try_into().unwrap());
-                image.bytes[pe_off + 22..pe_off + 24].copy_from_slice(&(flags | 0x2000).to_le_bytes());
-            }
-            image.bytes = refresh_pe_checksum(core::mem::take(&mut image.bytes));
+            image.bytes = native_system_image(core::mem::take(&mut image.bytes), image.name == "hal.dll");
         }
     }
     let root=std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");

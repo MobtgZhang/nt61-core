@@ -64,6 +64,15 @@ pub(super) fn prepare_imports(
     Ok(ImportBindings { width, writes })
 }
 
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn import_modules(image: &[u8]) -> Option<impl Iterator<Item = Option<&str>>> {
+    let (_, _, magic, optional) = parse_headers(image)?;
+    let (start, size) = directory(image, optional, magic == 0x20b, 1);
+    let descriptors = image.get(start..start.checked_add(size)?)?;
+    Some(descriptors.chunks_exact(20).take_while(|descriptor| *descriptor != [0; 20])
+        .map(|descriptor| string(image, dword(descriptor, 12)?)))
+}
+
 fn import_writes(
     image: &[u8],
     database: &ImageDatabase,

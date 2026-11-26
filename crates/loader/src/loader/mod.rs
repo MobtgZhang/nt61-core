@@ -733,6 +733,12 @@ pub fn load_image_full(
     image_db: &mut ImageDatabase,
     preferred_base: u64,
 ) -> Option<LoadedImage> {
+    let mut loaded = layout_image(name, bytes, preferred_base)?;
+    image_link::bind_imports(&mut loaded.bytes, image_db).ok()?;
+    Some(loaded)
+}
+
+fn layout_image(name: &str, bytes: &[u8], preferred_base: u64) -> Option<LoadedImage> {
     let (file_hdr, _opt_size, magic, opt_off) = parse_headers(bytes)?;
     let (image_base, size_of_image, aep, subsystem) = if magic == 0x10B {
         read_opt32(bytes, opt_off)?
@@ -865,7 +871,6 @@ pub fn load_image_full(
         apply_base_relocations(&mut loaded, bytes, delta);
     }
 
-    image_link::bind_imports(&mut loaded.bytes, image_db).ok()?;
     Some(loaded)
 }
 
@@ -1707,9 +1712,32 @@ pub fn load_into_process_address_space(
     process: &mut ntoskrnl::ps::process::Eprocess,
     image: &[u8],
 ) -> Option<UserImageMapping> {
+    #[cfg(target_arch = "x86_64")]
     use ntoskrnl::mm::{pool, vad::{VadEntry, VadFlags, VadProtection, VadType}, vas};
     if process.user_image_size != 0 { return None; }
     let root = process.pml4_phys;
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let (_, _, magic, optional) = parse_headers(image)?;
+        if magic != 0x20b || read_data_directory_pe32plus(image, optional, 13) != (0, 0) {
+            return None;
+        }
+        if read_data_directory_pe32plus(image, optional, 1) != (0, 0) {
+            let (mapping, dependencies) = match load_native_image_with_system_dlls(root, image) {
+                Ok(images) => images,
+                Err(reason) => {
+                    ntoskrnl::hal::serial::write_string_always("K:native-import: ");
+                    ntoskrnl::hal::serial::write_string_always(reason);
+                    ntoskrnl::hal::serial::write_string_always("\r\n");
+                    return None;
+                }
+            };
+            process.user_image_base = mapping.image_base;
+            process.user_image_size = mapping.image_size;
+            process.bootstrap_system_dlls = dependencies;
+            return Some(mapping);
+        }
+    }
     let mapping = load_named_user_image(root, image, "user.exe", cfg!(target_arch = "x86_64"))?;
     #[cfg(target_arch = "x86_64")]
     {
@@ -1751,6 +1779,15 @@ pub fn load_named_image_into_user_address_space(
 fn load_named_user_image(
     pml4_phys: u64, image: &[u8], image_name: &str, allow_demand_zero: bool,
 ) -> Option<UserImageMapping> {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = allow_demand_zero;
+        let (_, _, magic, optional) = parse_headers(image)?;
+        if magic != 0x20b || [1, 13].into_iter()
+            .any(|directory| read_data_directory_pe32plus(image, optional, directory) != (0, 0)) {
+            return None;
+        }
+    }
     #[cfg(target_arch = "riscv64")]
     {
         let _ = image_name;
@@ -1784,6 +1821,104 @@ fn load_named_user_image(
                 ntoskrnl::hal::serial::write_string_always("K:load-map-failed\r\n");
                 None
             }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn load_native_image_with_system_dlls(
+    root: u64,
+    program: &[u8],
+) -> Result<(UserImageMapping, [(u64, u64); 2]), &'static str> {
+    use ntoskrnl::mm::vas;
+
+    let machine = if cfg!(target_arch = "aarch64") { MachineType::ARM64 }
+        else if cfg!(target_arch = "riscv64") { MachineType::RISCV64 }
+        else { MachineType::LOONGARCH64 };
+    let (program_header, _, _, program_optional) = parse_headers(program).ok_or("invalid executable PE header")?;
+    if program_header.machine_type() != Some(machine) || program_header.characteristics & 0x2000 != 0
+        || read_data_directory_pe32plus(program, program_optional, 9) != (0, 0) {
+        return Err("executable machine, type or TLS is unsupported");
+    }
+    let (program_base, program_size, entry, _) = read_opt64(program, program_optional).ok_or("invalid executable optional header")?;
+    if entry == 0 || entry >= program_size || program_size > 128 * 1024 * 1024 {
+        return Err("invalid executable entry point or size");
+    }
+
+    let range_available = |base: u64, size: u64| {
+        base >= 0x1000 && base & 0xfff == 0 && vas::user_mapping_available(base, size)
+            && base.checked_add(size).is_some_and(|end|
+                (base..end).step_by(4096).all(|page| !vas::is_user_range_mapped(root, page, 1)))
+    };
+    let program_size = u64::from(program_size).next_multiple_of(4096);
+    if !range_available(program_base, program_size) {
+        return Err("executable address range unavailable");
+    }
+
+    let mut executable = layout_image("user.exe", program, 0).ok_or("invalid executable sections or unresolved imports")?;
+    let names = ["ntdll.dll", "kernel32.dll"];
+    let mut needed = [false; 2];
+    for module in image_link::import_modules(&executable.bytes).ok_or("invalid import directory")? {
+        let module = module.ok_or("invalid import module name")?;
+        let slot = names.iter().position(|name| name.eq_ignore_ascii_case(module))
+            .ok_or("unsupported native import module")?;
+        needed[slot] = true;
+    }
+    if !needed.contains(&true) { return Err("empty native import directory"); }
+
+    let local = ImageDatabase::new();
+    let mut libraries: [Option<LoadedImage>; 2] = [None, None];
+    for (slot, (name, path)) in names.into_iter().zip([
+        "C:\\Windows\\System32\\ntdll.dll", "C:\\Windows\\System32\\kernel32.dll",
+    ]).enumerate() {
+        if !needed[slot] { continue; }
+        let library = ntoskrnl::fs::system_volume::read(path).map_err(|_| "cannot read System32 dependency")?;
+        let (header, _, magic, optional) = parse_headers(&library).ok_or("invalid dependency PE header")?;
+        if magic != 0x20b || header.machine_type() != Some(machine) || header.characteristics & 0x2000 == 0
+            || [1, 9, 13].into_iter().any(|directory| read_data_directory_pe32plus(&library, optional, directory) != (0, 0)) {
+            return Err(if slot == 0 { "ntdll format, machine or directories are unsupported" }
+                else { "kernel32 format, machine or directories are unsupported" });
+        }
+        let (base, size, entry, _) = read_opt64(&library, optional).ok_or("invalid dependency optional header")?;
+        if entry != 0 || size == 0 || size > 1024 * 1024 {
+            return Err("invalid dependency entry point or size");
+        }
+        let size = u64::from(size).next_multiple_of(4096);
+        if !range_available(base, size) { return Err("dependency address range unavailable"); }
+        if program_base < base + size && base < program_base + program_size {
+            return Err(if slot == 0 { "executable and ntdll address ranges overlap" }
+                else { "executable and kernel32 address ranges overlap" });
+        }
+        if libraries.iter().flatten().any(|other| base < other.image_base + other.image_size.next_multiple_of(4096)
+            && other.image_base < base + size) {
+            return Err("native dependency address ranges overlap");
+        }
+        let dll = layout_image(name, &library, 0).ok_or("invalid dependency sections")?;
+        local.register(&dll, &library);
+        libraries[slot] = Some(dll);
+    }
+    image_link::bind_imports(&mut executable.bytes, &local).map_err(|_| "invalid executable sections or unresolved imports")?;
+    let mut dependencies = [(0, 0); 2];
+    for (slot, library) in libraries.iter().enumerate() {
+        let Some(library) = library else { continue; };
+        let Some(mapping) = map_prebuilt_image_into_user_address_space(root, library, false) else {
+            for (base, size) in dependencies.into_iter().filter(|(_, size)| *size != 0) {
+                let _ = vas::unmap_user_pages(root, base, size);
+            }
+            return Err("cannot map native dependency");
+        };
+        dependencies[slot] = (mapping.image_base, mapping.image_size);
+    }
+    match map_prebuilt_image_into_user_address_space(root, &executable, false) {
+        Some(mapping) => {
+            ntoskrnl::ke::instruction_shootdown::flush_all();
+            Ok((mapping, dependencies))
+        }
+        None => {
+            for (base, size) in dependencies.into_iter().filter(|(_, size)| *size != 0) {
+                let _ = vas::unmap_user_pages(root, base, size);
+            }
+            Err("cannot map executable")
         }
     }
 }
@@ -2087,7 +2222,6 @@ fn load_raw_image_into_user_address_space(
 /// This completes the PE pipeline for user-mode images: the bytes the
 /// loader validated (relocated, IAT-patched) are the bytes user code
 /// executes, instead of a half-mapped re-parse of the raw file.
-#[cfg(not(target_arch = "riscv64"))]
 fn map_prebuilt_image_into_user_address_space(
     pml4_phys: u64,
     loaded: &LoadedImage,

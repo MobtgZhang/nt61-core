@@ -3,8 +3,8 @@
 //! Guest exports enter a checked runtime gateway; name/ABI availability is
 //! distinct from handler support. Guest runtime and foundation facade names
 //! present in the audited Windows 7 SP1 reference use its ordinals.
-//! Additional compatibility names use NT61 private assignments. Native
-//! placeholder metadata retains NT61 numbering. Product
+//! Additional compatibility names use NT61 private assignments. Non-x86
+//! ntdll exposes a subset of native kernel services independently. Product
 //! code and thunks are built from source; no Microsoft machine code is shipped.
 
 use super::pe::{ImportSymbol, PeImageSpec, SectionSpec};
@@ -83,8 +83,8 @@ pub struct DllSpec {
 ///
 /// `ntdll.dll` is the boundary between Ring 3 and the kernel. Every
 /// native service belongs here; win32k entry points belong inside user32/gdi32.
-/// This specification describes a legacy placeholder surface, not implementations
-/// of the native services or runtime helpers.
+/// The Nt exports call the native kernel on the non-x86 hosts; the remaining
+/// native runtime helpers are placeholders.
 pub const NTDLL_EXPORTS: &[(&str, u32)] = &[
     // --- Native system services -------------------------------------
     ("NtAllocateVirtualMemory", 192),
@@ -120,6 +120,12 @@ pub const KERNEL32_EXPORTS: &[(&str, u32)] = &[
     ("VirtualAlloc", 1274),
     ("VirtualFree", 1277),
     ("WriteFile", 1334),
+];
+
+const NATIVE_KERNEL32_EXPORTS: &[(&str, u32)] = &[
+    ("GetCurrentProcess", 455),
+    ("GetCurrentThread", 459),
+    ("Sleep", 1218),
 ];
 
 /// The `user32.dll` surface.
@@ -483,8 +489,15 @@ pub fn build_dll_image(spec: &DllSpec) -> Vec<u8> {
 }
 
 fn build_dll_image_native(spec: &DllSpec, machine: u16, return_code: &[u8]) -> Vec<u8> {
+    let native_ntdll = machine != MACHINE_AMD64 && spec.file_name == "ntdll.dll";
+    let native_kernel32 = machine != MACHINE_AMD64 && spec.file_name == "kernel32.dll";
+    let image_base = match (machine, native_ntdll, native_kernel32) {
+        (0x5064, true, _) => 0x0000_0030_0000_0000,
+        (0x5064, _, true) => 0x0000_0030_1000_0000,
+        _ => spec.image_base,
+    };
     let mut image = PeImageSpec::new(
-        spec.image_base,
+        image_base,
         super::pe::IMAGE_SUBSYSTEM_WINDOWS_GUI,
         true,
         machine,
@@ -493,21 +506,35 @@ fn build_dll_image_native(spec: &DllSpec, machine: u16, return_code: &[u8]) -> V
     image.module_name = spec.file_name.to_string();
     image.entry_point_rva = 0; // No DllMain; export zero is not an initializer.
 
-    // The `.text` section: one stub per export.
-    let mut text = vec![0u8; spec.exports.len() * STUB_STRIDE as usize];
-    for (index, _) in spec.exports.iter().enumerate() {
-        let at = index * STUB_STRIDE as usize;
-        text[at..at + return_code.len()].copy_from_slice(return_code);
+    let stride = if native_kernel32 { 80 } else if native_ntdll { 64 } else { STUB_STRIDE as usize };
+    let exports = if native_kernel32 { NATIVE_KERNEL32_EXPORTS } else { spec.exports };
+    let exports = exports.iter().filter(|(name, _)| !native_ntdll || name.starts_with("Nt"));
+    let mut text = vec![0u8; exports.clone().count() * stride];
+    for (index, (name, ordinal)) in exports.enumerate() {
+        let at = index * stride;
+        if native_ntdll || native_kernel32 {
+            let words = if native_ntdll {
+                let service = syscall_metadata::NATIVE_SERVICE_METADATA.iter().find(|entry| entry.name == *name)
+                    .expect("native ntdll service must exist in the SP1 table");
+                assert_eq!(u32::from(service.x64_nt_ordinal), *ordinal);
+                native_nt_thunk(machine, service.number, service.arguments)
+            } else {
+                native_kernel32_thunk(machine, name).to_vec()
+            };
+            assert!(words.len() * 4 <= stride);
+            for (slot, instruction) in text[at..at + stride].chunks_exact_mut(4).zip(words) {
+                slot.copy_from_slice(&instruction.to_le_bytes());
+            }
+        } else {
+            text[at..at + return_code.len()].copy_from_slice(return_code);
+        }
+        image.export_named(name, u16::try_from(*ordinal).expect("SP1 export ordinal"), TEXT_RVA + at as u32);
     }
 
-    // Preserve original SP1 ordinals independently of the code array order.
-    for (index, (name, ordinal)) in spec.exports.iter().enumerate() {
-        image.export_named(name, u16::try_from(*ordinal).expect("SP1 export ordinal"), stub_rva(index as u32));
-    }
-
-    // The imports.
-    for (dll_name, symbols) in spec.imports {
-        image.import(dll_name, symbols.to_vec());
+    if !native_kernel32 {
+        for (dll_name, symbols) in spec.imports {
+            image.import(dll_name, symbols.to_vec());
+        }
     }
 
     // These position-independent instructions contain no absolute addresses.
@@ -521,6 +548,65 @@ fn build_dll_image_native(spec: &DllSpec, machine: u16, return_code: &[u8]) -> V
 
     let (bytes, _) = super::pe::emit(&image);
     bytes
+}
+
+fn native_kernel32_thunk(machine: u16, name: &str) -> &'static [u32] {
+    match (machine, name) {
+        (0xaa64, "GetCurrentProcess") => &[0x9280_0000, 0xd65f_03c0],
+        (0xaa64, "GetCurrentThread") => &[0x9280_0020, 0xd65f_03c0],
+        (0x5064, "GetCurrentProcess") => &[0xfff0_0513, 0x0000_8067],
+        (0x5064, "GetCurrentThread") => &[0xffe0_0513, 0x0000_8067],
+        (0x6264, "GetCurrentProcess") => &[0x02bf_fc04, 0x4c00_0020],
+        (0x6264, "GetCurrentThread") => &[0x02bf_f804, 0x4c00_0020],
+        (0xaa64, "Sleep") => &[
+            0x5284_e209, 0x9ba9_7c08, 0xcb08_03e8, 0xd2f0_000a, 0x3100_041f, 0x9a88_0148,
+            0xf81f_0fe8, 0x9100_03e1, 0x2a1f_03e0, 0x5280_0630, 0xd400_0001, 0x9100_43ff,
+            0xd65f_03c0,
+        ],
+        (0x5064, "Sleep") => &[
+            0x0005_031b, 0xfff0_0293, 0x0253_0063, 0x0205_1313, 0x0203_5313, 0x0000_22b7,
+            0x7102_829b, 0x0253_02b3, 0x4050_02b3, 0x00c0_006f, 0xfff0_029b, 0x03f2_9293,
+            0xff01_0113, 0x0051_3023, 0x0001_0593, 0x0000_0513, 0x0310_0893, 0x0000_0073,
+            0x0101_0113, 0x0000_8067,
+        ],
+        (0x6264, "Sleep") => &[
+            0x0040_808e, 0x02bf_fc0d, 0x5800_1dcd, 0x00df_008c, 0x1400_004d, 0x039c_41ad,
+            0x001d_b58c, 0x0011_b00c, 0x5000_0800, 0x0320_000c, 0x02ff_c063, 0x29c0_006c,
+            0x0015_0065, 0x0015_0004, 0x0280_c40b, 0x002b_0000, 0x02c0_4063, 0x4c00_0020,
+        ],
+        _ => unreachable!("unsupported native Kernel32 export: {machine:#06x}/{name}"),
+    }
+}
+
+fn native_nt_thunk(machine: u16, service: u16, arguments: u8) -> Vec<u32> {
+    let service = u32::from(service);
+    assert!(service <= 0x7ff && arguments <= 11);
+    if machine == 0xaa64 {
+        return vec![0x5280_0010 | (service << 5), 0xd400_0001, 0xd65f_03c0];
+    }
+    let extra = arguments.saturating_sub(7) as usize;
+    let (reserve, spill, copies, load_service, trap, extend_status, restore, ret) = match machine {
+        0x5064 => (
+            0xfe01_0113, 0x0111_3023,
+            [0x0201_3283, 0x0051_3423, 0x0281_3283, 0x0051_3823, 0x0301_3283, 0x0051_3c23],
+            0x0000_0893 | (service << 20), 0x0000_0073, 0x0005_051b, 0x0201_0113, 0x0000_8067,
+        ),
+        0x6264 => (
+            0x02ff_8063, 0x29c0_006b,
+            [0x28c0_806c, 0x29c0_206c, 0x28c0_a06c, 0x29c0_406c, 0x28c0_c06c, 0x29c0_606c],
+            0x0280_000b | (service << 10), 0x002b_0000, 0x0010_0084, 0x02c0_8063, 0x4c00_0020,
+        ),
+        _ => unreachable!("no native NT syscall ABI for machine {machine:#06x}"),
+    };
+    let mut words = Vec::new();
+    if extra != 0 {
+        words.extend([reserve, spill]);
+        words.extend_from_slice(&copies[..(extra - 1) * 2]);
+    }
+    words.extend([load_service, trap, extend_status]);
+    if extra != 0 { words.push(restore); }
+    words.push(ret);
+    words
 }
 
 /// DLLs backed by the isolated x86/x64 runtime gateway. Keeping this set
@@ -627,6 +713,20 @@ fn kernel32_extra_forwarders(x64: bool) -> Vec<FoundationExport> {
     foundation_exports("kernel32.dll", x64).into_iter().filter(|e|
         catalog::find("kernel32.dll", e.name).is_none()
         && !KERNEL32_FORWARDERS.contains(&e.name)).collect()
+}
+
+fn msvcrt_extra_forwarders(x64: bool) -> impl Iterator<Item = FoundationExport> {
+    foundation_exports("msvcrt.dll", x64).into_iter()
+        .filter(|export| export.target.dll != "msvcrt.dll")
+}
+
+fn msvcrt_data_exports(x64: bool) -> impl Iterator<Item = (&'static str, u16, u32)> {
+    let reference = reference_module("msvcrt.dll", x64).expect("audited MSVCRT reference");
+    catalog::MSVCRT_DATA_EXPORTS.iter().map(move |&(name, offset)| {
+        let ordinal = reference.exports.iter().find(|export| export.name == name)
+            .expect("audited MSVCRT data export").ordinal;
+        (name, ordinal, catalog::MSVCRT_DATA_RVA + offset)
+    })
 }
 
 fn kernel32_ordinal(name: &str, x64: bool, private_index: usize) -> u16 {
@@ -878,16 +978,12 @@ fn build_runtime_image(file_name: &str, x64: bool, resources: Option<&[u8]>) -> 
     image.sections = vec![SectionSpec::code(text)];
     if file_name.eq_ignore_ascii_case("msvcrt.dll") {
         assert!(image.sections[0].data.len() <= (catalog::MSVCRT_DATA_RVA - TEXT_RVA) as usize);
-        let reference = reference_module(file_name, x64)?;
-        for &(name, offset) in catalog::MSVCRT_DATA_EXPORTS {
-            let ordinal = reference.exports.iter().find(|export| export.name == name)?.ordinal;
-            image.export_named(name, ordinal, catalog::MSVCRT_DATA_RVA + offset);
+        for (name, ordinal, rva) in msvcrt_data_exports(x64) {
+            image.export_named(name, ordinal, rva);
         }
-        for export in foundation_exports(file_name, x64) {
-            if export.target.dll != "msvcrt.dll" {
-                let host = export.target.dll.trim_end_matches(".dll");
-                image.export_forwarder(export.name, export.ordinal, &format!("{host}.{}", export.target.name));
-            }
+        for export in msvcrt_extra_forwarders(x64) {
+            let host = export.target.dll.trim_end_matches(".dll");
+            image.export_forwarder(export.name, export.ordinal, &format!("{host}.{}", export.target.name));
         }
         let mut data = vec![0; 16];
         data.extend_from_slice(&catalog::MSVCRT_DATA_TAG);
@@ -985,6 +1081,12 @@ pub fn runtime_manifest(x64: bool) -> String {
         text.push_str(&format!("{{\"dll\":\"{}\",\"name\":\"{}\",\"ordinal\":{},\"ordinal_provenance\":\"{}\",\"service\":{},\"arguments\":{},\"x86_stack_words\":{},\"cdecl\":{}, {}}}",
             api.dll, api.name, ordinal, if ordinal < 0x1000 { "Windows 7 SP1 reference" } else { "NT61 private" }, catalog::GATEWAY_BASE | api.id, api.arguments, api.x86_arguments, api.cdecl, fields(api.dll, api.name)));
     }
+    text.push_str("],\"data_exports\":[");
+    for (index, (name, ordinal, rva)) in msvcrt_data_exports(x64).enumerate() {
+        if index != 0 { text.push(','); }
+        text.push_str(&format!("{{\"dll\":\"msvcrt.dll\",\"name\":\"{name}\",\"ordinal\":{ordinal},\"rva\":{rva},{}}}",
+            fields("msvcrt.dll", name)));
+    }
     text.push_str("],\"native_services\":[");
     for (index, service) in syscall_metadata::NATIVE_SERVICE_METADATA.iter().enumerate() {
         if index != 0 { text.push(','); }
@@ -1006,6 +1108,11 @@ pub fn runtime_manifest(x64: bool) -> String {
     }
     for export in kernel32_extra_forwarders(x64) {
         text.push_str(&format!(",{{\"dll\":\"kernel32.dll\",\"name\":\"{}\",\"ordinal\":{},\"target\":\"{}.{}\",{}}}",
+            export.name, export.ordinal, export.target.dll.trim_end_matches(".dll"), export.target.name,
+            fields(export.target.dll, export.target.name)));
+    }
+    for export in msvcrt_extra_forwarders(x64) {
+        text.push_str(&format!(",{{\"dll\":\"msvcrt.dll\",\"name\":\"{}\",\"ordinal\":{},\"target\":\"{}.{}\",{}}}",
             export.name, export.ordinal, export.target.dll.trim_end_matches(".dll"), export.target.name,
             fields(export.target.dll, export.target.name)));
     }
@@ -1094,20 +1201,64 @@ mod architecture_tests {
                 let bytes = build_dll_image_for_arch(spec, arch).unwrap();
                 let image = super::super::pe_read::parse(&bytes).expect("valid PE");
                 assert_eq!(image.machine, machine, "{arch}/{}", spec.file_name);
-                assert_eq!(image.exports_by_name.len(), spec.exports.len());
+                let real_native_ntdll = machine != MACHINE_AMD64 && spec.file_name == "ntdll.dll";
+                let real_native_kernel32 = machine != MACHINE_AMD64 && spec.file_name == "kernel32.dll";
+                let exports = if real_native_kernel32 { NATIVE_KERNEL32_EXPORTS } else { spec.exports };
+                if real_native_kernel32 {
+                    assert!(image.imports.is_empty(), "{arch}/{}", spec.file_name);
+                }
+                let count = exports.iter().filter(|(name, _)| !real_native_ntdll || name.starts_with("Nt")).count();
+                assert_eq!(image.exports_by_name.len(), count);
+                if (real_native_ntdll || real_native_kernel32) && machine == 0x5064 {
+                    let pe = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+                    let base = u64::from_le_bytes(bytes[pe + 0x30..pe + 0x38].try_into().unwrap());
+                    assert!((0x1000..1 << 38).contains(&base));
+                }
                 let text = image.sections.iter().find(|s| s.name == ".text").unwrap();
-                for index in 0..spec.exports.len() {
-                    let offset = text.pointer_to_raw_data as usize + index * STUB_STRIDE as usize;
+                for &(name, ordinal) in exports {
+                    if real_native_ntdll && !name.starts_with("Nt") {
+                        assert!(!image.exports_by_name.contains_key(name));
+                        assert!(!image.exports_by_ordinal.contains_key(&(ordinal as u16)));
+                        continue;
+                    }
+                    let rva = image.exports_by_name[name];
+                    assert_eq!(image.exports_by_ordinal[&(ordinal as u16)], rva);
+                    let offset = text.pointer_to_raw_data as usize + (rva - text.virtual_address) as usize;
+                    if real_native_ntdll || real_native_kernel32 {
+                        assert_ne!(&bytes[offset..offset + code.len()], code, "{arch}/{name}");
+                        continue;
+                    }
                     assert_eq!(
                         &bytes[offset..offset + code.len()],
                         code,
-                        "{arch}/{} export {index}",
+                        "{arch}/{} export {name}",
                         spec.file_name
                     );
                 }
             }
         }
         assert!(build_dll_image_for_arch(&ALL_DLLS[0], "=riscv64").is_err());
+    }
+
+    #[test]
+    fn native_create_file_exports_bridge_all_eleven_arguments() {
+        let cases: &[(&str, &[u32])] = &[
+            ("aarch64", &[0x5280_0a50, 0xd400_0001, 0xd65f_03c0]),
+            ("riscv64", &[0xfe01_0113, 0x0111_3023, 0x0201_3283, 0x0051_3423, 0x0281_3283, 0x0051_3823,
+                0x0301_3283, 0x0051_3c23, 0x0520_0893, 0x0000_0073, 0x0005_051b, 0x0201_0113, 0x0000_8067]),
+            ("loongarch64", &[0x02ff_8063, 0x29c0_006b, 0x28c0_806c, 0x29c0_206c, 0x28c0_a06c, 0x29c0_406c,
+                0x28c0_c06c, 0x29c0_606c, 0x0281_480b, 0x002b_0000, 0x0010_0084, 0x02c0_8063, 0x4c00_0020]),
+        ];
+        let spec = ALL_DLLS.iter().find(|spec| spec.file_name == "ntdll.dll").unwrap();
+        for &(arch, expected) in cases {
+            let bytes = build_dll_image_for_arch(spec, arch).unwrap();
+            let parsed = super::super::pe_read::parse(&bytes).unwrap();
+            let text = parsed.sections.iter().find(|section| section.name == ".text").unwrap();
+            let rva = parsed.exports_by_name["NtCreateFile"];
+            let offset = (text.pointer_to_raw_data + rva - text.virtual_address) as usize;
+            let expected: Vec<u8> = expected.iter().copied().flat_map(u32::to_le_bytes).collect();
+            assert_eq!(&bytes[offset..offset + expected.len()], expected, "{arch}");
+        }
     }
 
     #[test]
@@ -1122,15 +1273,15 @@ mod architecture_tests {
     }
 
     #[test]
-    fn synchronous_io_and_wait_object_exports_keep_sp1_ordinals() {
+    fn disk_io_and_wait_object_exports_keep_sp1_ordinals() {
         for (x64, ordinals) in [
-            (false, [68, 157, 160, 1018, 173, 176, 1022]),
-            (true, [67, 156, 159, 1022, 172, 175, 1026]),
+            (false, [68, 568, 157, 160, 1018, 173, 176, 1022]),
+            (true, [67, 574, 156, 159, 1022, 172, 175, 1026]),
         ] {
             let bytes = build_runtime_dll("kernel32.dll", x64).unwrap();
             let library = super::super::pe_read::parse(&bytes).unwrap();
             let code = library.sections.iter().find(|section| section.name == ".text").unwrap();
-            for (name, ordinal) in ["CancelIo", "CreateMutexA", "CreateMutexW", "ReleaseMutex",
+            for (name, ordinal) in ["CancelIo", "GetOverlappedResult", "CreateMutexA", "CreateMutexW", "ReleaseMutex",
                 "CreateSemaphoreA", "CreateSemaphoreW", "ReleaseSemaphore"].into_iter().zip(ordinals) {
                 let rva = library.exports_by_name[name];
                 assert_eq!(library.exports_by_ordinal[&ordinal], rva);

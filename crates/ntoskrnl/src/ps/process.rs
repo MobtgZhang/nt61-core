@@ -794,6 +794,8 @@ pub struct Eprocess {
     pub wow64_reserved: [u64; 4],
     /// Clock ticks charged to this process across CPUs; separate from the NT ABI fields.
     pub activity_ticks: AtomicU64,
+    #[cfg(not(target_arch = "x86_64"))]
+    pub bootstrap_system_dlls: [(u64, u64); 2],
     // === 0x500: END ===
     // Structure ends here - total size should be approximately 0x540 for Windows 7 x64
 }
@@ -1004,6 +1006,8 @@ impl Eprocess {
             // Reserved for future WoW64 extension data
             wow64_reserved: [0; 4],
             activity_ticks: AtomicU64::new(0),
+            #[cfg(not(target_arch = "x86_64"))]
+            bootstrap_system_dlls: [(0, 0); 2],
         }
     }
 
@@ -2237,7 +2241,17 @@ fn release_bootstrap_image(process: &mut Eprocess) {
         process.user_image_size = 0;
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = process;
+    if process.pml4_phys != 0 && process.bootstrap_system_dlls.iter().any(|(_, size)| *size != 0) {
+        for (base, size) in core::mem::take(&mut process.bootstrap_system_dlls) {
+            if size != 0 {
+                let _ = crate::mm::vas::unmap_user_pages(process.pml4_phys, base, size);
+            }
+        }
+        let _ = crate::mm::vas::unmap_user_pages(
+            process.pml4_phys, process.user_image_base, process.user_image_size);
+        process.user_image_base = 0;
+        process.user_image_size = 0;
+    }
 }
 
 /// Remove a terminated process from PROCESS_LIST and compact the array.
