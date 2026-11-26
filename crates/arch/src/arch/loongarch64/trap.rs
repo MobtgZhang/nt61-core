@@ -189,8 +189,15 @@ pub extern "C" fn trap_dispatch(frame: *mut TrapFrame) {
             // module which fills in $a0 with the return value and
             // patches the trap frame so the saved ERA advances past
             // the syscall instruction (we don't actually replay it).
+            let from_user = context.prmd & 3 == 3;
+            if from_user {
+                crate::arch::enable_interrupts();
+            }
             unsafe {
                 crate::arch::loongarch64::syscall::dispatch_syscall(frame);
+            }
+            if from_user {
+                crate::arch::disable_interrupts();
             }
         }
         TrapKind::PageInvalidFetch
