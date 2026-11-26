@@ -127,6 +127,7 @@ pub unsafe fn __user_entry_enter(user_rip: u64, user_rsp: u64) -> ! {
             // anyway: the kernel runs at EL1h, so the current SP is
             // already SP_EL1 and already holds this thread's kernel
             // stack, which is what EL0 exceptions must land on.
+            "msr daifset, #0xf",
             "msr sp_el0, {rsp}",
             "msr spsr_el1, {spsr}",
             "msr elr_el1, {rip}",
@@ -177,7 +178,6 @@ pub fn __user_entry_get_kernel_stack() -> u64 {
 /// The kernel enters this function in EL1 with:
 ///   - TPIDR_EL1 pointing at the per-CPU area
 ///   - MMU enabled with kernel page table active
-///   - Interrupts disabled
 ///
 /// ## Post-conditions
 ///
@@ -201,24 +201,7 @@ pub fn enter_first_user_thread(pml4_phys: u64, user_rip: u64, user_rsp: u64) -> 
     //    On aarch64 we use TTBR0_EL1 for the user address space.
     crate::mm::vas::attach_process(pml4_phys);
 
-    // 2. Transfer to EL0. The eret instruction restores SPSR_EL1
-    //    (interrupts remain masked) and jumps to ELR_EL1.
-    unsafe {
-        let rip_v = core::hint::black_box(user_rip);
-        let rsp_v = core::hint::black_box(user_rsp);
-        core::arch::asm!(
-            "msr sp_el0, {rsp}",
-            "msr elr_el1, {rip}",
-            // SPSR_EL1: M=EL0t, DAIF all masked (GIC not ready)
-            "msr spsr_el1, {spsr}",
-            "isb",
-            "eret",
-            rip = in(reg) rip_v,
-            rsp = in(reg) rsp_v,
-            spsr = in(reg) AARCH64_SPSR_EL0T,
-            options(noreturn),
-        );
-    }
+    unsafe { __user_entry_enter(user_rip, user_rsp) }
 }
 
 /// # Safety

@@ -140,7 +140,7 @@ pub unsafe extern "C" fn arch_aarch64_trap_dispatch(kind: u64, tf: *mut TrapFram
         }
         exception_kind::LOWER_EL_AARCH64_IRQ => {
             // Maskable interrupt from EL0.
-            handle_irq();
+            handle_irq(true);
         }
         exception_kind::CURRENT_EL_SP0_SYNC | exception_kind::CURRENT_EL_SPX_SYNC => {
             // Synchronous exception from EL1: kernel fault (page fault,
@@ -155,7 +155,7 @@ pub unsafe extern "C" fn arch_aarch64_trap_dispatch(kind: u64, tf: *mut TrapFram
             handle_kernel_sync(tf_ref);
         }
         exception_kind::CURRENT_EL_SP0_IRQ | exception_kind::CURRENT_EL_SPX_IRQ => {
-            handle_irq();
+            handle_irq(false);
         }
         _ => {
             // Unhandled class: emit the class before hanging so an
@@ -320,7 +320,7 @@ pub unsafe extern "C" fn arch_aarch64_trap_aarch32_sync_hang() {
 }
 
 /// handle a maskable IRQ.
-fn handle_irq() {
+fn handle_irq(from_user: bool) {
     let percpu = crate::arch::common::percpu::get_current();
     percpu.interrupt_count = percpu.interrupt_count.wrapping_add(1);
 
@@ -329,10 +329,9 @@ fn handle_irq() {
     // initialised. For the bootstrap, we just acknowledge the IRQ
     // source here.
     let irq = crate::hal::aarch64::apic::handle_irq();
-    if irq == 29 {
-        crate::hal::aarch64::arch_timer::acknowledge();
+    if irq == crate::hal::aarch64::arch_timer::VIRTUAL_TIMER_IRQ as u64 {
         crate::ke::timer::tick();
-        crate::ke::scheduler::tick();
+        crate::ke::scheduler::tick_with_mode(from_user);
         crate::ke::psss::psss_tick();
         crate::ke::scheduler::dispatch_pending_reschedule();
     } else if irq < 16 {

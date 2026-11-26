@@ -28,9 +28,6 @@ pub fn init() {
     crate::hal::serial::write_string("hal_init:apic\r\n");
     apic::init(0x0800_0000, 0x0801_0000);
     crate::arch::boot::early_write_str(b"[TRACE] hal-gic-done\r\n");
-    crate::hal::serial::write_string("hal_init:timer_init\r\n");
-    timer::init(1000);
-    crate::arch::boot::early_write_str(b"[TRACE] hal-timer-init-done\r\n");
     crate::hal::serial::write_string("hal_init:timer_mark\r\n");
     timer::mark_boot();
     crate::arch::boot::early_write_str(b"[TRACE] hal-timer-mark-done\r\n");

@@ -709,12 +709,21 @@ pub unsafe fn load_page_root(pml4_pfn: u64) {
     // half (see create_user_address_space / refresh_kernel_mappings),
     // so every kernel mapping is already present.  Just switch the
     // translation registers and flush stale translations.
-    asm!("tlbi vmalle1is", options(nostack));
-    asm!("dsb ishst", options(nostack));
-    asm!("msr TTBR1_EL1, {}", in(reg) pa, options(nostack));
-    asm!("msr TTBR0_EL1, {}", in(reg) pa, options(nostack));
-    asm!("dsb nsh", options(nostack));
-    asm!("isb", options(nostack));
+    asm!(
+        "mrs {daif}, daif",
+        "msr daifset, #2",
+        "dsb ishst",
+        "msr ttbr1_el1, {root}",
+        "msr ttbr0_el1, {root}",
+        "isb",
+        "tlbi vmalle1",
+        "dsb nsh",
+        "isb",
+        "msr daif, {daif}",
+        root = in(reg) pa,
+        daif = out(reg) _,
+        options(nostack),
+    );
     crate::hal::serial::write_string_always("[TTBR] root stored\r\n");
 }
 

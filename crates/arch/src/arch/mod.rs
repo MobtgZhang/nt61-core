@@ -1023,6 +1023,8 @@ static INTERRUPTS_ENABLED_ONCE: core::sync::atomic::AtomicBool =
 /// completed their setup. See `enable_interrupts_once`.
 pub fn mark_interrupts_ready() {
     INTERRUPTS_READY.store(true, core::sync::atomic::Ordering::Release);
+    #[cfg(target_arch = "aarch64")]
+    crate::hal::aarch64::arch_timer::start_clock();
     #[cfg(target_arch = "riscv64")]
     riscv64::pit::arm_next_tick();
 }

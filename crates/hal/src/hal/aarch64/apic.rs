@@ -315,11 +315,20 @@ static IRQ_COUNT: AtomicU32 = AtomicU32::new(0);
 /// that the path is exercised.
 pub fn dispatch_irq(irq: u64) {
     IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
-    // Route the serial receive line into the unified keyboard ring;
-    // other lines were acknowledged by the caller and are dropped.
     if irq == UART_IRQ as u64 {
         crate::hal::common::keyboard_unified::serial_rx_irq();
+    } else if irq == super::timer::VIRTUAL_TIMER_IRQ as u64 {
+        super::timer::acknowledge();
     }
+}
+
+pub fn enable_virtual_timer_irq() -> bool {
+    if soc::interrupt_controller() != soc::InterruptController::GICv2 {
+        return false;
+    }
+    let enable = (GICV2_DIST_BASE + gicd::ISENABLER as u64) as *mut u32;
+    unsafe { write_volatile(enable, 1 << super::timer::VIRTUAL_TIMER_IRQ) };
+    true
 }
 
 /// Acknowledge-elapsed IRQ count (for smoke tests).

@@ -105,11 +105,17 @@ pub fn invalidate_va_all_cpus(va: u64) {
 /// Revoke a user permission before returning, with every online CPU's
 /// acknowledgement. Call without locks needed by remote interrupt handlers.
 pub fn invalidate_va_all_cpus_complete(va: u64) {
-    crate::arch::invalidate_tlb(va);
-    // Also discard non-current ASIDs on architectures retaining them. This
-    // must happen even on UP, where request_all_cpus has no remote work.
-    local_flush_and_publish();
-    request_all_cpus(true);
+    #[cfg(target_arch = "aarch64")]
+    crate::arch::aarch64::tlb::flush_page_all_asids(va);
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        crate::arch::invalidate_tlb(va);
+        // Also discard non-current ASIDs on architectures retaining them. This
+        // must happen even on UP, where request_all_cpus has no remote work.
+        local_flush_and_publish();
+        request_all_cpus(true);
+    }
 }
 
 /// Execute a full memory fence on every online processor before returning.

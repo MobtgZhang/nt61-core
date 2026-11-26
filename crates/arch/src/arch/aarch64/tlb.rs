@@ -22,6 +22,21 @@ pub fn flush_all() {
     }
 }
 
+/// Complete invalidation of a virtual page for every ASID in the shareability domain.
+pub fn flush_page_all_asids(virtual_address: u64) {
+    let operand = (virtual_address >> 12) & ((1u64 << 44) - 1);
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi vaae1is, {operand}",
+            "dsb ish",
+            "isb",
+            operand = in(reg) operand,
+            options(nostack),
+        );
+    }
+}
+
 /// Invalidate entire TLB for current ASID only
 #[inline]
 pub fn flush_current_asid() {

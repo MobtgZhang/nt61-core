@@ -6,7 +6,7 @@
 //!
 //! * `CNTFRQ_EL0` — the fixed clock rate of the system counter.
 //! * `CNTPCT_EL0` — the physical count value.
-//! * `CNTV_CTL_EL0` / `CNTV_CVAL_EL0` — the virtual timer.
+//! * `CNTV_CTL_EL0` / `CNTV_TVAL_EL0` — the virtual timer.
 //!
 //! In SMP systems each CPU has its own timer; we currently configure
 //! the BSP timer only and leave secondary timers to the SMP bring-up
@@ -16,6 +16,9 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::aarch64::soc;
+
+pub const VIRTUAL_TIMER_IRQ: u32 = 27;
+static COUNTS_PER_TICK: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the system counter frequency in Hz.
 pub fn counter_freq() -> u64 {
@@ -31,39 +34,28 @@ pub fn counter() -> u64 {
     v
 }
 
-/// Initialise the per-CPU timer.
-///
-/// Uses the physical timer (`CNTP_*`) because we are still
-/// configuring EL1 state when this is first called and the virtual
-/// timer requires EL0 page tables.
-pub fn init(hz: u64) {
-    let _ = hz;
-    let freq = counter_freq();
-    if freq == 0 {
-        // QEMU virt: emulated 62.5 MHz.
-        let _ = 62_500_000u64;
+/// Start the boot CPU's clock after the executive is ready for ticks.
+pub fn start_clock() {
+    let counts = counter_freq() / crate::ke::time::TICKS_PER_SECOND as u64;
+    if counts == 0 || counts > i32::MAX as u64 {
+        return;
     }
-    // Programming the physical timer (CNTP_*EL0) from EL1 traps
-    // when `HCR_EL2.TGE` is set (which is the default for EDK2
-    // on QEMU `virt`). The virtual timer (CNTV_*EL0) is not
-    // trapped the same way, but writing its comparator still
-    // requires either EL0 access or a properly configured EL2
-    // stub. Skipping the touch here keeps the bootstrap path free
-    // of synchronous exceptions; the SMP bring-up adds a real
-    // generic-timer wiring.
-    let _ = freq;
-    crate::hal::serial::write_string("hal_timer:init_done\r\n");
+    if !crate::hal::aarch64::apic::enable_virtual_timer_irq() {
+        return;
+    }
+    COUNTS_PER_TICK.store(counts, Ordering::Relaxed);
+    acknowledge();
+    unsafe { asm!("msr CNTV_CTL_EL0, {enable}", "isb", enable = in(reg) 1u64, options(nostack)) };
 }
 
 /// Acknowledge the timer interrupt and re-arm for the next tick.
 pub fn acknowledge() {
-    let freq = counter_freq();
-    let delta = freq / 1000;
-    let cur = counter();
+    let counts = COUNTS_PER_TICK.load(Ordering::Relaxed);
     unsafe {
         asm!(
-            "msr CNTP_CVAL_EL0, {v}",
-            v = in(reg) cur.wrapping_add(delta),
+            "msr CNTV_TVAL_EL0, {counts}",
+            "isb",
+            counts = in(reg) counts,
             options(nostack),
         );
     }
@@ -79,7 +71,7 @@ pub fn time_ms() -> u64 {
     c * 1000 / f
 }
 
-/// Boot timestamp captured in `init()`.
+/// Boot timestamp captured during HAL initialization.
 static BOOT_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Convenience: capture the boot time.
