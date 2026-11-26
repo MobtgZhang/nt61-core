@@ -248,6 +248,7 @@ impl QueueLayout {
             if used_idx == self.last_used {
                 return None;
             }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
             let elem_size = core::mem::size_of::<UsedElement>();
             let ring = self.used_base.add(4);

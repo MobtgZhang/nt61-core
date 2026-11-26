@@ -15,6 +15,7 @@ pub const F_SEG_MAX: u64 = 1 << 2;
 pub const F_RO: u64 = 1 << 5;
 pub const F_BLK_SIZE: u64 = 1 << 6;
 pub const F_FLUSH: u64 = 1 << 9;
+const REQUEST_TIMEOUT_MS: u64 = 5_000;
 
 // virtio_blk.h operation types (VIRTIO_BLK_T_*).
 pub const TYPE_IN: u32 = 0;
@@ -184,17 +185,30 @@ impl VirtioBlk {
             let head=if kind==TYPE_FLUSH{self.queue.add_chain(&[header,status])}
                 else{self.queue.add_chain(&[header,data,status])}?;
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            let started = crate::hal::pit::get_system_time_ms();
             transport.notify(0);
-            for _ in 0..10_000_000 {
-                if let Some((completed,length))=self.queue.pop_used(){
-                    core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-                    if completed!=head || length<if kind==TYPE_IN{513}else{1}{self.failed=true;transport.reset();return None;}
-                    return (core::ptr::read_volatile(base.add(528))==S_OK).then_some(());
+            loop {
+                for _ in 0..256 {
+                    if let Some((completed, length)) = self.queue.pop_used() {
+                        let minimum = if kind == TYPE_IN { 513 } else { 1 };
+                        if completed != head || length < minimum {
+                            self.failed = true;
+                            transport.reset();
+                            return None;
+                        }
+                        return (core::ptr::read_volatile(base.add(528)) == S_OK).then_some(());
+                    }
+                    core::hint::spin_loop();
                 }
-                core::hint::spin_loop();
+                if crate::hal::pit::get_system_time_ms().wrapping_sub(started) >= REQUEST_TIMEOUT_MS {
+                    break;
+                }
             }
             // Do not free or reuse the DMA page while a delayed device could
             // still own descriptors. Subsequent requests fail explicitly.
+            crate::hal::serial::write_string_always("[VBLK] request timed out, type=");
+            crate::hal::serial::write_hex_u64_always(kind as u64);
+            crate::hal::serial::write_string_always("\r\n");
             self.failed=true;transport.reset();None
         }
     }
