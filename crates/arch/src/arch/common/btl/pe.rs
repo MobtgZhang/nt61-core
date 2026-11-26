@@ -236,6 +236,7 @@ pub struct GuestImage {
     pub win32: win32::Runtime,
     module_metadata: Vec<ModuleMetadata>,
     process_image_path: alloc::string::String,
+    process_id: u32,
     resource_satellites: Vec<(u64, u16, ModuleMetadata)>,
     /// Exclusive application allocation boundary for the SP1 address model.
     /// WOW64 LARGEADDRESSAWARE is an executable property, not a DLL property.
@@ -250,6 +251,22 @@ pub enum ImageRunResult {
 }
 
 impl GuestImage {
+    pub fn process_id(&self) -> u32 { self.process_id }
+
+    pub fn assign_process_identity(&mut self) -> Result<(), LoadError> {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static NEXT_PROCESS_ID: AtomicU32 = AtomicU32::new(2);
+        let id = NEXT_PROCESS_ID.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            (id < 0x4000).then_some(id + 1)
+        }).map_err(|_| LoadError::ImageTooLarge)?;
+        let (offset, width) = if self.thread.context.mode == DecodeMode::X86 { (0x20, 4) } else { (0x40, 8) };
+        if !self.memory.write_virt(self.teb + offset, &u64::from(id).to_le_bytes()[..width]) {
+            return Err(LoadError::InvalidImage);
+        }
+        self.assign_thread_identity(id << 12)?;
+        self.process_id = id;
+        Ok(())
+    }
     /// Execute a scheduler quantum, including guest ABI service conversion.
     pub fn run(
         &mut self,
@@ -285,9 +302,7 @@ impl GuestImage {
             }
             self.finish_detach();
             if let Some(code) = self.all_threads_exited() {
-                let result = ImageRunResult::Exited(code);
-                self.terminal = Some(result);
-                return result;
+                return self.complete_exit(code, services);
             }
             match self.schedule(services) {
                 Ok(true) => {},
@@ -383,9 +398,7 @@ impl GuestImage {
                                 return result;
                             }
                             Ok(win32::Outcome::Exit(code)) => {
-                                let result = ImageRunResult::Exited(code);
-                                self.terminal = Some(result);
-                                return result;
+                                return self.complete_exit(code, services);
                             }
                             Err(reason) => {
                                 let result = ImageRunResult::Fault(reason);
@@ -399,6 +412,10 @@ impl GuestImage {
                         if let Ok(args) = super::nt61::capture_arguments(
                             abi, &self.thread.context.regs, 1, &mut self.memory,
                         ) {
+                            if win32::mapping::close(self, services, args[0]) {
+                                self.thread.context.set_reg(X86Reg::Rax, 0);
+                                continue;
+                            }
                             if let Some(status) = win32::close_token(self, args[0]) {
                                 self.thread.context.set_reg(X86Reg::Rax, u64::from(status));
                                 continue;
@@ -422,9 +439,7 @@ impl GuestImage {
                             return result;
                         }
                         ServiceResult::ExitProcess(status) => {
-                            let result = ImageRunResult::Exited(status);
-                            self.terminal = Some(result);
-                            return result;
+                            return self.complete_exit(status, services);
                         }
                     }
                 }
@@ -439,6 +454,15 @@ impl GuestImage {
         }
     }
 
+    fn complete_exit(&mut self, code: u32, services: &mut dyn super::nt61::GuestServices) -> ImageRunResult {
+        let result = match win32::mapping::finish(self, services) {
+            Ok(()) => ImageRunResult::Exited(code),
+            Err(error) => ImageRunResult::Fault(super::runtime::StopReason::MappedWritebackFailed { error }),
+        };
+        self.terminal = Some(result);
+        result
+    }
+
     /// Populate RTL_USER_PROCESS_PARAMETERS in the guest ABI, including UTF-16
     /// command line, current directory, environment and standard handles.
     /// Values live entirely in guest memory; no host strings/pointers leak in.
@@ -447,6 +471,16 @@ impl GuestImage {
         image_path: &str,
         command_line: &str,
         directory: &str,
+    ) -> Result<(), LoadError> {
+        self.set_process_parameters_with_environment(image_path, command_line, directory, None)
+    }
+
+    pub fn set_process_parameters_with_environment(
+        &mut self,
+        image_path: &str,
+        command_line: &str,
+        directory: &str,
+        environment: Option<&[u8]>,
     ) -> Result<(), LoadError> {
         let base = 0x7ffc_0000u64;
         let length = 0x10000usize;
@@ -504,13 +538,19 @@ impl GuestImage {
         let env_offset = if x86 { 0x48 } else { 0x80 };
         params.bytes[env_offset..env_offset + width]
             .copy_from_slice(&(base + cursor as u64).to_le_bytes()[..width]);
-        for value in env.encode_utf16() {
-            if cursor + 2 > length {
-                return Err(LoadError::InvalidImage);
+        let default_environment;
+        let environment = match environment {
+            Some(bytes) => bytes,
+            None => {
+                default_environment = env.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
+                &default_environment
             }
-            params.bytes[cursor..cursor + 2].copy_from_slice(&value.to_le_bytes());
-            cursor += 2;
+        };
+        if environment.len() % 2 != 0 || !environment.ends_with(&[0; 4]) {
+            return Err(LoadError::InvalidImage);
         }
+        params.bytes.get_mut(cursor..cursor + environment.len()).ok_or(LoadError::InvalidImage)?
+            .copy_from_slice(environment);
         let structure_size = if x86 { 0x290u32 } else { 0x400u32 };
         params.bytes[..4].copy_from_slice(&(length as u32).to_le_bytes());
         params.bytes[4..8].copy_from_slice(&structure_size.to_le_bytes());
@@ -679,6 +719,7 @@ impl GuestImage {
             win32: win32::Runtime::new(base),
             module_metadata,
             process_image_path: alloc::string::String::new(),
+            process_id: GUEST_PROCESS_ID as u32,
             resource_satellites: Vec::new(),
             user_address_end,
         })

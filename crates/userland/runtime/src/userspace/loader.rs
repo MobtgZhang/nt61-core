@@ -136,12 +136,17 @@ impl UserProgramLoader {
 /// returned context must be resumed in bounded quanta, not entered natively.
 pub fn load_translated_image(image_path: &str, command_line: &str, directory: &str)
     -> Result<crate::arch::common::btl::pe::GuestImage, GuestLoadError> {
+    load_translated_image_with_environment(image_path, command_line, directory, None)
+}
+
+pub fn load_translated_image_with_environment(image_path: &str, command_line: &str, directory: &str, environment: Option<&[u8]>)
+    -> Result<crate::arch::common::btl::pe::GuestImage, GuestLoadError> {
     use crate::arch::common::btl::pe::{GuestImage, LinkError};
     let bytes = read_guest_pe(image_path).map_err(GuestLoadError::Read)?;
     let application_directory = image_path.rsplit_once('\\').map_or(directory, |(parent, _)| parent);
     let mut resolver = VolumeLibraries { application_directory };
     let mut image = GuestImage::load_linked(&bytes, &mut resolver).map_err(GuestLoadError::Link)?;
-    image.set_process_parameters(image_path, command_line, directory)
+    image.set_process_parameters_with_environment(image_path, command_line, directory, environment)
         .map_err(|error| GuestLoadError::Link(LinkError::Image(error)))?;
     if let Ok(bytes) = crate::fs::system_volume::read_at("C:\\Windows\\NT61\\ui-language", 0, 65) {
         if bytes.len() <= 64 {

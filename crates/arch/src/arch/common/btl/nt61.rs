@@ -165,6 +165,19 @@ pub struct NativeProcessorInfo {
     pub level: u16,
     pub revision: u16,
 }
+
+pub struct VolumeAllocation {
+    pub bytes_per_sector: u32,
+    pub sectors_per_cluster: u32,
+    pub total_clusters: u64,
+    pub free_clusters: u64,
+}
+
+pub struct FileBasicInformation {
+    pub attributes: u32,
+    pub times: [u64; 3],
+    pub size: u64,
+}
 /// Owned classic Application log data. UTF-16 insertion strings, full DWORD
 /// event identity, SID and binary payload survive the guest ABI boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,7 +215,35 @@ pub enum SocketKind {
     UdpV4,
 }
 
+pub struct ChildRequest {
+    pub application: Option<alloc::string::String>,
+    pub command_line: Option<alloc::string::String>,
+    pub directory: alloc::string::String,
+    pub parent_directory: alloc::string::String,
+    pub search_path: Option<alloc::string::String>,
+    pub environment: Option<alloc::vec::Vec<u8>>,
+    pub abi: GuestAbi,
+    pub redirect: bool,
+}
+
+pub struct ChildProcess {
+    pub process_id: u32,
+    pub thread_id: u32,
+    pub exit: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+    pub thread_exit: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+}
+
+impl ChildProcess {
+    pub fn exit_code(&self, thread: bool) -> Option<u32> {
+        let exit = if thread { &self.thread_exit } else { &self.exit };
+        u32::try_from(exit.load(core::sync::atomic::Ordering::Acquire)).ok()
+    }
+}
+
 pub trait GuestServices {
+    fn create_process(&mut self, _request: ChildRequest) -> Result<[u32; 4], u32> { Err(120) }
+    fn child_info(&self, _handle: u64, _thread: bool) -> Result<(u32, u32, u32), u32> { Err(6) }
+    fn is_child_handle(&self, _handle: u64) -> bool { false }
     fn select_file_view(&mut self, _redirection_enabled: bool) {}
     fn resolve_ipv4(&mut self, _name: &str) -> Result<[u8; 4], u32> { Err(11003) }
     fn open_socket(&mut self, _kind: SocketKind) -> Result<u64, u32> { Err(10050) }
@@ -243,7 +284,17 @@ pub trait GuestServices {
     fn file_attributes(&mut self, _abi: GuestAbi, _path: &str) -> Result<u32, u32> {
         Err(STATUS_NOT_IMPLEMENTED)
     }
+    fn file_basic_information(&mut self, _abi: GuestAbi, _path: &str) -> Result<FileBasicInformation, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
     fn set_file_attributes(&mut self, _abi: GuestAbi, _path: &str, _attributes: u32) -> Result<(), u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn delete_file(&mut self, _abi: GuestAbi, _path: &str) -> Result<(), u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn remove_directory(&mut self, _abi: GuestAbi, _path: &str) -> Result<(), u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn move_file(&mut self, _abi: GuestAbi, _source: &str, _destination: &str) -> Result<(), u32> {
         Err(STATUS_NOT_IMPLEMENTED)
     }
     fn set_file_times(&mut self, _handle: u64, _times: [Option<u64>; 3]) -> Result<(), u32> {
@@ -268,7 +319,25 @@ pub trait GuestServices {
     fn file_type(&mut self, _handle: u64) -> Result<u32, u32> { Err(STATUS_NOT_IMPLEMENTED) }
     fn file_handle_flags(&mut self, _handle: u64) -> Result<u32, u32> { Err(STATUS_NOT_IMPLEMENTED) }
     fn cancel_file_io(&mut self, _handle: u64) -> Result<(), u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn validate_disk_file(&self, _handle: u64) -> Result<(), u32> { Err(STATUS_NOT_IMPLEMENTED) }
     fn file_size(&mut self, _handle: u64) -> Result<u64, u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn flush_file_buffers(&mut self, _handle: u64) -> Result<(), u32> { Err(STATUS_NOT_IMPLEMENTED) }
+    fn set_file_range_lock(&mut self, _handle: u64, _offset: u64, _length: u64, _lock: bool) -> Result<(), u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn volume_allocation(&mut self, _abi: GuestAbi, _directory: &str) -> Result<VolumeAllocation, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn retain_file_mapping(&mut self, _file: Option<u64>, _writable: bool) -> Result<(u64, u64), u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn release_file_mapping(&mut self, _mapping: u64) {}
+    fn read_file_mapping(&mut self, _mapping: u64, _offset: u64, _length: usize) -> Result<alloc::vec::Vec<u8>, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn write_file_mapping(&mut self, _mapping: u64, _offset: u64, _bytes: &[u8]) -> Result<usize, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
     fn seek_file(&mut self, _handle: u64, _distance: i64, _origin: u32, _limit: u64) -> Result<u64, FileSeekError> {
         Err(FileSeekError::Status(STATUS_NOT_IMPLEMENTED))
     }

@@ -36,6 +36,7 @@ pub enum StopReason {
     },
     /// A checked runtime gateway was called for an API without an implementation.
     UnsupportedApi { id: u32 },
+    MappedWritebackFailed { error: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

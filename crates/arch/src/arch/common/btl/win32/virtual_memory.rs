@@ -33,10 +33,13 @@ fn describe(image: &GuestImage, address: u64) -> Result<BasicInformation, u32> {
         let (page_state, protection) = state(first);
         let mut end = first + 1;
         while end < region.protections.len() && state(end) == (page_state, protection) { end += 1; }
+        let kind = if region.image { 0x1000000 }
+            else if image.win32.mappings.contains_view(region.base) { 0x40000 }
+            else { 0x20000 };
         Ok(BasicInformation {
             base, allocation: region.base, allocation_protection: region.allocation_protection,
             size: (region.bytes.len().min(end * PAGE) - first * PAGE) as u64,
-            state: page_state, protection, kind: if region.image { 0x1000000 } else { 0x20000 },
+            state: page_state, protection, kind,
         })
     } else {
         // The null allocation granule is a distinct free range even when the

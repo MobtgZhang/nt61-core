@@ -126,6 +126,8 @@ struct Parked {
 }
 pub(super) struct State {
     priority_class: PriorityClass,
+    primary_id: u32,
+    primary_exit: Option<u32>,
     current: Info,
     parked: Vec<Parked>,
     next_id: u32,
@@ -137,7 +139,7 @@ pub(super) struct State {
 }
 impl State {
     pub(super) fn new(tls_base: u64) -> Self {
-        Self { priority_class: PriorityClass::Normal, current: Info { id: 1, priority: 0,
+        Self { priority_class: PriorityClass::Normal, primary_id: 1, primary_exit: None, current: Info { id: 1, priority: 0,
             priority_boost_disabled: false, wait_boost: false, suspended: 0, exit: None,
             detaching: None, wait: None, apcs: Apcs::default(), allocations: Vec::new(), tls_base, return_sp: 0 },
             parked: Vec::new(), next_id: 2, handles: Vec::new(), next_handle: HANDLE_BASE + 4,
@@ -191,7 +193,7 @@ pub(super) fn create(image: &mut GuestImage, a: &[u64]) -> Result<u64, u32> {
     image.threads.parked.try_reserve(1).map_err(|_| 8u32)?;
     let (handle, next_handle) = reserve_handle(image)?;
     let id = image.threads.next_id;
-    let next_id = id.checked_add(1).filter(|id| *id < 0x0400_0000).ok_or(8u32)?;
+    let next_id = id.checked_add(1).filter(|next| *next & 0xfff != 0).ok_or(8u32)?;
     let default = image.stack_reserve.max(0x10000);
     let requested = usize::try_from(a[1]).map_err(|_| 8u32)?;
     let size = if flags & 0x10000 != 0 && requested != 0 { requested.checked_add(0xffff).ok_or(8u32)? / 0x10000 * 0x10000 }
@@ -220,9 +222,9 @@ pub(super) fn create(image: &mut GuestImage, a: &[u64]) -> Result<u64, u32> {
         }
         // NT_TIB, CLIENT_ID and PEB pointer use the guest's pointer width.
         let fields: &[(u64,u64)] = if x86 {
-            &[(0,0xffff_ffff),(4,top),(8,stack+PAGE as u64),(0x18,teb),(0x20,super::GUEST_PROCESS_ID),(0x24,u64::from(id)),(0x30,image.peb)]
+            &[(0,0xffff_ffff),(4,top),(8,stack+PAGE as u64),(0x18,teb),(0x20,u64::from(image.process_id())),(0x24,u64::from(id)),(0x30,image.peb)]
         } else {
-            &[(8,top),(0x10,stack+PAGE as u64),(0x30,teb),(0x40,super::GUEST_PROCESS_ID),(0x48,u64::from(id)),(0x60,image.peb)]
+            &[(8,top),(0x10,stack+PAGE as u64),(0x30,teb),(0x40,u64::from(image.process_id())),(0x48,u64::from(id)),(0x60,image.peb)]
         };
         for &(off, val) in fields { if !image.memory.write_virt(teb+off, &val.to_le_bytes()[..width]) { return Err(998); } }
         if !image.memory.regions.iter().any(|r| r.base == RETURN_GATE) {
@@ -280,7 +282,7 @@ pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Result<u6
         return Ok(1);
     }
     if name == "GetThreadId" { return Ok(u64::from(id)); }
-    if name == "GetProcessIdOfThread" { return Ok(super::GUEST_PROCESS_ID); }
+    if name == "GetProcessIdOfThread" { return Ok(u64::from(image.process_id())); }
     if name == "GetThreadPriority" {
         return Ok(u64::from(info(image, id).ok_or(6u32)?.priority as u32));
     }
@@ -414,6 +416,7 @@ pub(super) fn wait_multiple(
     alertable: bool, services: &mut dyn GuestServices,
 ) -> Result<Result<u64, Wait>, u32> {
     let mut objects = Vec::with_capacity(handles.len());
+    let mut local_ids = [0; 64];
     for (index, &handle) in handles.iter().enumerate() {
         if handles[..index].contains(&handle) { return Err(87); }
         if let Some((id, access)) = handle_info(image, handle) {
@@ -421,6 +424,9 @@ pub(super) fn wait_multiple(
             info(image, id).ok_or(6u32)?;
             objects.push(WaitObject::Thread(id));
         } else if sync::is_wait_handle(handle) {
+            let id = sync::wait_identity(image, handle)?;
+            if all && local_ids[..index].contains(&id) { return Err(87); }
+            local_ids[index] = id;
             sync::wait_object_ready(image, handle, image.thread_id())?;
             objects.push(WaitObject::Local(handle));
         } else {
@@ -587,6 +593,19 @@ impl GuestImage {
     }
 
     pub fn thread_id(&self) -> u32 { self.threads.current.id }
+
+    pub fn primary_thread_exit_code(&self) -> Option<u32> { self.threads.primary_exit }
+
+    pub(super) fn assign_thread_identity(&mut self, id: u32) -> Result<(), super::LoadError> {
+        let (offset, width) = if self.thread.context.mode == DecodeMode::X86 { (0x24, 4) } else { (0x48, 8) };
+        if !self.memory.write_virt(self.teb + offset, &u64::from(id).to_le_bytes()[..width]) {
+            return Err(super::LoadError::InvalidImage);
+        }
+        self.threads.current.id = id;
+        self.threads.primary_id = id;
+        self.threads.next_id = id + 1;
+        Ok(())
+    }
     pub(in crate::arch::common::btl) fn has_live_thread(&self, id: u32) -> bool {
         info(self, id).is_some_and(|thread| thread.exit.is_none())
     }
@@ -655,6 +674,9 @@ impl GuestImage {
             if let Some(code) = self.threads.current.detaching.take() {
                 win32::cleanup_thread(self);
                 self.threads.current.exit = Some(code);
+                if self.threads.current.id == self.threads.primary_id {
+                    self.threads.primary_exit = Some(code);
+                }
                 self.threads.rotate = true;
                 self.initialization.remove_thread(&mut self.memory, self.teb);
                 let allocations = core::mem::take(&mut self.threads.current.allocations);
@@ -663,7 +685,7 @@ impl GuestImage {
         }
     }
     pub(super) fn returned_thread(&self, reason: StopReason) -> bool {
-        self.threads.current.id != 1 && reason == (StopReason::InstructionFault { pc: RETURN_GATE })
+        self.threads.current.id != self.threads.primary_id && reason == (StopReason::InstructionFault { pc: RETURN_GATE })
             && self.thread.context.reg(X86Reg::Rsp) == self.threads.current.return_sp
     }
     // Readiness is sampled without executing guest code or blocking a host

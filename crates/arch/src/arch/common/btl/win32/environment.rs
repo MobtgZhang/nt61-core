@@ -12,6 +12,10 @@ pub(super) fn snapshot(image: &mut GuestImage) -> Result<Vec<u8>, ApiError> {
     let parameters = word(&mut image.memory, image.peb + if x86 { 0x10 } else { 0x20 }, width)?;
     let slot = parameters.checked_add(if x86 { 0x48 } else { 0x80 }).ok_or(NOACCESS)?;
     let source = word(&mut image.memory, slot, width)?;
+    capture(&mut image.memory, source, true)
+}
+
+pub(super) fn capture(memory: &mut dyn GuestMemory, source: u64, wide: bool) -> Result<Vec<u8>, ApiError> {
     let mut bytes = Vec::new();
     if source == 0 {
         bytes.extend_from_slice(&[0; 4]);
@@ -19,8 +23,15 @@ pub(super) fn snapshot(image: &mut GuestImage) -> Result<Vec<u8>, ApiError> {
         let mut previous_nul = false;
         loop {
             if bytes.len() >= MAX_BUFFER { return Err(INVALID_PARAMETER.into()); }
-            let address = source.checked_add(bytes.len() as u64).ok_or(NOACCESS)?;
-            let value = word(&mut image.memory, address, 2)? as u16;
+            let offset = if wide { bytes.len() } else { bytes.len() / 2 };
+            let address = source.checked_add(offset as u64).ok_or(NOACCESS)?;
+            let value = if wide {
+                word(memory, address, 2)? as u16
+            } else {
+                let mut byte = [0];
+                if memory.read_virt(address, &mut byte) != 1 { return Err(NOACCESS.into()); }
+                nls::decode_ansi(byte[0])
+            };
             bytes.extend_from_slice(&value.to_le_bytes());
             if previous_nul && value == 0 { break; }
             previous_nul = value == 0;

@@ -3,18 +3,156 @@
 //! process (GUI dispatch, SEH and guest thread creation
 //! remain separate). Normal imports link only to checked guest DLL code.
 use crate::arch::common::btl::{
-    io::{IoHost, IoServices},
-    nt61::{DcExtent, SocketKind},
-    pe::ImageRunResult,
+    io::{guest_file_path, FileLockKey, IoHost, IoServices},
+    nt61::{ChildProcess, ChildRequest, DcExtent, FileBasicInformation, SocketKind, VolumeAllocation},
+    pe::{GuestImage, ImageRunResult},
     runtime::StopReason,
 };
-use alloc::{boxed::Box, format, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 struct VolumeIo {
     output: fn(&[u8]),
     desktop_client: u32,
     desktop_windows:bool,
     application_directory: String,
+}
+
+struct ChildJob {
+    image: GuestImage,
+    services: IoServices<VolumeIo>,
+    exit: Arc<AtomicU64>,
+    thread_exit: Arc<AtomicU64>,
+    _slot: ChildSlot,
+}
+
+static ACTIVE_CHILDREN: AtomicU32 = AtomicU32::new(0);
+
+struct ChildSlot;
+
+impl ChildSlot {
+    fn reserve() -> Result<Self, u32> {
+        ACTIVE_CHILDREN.try_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+            (active < 16).then_some(active + 1)
+        }).map_err(|_| 89u32)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ChildSlot {
+    fn drop(&mut self) {
+        ACTIVE_CHILDREN.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+extern "C" fn run_child(context: u64) -> ! {
+    let mut job = unsafe { Box::from_raw(context as *mut ChildJob) };
+    let mut publisher = crate::mm::jit_code::KernelPublisher;
+    let mut jit = crate::arch::common::btl::runtime::jit::Jit::new(&mut publisher);
+    let mut status = 0xc000_0044;
+    for _ in 0..16384 {
+        let result = job.image.run_with_jit(8192, &mut job.services, &mut jit);
+        if let Some(code) = job.image.primary_thread_exit_code() {
+            job.thread_exit.store(u64::from(code), Ordering::Release);
+        }
+        match result {
+            ImageRunResult::Yielded => crate::ke::scheduler::yield_(),
+            ImageRunResult::Exited(code) => {
+                status = code;
+                break;
+            }
+            ImageRunResult::Fault(_) => {
+                status = 0xc000_0142;
+                break;
+            }
+        }
+    }
+    drop(jit);
+    let exit = Arc::clone(&job.exit);
+    let thread_exit = Arc::clone(&job.thread_exit);
+    drop(job);
+    let _ = thread_exit.compare_exchange(u64::MAX, u64::from(status), Ordering::Release, Ordering::Relaxed);
+    exit.store(u64::from(status), Ordering::Release);
+    drop(thread_exit);
+    drop(exit);
+    crate::ps::thread::ps_exit_system_thread(status)
+}
+
+impl VolumeIo {
+    fn new(path: &str, directory: &str, output: fn(&[u8])) -> Self {
+        static NEXT_DESKTOP_CLIENT: AtomicU32 = AtomicU32::new(1);
+        Self {
+            output,
+            desktop_client: NEXT_DESKTOP_CLIENT.fetch_add(1, Ordering::Relaxed),
+            desktop_windows: false,
+            application_directory: path.rsplit_once('\\').map_or(directory, |(parent, _)| parent).into(),
+        }
+    }
+
+    fn resolve_child(&self, request: &ChildRequest) -> Result<String, u32> {
+        let line = request.command_line.as_deref().unwrap_or_default().trim_start();
+        if let Some(name) = request.application.as_deref() {
+            return self.find_executable(request, name, false)?.ok_or(2);
+        }
+        if let Some(quoted) = line.strip_prefix('"') {
+            let name = quoted.split_once('"').ok_or(87u32)?.0;
+            return self.find_executable(request, name, true)?.ok_or(2);
+        }
+        for end in line.match_indices([' ', '\t']).map(|(offset, _)| offset).chain([line.len()]) {
+            let name = &line[..end];
+            if name.ends_with([' ', '\t']) || name.contains('"') { continue; }
+            if let Some(path) = self.find_executable(request, name, true)? { return Ok(path); }
+        }
+        Err(2)
+    }
+
+    fn find_executable(&self, request: &ChildRequest, name: &str, search: bool) -> Result<Option<String>, u32> {
+        if name.is_empty() { return Err(2); }
+        let directory = &request.parent_directory;
+        let name = name.replace('/', "\\");
+        let leaf = name.rsplit('\\').next().unwrap_or_default();
+        let name = if search && !leaf.contains('.') { format!("{name}.exe") } else { name };
+        let mut candidates = Vec::new();
+        if name.contains(':') {
+            candidates.push(name);
+        } else if name.starts_with('\\') {
+            candidates.push(format!("C:{name}"));
+        } else if !search || name.contains('\\') {
+            candidates.push(format!("{directory}\\{name}"));
+        } else {
+            for directory in [self.application_directory.as_str(), directory, "C:\\Windows\\System32", "C:\\Windows\\System", "C:\\Windows"]
+                .into_iter().chain(request.search_path.as_deref().unwrap_or_default().split(';').filter(|entry| !entry.is_empty())) {
+                candidates.push(format!("{directory}\\{name}"));
+            }
+        }
+        for candidate in candidates {
+            let path = guest_file_path(request.abi, &candidate, request.redirect)
+                .map_err(file_launch_error)?;
+            match crate::fs::system_volume::file_attributes(&path) {
+                Ok(flags) if flags & 0x10 == 0 => return Ok(Some(path)),
+                Ok(_) | Err(0xc000_000d | 0xc000_0034 | 0xc000_003a) => continue,
+                Err(status) => {
+                    crate::boot_println!("[BTL process] executable lookup {path}: NTSTATUS 0x{status:08X}");
+                    return Err(file_launch_error(status));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn file_launch_error(status: u32) -> u32 {
+    match status {
+        0xc000_000d => 87,
+        0xc000_0017 => 8,
+        0xc000_0022 => 5,
+        0xc000_0034 => 2,
+        0xc000_003a => 3,
+        0xc000_0135 => 126,
+        0xc000_0139 => 127,
+        0xc000_007b => 193,
+        _ => 1,
+    }
 }
 impl Drop for VolumeIo {
     fn drop(&mut self) {
@@ -44,6 +182,51 @@ fn socket_error(error: crate::netstack::socket::SocketError) -> u32 {
 }
 
 impl IoHost for VolumeIo {
+    fn create_process(&mut self, request: ChildRequest) -> Result<ChildProcess, u32> {
+        let slot = ChildSlot::reserve()?;
+        let supplied = request.directory.replace('/', "\\");
+        if supplied.is_empty() { return Err(267); }
+        let directory = if supplied.contains(':') || supplied.starts_with('\\') {
+            supplied
+        } else { format!("{}\\{supplied}", request.parent_directory) };
+        let directory = crate::fs::system_volume::normalize(&directory).map_err(file_launch_error)?;
+        let directory = guest_file_path(request.abi, &directory, request.redirect).map_err(file_launch_error)?;
+        let attributes = crate::fs::system_volume::file_attributes(&directory).map_err(|status| {
+            crate::boot_println!("[BTL process] working directory {directory}: NTSTATUS 0x{status:08X}");
+            file_launch_error(status)
+        })?;
+        if attributes & 0x10 == 0 {
+            return Err(267);
+        }
+        let path = self.resolve_child(&request)?;
+        let command_line = request.command_line.as_deref().filter(|line| !line.is_empty());
+        let default_line;
+        let command_line = match command_line {
+            Some(line) => line,
+            None => { default_line = format!("\"{path}\""); &default_line }
+        };
+        let mut image = crate::userspace::loader::load_translated_image_with_environment(
+            &path, command_line, &directory, request.environment.as_deref(),
+        )
+        .map_err(|error| {
+            crate::boot_println!("[BTL process] cannot load {path}: {error}");
+            file_launch_error(error.ntstatus())
+        })?;
+        image.assign_process_identity().map_err(|_| 89u32)?;
+        let id = image.process_id();
+        let thread_id = image.thread_id();
+        let exit = Arc::new(AtomicU64::new(u64::MAX));
+        let thread_exit = Arc::new(AtomicU64::new(u64::MAX));
+        let services = IoServices::new(Self::new(&path, &directory, self.output));
+        let job = Box::into_raw(Box::new(ChildJob { image, services, exit: Arc::clone(&exit), thread_exit: Arc::clone(&thread_exit), _slot: slot }));
+        let worker = crate::ps::thread::ps_create_system_thread(run_child as *const () as u64, job as u64);
+        if !worker.success {
+            drop(unsafe { Box::from_raw(job) });
+            return Err(8);
+        }
+        Ok(ChildProcess { process_id: id, thread_id, exit, thread_exit })
+    }
+
     fn resolve_ipv4(&mut self, name: &str) -> Result<[u8; 4], u32> {
         use crate::netstack::dns::{resolve, DnsError};
 
@@ -203,6 +386,10 @@ impl IoHost for VolumeIo {
     fn file_attributes(&mut self, path: &str) -> Result<u32, u32> {
         crate::fs::system_volume::file_attributes(path)
     }
+    fn file_basic_information(&mut self, path: &str) -> Result<FileBasicInformation, u32> {
+        let (attributes, times, size) = crate::fs::system_volume::file_basic_information(path)?;
+        Ok(FileBasicInformation { attributes, times, size })
+    }
     fn set_file_attributes(&mut self, path: &str, attributes: u32) -> Result<(), u32> {
         crate::fs::system_volume::set_file_attributes(path, attributes)
     }
@@ -341,17 +528,59 @@ impl IoHost for VolumeIo {
         // loading its complete contents or opening directories as files.
         crate::fs::system_volume::read_at(path, 0, 1).map(|_| ())
     }
-    fn open_file(&mut self, path: &str, disposition: u32, writable: bool, allow_directory: bool) -> Result<(u64, bool), u32> {
+    fn open_tracked_file(&mut self, path: &str, disposition: u32, writable: bool, allow_directory: bool) -> Result<(u64, bool, Option<u64>), u32> {
         crate::fs::system_volume::open_guest_file(path, disposition, writable, allow_directory)
+    }
+    fn close_tracked_file(&mut self, identity: u64) {
+        crate::fs::system_volume::close_guest_file(identity);
+    }
+    fn set_file_range_lock(&mut self, key: FileLockKey, offset: u64, length: u64, lock: bool) -> Result<(), u32> {
+        crate::fs::system_volume::set_guest_file_range_lock(key, offset, length, lock)
+    }
+    fn release_file_range_locks(&mut self, key: FileLockKey) {
+        crate::fs::system_volume::release_guest_file_range_locks(key);
+    }
+    fn delete_file(&mut self, path: &str) -> Result<(), u32> {
+        crate::fs::system_volume::delete_guest_file(path)
+    }
+    fn remove_directory(&mut self, path: &str) -> Result<(), u32> {
+        crate::fs::system_volume::remove_guest_directory(path)
+    }
+    fn move_file(&mut self, source: &str, destination: &str) -> Result<(), u32> {
+        crate::fs::system_volume::move_guest_file(source, destination)
     }
     fn file_size(&mut self, path: &str) -> Result<u64, u32> {
         crate::fs::system_volume::file_size(path)
+    }
+    fn flush_file_buffers(&mut self) -> Result<(), u32> {
+        crate::fs::system_volume::flush()
+    }
+    fn volume_allocation(&mut self, directory: &str) -> Result<VolumeAllocation, u32> {
+        let (bytes_per_sector, sectors_per_cluster, total_clusters, free_clusters) =
+            crate::fs::system_volume::allocation_units(directory)?;
+        Ok(VolumeAllocation { bytes_per_sector, sectors_per_cluster, total_clusters, free_clusters })
     }
     fn read_at(&mut self, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, u32> {
         crate::fs::system_volume::read_at(path, offset, len)
     }
     fn write_at(&mut self, path: &str, offset: u64, bytes: &[u8]) -> Result<usize, u32> {
         crate::fs::system_volume::write_at(path, offset, bytes)
+    }
+    fn read_open_file(&mut self, path: &str, key: Option<FileLockKey>, offset: u64, length: usize) -> Result<Vec<u8>, u32> {
+        crate::fs::system_volume::read_open_file(path, key, offset, length)
+    }
+    fn write_open_file(&mut self, path: &str, key: Option<FileLockKey>, offset: u64, bytes: &[u8]) -> Result<usize, u32> {
+        crate::fs::system_volume::write_open_file(path, key, offset, bytes)
+    }
+    fn read_mapped_file(&mut self, path: &str, record: Option<u64>, offset: u64, length: usize) -> Result<Vec<u8>, u32> {
+        match record {
+            Some(record) => crate::fs::system_volume::read_mapped_file(path, record, offset, length),
+            None => crate::fs::system_volume::read_at(path, offset, length),
+        }
+    }
+    fn write_mapped_file(&mut self, path: &str, record: Option<u64>, offset: u64, bytes: &[u8]) -> Result<usize, u32> {
+        let record = record.ok_or(0xc000_0002u32)?;
+        crate::fs::system_volume::write_mapped_file(path, record, offset, bytes)
     }
     fn console_write(&mut self, bytes: &[u8]) -> Result<(), u32> {
         (self.output)(bytes);
@@ -430,16 +659,10 @@ pub fn try_execute(
                 }
             };
         crate::hal::serial::write_string_always(&format!("[PE] Running {candidate}\r\n"));
-        static NEXT_DESKTOP_CLIENT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
-        let mut services = IoServices::new(VolumeIo {
-            desktop_client: NEXT_DESKTOP_CLIENT.fetch_add(1,core::sync::atomic::Ordering::Relaxed),
-            desktop_windows:false,
-            output,
-            application_directory: candidate
-                .rsplit_once('\\')
-                .map_or(directory, |(parent, _)| parent)
-                .into(),
-        });
+        if image.assign_process_identity().is_err() {
+            return Some(0xc000_009a);
+        }
+        let mut services = IoServices::new(VolumeIo::new(&candidate, directory, output));
         // Bounded maintenance/desktop console execution. Every quantum lets
         // runnable kernel/desktop threads proceed; no global BTL lock is held.
         // Large SFX installers need more than 8M instructions just to inspect
@@ -489,7 +712,9 @@ pub fn try_execute(
                     }
                     return Some(code);
                 }
-                ImageRunResult::Yielded => crate::ke::scheduler::yield_(),
+                ImageRunResult::Yielded => {
+                    crate::ke::scheduler::yield_();
+                }
                 ImageRunResult::Fault(reason) => {
                     use crate::arch::common::btl::memory::GuestMemory;
                     let mut bytes = [0; 15];
@@ -511,6 +736,7 @@ pub fn try_execute(
                         }
                         StopReason::InitializationFailed { .. } => 0xc0000142,
                         StopReason::UnsupportedApi { .. } => 0xc0000002,
+                        StopReason::MappedWritebackFailed { .. } => 0xc0000185,
                         _ => 0xc000001d,
                     };
                     let api = image

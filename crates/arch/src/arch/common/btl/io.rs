@@ -6,6 +6,12 @@ use super::{
     nt61::{self, BasicServices, GuestServices, Service, ServiceResult, SocketKind},
 };
 use alloc::{string::String, vec, vec::Vec};
+use core::sync::atomic::{AtomicU64, Ordering};
+#[path = "io/file_ranges.rs"]
+mod file_ranges;
+pub use file_ranges::{FileLockKey, FileRangeLocks};
+
+static NEXT_FILE_OWNER: AtomicU64 = AtomicU64::new(1);
 const INVALID_PARAMETER: u32 = 0xc000_000d;
 const INVALID_HANDLE: u32 = 0xc000_0008;
 const ACCESS_DENIED: u32 = 0xc000_0022;
@@ -19,6 +25,7 @@ pub const STD_ERROR: u64 = 0x18;
 
 /// Host operations receive owned, validated values rather than guest pointers.
 pub trait IoHost {
+    fn create_process(&mut self, _request: nt61::ChildRequest) -> Result<nt61::ChildProcess, u32> { Err(120) }
     fn resolve_ipv4(&mut self, _name: &str) -> Result<[u8; 4], u32> { Err(11003) }
     fn open_socket(&mut self, _kind: SocketKind) -> Result<u32, u32> { Err(10050) }
     fn close_socket(&mut self, _socket: u32) -> Result<(), u32> { Err(10038) }
@@ -56,7 +63,15 @@ pub trait IoHost {
     fn file_attributes(&mut self, _path: &str) -> Result<u32, u32> {
         Err(nt61::STATUS_NOT_IMPLEMENTED)
     }
+    fn file_basic_information(&mut self, _path: &str) -> Result<nt61::FileBasicInformation, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
     fn set_file_attributes(&mut self, _path: &str, _attributes: u32) -> Result<(), u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn delete_file(&mut self, _path: &str) -> Result<(), u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn remove_directory(&mut self, _path: &str) -> Result<(), u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn move_file(&mut self, _source: &str, _destination: &str) -> Result<(), u32> {
         Err(nt61::STATUS_NOT_IMPLEMENTED)
     }
     fn set_file_times(&mut self, _path: &str, _times: [Option<u64>; 3]) -> Result<(), u32> {
@@ -105,9 +120,35 @@ pub trait IoHost {
         self.open_read(path)?;
         Ok((1, false))
     }
+    fn open_tracked_file(&mut self, path: &str, disposition: u32, writable: bool, directory: bool) -> Result<(u64, bool, Option<u64>), u32> {
+        let (information, directory) = self.open_file(path, disposition, writable, directory)?;
+        Ok((information, directory, None))
+    }
+    fn close_tracked_file(&mut self, _identity: u64) {}
+    fn set_file_range_lock(&mut self, _key: FileLockKey, _offset: u64, _length: u64, _lock: bool) -> Result<(), u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn release_file_range_locks(&mut self, _key: FileLockKey) {}
     fn file_size(&mut self, _path: &str) -> Result<u64, u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn flush_file_buffers(&mut self) -> Result<(), u32> { Err(nt61::STATUS_NOT_IMPLEMENTED) }
+    fn volume_allocation(&mut self, _directory: &str) -> Result<nt61::VolumeAllocation, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
     fn read_at(&mut self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>, u32>;
     fn write_at(&mut self, _path: &str, _offset: u64, _bytes: &[u8]) -> Result<usize, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn read_open_file(&mut self, path: &str, _key: Option<FileLockKey>, offset: u64, length: usize) -> Result<Vec<u8>, u32> {
+        self.read_at(path, offset, length)
+    }
+    fn write_open_file(&mut self, path: &str, _key: Option<FileLockKey>, offset: u64, bytes: &[u8]) -> Result<usize, u32> {
+        self.write_at(path, offset, bytes)
+    }
+    fn read_mapped_file(&mut self, path: &str, identity: Option<u64>, offset: u64, length: usize) -> Result<Vec<u8>, u32> {
+        if identity.is_some() { return Err(nt61::STATUS_NOT_IMPLEMENTED); }
+        self.read_at(path, offset, length)
+    }
+    fn write_mapped_file(&mut self, _path: &str, _identity: Option<u64>, _offset: u64, _bytes: &[u8]) -> Result<usize, u32> {
         Err(nt61::STATUS_NOT_IMPLEMENTED)
     }
     fn console_write(&mut self, bytes: &[u8]) -> Result<(), u32>;
@@ -122,6 +163,8 @@ pub trait IoHost {
 }
 struct File {
     handle: u64,
+    identity: Option<u64>,
+    owner: u64,
     inheritable: bool,
     path: String,
     position: u64,
@@ -129,6 +172,26 @@ struct File {
     writable: bool,
     write_attributes: bool,
     directory: bool,
+    overlapped: bool,
+}
+impl File {
+    fn lock_key(&self) -> Option<FileLockKey> {
+        self.identity.map(|record| FileLockKey { record, owner: self.owner })
+    }
+}
+
+fn close_open_file(host: &mut impl IoHost, file: File) {
+    if let Some(key) = file.lock_key() {
+        host.release_file_range_locks(key);
+        host.close_tracked_file(key.record);
+    }
+}
+
+struct MappedFile {
+    mapping: u64,
+    identity: Option<u64>,
+    path: String,
+    writable: bool,
 }
 struct GuestSocket {
     handle: u64,
@@ -140,7 +203,9 @@ struct GuestSocket {
 pub struct IoServices<H: IoHost> {
     pub host: H,
     files: Vec<File>,
+    mapped_files: Vec<MappedFile>,
     events: Vec<(u64, u64)>, // guest handle, backend-owned event identifier
+    children: Vec<(u64, u64, nt61::ChildProcess)>,
     sockets: Vec<GuestSocket>,
     memory_dcs: Vec<(u64, u64)>,
     fonts: Vec<(u64, u64)>,
@@ -153,7 +218,9 @@ impl<H: IoHost> IoServices<H> {
         Self {
             host,
             files: Vec::new(),
+            mapped_files: Vec::new(),
             events: Vec::new(),
+            children: Vec::new(),
             sockets: Vec::new(),
             memory_dcs: Vec::new(),
             fonts: Vec::new(),
@@ -219,7 +286,11 @@ impl<H: IoHost> IoServices<H> {
                 if a[1] & !(0xc000_0000 | 0x0012_019f) != 0 {
                     return Err(ACCESS_DENIED);
                 }
-                if a[8] & !0x0000_4074 != 0 || !matches!(a[8] & 0x30, 0x10 | 0x20) || a[6] & !7 != 0 {
+                if a[8] & !0x0000_4074 != 0 || a[8] & 0x30 == 0x30 || a[6] & !7 != 0 {
+                    return Err(nt61::STATUS_NOT_IMPLEMENTED);
+                }
+                let overlapped = a[8] & 0x30 == 0;
+                if overlapped && a[8] & 0x40 == 0 {
                     return Err(nt61::STATUS_NOT_IMPLEMENTED);
                 }
                 let readable = a[1] & 0x8000_0001 != 0;
@@ -270,11 +341,18 @@ impl<H: IoHost> IoServices<H> {
                     .checked_add(4)
                     .filter(|n| *n <= u32::MAX as u64)
                     .ok_or(0xc000_011fu32)?;
-                let (information, directory) = self.host.open_file(&path, a[7] as u32, can_write, a[8] & 0x4040 == 0x4000)?;
-                put(m, a[0], handle, width)?;
-                iosb(m, a[3], width, 0, information)?;
+                self.files.try_reserve(1).map_err(|_| 0xc000_0017u32)?;
+                let owner = NEXT_FILE_OWNER.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+                    .map_err(|_| 0xc000_011fu32)?;
+                let (information, directory, identity) = self.host.open_tracked_file(&path, a[7] as u32, can_write, a[8] & 0x4040 == 0x4000)?;
+                if let Err(status) = put(m, a[0], handle, width).and_then(|_| iosb(m, a[3], width, 0, information)) {
+                    if let Some(identity) = identity { self.host.close_tracked_file(identity); }
+                    return Err(status);
+                }
                 self.files.push(File {
                     handle,
+                    identity,
+                    owner,
                     inheritable: attributes & 2 != 0,
                     path,
                     position: 0,
@@ -282,11 +360,20 @@ impl<H: IoHost> IoServices<H> {
                     writable: can_write,
                     write_attributes: a[1] & (GENERIC_WRITE | FILE_WRITE_ATTRIBUTES) != 0,
                     directory,
+                    overlapped,
                 });
                 self.next_handle = next;
                 Ok(0)
             }
             Service::Close => {
+                if let Some(index) = self.children.iter().position(|(process, thread, _)| {
+                    a[0] != 0 && (*process == a[0] || *thread == a[0])
+                }) {
+                    let (process, thread, _) = &mut self.children[index];
+                    if *process == a[0] { *process = 0; } else { *thread = 0; }
+                    if *process == 0 && *thread == 0 { self.children.swap_remove(index); }
+                    return Ok(0);
+                }
                 if let Some(index) = self.events.iter().position(|event| event.0 == a[0]) {
                     self.host.close_event(self.events[index].1)?;
                     self.events.remove(index);
@@ -297,7 +384,7 @@ impl<H: IoHost> IoServices<H> {
                     .iter()
                     .position(|f| f.handle == a[0])
                     .ok_or(INVALID_HANDLE)?;
-                self.files.remove(index);
+                close_open_file(&mut self.host, self.files.remove(index));
                 Ok(0)
             }
             Service::WaitForSingleObject => {
@@ -336,11 +423,13 @@ impl<H: IoHost> IoServices<H> {
                     return Err(ACCESS_DENIED);
                 }
                 let offset = if a[7] == 0 {
+                    if file.overlapped { return Err(INVALID_PARAMETER); }
                     file.position
                 } else {
                     let b = read(m, a[7], 8)?;
                     let raw = word(&b, 0, 8);
                     if raw == u64::MAX - 1 {
+                        if file.overlapped { return Err(INVALID_PARAMETER); }
                         file.position
                     } else if raw > i64::MAX as u64 {
                         return Err(INVALID_PARAMETER);
@@ -352,10 +441,10 @@ impl<H: IoHost> IoServices<H> {
                     offset.checked_add(len as u64).filter(|end| *end <= i64::MAX as u64)
                         .ok_or(INVALID_PARAMETER)?;
                     let bytes = if len == 0 { Vec::new() } else { read(m, a[5], len)? };
-                    let count = self.host.write_at(&file.path, offset, &bytes)?;
+                    let count = self.host.write_open_file(&file.path, file.lock_key(), offset, &bytes)?;
                     if count > len { return Err(0xc000_0185); }
                     iosb(m, a[4], width, 0, count as u64)?;
-                    file.position = offset + count as u64;
+                    if !file.overlapped { file.position = offset + count as u64; }
                     return Ok(0);
                 }
                 writable(m, a[5], len)?;
@@ -364,7 +453,14 @@ impl<H: IoHost> IoServices<H> {
                     let count = (len - transferred).min(MAX_IO);
                     let chunk_offset = offset.checked_add(transferred as u64).ok_or(INVALID_PARAMETER)?;
                     let address = a[5].checked_add(transferred as u64).ok_or(INVALID_PARAMETER)?;
-                    let bytes = self.host.read_at(&file.path, chunk_offset, count)?;
+                    let bytes = match self.host.read_open_file(&file.path, file.lock_key(), chunk_offset, count) {
+                        Ok(bytes) => bytes,
+                        Err(status) => {
+                            iosb(m, a[4], width, status, transferred as u64)?;
+                            if !file.overlapped { file.position = chunk_offset; }
+                            return Ok(status);
+                        }
+                    };
                     if bytes.len() > count {
                         return Err(0xc000_0185);
                     }
@@ -381,7 +477,7 @@ impl<H: IoHost> IoServices<H> {
                     .ok_or(INVALID_PARAMETER)?;
                 let status = if len != 0 && transferred == 0 { EOF } else { 0 };
                 iosb(m, a[4], width, status, transferred as u64)?;
-                file.position = end;
+                if !file.overlapped { file.position = end; }
                 Ok(status)
             }
             _ => Err(nt61::STATUS_NOT_IMPLEMENTED),
@@ -391,12 +487,95 @@ impl<H: IoHost> IoServices<H> {
 impl<H: IoHost> Drop for IoServices<H> {
     fn drop(&mut self) {
         self.close_sockets();
+        for file in self.files.drain(..) {
+            close_open_file(&mut self.host, file);
+        }
+        for file in self.mapped_files.drain(..) {
+            if let Some(identity) = file.identity { self.host.close_tracked_file(identity); }
+        }
         for (_, event) in self.events.drain(..) { let _ = self.host.close_event(event); }
         for (_, dc) in self.memory_dcs.drain(..) { self.host.delete_memory_dc(dc); }
         for (_, font) in self.fonts.drain(..) { self.host.delete_font(font); }
     }
 }
 impl<H: IoHost> GuestServices for IoServices<H> {
+    fn set_file_range_lock(&mut self, handle: u64, offset: u64, length: u64, lock: bool) -> Result<(), u32> {
+        let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
+        if file.directory || !(file.readable || file.writable) { return Err(ACCESS_DENIED); }
+        let key = file.lock_key().ok_or(nt61::STATUS_NOT_IMPLEMENTED)?;
+        self.host.set_file_range_lock(key, offset, length, lock)
+    }
+    fn volume_allocation(&mut self, abi: GuestAbi, directory: &str) -> Result<nt61::VolumeAllocation, u32> {
+        let directory = guest_file_path(abi, directory, self.fs_redirection)?;
+        self.host.volume_allocation(&directory)
+    }
+    fn flush_file_buffers(&mut self, handle: u64) -> Result<(), u32> {
+        let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
+        if file.directory || !file.writable { return Err(ACCESS_DENIED); }
+        self.host.flush_file_buffers()
+    }
+    fn retain_file_mapping(&mut self, file: Option<u64>, writable: bool) -> Result<(u64, u64), u32> {
+        let mapping = self.next_handle;
+        let next = mapping.checked_add(4).filter(|next| *next <= u64::from(u32::MAX)).ok_or(0xc000_0017u32)?;
+        let size = if let Some(handle) = file {
+            let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
+            if file.directory || !file.readable || (writable && !file.writable) { return Err(ACCESS_DENIED); }
+            if self.mapped_files.iter().any(|other| (writable || other.writable)
+                && (file.path.eq_ignore_ascii_case(&other.path) || (file.identity.is_some() && file.identity == other.identity))) {
+                return Err(0xc000_0043);
+            }
+            let size = self.host.file_size(&file.path)?;
+            let (_, directory, identity) = self.host.open_tracked_file(&file.path, 1, writable, false)?;
+            if directory || identity != file.identity {
+                if let Some(id) = identity { self.host.close_tracked_file(id); }
+                return Err(INVALID_HANDLE);
+            }
+            self.mapped_files.push(MappedFile { mapping, path: file.path.clone(), identity, writable });
+            size
+        } else { 0 };
+        self.next_handle = next;
+        Ok((mapping, size))
+    }
+    fn release_file_mapping(&mut self, mapping: u64) {
+        if let Some(index) = self.mapped_files.iter().position(|file| file.mapping == mapping) {
+            if let Some(identity) = self.mapped_files.swap_remove(index).identity {
+                self.host.close_tracked_file(identity);
+            }
+        }
+    }
+    fn read_file_mapping(&mut self, mapping: u64, offset: u64, length: usize) -> Result<Vec<u8>, u32> {
+        let file = self.mapped_files.iter().find(|file| file.mapping == mapping).ok_or(INVALID_HANDLE)?;
+        self.host.read_mapped_file(&file.path, file.identity, offset, length)
+    }
+    fn write_file_mapping(&mut self, mapping: u64, offset: u64, bytes: &[u8]) -> Result<usize, u32> {
+        let file = self.mapped_files.iter().find(|file| file.mapping == mapping).ok_or(INVALID_HANDLE)?;
+        if !file.writable { return Err(ACCESS_DENIED); }
+        self.host.write_mapped_file(&file.path, file.identity, offset, bytes)
+    }
+    fn create_process(&mut self, request: nt61::ChildRequest) -> Result<[u32; 4], u32> {
+        if self.children.len() >= 64 { return Err(4); }
+        let process = u32::try_from(self.next_handle).map_err(|_| 4u32)?;
+        let next = process.checked_add(8).ok_or(4u32)?;
+        self.children.try_reserve(1).map_err(|_| 8u32)?;
+        let child = self.host.create_process(request)?;
+        let thread = process + 4;
+        let information = [process, thread, child.process_id, child.thread_id];
+        self.children.push((u64::from(process), u64::from(thread), child));
+        self.next_handle = u64::from(next);
+        Ok(information)
+    }
+
+    fn child_info(&self, handle: u64, thread_handle: bool) -> Result<(u32, u32, u32), u32> {
+        let (_, _, child) = self.children.iter().find(|(process, thread, _)| {
+            handle != 0 && handle == if thread_handle { *thread } else { *process }
+        }).ok_or(6u32)?;
+        let id = if thread_handle { child.thread_id } else { child.process_id };
+        Ok((id, child.process_id, child.exit_code(thread_handle).unwrap_or(259)))
+    }
+
+    fn is_child_handle(&self, handle: u64) -> bool {
+        handle != 0 && self.children.iter().any(|(process, thread, _)| *process == handle || *thread == handle)
+    }
     fn select_file_view(&mut self, redirection_enabled: bool) {
         self.set_fs_redirection(redirection_enabled);
     }
@@ -463,19 +642,43 @@ impl<H: IoHost> GuestServices for IoServices<H> {
         self.host.change_event(event, signaled)
     }
     fn wait_event(&mut self, handle: u64, timeout: Option<i64>) -> Result<u32, u32> {
+        if self.is_child_handle(handle) {
+            return if timeout == Some(0) { self.poll_events(&[handle], false) }
+                else { Err(nt61::STATUS_NOT_IMPLEMENTED) };
+        }
         let event = self.events.iter().find(|event| event.0 == handle).ok_or(INVALID_HANDLE)?.1;
         self.host.wait_event(event, timeout)
     }
     fn validate_wait_event(&self, handle: u64) -> Result<(), u32> {
-        self.events.iter().any(|event| event.0 == handle).then_some(()).ok_or(INVALID_HANDLE)
+        (self.is_child_handle(handle) || self.events.iter().any(|event| event.0 == handle))
+            .then_some(()).ok_or(INVALID_HANDLE)
     }
     fn poll_events(&mut self, handles: &[u64], all: bool) -> Result<u32, u32> {
         let mut events = [0; 64];
-        let events = events.get_mut(..handles.len()).ok_or(INVALID_PARAMETER)?;
-        for (event, handle) in events.iter_mut().zip(handles) {
-            *event = self.events.iter().find(|event| event.0 == *handle).ok_or(INVALID_HANDLE)?.1;
+        let mut indices = [0; 64];
+        if handles.is_empty() || handles.len() > events.len() { return Err(INVALID_PARAMETER); }
+        let mut count = 0;
+        let mut ready = None;
+        for (index, &handle) in handles.iter().enumerate() {
+            if let Some((_, thread, child)) = self.children.iter().find(|(process, thread, _)| {
+                handle != 0 && (*process == handle || *thread == handle)
+            }) {
+                match (all, child.exit_code(handle == *thread)) {
+                    (true, None) => return Ok(0x102),
+                    (false, Some(_)) => { ready = Some(index as u32); break; }
+                    _ => {}
+                }
+            } else {
+                events[count] = self.events.iter().find(|event| event.0 == handle).ok_or(INVALID_HANDLE)?.1;
+                indices[count] = index as u32;
+                count += 1;
+            }
         }
-        self.host.poll_events(events, all)
+        if count == 0 { return Ok(if all { 0 } else { ready.unwrap_or(0x102) }); }
+        let result = self.host.poll_events(&events[..count], all)?;
+        if all { return Ok(result); }
+        if result == 0x102 { return Ok(ready.unwrap_or(result)); }
+        indices.get(..count).and_then(|values| values.get(result as usize)).copied().ok_or(INVALID_PARAMETER)
     }
 
     fn create_memory_dc(&mut self, source: u64) -> Option<u64> {
@@ -600,9 +803,26 @@ impl<H: IoHost> GuestServices for IoServices<H> {
         let path = guest_file_path(abi, path, self.fs_redirection)?;
         self.host.file_attributes(&path)
     }
+    fn file_basic_information(&mut self, abi: GuestAbi, path: &str) -> Result<nt61::FileBasicInformation, u32> {
+        let path = guest_file_path(abi, path, self.fs_redirection)?;
+        self.host.file_basic_information(&path)
+    }
     fn set_file_attributes(&mut self, abi: GuestAbi, path: &str, attributes: u32) -> Result<(), u32> {
         let path = guest_file_path(abi, path, self.fs_redirection)?;
         self.host.set_file_attributes(&path, attributes)
+    }
+    fn delete_file(&mut self, abi: GuestAbi, path: &str) -> Result<(), u32> {
+        let path = guest_file_path(abi, path, self.fs_redirection)?;
+        self.host.delete_file(&path)
+    }
+    fn remove_directory(&mut self, abi: GuestAbi, path: &str) -> Result<(), u32> {
+        let path = guest_file_path(abi, path, self.fs_redirection)?;
+        self.host.remove_directory(&path)
+    }
+    fn move_file(&mut self, abi: GuestAbi, source: &str, destination: &str) -> Result<(), u32> {
+        let source = guest_file_path(abi, source, self.fs_redirection)?;
+        let destination = guest_file_path(abi, destination, self.fs_redirection)?;
+        self.host.move_file(&source, &destination)
     }
     fn set_file_times(&mut self, handle: u64, times: [Option<u64>; 3]) -> Result<(), u32> {
         let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
@@ -638,6 +858,11 @@ impl<H: IoHost> GuestServices for IoServices<H> {
     }
     fn cancel_file_io(&mut self, handle: u64) -> Result<(), u32> {
         self.files.iter().any(|file| file.handle == handle).then_some(()).ok_or(INVALID_HANDLE)
+    }
+    fn validate_disk_file(&self, handle: u64) -> Result<(), u32> {
+        let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
+        if file.directory { return Err(ACCESS_DENIED); }
+        Ok(())
     }
     fn file_size(&mut self, handle: u64) -> Result<u64, u32> {
         let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;

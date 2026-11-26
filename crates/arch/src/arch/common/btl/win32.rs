@@ -5,6 +5,8 @@
 mod eventlog;
 #[path = "win32/directory.rs"]
 mod directory;
+#[path = "win32/process.rs"]
+mod process;
 #[path = "win32/advapi.rs"]
 mod advapi;
 #[path = "win32/gui.rs"]
@@ -27,6 +29,8 @@ mod winsock;
 mod runonce;
 #[path = "win32/virtual_memory.rs"]
 mod virtual_memory;
+#[path = "win32/mapping.rs"]
+pub(super) mod mapping;
 #[path = "win32/context.rs"]
 mod context;
 #[path = "win32/function_table.rs"]
@@ -79,6 +83,11 @@ struct VirtualAllocation {
     committed: Vec<bool>,
 }
 
+struct PrivateHeap {
+    handle: u64,
+    blocks: Vec<(u64, usize)>,
+}
+
 pub struct Runtime {
     pub modules: Vec<(String, u64)>,
     pub(super) module_paths: Vec<(u64, String)>,
@@ -93,7 +102,9 @@ pub struct Runtime {
     pinned_modules: Vec<u64>,
     allocations: Vec<(u64, usize)>,
     heap_allocations: Vec<(u64, usize)>,
+    private_heaps: Vec<PrivateHeap>,
     virtual_allocations: Vec<VirtualAllocation>,
+    mappings: mapping::State,
     tls: Vec<bool>,
     pub(super) local: ThreadLocal,
     ui_language: u16,
@@ -145,7 +156,9 @@ impl Runtime {
             pinned_modules: Vec::new(),
             allocations: Vec::new(),
             heap_allocations: Vec::new(),
+            private_heaps: Vec::new(),
             virtual_allocations: Vec::new(),
+            mappings: mapping::State::default(),
             tls: Vec::new(),
             local: ThreadLocal::default(),
             ui_language: nls::DEFAULT_UI_LANGUAGE,
@@ -174,6 +187,22 @@ impl Runtime {
             terminate_on_heap_corruption: false,
             exception_filter: 0,
         }
+    }
+
+    fn heap_blocks(&self, handle: u64) -> Option<&[(u64, usize)]> {
+        if handle == HEAP {
+            return Some(&self.heap_allocations);
+        }
+        self.private_heaps.iter().find(|heap| heap.handle == handle)
+            .map(|heap| heap.blocks.as_slice())
+    }
+
+    fn heap_blocks_mut(&mut self, handle: u64) -> Result<&mut Vec<(u64, usize)>, u32> {
+        if handle == HEAP {
+            return Ok(&mut self.heap_allocations);
+        }
+        self.private_heaps.iter_mut().find(|heap| heap.handle == handle)
+            .map(|heap| &mut heap.blocks).ok_or(INVALID_PARAMETER)
     }
 }
 #[derive(Default)]
@@ -491,6 +520,10 @@ fn protect(image: &mut GuestImage, p: u64, n: u64, flags: u32) -> Result<u32, u3
         .iter_mut()
         .find(|r| p >= r.base && end <= r.base + r.bytes.len() as u64)
         .ok_or(487u32)?;
+    if image.win32.mappings.contains_view(r.base) && (bits & EXECUTE != 0
+        || (bits & WRITE != 0 && r.allocation_protection == 2)) {
+        return Err(5);
+    }
     let first = ((p - r.base) as usize) / PAGE;
     let last = ((end - 1 - r.base) as usize) / PAGE;
     let old = r.protections[first];
@@ -499,27 +532,32 @@ fn protect(image: &mut GuestImage, p: u64, n: u64, flags: u32) -> Result<u32, u3
     Ok(old)
 }
 fn heap_allocate(image: &mut GuestImage, n: u64) -> Result<u64, u32> {
-    image.win32.heap_allocations.try_reserve(1).map_err(|_| 8u32)?;
+    heap_allocate_in(image, HEAP, n)
+}
+fn heap_allocate_in(image: &mut GuestImage, handle: u64, n: u64) -> Result<u64, u32> {
+    image.win32.heap_blocks_mut(handle)?.try_reserve(1).map_err(|_| 8u32)?;
     let p = allocate(image, 0, n.max(1), READ | WRITE)?;
-    image.win32.heap_allocations.push((p, n as usize));
+    image.win32.heap_blocks_mut(handle)?.push((p, n as usize));
     Ok(p)
 }
 fn heap_free(image: &mut GuestImage, p: u64) -> Result<(), u32> {
+    heap_free_in(image, HEAP, p)
+}
+fn heap_free_in(image: &mut GuestImage, handle: u64, p: u64) -> Result<(), u32> {
+    let blocks = image.win32.heap_blocks_mut(handle)?;
     if p == 0 {
         return Ok(());
     }
-    let index = image
-        .win32
-        .heap_allocations
-        .iter()
-        .position(|a| a.0 == p)
-        .ok_or(INVALID_PARAMETER)?;
+    let index = blocks.iter().position(|block| block.0 == p).ok_or(INVALID_PARAMETER)?;
     free(image, p)?;
-    image.win32.heap_allocations.remove(index);
+    image.win32.heap_blocks_mut(handle)?.remove(index);
     Ok(())
 }
 fn heap_move(image: &mut GuestImage, old: u64, length: usize, size: u64) -> Result<u64, u32> {
-    let destination = heap_allocate(image, size)?;
+    heap_move_in(image, HEAP, old, length, size)
+}
+fn heap_move_in(image: &mut GuestImage, handle: u64, old: u64, length: usize, size: u64) -> Result<u64, u32> {
+    let destination = heap_allocate_in(image, handle, size)?;
     let result = (|| {
         let count = length.min(size as usize);
         let mut cursor = 0;
@@ -531,10 +569,10 @@ fn heap_move(image: &mut GuestImage, old: u64, length: usize, size: u64) -> Resu
             }
             cursor += chunk;
         }
-        heap_free(image, old)
+        heap_free_in(image, handle, old)
     })();
     if let Err(error) = result {
-        let _ = heap_free(image, destination);
+        let _ = heap_free_in(image, handle, destination);
         return Err(error);
     }
     Ok(destination)
@@ -826,6 +864,9 @@ pub fn dispatch(
     if api.dll == "ntdll.dll" {
         if let Some(service) = nt_service(api.name) {
             if service == Service::Close {
+                if mapping::close(image, services, a[0]) {
+                    return Ok(Outcome::Return(0));
+                }
                 if let Some(status) = close_token(image, a[0]) {
                     return Ok(Outcome::Return(u64::from(status)));
                 }
@@ -894,7 +935,7 @@ pub fn dispatch(
                 alloc::format!("{} access={:#x} share={:#x} security=[{}] disposition={} flags={:#x} template={:#x}",
                     string(&mut image.memory, a[0], api.name.ends_with('W')).unwrap_or_default(),
                     a[1] as u32, a[2] as u32, security, a[4] as u32, a[5] as u32, a[6])
-            } else if matches!(api.name, "CreateDirectoryW" | "FindFirstFileW" | "FindFirstFileExW" | "GetFileAttributesW" | "SetFileAttributesW") {
+            } else if matches!(api.name, "CreateDirectoryW" | "RemoveDirectoryW" | "FindFirstFileW" | "FindFirstFileExW" | "GetFileAttributesW" | "SetFileAttributesW") {
                 string(&mut image.memory, a[0], true).unwrap_or_default()
             } else if matches!(api.name, "ReadFile" | "WriteFile") {
                 alloc::format!("length={} overlapped={}", a[2] as u32, a[4] != 0)
@@ -975,6 +1016,24 @@ fn invoke(
     services: &mut dyn GuestServices,
 ) -> Result<u64, ApiError> {
     match (api.dll, api.name) {
+        ("kernel32.dll", "GetDiskFreeSpaceA" | "GetDiskFreeSpaceW"
+            | "GetDiskFreeSpaceExA" | "GetDiskFreeSpaceExW") => {
+            return volume_space(image, services, api.name, a);
+        }
+        ("kernel32.dll", "CreateFileMappingA" | "CreateFileMappingW" | "MapViewOfFile"
+            | "MapViewOfFileEx" | "FlushViewOfFile" | "UnmapViewOfFile") => {
+            return mapping::invoke(image, services, api.name, a);
+        }
+        ("kernel32.dll", "FlushFileBuffers") => {
+            services.flush_file_buffers(a[0]).map_err(status_error)?;
+            return Ok(1);
+        }
+        ("kernel32.dll", "LockFile" | "UnlockFile") => {
+            let offset = u64::from(a[1] as u32) | (u64::from(a[2] as u32) << 32);
+            let length = u64::from(a[3] as u32) | (u64::from(a[4] as u32) << 32);
+            services.set_file_range_lock(a[0], offset, length, api.name == "LockFile").map_err(status_error)?;
+            return Ok(1);
+        }
         ("ws2_32.dll", _) => return winsock::invoke(image, services, api.name, a),
         ("version.dll", _) => return version::invoke(image, api.name, a, services),
         ("ntdll.dll", "WinSqmAddToStream" | "WinSqmIncrementDWORD") => return Ok(0),
@@ -1066,14 +1125,13 @@ fn invoke(
     }
     if api.dll == "ntdll.dll" && api.name == "RtlSizeHeap" {
         // Native heap queries preserve Win32 LastError, including failures.
-        // Only the process-owned heap and documented HEAP_NO_SERIALIZE flag
+        // Only process-owned heaps and the documented HEAP_NO_SERIALIZE flag
         // are accepted; there is no host-pointer dereference.
         let failure = if image.thread.context.mode == DecodeMode::X86 { u32::MAX as u64 } else { u64::MAX };
         if a[1] & !1 != 0 { return Err(ApiError::Unsupported); }
-        return Ok(if a[0] != HEAP { failure } else {
-            image.win32.heap_allocations.iter().find(|p| p.0 == a[2])
-                .map_or(failure, |p| p.1 as u64)
-        });
+        return Ok(image.win32.heap_blocks(a[0])
+            .and_then(|blocks| blocks.iter().find(|block| block.0 == a[2]))
+            .map_or(failure, |block| block.1 as u64));
     }
     if api.dll == "ntdll.dll" && crt::handles(api.name) {
         return crt::invoke(image, api.name, a);
@@ -1237,9 +1295,13 @@ fn invoke(
     if runonce::handles(name) {
         return runonce::invoke(image, api, a);
     }
-    if api.dll == "kernel32.dll" && matches!(name, "CreateDirectoryA" | "CreateDirectoryW" |
+    if api.dll == "kernel32.dll" && matches!(name, "GetFullPathNameA" | "GetFullPathNameW") {
+        return directory::full_path_name(image, a, name.ends_with('W'));
+    }
+    if api.dll == "kernel32.dll" && matches!(name, "CreateDirectoryA" | "CreateDirectoryW" | "RemoveDirectoryA" | "RemoveDirectoryW" |
         "FindFirstFileA" | "FindFirstFileW" | "FindFirstFileExW" | "FindNextFileA" | "FindNextFileW" |
-        "FindClose" | "GetFileAttributesA" | "GetFileAttributesW" | "SetFileAttributesW") {
+        "FindClose" | "GetFileAttributesA" | "GetFileAttributesW" | "GetFileAttributesExA" | "GetFileAttributesExW"
+        | "SetFileAttributesW" | "DeleteFileA" | "DeleteFileW" | "MoveFileA" | "MoveFileW") {
         return directory::invoke(image, name, a, services);
     }
     if api.dll == "kernel32.dll" && nls::handles(name) {
@@ -1326,6 +1388,8 @@ fn invoke(
         }
         "CreateThread" => return super::threads::create(image, a).map_err(ApiError::Windows),
         "OpenThread" => return super::threads::open(image, a[0] as u32, a[1] as u32 != 0, a[2] as u32).map_err(ApiError::Windows),
+        "GetThreadId" | "GetExitCodeThread" | "GetProcessIdOfThread" if services.is_child_handle(a[0]) =>
+            return process::child_info(image, a, services, name),
         "ResumeThread" | "SuspendThread" | "GetThreadId" | "GetProcessIdOfThread" | "GetExitCodeThread" | "SetThreadPriority" | "GetThreadPriority" =>
             return super::threads::invoke(image, name, a).map_err(ApiError::Windows),
         "GetThreadPriorityBoost" => {
@@ -1558,7 +1622,9 @@ fn invoke(
                 u64::MAX - 1
             }
         }
-        "GetCurrentProcessId" => super::GUEST_PROCESS_ID,
+        "GetCurrentProcessId" => u64::from(image.process_id()),
+        "CreateProcessA" | "CreateProcessW" => return process::create(image, a, services, name.ends_with('W')),
+        "GetProcessId" | "GetExitCodeProcess" => return process::child_info(image, a, services, name),
         "GetPriorityClass" => image.process_priority_class(a[0])?,
         "SetPriorityClass" => image.set_process_priority_class(a[0], a[1] as u32)?,
         "SetProcessShutdownParameters" => {
@@ -1588,6 +1654,21 @@ fn invoke(
         "IsDebuggerPresent" => 0,
         "GetVersion" => 0x1db10106,
         "GetProcessHeap" => HEAP,
+        "GetProcessHeaps" => {
+            let count = image.win32.private_heaps.len() + 1;
+            if a[0] as u32 as usize >= count {
+                let width = if abi == GuestAbi::X86_64 { 8 } else { 4 };
+                if !image.memory.probe_write(a[1], count * width) {
+                    return Err(NOACCESS.into());
+                }
+                for (index, handle) in core::iter::once(HEAP)
+                    .chain(image.win32.private_heaps.iter().map(|heap| heap.handle)).enumerate()
+                {
+                    put(&mut image.memory, a[1] + (index * width) as u64, handle, width)?;
+                }
+            }
+            count as u64
+        }
         "GetFileType" => services.file_type(a[0]).map_err(|status| ApiError::Windows(status_error(status)))? as u64,
         "GetFileSizeEx" => {
             if !image.memory.probe_write(a[1], 8) { return Err(NOACCESS.into()); }
@@ -1692,6 +1773,7 @@ fn invoke(
             if !image.memory.write_virt(a[0], &header[..size]) { return Err(ApiError::MemoryFault); }
             0
         }
+        "InterlockedFlushSList" => flush_slist(&mut image.memory, a[0], x86)?,
         "GetEnvironmentStrings" | "GetEnvironmentStringsW" => environment::get(image, name.ends_with('W'))?,
         "FreeEnvironmentStringsA" | "FreeEnvironmentStringsW" => environment::release(image, a[0], name.ends_with('W'))?,
         "GetEnvironmentVariableA" | "GetEnvironmentVariableW" => environment::variable(image, a, name.ends_with('W'))?,
@@ -2118,38 +2200,55 @@ fn invoke(
             image.win32.terminate_on_heap_corruption = true;
             1
         }
+        "HeapCreate" => {
+            if a[0] as u32 & !1 != 0 || a[2] != 0 {
+                return Err(INVALID_PARAMETER.into());
+            }
+            image.win32.private_heaps.try_reserve(1).map_err(|_| 8u32)?;
+            let handle = allocate(image, 0, a[1].max(PAGE as u64), READ | WRITE)?;
+            image.win32.private_heaps.push(PrivateHeap { handle, blocks: Vec::new() });
+            handle
+        }
+        "HeapDestroy" => {
+            let index = image.win32.private_heaps.iter().position(|heap| heap.handle == a[0])
+                .ok_or(INVALID_PARAMETER)?;
+            while let Some(&(address, _)) = image.win32.private_heaps[index].blocks.last() {
+                heap_free_in(image, a[0], address)?;
+            }
+            free(image, a[0])?;
+            image.win32.private_heaps.remove(index);
+            1
+        }
         "HeapAlloc" | "HeapReAlloc" => {
-            if a[0] != HEAP || a[1] & !8 != 0 {
+            if a[1] & !9 != 0 {
                 return Err(INVALID_PARAMETER.into());
             }
             if name == "HeapReAlloc" {
-                let (old, length) = image.win32.heap_allocations.iter()
-                    .find(|entry| entry.0 == a[2]).copied().ok_or(INVALID_PARAMETER)?;
-                heap_move(image, old, length, a[3])?
+                let (old, length) = image.win32.heap_blocks(a[0])
+                    .and_then(|blocks| blocks.iter().find(|block| block.0 == a[2]))
+                    .copied().ok_or(INVALID_PARAMETER)?;
+                heap_move_in(image, a[0], old, length, a[3])?
             } else {
-                heap_allocate(image, a[2])?
+                heap_allocate_in(image, a[0], a[2])?
             }
         }
         "HeapFree" => {
-            if a[0] != HEAP || a[1] != 0 {
+            if a[1] & !1 != 0 {
                 return Err(INVALID_PARAMETER.into());
             }
             let tracked = image.win32.terminate_on_heap_corruption
-                && image.win32.heap_allocations.iter().any(|entry| entry.0 == a[2]);
-            heap_free(image, a[2]).map_err(|error| {
+                && image.win32.heap_blocks(a[0]).is_some_and(|blocks| blocks.iter().any(|block| block.0 == a[2]));
+            heap_free_in(image, a[0], a[2]).map_err(|error| {
                 if tracked { ApiError::CorruptHeap } else { error.into() }
             })?;
             1
         }
         "HeapSize" => {
-            if a[0] != HEAP || a[1] != 0 {
+            if a[1] & !1 != 0 {
                 return Err(INVALID_PARAMETER.into());
             }
-            image
-                .win32
-                .heap_allocations
-                .iter()
-                .find(|p| p.0 == a[2])
+            image.win32.heap_blocks(a[0])
+                .and_then(|blocks| blocks.iter().find(|block| block.0 == a[2]))
                 .ok_or(INVALID_PARAMETER)?
                 .1 as u64
         }
@@ -2232,6 +2331,7 @@ fn invoke(
         "CreateFileA" | "CreateFileW" => {
             const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
             const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            const FILE_FLAG_OVERLAPPED: u32 = 0x4000_0000;
             let access = a[1] as u32;
             let share = a[2] as u32;
             let disposition = a[4] as u32;
@@ -2250,10 +2350,12 @@ fn invoke(
             if access & !(0xc000_0000 | 0x0012_019f) != 0 || share & !7 != 0 {
                 return Err(5.into());
             }
-            if flags & !(0x0000_00a0 | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_BACKUP_SEMANTICS) != 0 {
+            if flags & !(0x0000_00a0 | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED) != 0
+                || flags & (FILE_FLAG_OVERLAPPED | FILE_FLAG_BACKUP_SEMANTICS) == (FILE_FLAG_OVERLAPPED | FILE_FLAG_BACKUP_SEMANTICS) {
                 return Err(120.into());
             }
-            let options = if flags & FILE_FLAG_BACKUP_SEMANTICS != 0 { 0x4020 } else { 0x60 }
+            let options = if flags & FILE_FLAG_BACKUP_SEMANTICS != 0 { 0x4020 }
+                else if flags & FILE_FLAG_OVERLAPPED != 0 { 0x40 } else { 0x60 }
                 | if flags & FILE_FLAG_SEQUENTIAL_SCAN != 0 { 4 } else { 0 };
             let mut object_attributes = 0x40;
             if a[3] != 0 {
@@ -2338,10 +2440,28 @@ fn invoke(
             services.cancel_file_io(a[0]).map_err(status_error)?;
             1
         }
+        "GetOverlappedResult" => {
+            services.validate_disk_file(a[0]).map_err(status_error)?;
+            let completion = read(&mut image.memory, a[1], width * 2)?;
+            let status = u32::from_le_bytes(completion[..4].try_into().unwrap());
+            if status == 0x103 {
+                return Err(if a[3] as u32 == 0 { 996u32 } else { 120u32 }.into());
+            }
+            let mut transferred = [0; 8];
+            transferred[..width].copy_from_slice(&completion[width..]);
+            put(&mut image.memory, a[2], u64::from_le_bytes(transferred), 4)?;
+            if (status as i32) < 0 { return Err(status_error(status).into()); }
+            1
+        }
         "ReadFile" | "WriteFile" => {
             let length = a[2] as u32;
-            if a[4] != 0 || (name == "WriteFile" && length > 65536) {
+            if name == "WriteFile" && length > 65536 {
                 return Err(120.into());
+            }
+            let service = if name == "ReadFile" { Service::ReadFile } else { Service::WriteFile };
+            if a[4] != 0 {
+                overlapped_file_io(image, services, abi, width, service, a, length)?;
+                return Ok(1);
             }
             if a[3] == 0 || !image.memory.probe_write(a[3], 4) {
                 return Err(NOACCESS.into());
@@ -2355,11 +2475,7 @@ fn invoke(
             let result = (|| -> Result<u64, u32> {
                 match services.call(
                     abi,
-                    if name == "ReadFile" {
-                        Service::ReadFile
-                    } else {
-                        Service::WriteFile
-                    },
+                    service,
                     &args,
                     &mut image.memory,
                 ) {
@@ -2439,6 +2555,7 @@ fn invoke(
             1
         }
         "CloseHandle" => {
+            if mapping::close(image, services, a[0]) { return Ok(1); }
             let status = match close_token(image, a[0]) {
                 Some(status) => status,
                 None => match services.call(abi, Service::Close, &a[..1], &mut image.memory) {
@@ -2478,6 +2595,37 @@ pub(super) fn sleep_counter(
     }
     Ok((counter, frequency))
 }
+fn flush_slist(memory: &mut super::ImageMemory, address: u64, x86: bool) -> Result<u64, ApiError> {
+    let size = if x86 { 8 } else { 16 };
+    if address == 0 || address % size as u64 != 0 {
+        return Err(ApiError::MemoryFault);
+    }
+    let mut header = [0; 16];
+    if memory.read_virt(address, &mut header[..size]) != size {
+        return Err(ApiError::MemoryFault);
+    }
+    let low = u64::from_le_bytes(header[..8].try_into().unwrap());
+    let high = u64::from_le_bytes(header[8..].try_into().unwrap());
+    let (entry, replacement, changed) = if x86 {
+        (u64::from(low as u32), 0xffff_0000_0000_0000, 8)
+    } else if high & 1 != 0 {
+        (high & !0xf, low & !0xffff, 16)
+    } else {
+        (low & !0x01ff_ffff, low & 0x01ff_0000, 8)
+    };
+    if entry == 0 {
+        return Ok(0);
+    }
+    header[..8].copy_from_slice(&replacement.to_le_bytes());
+    if changed == 16 {
+        header[8..].copy_from_slice(&1u64.to_le_bytes());
+    }
+    if !memory.write_virt(address, &header[..changed]) {
+        return Err(ApiError::MemoryFault);
+    }
+    Ok(if !x86 && changed == 8 { entry >> 21 } else { entry })
+}
+
 fn wow64_fs_redirection(image: &mut GuestImage, name: &str, args: &[u64]) -> Result<u64, ApiError> {
     let rtl = name.starts_with("Rtl");
     let status = if image.thread.context.mode != DecodeMode::X86 {
@@ -2520,6 +2668,36 @@ fn file_seek_error(error: nt61::FileSeekError) -> u32 {
     }
 }
 
+fn overlapped_file_io(image: &mut GuestImage, services: &mut dyn GuestServices, abi: GuestAbi,
+    width: usize, service: Service, args: &[u64], length: u32) -> Result<(), ApiError> {
+    let file = args[0];
+    let buffer = args[1];
+    let count = args[3];
+    let overlapped = args[4];
+    services.validate_disk_file(file).map_err(status_error)?;
+    let offset = overlapped.checked_add(2 * width as u64).ok_or(NOACCESS)?;
+    let event = word(&mut image.memory, offset.checked_add(8).ok_or(NOACCESS)?, width)? & !1;
+    word(&mut image.memory, offset, 8)?;
+    if !image.memory.probe_write(overlapped, width * 2)
+        || (count != 0 && !image.memory.probe_write(count, 4)) {
+        return Err(NOACCESS.into());
+    }
+    if count != 0 { put(&mut image.memory, count, 0, 4)?; }
+    if event != 0 { services.change_event(event, false).map_err(status_error)?; }
+    let transferred_address = overlapped + width as u64;
+    put(&mut image.memory, transferred_address, 0, width)?;
+    let request = [file, 0, 0, 0, overlapped, buffer, u64::from(length), offset, 0];
+    let ServiceResult::Return(status) = services.call(abi, service, &request, &mut image.memory) else {
+        return Err(ApiError::Unsupported);
+    };
+    put(&mut image.memory, overlapped, u64::from(status), width)?;
+    if status == 0x103 { return Err(997u32.into()); }
+    let transferred = word(&mut image.memory, transferred_address, width)?;
+    if count != 0 { put(&mut image.memory, count, transferred, 4)?; }
+    if event != 0 { services.change_event(event, true).map_err(status_error)?; }
+    if status == 0 { Ok(()) } else { Err(status_error(status).into()) }
+}
+
 pub(super) fn status_error(s: u32) -> u32 {
     match s {
         0xc0000005 => NOACCESS,
@@ -2531,11 +2709,57 @@ pub(super) fn status_error(s: u32) -> u32 {
         0xc0000034 | 0xc000000f => 2,
         0xc0000035 => 183,
         0xc000003a => 3,
+        0xc0000043 => 32,
+        0xc0000054 | 0xc0000055 => 33,
+        0xc000007e => 158,
+        0xc0000101 => 145,
+        0xc0000103 => 267,
         0xc00000ba => 5,
         0xc0000011 => 38,
+        0xc0000185 => 1117,
         0xc0000002 | 0xc00000bb => 120,
         _ => 1,
     }
+}
+
+fn volume_space(image: &mut GuestImage, services: &mut dyn GuestServices, name: &str, args: &[u64]) -> Result<u64, ApiError> {
+    let extended = matches!(name, "GetDiskFreeSpaceExA" | "GetDiskFreeSpaceExW");
+    let requested = process::process_string(&mut image.memory, args[0], name.ends_with('W'))?;
+    let directory = if extended {
+        directory::path(image, requested.as_deref().unwrap_or(""))?
+    } else if let Some(root) = requested.as_deref().filter(|root| *root != "\\") {
+        match root.as_bytes() {
+            [drive, b':', b'\\' | b'/'] if drive.is_ascii_alphabetic() => root.replace('/', "\\"),
+            _ => return Err(123u32.into()),
+        }
+    } else {
+        let cwd = directory::path(image, "")?;
+        cwd.get(..3).filter(|root| root.as_bytes().get(1..) == Some(b":\\"))
+            .ok_or(15u32)?.into()
+    };
+    let width = if extended { 8 } else { 4 };
+    let outputs = &args[1..if extended { 4 } else { 5 }];
+    if outputs.iter().any(|&out| !(extended && out == 0) && !image.memory.probe_write(out, width)) {
+        return Err(NOACCESS.into());
+    }
+    let abi = if image.thread.context.mode == DecodeMode::X86 { GuestAbi::X86_32 } else { GuestAbi::X86_64 };
+    let allocation = services.volume_allocation(abi, &directory).map_err(|status| match status {
+        0xc000_0034 => 15,
+        other => status_error(other),
+    })?;
+    let values = if extended {
+        let cluster = u64::from(allocation.bytes_per_sector) * u64::from(allocation.sectors_per_cluster);
+        let free = allocation.free_clusters.checked_mul(cluster).ok_or(534u32)?;
+        [free, allocation.total_clusters.checked_mul(cluster).ok_or(534u32)?, free, 0]
+    } else {
+        let total = u32::try_from(allocation.total_clusters).map_err(|_| 534u32)?;
+        let free = u32::try_from(allocation.free_clusters).map_err(|_| 534u32)?;
+        [allocation.sectors_per_cluster.into(), allocation.bytes_per_sector.into(), free.into(), total.into()]
+    };
+    for (&out, value) in outputs.iter().zip(values) {
+        if out != 0 { put(&mut image.memory, out, value, width)?; }
+    }
+    Ok(1)
 }
 const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 fn encode64(b: &[u8]) -> String {

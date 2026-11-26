@@ -228,6 +228,12 @@ pub const APIS: &[Api] = &[
     Api { id: 4154, dll: "kernel32.dll", name: "CreateSemaphoreA", arguments: 4, x86_arguments: 4, cdecl: false },
     Api { id: 4155, dll: "kernel32.dll", name: "CreateSemaphoreW", arguments: 4, x86_arguments: 4, cdecl: false },
     Api { id: 4156, dll: "kernel32.dll", name: "ReleaseSemaphore", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4157, dll: "kernel32.dll", name: "DeleteFileA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4158, dll: "kernel32.dll", name: "MoveFileA", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4159, dll: "kernel32.dll", name: "GetOverlappedResult", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 4160, dll: "kernel32.dll", name: "OpenSemaphoreA", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4161, dll: "kernel32.dll", name: "OpenSemaphoreW", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4162, dll: "kernel32.dll", name: "RemoveDirectoryA", arguments: 1, x86_arguments: 1, cdecl: false },
     // Process/thread token gateway used by the SP1 Kernel32 API-set
     // processthreads contract. These entries define ABI only: token handling
     // remains explicitly unsupported until a guest-owned token backend exists.
@@ -4572,6 +4578,16 @@ pub const APIS: &[Api] = &[
     Api { id: 3480, dll: "kernel32.dll", name: "LocalUnlock", arguments: 1, x86_arguments: 1, cdecl: false },
     Api { id: 3481, dll: "kernel32.dll", name: "SetThreadPreferredUILanguages", arguments: 3, x86_arguments: 3, cdecl: false },
     Api { id: 3482, dll: "kernel32.dll", name: "GetThreadUILanguage", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 3483, dll: "kernel32.dll", name: "CreateProcessA", arguments: 10, x86_arguments: 10, cdecl: false },
+    Api { id: 3484, dll: "kernel32.dll", name: "FlushViewOfFile", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 3485, dll: "kernel32.dll", name: "MapViewOfFileEx", arguments: 6, x86_arguments: 6, cdecl: false },
+    Api { id: 3486, dll: "kernel32.dll", name: "GetDiskFreeSpaceA", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 3487, dll: "kernel32.dll", name: "GetDiskFreeSpaceExA", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 3488, dll: "kernel32.dll", name: "GetFileAttributesExA", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3489, dll: "kernel32.dll", name: "GetFullPathNameA", arguments: 4, x86_arguments: 4, cdecl: false },
+    Api { id: 3490, dll: "kernel32.dll", name: "HeapCreate", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 3491, dll: "kernel32.dll", name: "LockFile", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 3492, dll: "kernel32.dll", name: "UnlockFile", arguments: 5, x86_arguments: 5, cdecl: false },
 ];
 
 pub fn resolve(id: u32) -> Option<&'static Api> {
@@ -4612,8 +4628,25 @@ pub const RUNTIME_LIMITATIONS: &str = "Limited implementations operate in one is
 /// and subsequently added catalog entries default to unsupported.
 pub fn support(dll: &str, name: &str) -> RuntimeSupport {
     use SupportStatus::{HostService as H, ImplementedLimited as L, Unsupported as U};
-    let (status, scope) = if find(dll, name).is_none() {
+    let (status, scope) = if dll.eq_ignore_ascii_case("msvcrt.dll")
+        && MSVCRT_DATA_EXPORTS.iter().any(|(symbol, _)| name == *symbol) {
+        (L, "Process-private writable CRT data; not a callable gateway")
+    } else if find(dll, name).is_none() {
         (U, "No catalog entry or runtime implementation")
+    } else if dll.eq_ignore_ascii_case("msvcrt.dll") {
+        match name {
+            "__getmainargs" => (L, "Builds process-owned ANSI argv and environment from the guest command line; no wildcard expansion or full code-page translation"),
+            "_initterm" => (L, "Calls a bounded range of non-null guest initializers, in order"),
+            "__p__fmode" | "__p__commode" => (L, "Pointers to process-private data in the generated CRT image"),
+            "_wtol" => (L, "Decimal conversion of a checked UTF-16 string using ASCII digits and whitespace only"),
+            "iswctype" => (L, "Western CTYPE1 classification with the caller's mask"),
+            "_ismbblead" => (L, "No lead bytes in the fixed single-byte CRT profile; no DBCS code pages"),
+            "_controlfp" => (L, "Reads and updates modeled x87 control bits; no SSE control-word synchronization"),
+            "exit" | "_exit" | "_amsg_exit" => (L, "Terminates the guest with an exit status; no CRT stream flushing or termination callbacks"),
+            "__set_app_type" | "__setusermatherr" => (U, "Compatibility fallback records state but does not change application behavior or dispatch math-error callbacks"),
+            "_cexit" => (U, "Compatibility no-op; CRT stream cleanup and termination callbacks are not implemented"),
+            _ => (U, "No CRT runtime implementation"),
+        }
     } else if dll.eq_ignore_ascii_case("ws2_32.dll") {
         match name {
             "WSAStartup" | "WSACleanup" => (L, "SP1 WSADATA layouts, process-local startup count and endpoint cleanup on the final call; provider catalog unavailable"),
@@ -4623,8 +4656,18 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "getaddrinfo" | "freeaddrinfo" => (H, "Guest-width IPv4 result lists with checked lifetime, numeric services and a single IPv4 answer from the guest DNS stack"),
             "WSAGetLastError" | "WSASetLastError" | "htons" | "ntohs" | "htonl" | "ntohl" | "__WSAFDIsSet" =>
                 (L, "Win32 thread last-error slot, byte order conversion and bounded guest-width fd_set membership"),
+            "WSCEnumProtocols" | "WSCGetProviderInfo" | "WSCGetProviderPath" =>
+                (U, "Provider catalog unavailable; returns SOCKET_ERROR and reports the failure through lpErrno"),
             _ => (U, "No Winsock runtime implementation"),
         }
+    } else if dll.eq_ignore_ascii_case("version.dll") {
+        match name {
+            "GetFileVersionInfoSizeExW" | "GetFileVersionInfoExW" => (H, "Reads version resources from a guest PE via GuestServices; no version-resource merging"),
+            "VerQueryValueW" => (L, "Bounded version-resource entry lookup over caller-owned data; checked guest-size outputs"),
+            _ => (U, "No version runtime implementation"),
+        }
+    } else if dll.eq_ignore_ascii_case("winspool.drv") {
+        (U, "Printer backend unavailable; declared entries return errors without opening a printer or returning driver data")
     } else if dll.eq_ignore_ascii_case("shell32.dll") {
         (H, "Current-user RoamingAppData, LocalAppData and Profile paths from the provisioned environment; default flags verify through mounted-volume directories, DONT_VERIFY supported; other tokens, flags and registry folder redirection unsupported")
     } else if dll.eq_ignore_ascii_case("ole32.dll") {
@@ -4653,6 +4696,7 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "RtlAllocateHeap" | "RtlReAllocateHeap" | "RtlFreeHeap" => (L, "Checked process-owned heap allocation/reallocation/free shared with Kernel32; copies old data, zeroes requested growth, preserves Win32 LastError; exception/in-place-only flags unsupported"),
             "RtlSizeHeap" => (L, "Size of an exact owned process-heap block; pointer-width failure sentinel and Win32 LastError preserved; HEAP_NO_SERIALIZE accepted, unsupported flags stop explicitly"),
             "RtlQueryPerformanceCounter" => (H, "Performance counter copied from GuestServices with checked guest output; backend failures remain explicit"),
+            "WinSqmAddToStream" | "WinSqmIncrementDWORD" => (U, "Compatibility no-op; no SQM data is recorded"),
             "memchr" | "strstr" | "wcsstr" | "strpbrk" | "wcspbrk"
             | "strspn" | "wcsspn" | "strcspn" | "wcscspn" =>
                 (L, "Checked raw-byte/UTF-16 search and set spans; linear scans with a 1 MiB input bound, no locale or LastError mutation; invalid memory faults, unsupported sizes stop explicitly"),
@@ -4700,6 +4744,7 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "DllGetVersion" | "InitMUILanguage" | "GetMUILanguage" | "ImageList_Create" | "ImageList_Destroy" | "ImageList_GetImageCount" | "ImageList_GetIconSize" | "ImageList_SetIconSize" | "ImageList_SetImageCount" | "ImageList_Remove" => (L, "Checked metadata and bounded process-private image-list storage; no GDI bitmap ingestion or icon rendering"),
             "InitCommonControls" | "InitCommonControlsEx" => (L, "Registers process-private list, tree and toolbar classes for the desktop HWND transport"),
             "CreateStatusWindowW" => (H, "Creates a single-pane text status control through the desktop window transport"),
+            "TaskDialogIndirect" => (U, "Returns E_NOTIMPL; no task dialog backend"),
             _ => (U, "No runtime handler; dispatch stops with UnsupportedApi"),
         }
     } else if dll.eq_ignore_ascii_case("user32.dll") {
@@ -4739,6 +4784,9 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "GetWindowPlacement" | "SetWindowPlacement" => (H, "Query or update owned top-level windows and their normal desktop geometry"),
             "CharUpperW" => (L, "Uppercase a UTF-16 unit or writable string using the installed NLS repertoire"),
             "WinHelpW" => (U, "Legacy Help viewer unavailable; return FALSE with ERROR_CALL_NOT_IMPLEMENTED"),
+            "SetWinEventHook" | "UnhookWinEvent" => (U, "WinEvent hooks unavailable; returns an explicit failure"),
+            "MessageBoxW" => (U, "Message box UI unavailable; returns zero with ERROR_CALL_NOT_IMPLEMENTED"),
+            "IsDialogMessageW" => (U, "Rejects messages aimed at an owned dialog because dialog preprocessing is not implemented; other targets are not consumed"),
             _ if (3700..=3729).contains(&find(dll,name).unwrap().id) => (H,"Process-owned HWNDs, direct child controls and copied desktop messages; bounded queues and x86/x64 guest window procedures; unsupported messages fail explicitly"),
             _ => (U,"No runtime handler"),
         }
@@ -4777,6 +4825,8 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
                 (U, "Explicit E_NOTIMPL HRESULT preserving LastError; no WER service, callback host or registration is implemented"),
             "CreateDirectoryA" | "CreateDirectoryW" =>
                 (H, "Creates one directory through the mounted-volume backend with WoW64 path redirection and preserved NTSTATUS errors; null security attributes only; ordinary drive-absolute or current-directory-relative paths; no UNC, drive-relative paths, dot components, trailing-dot/space normalization or explicit ACLs"),
+            "RemoveDirectoryA" | "RemoveDirectoryW" =>
+                (H, "Removes one empty ordinary directory on mounted NTFS with WoW64 path redirection; does not support reparse points, delete-pending handles, or UNC and drive-relative paths"),
             "FindFirstFileA" | "FindFirstFileW" | "FindFirstFileExW" | "FindNextFileA" | "FindNextFileW" | "FindClose" =>
                 (H, "Process-owned snapshot cursors over mounted NTFS metadata with WoW64 view selection; literal and star patterns including *.*; Western case mapping only; no short-name/reparse capture; Ex supports basic info and directory filtering only"),
             "GetFileAttributesA" | "GetFileAttributesW" | "SetFileAttributesW" =>
@@ -4813,17 +4863,32 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "FindNLSString" => (L, "Bounded invariant and en-US search for ASCII letters, digits and spaces, with direction and case options; general locale collation unsupported"),
             "FoldStringW" => (L, "Windows 7 SP1 digit folding for UTF-16, including supplementary code points; other folding modes unsupported"),
             "InitializeConditionVariable" | "WakeConditionVariable" | "WakeAllConditionVariable" => (L, "Pointer-sized condition initialization and empty wait queues only; nonempty queues and guest wait scheduling remain unsupported"),
-            "CreateFileA" | "CreateFileW" => (H, "Synchronous mounted-volume open and NTFS creation or truncation via GuestServices; default security and basic flags"),
+            "CreateFileA" | "CreateFileW" => (H, "Mounted-volume open and NTFS creation or truncation; overlapped regular-file handles support inline positional completion only"),
+            "DeleteFileA" | "DeleteFileW" => (H, "Unlinks a closed, writable regular file on mounted NTFS; deletion while open and reparse points are unsupported"),
+            "MoveFileA" | "MoveFileW" => (H, "Renames a closed regular file within its NTFS directory without replacing another file; cross-directory moves and reparse points are unsupported"),
             "SetFileTime" => (H, "Updates NTFS creation, access and write times on owned handles with FILE_WRITE_ATTRIBUTES; omitted and zero values preserve timestamps"),
             "GetFileSizeEx" | "SetFilePointer" | "SetFilePointerEx" => (H, "64-bit size and cursor for synchronous owned disk handles via GuestServices"),
-            "ReadFile" => (H, "Synchronous disk reads stream through bounded 64 KiB backend requests; OVERLAPPED rejected"),
-            "WriteFile" => (H, "Synchronous GuestServices writes up to 64 KiB; OVERLAPPED rejected"),
-            "CancelIo" => (L, "Checks ownership of a synchronous mounted-volume handle, which cannot have pending overlapped requests"),
+            "ReadFile" => (H, "Regular disk reads stream in bounded 64 KiB requests; OVERLAPPED offsets and unnamed event completion are inline"),
+            "WriteFile" => (H, "Disk writes up to 64 KiB; OVERLAPPED offsets and unnamed event completion are inline"),
+            "GetOverlappedResult" => (H, "Reports actual inline regular-file status and byte count; queued requests and waiting for pending I/O are unsupported"),
+            "CreateFileMappingA" | "CreateFileMappingW" | "MapViewOfFile" | "MapViewOfFileEx"
+            | "FlushViewOfFile" | "UnmapViewOfFile" => (H, "Bounded unnamed non-executable guest views with checked file rights, private copy-on-write and dirty-page NTFS writeback; no growth, shared aliases, or device-cache flush"),
+            "FlushFileBuffers" => (H, "Checks for a writable disk handle and persists the mounted NTFS mirror to its boot disk; does not flush dirty mapped views"),
+            "LockFile" | "UnlockFile" => (H, "Nonblocking exclusive byte ranges shared across BTL NTFS opens; exact unlock and close cleanup; mapped views are exempt"),
+            "GetDiskFreeSpaceA" | "GetDiskFreeSpaceW" | "GetDiskFreeSpaceExA" | "GetDiskFreeSpaceExW" =>
+                (H, "Mounted NTFS C: allocation geometry and live $Bitmap counts; no quotas, UNC paths, or other volumes"),
+            "GetFileAttributesExA" | "GetFileAttributesExW" =>
+                (H, "GetFileExInfoStandard with mounted NTFS attributes, timestamps and sizes; reparse points unsupported"),
+            "GetFullPathNameA" | "GetFullPathNameW" =>
+                (L, "Resolves ordinary drive and relative DOS paths against the guest process current directory without querying the volume; UNC, device paths, alternate streams and other-drive current directories are unsupported"),
+            "CancelIo" => (L, "Checks ownership of a mounted-volume handle; inline disk I/O cannot have pending requests"),
             "CreateMutexA" | "CreateMutexW" | "ReleaseMutex" => (L, "Unnamed guest-owned mutexes with recursive ownership, cooperative waits and abandonment on guest thread exit; custom security and named mutexes are unsupported"),
-            "CreateSemaphoreA" | "CreateSemaphoreW" | "ReleaseSemaphore" => (L, "Unnamed guest-owned counting semaphores with cooperative waits and bounded release; custom security and named semaphores are unsupported"),
+            "CreateSemaphoreA" | "CreateSemaphoreW" | "OpenSemaphoreA" | "OpenSemaphoreW" | "ReleaseSemaphore" => (L, "Process-private named and unnamed counting semaphores; shared counts, checked handle rights and cooperative waits; no session namespace, custom security or inheritance"),
             "CreateEventW" | "SetEvent" | "ResetEvent" | "WaitForSingleObject" | "WaitForSingleObjectEx" => (H, "Owned unnamed non-inheritable kernel events with manual/auto-reset signal state, checked handle translation and NT timeout conversion; guest thread joins poll cooperatively and alertable waits dispatch queued guest APCs"),
-            "WaitForMultipleObjects" | "WaitForMultipleObjectsEx" => (H, "Wait-any index and atomic wait-all across owned events and guest threads; cooperative parking and guest APCs; other dispatcher object types require backend support"),
+            "WaitForMultipleObjects" | "WaitForMultipleObjectsEx" => (H, "Wait-any and atomic wait-all across owned events, threads and process-private synchronization objects; wait-all rejects aliases of the same local object"),
             "CloseHandle" => (H, "Process-owned thread handles and GuestServices Close operation for owned file/event handles with NTSTATUS-to-Win32 error translation; remaining events closed when the service context exits"),
+            "CreateProcessA" | "CreateProcessW" => (H, "Starts a separate translated image through the system-volume backend; default startup and environment only; no handle inheritance or suspended creation"),
+            "GetProcessId" | "GetExitCodeProcess" => (H, "Identity and completion status for an owned translated child process handle"),
             "DuplicateHandle" => (L, "Same-process thread handles and current-thread pseudo-handle only; independent handle lifetime and restricted access, SAME_ACCESS and CLOSE_SOURCE options; rights escalation, generic mapping, cross-process and file/event duplication remain unsupported"),
             "SetHandleInformation" => (L, "Owned guest thread handles only; inheritance and protect-from-close flags; other object types unsupported"),
             "GetHandleInformation" => (H, "Reads flags of a live guest thread or file handle; result is a DWORD in either guest ABI"),
@@ -4838,7 +4903,7 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "InterlockedExchange" | "InterlockedCompareExchange" | "InterlockedExchangeAdd"
             | "InterlockedIncrement" | "InterlockedDecrement" => (L, "SP1 I386 exports for serialized 32-bit atomic updates in process-owned guest memory"),
             "GetCurrentProcess" | "GetCurrentThread" => (L, "Guest-bitness pseudo-handle only"),
-            "GetCurrentProcessId" => (L, "Single isolated process identity fixed at 1"),
+            "GetCurrentProcessId" => (L, "Identity of the current translated process"),
             "GetPriorityClass" | "SetPriorityClass" => (L, "Current process pseudo-handle, class-relative guest thread scheduling and unprivileged real-time fallback to high. Cross-process and background mode scheduling unavailable."),
             "QueueUserAPC" => (L, "Process-owned target threads with THREAD_SET_CONTEXT access, FIFO callback delivery on alertable waits and before a new guest thread enters its start routine"),
             "OpenThread" => (L, "Thread ID lookup within the guest process, explicit thread access mask and independent handle lifetime and inheritance flag"),
@@ -4852,7 +4917,7 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "GetVersionExA" | "GetVersionExW" => (L, "Checked OSVERSIONINFO/EX sizes and Win7 SP1 workstation compatibility identity, matching GetVersion and the PEB"),
             "VerifyVersionInfoW" => (L, "Win7 SP1 workstation version hierarchy and independent build/platform/product/suite conditions; checked guest fields, exact BOOL and LastError results, no manifest-based version override"),
             "GetNativeSystemInfo" => (H, "Guest-width SYSTEM_INFO populated from a distinct native processor backend and real processor mask; process virtual address bounds are retained; unavailable backend stops explicitly"),
-            "GetProcessHeap" => (L, "One private guest heap handle"),
+            "GetProcessHeap" | "GetProcessHeaps" => (L, "Default heap handle and guest-width enumeration of all live private heaps"),
             "GetStdHandle" => (L, "Known guest standard input/output/error handles only"),
             "GetCommandLineA" | "GetCommandLineW" => (L, "Reads current guest process parameters; ANSI result requires ASCII"),
             "GetEnvironmentStringsW" | "FreeEnvironmentStringsW" => (L, "Owned UTF-16 snapshots of the current guest process environment, bounded to 1 MiB; exact pointer ownership on release; no host environment or mutation APIs"),
@@ -4863,7 +4928,7 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "AcquireSRWLockExclusive" | "AcquireSRWLockShared" | "ReleaseSRWLockExclusive" | "ReleaseSRWLockShared"
             | "TryAcquireSRWLockExclusive" | "TryAcquireSRWLockShared" =>
                 (L, "Guest-width Win7 uncontended exclusive/shared SRW state and nonblocking TryAcquire; contended same-process acquisition yields to the guest scheduler; foreign wait queues and invalid releases stop explicitly"),
-            "InitializeSListHead" => (L, "Aligned x86 8-byte or x64 16-byte empty Win7 SLIST_HEADER initialization only; concurrent push/pop/flush remain unsupported"),
+            "InitializeSListHead" | "InterlockedFlushSList" => (L, "Aligned Win7 x86 and x64 SLIST_HEADER initialization and flush in exclusive, process-owned guest memory; push/pop APIs and shared-memory concurrency remain unsupported"),
             "GetModuleHandleA" | "GetModuleHandleW" => (L, "Current executable or already mapped guest module identity only"),
             "GetModuleHandleExW" => (L, "Checked guest-width output and loader-owned module range/name lookup; optional reference acquisition or process-lifetime pin; unchanged-reference flag preserves borrowed ownership"),
             "DisableThreadLibraryCalls" => (L, "Records thread notification policy on validated guest modules, rejects active static TLS and invalid handles; policy applied to subsequent thread attach/detach notifications"),
@@ -4873,7 +4938,9 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             "FlushInstructionCache" => (L, "Current-process guest decoded-code cache invalidation on all guest threads; SP1 empty non-null range bypass and LastError behavior; no cross-process cache backend"),
             "GlobalAlloc" | "GlobalFree" | "GlobalLock" | "GlobalUnlock" => (L,"Process-private stable heap-backed global handles with checked ownership"),
             "LocalAlloc" | "LocalReAlloc" | "LocalFree" | "LocalSize" | "LocalLock" | "LocalUnlock" => (L, "Fixed private-heap local memory with resizing, size queries and fixed-block locking semantics; movable handles unsupported"),
-            "HeapAlloc" | "HeapReAlloc" | "HeapFree" | "HeapSize" => (L, "Private guest heap allocations with checked ownership and restricted flags"),
+            "HeapCreate" | "HeapDestroy" => (L, "Creates growable non-executable guest heaps and unmaps their owned blocks on destruction; fixed-size heaps unsupported"),
+            "HeapSetInformation" => (L, "Enables the guest's process-wide termination policy on detected heap corruption; other information classes unsupported"),
+            "HeapAlloc" | "HeapReAlloc" | "HeapFree" | "HeapSize" => (L, "Guest heap allocations with exact block ownership and restricted flags"),
             "TlsAlloc" | "TlsFree" | "TlsSetValue" | "TlsGetValue" => (L, "Process-wide allocation of up to 1088 slots with per-thread values; direct TEB dynamic TLS slot access remains unsupported"),
             "EncodePointer" | "DecodePointer" => (L, "Identity mapping; no pointer obfuscation"),
             "lstrlenA" | "lstrlenW" | "lstrcmpA" | "lstrcmpW" | "lstrcmpiA" | "lstrcmpiW" => (L, "Bounded checked strings; ordinal or ASCII case-insensitive comparison rather than locale collation"),
