@@ -9,7 +9,9 @@ use core::fmt;
 
 const MAX_MODULES: usize = 128;
 const MAX_DEPTH: usize = 64;
-const MAX_RELOCATIONS: usize = 1_048_576;
+type RelocationFixup = (u32, Relocation);
+const MAX_RELOCATION_METADATA: usize = 16 * 1024 * 1024;
+const MAX_RELOCATIONS: usize = MAX_RELOCATION_METADATA / core::mem::size_of::<RelocationFixup>();
 const MAX_SYMBOLS: usize = 16_384;
 
 /// The resolver chooses a guest filesystem view, never a host DLL loader.
@@ -436,7 +438,7 @@ impl MappedImage {
         // Validate the entire directory and targets before applying any fixup.
         let directory = self.data(rva as usize, size as usize)?;
         let mut cursor = 0;
-        let mut fixups = Vec::new();
+        let mut fixups: Vec<RelocationFixup> = Vec::new();
         while cursor < directory.len() {
             let block = directory.get(cursor..).ok_or(bad)?;
             let page = u32_at(block, 0)? as usize;
@@ -462,16 +464,17 @@ impl MappedImage {
                     return Err(LoadError::ImageTooLarge);
                 }
                 fixups.try_reserve(1).map_err(|_| LoadError::OutOfMemory)?;
-                fixups.push((target, relocation));
+                fixups.push((u32::try_from(target).map_err(|_| bad)?, relocation));
             }
             cursor += length;
         }
         fixups.sort_unstable_by_key(|(target, _)| *target);
-        if fixups.windows(2).any(|pair| pair[0].0 + pair[0].1.width() > pair[1].0) {
+        if fixups.windows(2).any(|pair| pair[0].0 as usize + pair[0].1.width() > pair[1].0 as usize) {
             return Err(bad);
         }
         let delta = base.wrapping_sub(self.region.base);
         for (offset, relocation) in fixups {
+            let offset = offset as usize;
             let width = relocation.width();
             let target = &mut self.region.bytes[offset..offset + width];
             let mut original = [0; 8];
@@ -853,6 +856,35 @@ mod tests {
         assert_eq!(canonical_module("WINSPOOL.DRV").unwrap(), "winspool.drv");
         assert_eq!(canonical_module("KERNEL32").unwrap(), "kernel32.dll");
         assert!(canonical_module("..\\winspool.drv").is_err());
+    }
+
+    #[test]
+    fn dense_pe32_image_rebases_more_than_a_million_targets_within_metadata_budget() {
+        const TARGET_PAGES: usize = 1792;
+        const PAGE_SIZE: usize = 4096;
+        const FIXUPS_PER_PAGE: usize = PAGE_SIZE / 4;
+        const BLOCK_SIZE: usize = 8 + FIXUPS_PER_PAGE * 2;
+
+        let directory = TARGET_PAGES * PAGE_SIZE;
+        let directory_size = TARGET_PAGES * BLOCK_SIZE;
+        let mut region = Region::new(0x1000_0000, directory + directory_size, READ | super::super::WRITE).unwrap();
+        region.bytes[..directory].chunks_exact_mut(4)
+            .for_each(|target| target.copy_from_slice(&0x1000_abcd_u32.to_le_bytes()));
+        for (page, block) in region.bytes[directory..].chunks_exact_mut(BLOCK_SIZE).enumerate() {
+            block[..4].copy_from_slice(&((page * PAGE_SIZE) as u32).to_le_bytes());
+            block[4..8].copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+            for (index, entry) in block[8..].chunks_exact_mut(2).enumerate() {
+                entry.copy_from_slice(&(0x3000 | (index * 4) as u16).to_le_bytes());
+            }
+        }
+        let mut image = MappedImage {
+            region, mode: DecodeMode::X86, entry: 0, characteristics: 0, directories: [(0, 0); 16],
+        };
+        image.directories[5] = (directory as u32, directory_size as u32);
+        image.rebase(0x4000_0000, 0x8000_0000).unwrap();
+        assert_eq!(image.region.base, 0x4000_0000);
+        assert!(image.region.bytes[..directory].chunks_exact(4)
+            .all(|target| target == 0x4000_abcd_u32.to_le_bytes()));
     }
 
     #[test]
