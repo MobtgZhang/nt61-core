@@ -1503,8 +1503,8 @@ pub fn vcn_to_lcn(runs: &[(u64, u64)], vcn: u64) -> Option<u64> {
 ///
 /// Locates `attr_type` on `record_num`, parses its run list and reads
 /// `min(stream_size, max_len)` bytes through the mounted volume. Used
-/// for system streams such as `$Secure:$SDS` and the `$LogFile`
-/// restart pages. Returns `None` when the attribute is missing,
+/// for system streams such as the `$LogFile` restart pages. Returns
+/// `None` when the attribute is missing,
 /// resident (a non-resident stream is required), truncated, or
 /// unreadable.
 pub fn read_nonresident_stream(
@@ -1514,61 +1514,29 @@ pub fn read_nonresident_stream(
     max_len: usize,
 ) -> Option<alloc::vec::Vec<u8>> {
     let record = read_mft_record(ntfs, record_num)?;
-    let attr_offset = find_attribute_in_record(&record, attr_type)?;
-    if attr_offset + 0x40 > record.len() {
+    let attr = parse_attribute(&record, attr_type)?;
+    let offset = find_attribute_in_record(&record, attr_type)?;
+    if record.get(offset + 8) != Some(&1) {
         return None;
     }
-    if record[attr_offset + 8] == 0 {
-        return None;
-    }
-    let data_runs_offset =
-        u16::from_le_bytes([record[attr_offset + 0x20], record[attr_offset + 0x21]]) as usize;
-    if data_runs_offset == 0 || attr_offset + data_runs_offset > record.len() {
-        return None;
-    }
-    let run_list = &record[attr_offset + data_runs_offset..];
-    let mut runs = [(0u64, 0u64); 64];
-    let num_runs = parse_run_list(run_list, &mut runs);
-    if num_runs == 0 {
-        return None;
-    }
-    let mut size_bytes = [0u8; 8];
-    size_bytes.copy_from_slice(&record[attr_offset + 0x30..attr_offset + 0x38]);
-    let stream_size = u64::from_le_bytes(size_bytes);
+    read_nonresident_attribute(ntfs, attr, max_len)
+}
 
-    let cluster_size = ntfs.cluster_size as usize;
-    if cluster_size == 0 || !cluster_size.is_multiple_of(512) {
-        return None;
-    }
-    let read_limit = core::cmp::min(stream_size, max_len as u64) as usize;
+fn read_nonresident_attribute(ntfs: &NtfsData, attr: &[u8], max_len: usize) -> Option<Vec<u8>> {
+    let stream_size = u64::from_le_bytes(attr.get(48..56)?.try_into().ok()?);
+    let initialized = u64::from_le_bytes(attr.get(56..64)?.try_into().ok()?);
+    let read_limit = stream_size.min(initialized).min(max_len as u64) as usize;
     if read_limit == 0 {
         return None;
     }
     let mut out = alloc::vec![0u8; read_limit];
-    let mut filled = 0usize;
-    let sectors_per_cluster = cluster_size / 512;
-    'outer: for &(start_cluster, length) in runs[..num_runs].iter() {
-        for cluster_in_run in 0..length {
-            let first_sector = ntfs.hidden_sectors
-                + cluster_to_sector(start_cluster + cluster_in_run, ntfs.cluster_size);
-            for sector_index in 0..sectors_per_cluster {
-                if filled >= read_limit {
-                    break 'outer;
-                }
-                let mut sector_buf = [0u8; 512];
-                if !read_mounted_sector(ntfs, first_sector + sector_index as u64, &mut sector_buf) {
-                    return None;
-                }
-                let copy_len = core::cmp::min(512, read_limit - filled);
-                out[filled..filled + copy_len].copy_from_slice(&sector_buf[..copy_len]);
-                filled += copy_len;
-            }
-        }
-    }
-    if filled < read_limit {
-        return None;
-    }
+    read_nonresident_range(ntfs, attr, 0, &mut out)?;
     Some(out)
+}
+
+fn read_nonresident_range(ntfs: &NtfsData, attr: &[u8], offset: u64, out: &mut [u8]) -> Option<()> {
+    nonresident_stream::read(attr, u64::from(ntfs.cluster_size), ntfs.hidden_sectors, offset, out,
+        |sector, buffer| read_mounted_sector(ntfs, sector, buffer))
 }
 
 /// Convert a cluster number to a sector number.
@@ -3927,14 +3895,10 @@ pub fn create_directory(ntfs: &NtfsFileSystem, path: &[u16]) -> Result<NtfsHandl
 
 /// Build a $STANDARD_INFORMATION resident value.
 fn build_standard_information_value() -> Vec<u8> {
-    let mut value = alloc::vec![0u8; STANDARD_INFORMATION_VALUE_SIZE];
-    value[52..56].copy_from_slice(&security::DEFAULT_SECURITY_ID.to_le_bytes());
-    value
+    standard_security::new_value(security::DEFAULT_SECURITY_ID).to_vec()
 }
 
-/// Size of the on-disk `$STANDARD_INFORMATION` value (Windows NT 6.1,
-/// version 1.0 layout: four 8-byte timestamps, flags, version, class id).
-const STANDARD_INFORMATION_VALUE_SIZE: usize = 72;
+mod standard_security;
 
 /// Physical sector size of an NTFS volume (Windows NT 6.1 standard layout).
 const SECTOR_SIZE: usize = 512;
@@ -4051,6 +4015,14 @@ pub fn file_attributes(ntfs: &NtfsFileSystem, number: u64) -> Result<u32, NTSTAT
     let record = read_mft_record(&ntfs.ntfs_data, number).ok_or(STATUS_UNSUCCESSFUL)?;
     let offset = file_attribute_offset(&record)?;
     Ok(u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap()))
+}
+
+pub(super) fn file_basic_information(ntfs: &NtfsFileSystem, number: u64) -> Result<(u32, [u64; 3]), NTSTATUS> {
+    let record = read_mft_record(&ntfs.ntfs_data, number).ok_or(STATUS_UNSUCCESSFUL)?;
+    let value = parse_attribute(&record, AttributeHeader::TYPE_STANDARD_INFO)
+        .and_then(|standard| standard.get(..36)).ok_or(STATUS_UNSUCCESSFUL)?;
+    let time = |offset| u64::from_le_bytes(value[offset..offset + 8].try_into().unwrap());
+    Ok((u32::from_le_bytes(value[32..36].try_into().unwrap()), [time(0), time(24), time(8)]))
 }
 
 pub fn set_file_attributes(ntfs: &NtfsFileSystem, number: u64, mask: u32, attributes: u32) -> Result<(), NTSTATUS> {
@@ -4433,6 +4405,14 @@ pub fn query_space_bytes(ntfs: &NtfsFileSystem) -> Option<(u64, u64)> {
     if clusters == 0 || size == 0 { return None; }
     let free = count_free_clusters_checked(ntfs, clusters)?;
     Some((clusters.checked_mul(size)?, free.checked_mul(size)?))
+}
+
+pub(super) fn query_allocation_units(ntfs: &NtfsFileSystem) -> Option<(u32, u32, u64, u64)> {
+    let sector = ntfs.base.sector_size;
+    let cluster = ntfs.ntfs_data.cluster_size;
+    if sector == 0 || !cluster.is_multiple_of(sector) { return None; }
+    let (total_bytes, free_bytes) = query_space_bytes(ntfs)?;
+    Some((sector, cluster / sector, total_bytes / u64::from(cluster), free_bytes / u64::from(cluster)))
 }
 
 fn count_free_clusters(ntfs: &NtfsFileSystem, total_clusters: u64) -> u64 {
@@ -5499,6 +5479,7 @@ pub mod reparse_tags {
 }
 
 /// Security descriptor support.
+mod nonresident_stream;
 pub mod security;
 
 /// Check if an MFT record has a reparse point.

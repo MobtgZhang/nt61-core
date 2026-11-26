@@ -16,7 +16,7 @@
 use super::file::{alloc_handle, lookup_handle, HandleKind};
 use super::status::{
     STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_HANDLE,
-    STATUS_INVALID_PARAMETER, STATUS_NO_TOKEN, STATUS_SUCCESS,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, STATUS_NO_TOKEN, STATUS_SUCCESS,
 };
 use super::types::{HANDLE, NTSTATUS};
 use core::ptr;
@@ -342,7 +342,7 @@ pub fn nt_set_security_object_kernel(
 
     let _ = security_information;
 
-    STATUS_SUCCESS
+    STATUS_NOT_SUPPORTED
 }
 
 /// # Safety

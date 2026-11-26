@@ -643,141 +643,192 @@ pub fn check_file_access(security_id: SecurityId, desired_access: u32) -> bool {
     check_access(sd, &caller_sid, desired_access)
 }
 
-/// read security descriptor from the $Secure system file.
-///
-/// This function would read and parse the $SDS stream to extract
-/// a security descriptor given its ID.
-///
-/// In a full implementation, this would:
-/// 1. read the $SII index to find the security ID
-/// 2. Use that offset to read the full descriptor from $SDS
-/// 3. Parse and return the NtfsSecurityDescriptor
-///
-/// # Arguments
-/// * `ntfs` - NTFS filesystem data
-/// * `security_id` - Security ID to read
-///
-/// # Returns
-/// * Security descriptor if found
+/// Read and parse a descriptor from the volume's `$Secure` file.
 pub fn read_security_descriptor(
     ntfs: &crate::fs::ntfs::NtfsData,
     security_id: SecurityId,
 ) -> Option<NtfsSecurityDescriptor> {
-    // Read the $Secure record and locate its (non-resident) $DATA
-    // attribute, which is the $SDS stream.
+    parse_sds_descriptor(security_id, &read_descriptor_bytes(ntfs, security_id)?)
+}
+
+fn read_descriptor_bytes(
+    ntfs: &super::NtfsData,
+    security_id: SecurityId,
+) -> Option<alloc::vec::Vec<u8>> {
     let record = super::read_mft_record(ntfs, super::system_records::SECURE)?;
     if let Some((_, _, data)) = secure_stream::stream(&record) {
-        return parse_sds_descriptor(security_id, secure_stream::descriptor(data, security_id)?);
+        return Some(secure_stream::descriptor(data, security_id)?.to_vec());
     }
-    let attr_offset = super::find_attribute_in_record(&record, super::AttributeHeader::TYPE_DATA)?;
-    if attr_offset + 0x40 > record.len() {
-        return None;
-    }
-    if record[attr_offset + 8] == 0 {
-        // $SDS is always non-resident on a real volume.
-        return None;
-    }
-    let data_runs_offset =
-        u16::from_le_bytes([record[attr_offset + 0x20], record[attr_offset + 0x21]]) as usize;
-    if data_runs_offset == 0 || attr_offset + data_runs_offset > record.len() {
-        return None;
-    }
-    let run_list = &record[attr_offset + data_runs_offset..];
-    let mut runs = [(0u64, 0u64); 64];
-    let num_runs = super::parse_run_list(run_list, &mut runs);
-    if num_runs == 0 {
-        return None;
-    }
+    let (_, attr) = secure_stream::attribute(&record)?;
+    secure_stream::read_indexed(
+        &record, attr, security_id, u64::from(ntfs.cluster_size),
+        |attr, offset, buffer| super::read_nonresident_range(ntfs, attr, offset, buffer),
+        super::apply_fixup,
+    )
+}
 
-    let stream_size = u64::from_le_bytes([
-        record[attr_offset + 0x30],
-        record[attr_offset + 0x31],
-        record[attr_offset + 0x32],
-        record[attr_offset + 0x33],
-        record[attr_offset + 0x34],
-        record[attr_offset + 0x35],
-        record[attr_offset + 0x36],
-        record[attr_offset + 0x37],
-    ]);
-    if stream_size == 0 {
-        return None;
-    }
+/// Read the original self-relative descriptor selected by a file's MFT record.
+pub fn read_file_security_descriptor(
+    ntfs: &super::NtfsData,
+    file_record: u64,
+) -> Option<alloc::vec::Vec<u8>> {
+    let record = super::read_mft_record(ntfs, file_record)?;
+    descriptor_for_record(ntfs, &record)
+}
 
-    // Read the whole $SDS stream (bounded) through the run list.
-    let cluster_size = ntfs.cluster_size as usize;
-    if cluster_size == 0 {
-        return None;
+fn descriptor_for_record(ntfs: &super::NtfsData, record: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    if let Some(id) = super::standard_security::security_id(record) {
+        return read_descriptor_bytes(ntfs, id);
     }
-    let read_limit = core::cmp::min(stream_size, 4 * 1024 * 1024) as usize;
-    let mut sds = alloc::vec![0u8; read_limit];
-    let mut filled = 0usize;
-    for &(start_cluster, length) in runs[..num_runs].iter() {
-        for cluster_in_run in 0..length {
-            if filled >= read_limit {
-                break;
-            }
-            let cluster = start_cluster + cluster_in_run;
-            // Match the file read path: cluster LBAs are relative to
-            // the partition start, and the sector layer takes
-            // absolute LBAs, so the hidden-sector base is added.
-            let first_sector =
-                ntfs.hidden_sectors + super::cluster_to_sector(cluster, ntfs.cluster_size);
-            let sectors_per_cluster = cluster_size.div_ceil(512);
-            for sector_index in 0..sectors_per_cluster {
-                if filled >= read_limit {
-                    break;
-                }
-                let mut sector_buf = [0u8; 512];
-                if !super::read_mounted_sector(
-                    ntfs,
-                    first_sector + sector_index as u64,
-                    &mut sector_buf,
-                ) {
-                    return None;
-                }
-                let copy_len = core::cmp::min(512, read_limit - filled);
-                sds[filled..filled + copy_len].copy_from_slice(&sector_buf[..copy_len]);
-                filled += copy_len;
-            }
-        }
-        if filled >= read_limit {
-            break;
-        }
-    }
-    if filled == 0 {
-        return None;
-    }
+    Some(super::standard_security::inline_descriptor(record)?.to_vec())
+}
 
-    // Walk the $SDS entries. Each entry: u32 hash, u32 security id,
-    // u64 offset of the descriptor inside $SDS, u32 descriptor
-    // length, u32 padding, then the descriptor. Entries are 16-byte
-    // aligned.
-    let mut pos = 0usize;
-    while pos + 0x14 <= filled {
-        let hash = u32::from_le_bytes([sds[pos], sds[pos + 1], sds[pos + 2], sds[pos + 3]]);
-        let entry_id = u32::from_le_bytes([sds[pos + 4], sds[pos + 5], sds[pos + 6], sds[pos + 7]]);
-        let length = u32::from_le_bytes([
-            sds[pos + 0x10],
-            sds[pos + 0x11],
-            sds[pos + 0x12],
-            sds[pos + 0x13],
-        ]) as usize;
-        if length < 0x14 || length > 0x10000 {
-            // Corrupt entry: stop scanning rather than guessing.
-            break;
-        }
-        let entry_end = pos + length;
-        if entry_end > filled {
-            break;
-        }
-        if entry_id == security_id && hash != 0 {
-            return parse_sds_descriptor(security_id, &sds[pos + 0x14..entry_end]);
-        }
-        pos = (entry_end + 15) & !15;
+/// Associate an existing, validated descriptor with one user file record.
+/// The caller must serialize volume mutations and authorize the operation.
+/// This writes MFT sectors; the system-volume caller must flush for durability.
+pub fn associate_file_security_id(
+    ntfs: &super::NtfsData,
+    file_record: u64,
+    id: SecurityId,
+) -> Result<(), NTSTATUS> {
+    if file_record < super::system_records::FIRST_USER_RECORD
+        || read_security_descriptor(ntfs, id).is_none()
+    {
+        return Err(super::STATUS_UNSUCCESSFUL);
     }
+    let mut record = super::read_mft_record(ntfs, file_record).ok_or(super::STATUS_UNSUCCESSFUL)?;
+    if super::standard_security::security_id(&record) == Some(id) {
+        return Ok(());
+    }
+    super::standard_security::set_security_id(&mut record, id).ok_or(super::STATUS_UNSUCCESSFUL)?;
+    super::write_mft_record(ntfs, file_record, &record)
+}
 
-    // Not found: the caller must decide how to fail closed.
-    None
+/// The trusted caller authorizes and merges against the currently stored
+/// descriptor while holding the same volume guard used for both writes.
+pub(crate) fn update_file_security_descriptor(
+    fs: &super::NtfsFileSystem,
+    file_record: u64,
+    prepare: impl FnOnce(&[u8]) -> Result<alloc::vec::Vec<u8>, NTSTATUS>,
+    mut persist: impl FnMut() -> Result<(), NTSTATUS>,
+) -> Result<(), NTSTATUS> {
+    if file_record < super::system_records::FIRST_USER_RECORD {
+        return Err(0xc00000bbu32 as NTSTATUS);
+    }
+    let ntfs = &fs.ntfs_data;
+    let io_error = super::STATUS_UNSUCCESSFUL;
+    let original = super::read_mft_record(ntfs, file_record).ok_or(io_error)?;
+    let old_descriptor = descriptor_for_record(ntfs, &original).ok_or(io_error)?;
+    let descriptor = prepare(&old_descriptor)?;
+    if descriptor == old_descriptor {
+        return persist();
+    }
+    let mut updated = original.to_vec();
+    super::standard_security::set_security_id(&mut updated, DEFAULT_SECURITY_ID).ok_or(io_error)?;
+    let id = intern_security_descriptor(fs, &descriptor, &mut persist)?;
+    super::standard_security::set_security_id(&mut updated, id).ok_or(io_error)?;
+    let committed = super::write_mft_record(ntfs, file_record, &updated).and_then(|()| persist());
+    if let Err(error) = committed {
+        if super::write_mft_record(ntfs, file_record, &original).is_ok() {
+            let _ = persist();
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Intern a descriptor without changing any already published SecurityId.
+/// The caller holds the volume guard and supplies a durable write barrier.
+pub(super) fn intern_security_descriptor(
+    fs: &super::NtfsFileSystem,
+    descriptor: &[u8],
+    mut persist: impl FnMut() -> Result<(), NTSTATUS>,
+) -> Result<SecurityId, NTSTATUS> {
+    use secure_stream::append::Insertion;
+    let unsupported = 0xc00000bbu32 as NTSTATUS;
+    let io_error = super::STATUS_UNSUCCESSFUL;
+    if !valid_stored_descriptor(descriptor)
+        || parse_sds_descriptor(0, descriptor).is_none()
+    {
+        return Err(0xc000000du32 as NTSTATUS);
+    }
+    let ntfs = &fs.ntfs_data;
+    let number = super::system_records::SECURE;
+    let record = super::read_mft_record(ntfs, number).ok_or(io_error)?;
+    let commit_record = |mft_record: &[u8], persist: &mut dyn FnMut() -> Result<(), NTSTATUS>| {
+        let committed = super::write_mft_record(ntfs, number, mft_record).and_then(|()| persist());
+        if let Err(error) = committed {
+            if super::write_mft_record(ntfs, number, &record).is_ok() { let _ = persist(); }
+            return Err(error);
+        }
+        Ok(())
+    };
+    if secure_stream::stream(&record).is_some() {
+        let (id, updated) = secure_stream::intern_resident(&record, descriptor).ok_or(unsupported)?;
+        if let Some(updated) = updated {
+            commit_record(&updated, &mut persist)?;
+        } else {
+            persist()?;
+        }
+        return Ok(id);
+    }
+    let plan = secure_stream::append::plan(&record, descriptor, |attr, offset, out| {
+        super::read_nonresident_range(ntfs, attr, offset, out)
+    }).ok_or(unsupported)?;
+    let (id, mft_record, primary, mirror, bytes) = match plan {
+        Insertion::Existing(id) => {
+            persist()?;
+            return Ok(id);
+        }
+        Insertion::Append { id, mft_record, primary, mirror, bytes } => (id, mft_record, primary, mirror, bytes),
+    };
+    let (_, attr) = secure_stream::attribute(&record).ok_or(io_error)?;
+    let cluster_size = u64::from(ntfs.cluster_size);
+    let volume_end = fs.base.total_clusters.checked_mul(cluster_size / 512)
+        .and_then(|sectors| ntfs.hidden_sectors.checked_add(sectors)).ok_or(io_error)?;
+    let mut sectors = alloc::collections::BTreeMap::new();
+    for offset in [primary, mirror] {
+        super::nonresident_stream::stage_write(attr, cluster_size, ntfs.hidden_sectors, offset, &bytes, &mut sectors,
+            |sector, out| sector > ntfs.hidden_sectors && sector < volume_end && super::read_mounted_sector(ntfs, sector, out),
+        ).ok_or(unsupported)?;
+    }
+    for (sector, bytes) in sectors {
+        if !super::write_mounted_sector(ntfs, sector, &bytes) { return Err(io_error); }
+    }
+    persist()?;
+    commit_record(&mft_record, &mut persist)?;
+    Ok(id)
+}
+
+fn valid_stored_descriptor(descriptor: &[u8]) -> bool {
+    let Some(header) = descriptor.get(..20) else { return false };
+    let control = u16::from_le_bytes([header[2], header[3]]);
+    if header[0] != 1 || control & 0x8000 == 0 || descriptor.len() > 131072 {
+        return false;
+    }
+    for field in [4, 8, 12, 16] {
+        let offset = u32::from_le_bytes(header[field..field + 4].try_into().unwrap()) as usize;
+        if offset == 0 { continue; }
+        if offset < 20 || !offset.is_multiple_of(4) { return false; }
+        let Some(component) = descriptor.get(offset..) else { return false };
+        if field < 12 {
+            if component.first() != Some(&1) { return false; }
+            continue;
+        }
+        let present = if field == 12 { 0x10 } else { 4 };
+        let Some(acl) = component.get(..8) else { return false };
+        if control & present == 0 || !matches!(acl[0], 2 | 3 | 4) { return false; }
+        let size = usize::from(u16::from_le_bytes([acl[2], acl[3]]));
+        let Some(mut entries) = component.get(8..size) else { return false };
+        for _ in 0..u16::from_le_bytes([acl[4], acl[5]]) {
+            let Some(ace) = entries.get(..4) else { return false };
+            let length = usize::from(u16::from_le_bytes([ace[2], ace[3]]));
+            if length < 4 || !length.is_multiple_of(4) { return false; }
+            let Some(remaining) = entries.get(length..) else { return false };
+            entries = remaining;
+        }
+    }
+    true
 }
 
 /// Parse the self-relative security descriptor stored inside a `$SDS`
@@ -904,8 +955,7 @@ pub fn build_sds_entry(security_id: SecurityId, descriptor: &[u8]) -> alloc::vec
     secure_stream::entry(security_id, 0, descriptor).unwrap_or_default()
 }
 
-/// Update a bounded resident named DATA stream, preserving the MFT record layout.
-/// Nonresident SDS growth and the SII/SDH indexes are not implemented yet.
+/// Seed the project's resident security store without replacing a shared ID.
 pub fn update_secure_sds(
     ntfs: &super::NtfsFileSystem,
     security_id: SecurityId,

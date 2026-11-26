@@ -93,6 +93,7 @@ pub const INDEX_ENTRY_HEADER_SIZE: u16 = 16;
 pub const INDEX_ENTRY_FLAG_END: u16 = 0x0002;
 pub const RESIDENT_ATTRIBUTE_HEADER_SIZE: usize = 24;
 pub const FILE_NAME_MINIMUM_LENGTH: usize = 66;
+const STANDARD_INFORMATION_VALUE_LENGTH: usize = 48;
 
 // =====================================================================
 // NTFS Structures
@@ -1052,21 +1053,12 @@ impl NtfsImage {
     }
 
     /// Build standard information attribute
-    fn build_standard_info(&self) -> Vec<u8> {
-        // $STANDARD_INFORMATION value is exactly 32 bytes: 4 × u64
-        // timestamps plus a u32 file-attributes and a u32 (reserved /
-        // class-id / owner-id / security-id) that we keep zeroed.
-        let value_len = 32u32;
-        let mut data = build_attr_header(ATTR_TYPE_STANDARD_INFORMATION, value_len);
-
-        // Standard information value
-        data.extend_from_slice(&0u64.to_le_bytes()); // Creation time
-        data.extend_from_slice(&0u64.to_le_bytes()); // Modification time
-        data.extend_from_slice(&0u64.to_le_bytes()); // MFT change time
-        data.extend_from_slice(&0u64.to_le_bytes()); // Last access time
-        data.extend_from_slice(&0x20u32.to_le_bytes()); // File attributes (ARCHIVE)
-        data.extend_from_slice(&0u32.to_le_bytes()); // Reserved / class id
-
+    fn build_standard_info(&self, is_dir: bool) -> Vec<u8> {
+        let mut value = [0u8; STANDARD_INFORMATION_VALUE_LENGTH];
+        let attributes = if is_dir { 0x10u32 } else { 0x20u32 };
+        value[32..36].copy_from_slice(&attributes.to_le_bytes());
+        let mut data = build_attr_header(ATTR_TYPE_STANDARD_INFORMATION, value.len() as u32);
+        data.extend_from_slice(&value);
         fill_attr_length(&mut data);
         data
     }
@@ -1542,7 +1534,7 @@ impl NtfsImage {
         // builder can take &self later.
         let non_resident: Vec<(String, usize)> = child_meta
             .iter()
-            .filter(|(_, is_dir, _, data_len)| !*is_dir && *data_len > Self::MAX_RESIDENT_DATA_SIZE)
+            .filter(|(path, is_dir, _, data_len)| !*is_dir && self.uses_nonresident_data(path, *data_len))
             .map(|(path, _, _, data_len)| (path.clone(), *data_len))
             .collect();
         for (path, len) in non_resident {
@@ -1772,10 +1764,20 @@ impl NtfsImage {
         Some(5u64)
     }
 
-    /// Maximum bytes of data we store as a resident DATA attribute inside a
-    /// single MFT record. We leave headroom for the header (48), fixup (4),
-    /// STD_INFO (~72), FILE_NAME (~80), and INDEX_ROOT (~50 for dirs).
     const MAX_RESIDENT_DATA_SIZE: usize = 700;
+
+    fn mft_attributes_offset(&self) -> usize {
+        (48 + (self.mft_record_size as usize / 512 + 1) * 2).next_multiple_of(8)
+    }
+
+    fn uses_nonresident_data(&self, path: &str, data_len: usize) -> bool {
+        let leaf = path.rsplit('\\').next().unwrap_or(path);
+        let metadata = self.mft_attributes_offset() + 3 * RESIDENT_ATTRIBUTE_HEADER_SIZE
+            + STANDARD_INFORMATION_VALUE_LENGTH + FILE_NAME_MINIMUM_LENGTH
+            + 2 * leaf.encode_utf16().count() + 8;
+        let capacity = (self.mft_record_size as usize).saturating_sub(metadata);
+        data_len > capacity.min(Self::MAX_RESIDENT_DATA_SIZE)
+    }
 
     /// Build a complete MFT record for `entry` at `record_num`.
     ///
@@ -1793,7 +1795,7 @@ impl NtfsImage {
         let sectors_per_record = mft_record_size / 512;
         let fixup_offset = 48usize;
         let fixup_size = sectors_per_record + 1;
-        let attributes_offset = (fixup_offset + fixup_size * 2).next_multiple_of(8);
+        let attributes_offset = self.mft_attributes_offset();
 
         // Build the 48-byte MFT record header as a fixed-size array first.
         // This avoids any issues with Vec::extend_from_slice.
@@ -1821,7 +1823,7 @@ impl NtfsImage {
 
         // --- Attributes start here (offset 48) ---
         // 1. $STANDARD_INFORMATION
-        let std_info = self.build_standard_info();
+        let std_info = self.build_standard_info(entry.is_dir);
         record.extend_from_slice(&std_info);
 
         // 2. $FILE_NAME
@@ -1853,21 +1855,7 @@ impl NtfsImage {
                 let clusters = self.data_cluster_assignments["$MFT"];
                 let bytes = clusters.1 * self.sectors_per_cluster as u64 * self.sector_size as u64;
                 record.extend_from_slice(&self.build_non_resident_data_attr_sized(bytes, clusters));
-            } else if entry.data.len() > Self::MAX_RESIDENT_DATA_SIZE || entry.path == "$Bitmap" {
-                // The cluster allocation was done in a pre-pass by
-                // `finalize_with_offset`; the assignment lives in
-                // `data_cluster_assignments` keyed by `entry.path`.
-                let file_clusters = match self.data_cluster_assignments.get(&entry.path) {
-                    Some(&fc) => fc,
-                    None => {
-                        // Allocation missing — fall back to a resident
-                        // attribute so the record at least parses.
-                        let data_attr =
-                            self.build_data_attr(&entry.data[..Self::MAX_RESIDENT_DATA_SIZE]);
-                        record.extend_from_slice(&data_attr);
-                        return record;
-                    }
-                };
+            } else if let Some(&file_clusters) = self.data_cluster_assignments.get(&entry.path) {
                 let data_attr = self.build_non_resident_data_attr(entry, file_clusters);
                 record.extend_from_slice(&data_attr);
             } else {
@@ -2163,6 +2151,39 @@ impl FsBackend for NtfsImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_and_file_records_declare_the_complete_standard_information() {
+        let mut volume = NtfsImage::new(16, 4096).unwrap();
+        volume.write_file("child.exe", b"bytes").unwrap();
+        let record_size = volume.mft_record_size() as usize;
+        let bytes = volume.finalize().unwrap();
+        let mft_base = u64::from_le_bytes(bytes[48..56].try_into().unwrap()) as usize * 4096;
+        for (record_number, attributes) in [(5, 0x10u32), (16, 0x20)] {
+            let start = mft_base + record_number * record_size;
+            let record = &bytes[start..start + record_size];
+            assert_eq!(&record[..4], b"FILE");
+            let attribute_start = u16::from_le_bytes(record[20..22].try_into().unwrap()) as usize;
+            let attribute = &record[attribute_start..];
+            assert_eq!(u32::from_le_bytes(attribute[..4].try_into().unwrap()), ATTR_TYPE_STANDARD_INFORMATION);
+            let length = u32::from_le_bytes(attribute[16..20].try_into().unwrap()) as usize;
+            let offset = u16::from_le_bytes(attribute[20..22].try_into().unwrap()) as usize;
+            let value = &attribute[offset..offset + length];
+            assert_eq!(value.len(), 48);
+            assert_eq!(u32::from_le_bytes(value[32..36].try_into().unwrap()), attributes);
+        }
+    }
+
+    #[test]
+    fn long_names_with_small_data_spill_to_clusters_without_truncation() {
+        let mut volume = NtfsImage::new(16, 4096).unwrap();
+        let name = format!("{}.txt", "a".repeat(180));
+        let payload = vec![0x5a; 680];
+        volume.write_file(&name, &payload).unwrap();
+        let disk = volume.finalize().unwrap();
+        let parsed = NtfsImage::from_bytes(&disk).unwrap();
+        assert_eq!(parsed.read_file_path(&name).unwrap(), payload);
+    }
 
     #[test]
     fn edited_volume_publishes_new_root_files_to_firmware_reader() {
