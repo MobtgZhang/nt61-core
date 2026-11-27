@@ -65,6 +65,10 @@ fn reports_loader_and_runtime_faults_even_with_corrupted_guest_path() {
     let (status, report) = inspect(serial.as_bytes(), &["--deny-panic"]);
     assert_eq!(status, 1);
     assert_eq!(report["events"][0]["ntstatus"], 0xc0000139u32);
+    assert_eq!(
+        report["events"][0]["missing_import"],
+        "user32.dll!LoadImageW"
+    );
     assert!(report["events"][0]["detail"]
         .as_str()
         .unwrap()
@@ -77,6 +81,72 @@ fn reports_loader_and_runtime_faults_even_with_corrupted_guest_path() {
     assert_eq!(report["events"][3]["dll"], "test.dll");
     assert_eq!(report["events"][3]["symbol"], "#12");
     assert_eq!(report["events"][4]["kind"], "kernel_panic");
+}
+
+#[test]
+fn records_backend_and_last_progress_without_treating_them_as_an_exit() {
+    let serial = format!(
+        "[PE] Loading {PROBE}\n\
+         [PE] Context {PROBE}: pe_machine=014C guest_abi=pe32 host_arch=x86_64 backend=btl pid=2 tid=8192\n\
+         [PE] Running {PROBE}\n\
+         [PE] Progress {PROBE}: retired=1048576 pc=0x401000\n\
+         [PE] Progress {PROBE}: retired=1052672 pc=0x402000 runnable=1 waiting=2 suspended=3 tid=8193 module=sample dll.dll rva=0x2000\n\
+         [PE] Progress {PROBE}: retired=1056768 pc=0x1000 runnable=1 waiting=2 suspended=3 tid=8193\n"
+    );
+    let (status, report) = inspect(serial.as_bytes(), &["--require-exit", PROBE]);
+    assert_eq!(status, 1);
+    let context = &report["events"][1];
+    assert_eq!(context["pe_machine"], 0x014c);
+    assert_eq!(context["guest_abi"], "pe32");
+    assert_eq!(context["host_arch"], "x86_64");
+    assert_eq!(context["backend"], "btl");
+    assert_eq!(context["pid"], 2);
+    assert_eq!(context["tid"], 8192);
+    assert_eq!(report["events"][3]["retired"], 1048576);
+    assert_eq!(report["events"][3]["pc"], 0x401000);
+    assert!(report["events"][3].get("module").is_none());
+    assert_eq!(report["events"][4]["threads"], serde_json::json!([1, 2, 3]));
+    assert_eq!(report["events"][4]["tid"], 8193);
+    assert_eq!(report["events"][4]["module"], "sample dll.dll");
+    assert_eq!(report["events"][4]["rva"], 0x2000);
+    assert_eq!(report["events"][5]["tid"], 8193);
+    assert!(report["events"][5].get("module").is_none());
+}
+
+#[test]
+fn records_image_machine_before_an_unassigned_process_fails_to_link() {
+    let serial = format!(
+        "[PE] Loading {PROBE}\n\
+         [PE] Image {PROBE}: pe_machine=014C guest_abi=pe32 host_arch=x86_64 backend=btl\n\
+         [PE] Cannot execute {PROBE}: guest DLL advapi32.dll has no export Name(\"SetFileSecurityW\"); NTSTATUS 0xC0000139.\n"
+    );
+    let (status, report) = inspect(serial.as_bytes(), &["--require-exit", PROBE]);
+    assert_eq!(status, 1);
+    let image = &report["events"][1];
+    assert_eq!(image["kind"], "image");
+    assert_eq!(image["pe_machine"], 0x014c);
+    assert_eq!(image["backend"], "btl");
+    assert!(image.get("pid").is_none());
+    assert_eq!(report["events"][2]["missing_import"], "advapi32.dll!SetFileSecurityW");
+}
+
+#[test]
+fn concurrent_exit_cannot_satisfy_the_latest_attempt_of_the_same_path() {
+    let serial = format!(
+        "[PE] Loading {PROBE} [run=1]\n[PE] Running {PROBE} [run=1]\n\
+         [PE] Loading {PROBE} [run=2]\n[PE] Running {PROBE} [run=2]\n\
+         [PE] Translation {PROBE}: native=1 interpreted=3 [run=1]\n\
+         [PE] Guest exited {PROBE}: 0 [run=1]\n"
+    );
+    let checks = ["--require-exit", PROBE, "--require-jit", PROBE];
+    let (status, report) = inspect(serial.as_bytes(), &checks);
+    assert_eq!(status, 1);
+    assert_eq!(report["events"][5]["run"], 1);
+    let completed = format!(
+        "{serial}[PE] Translation {PROBE}: native=2 interpreted=4 [run=2]\n\
+         [PE] Guest exited {PROBE}: 0 [run=2]\n"
+    );
+    assert_eq!(inspect(completed.as_bytes(), &checks).0, 0);
 }
 
 #[test]

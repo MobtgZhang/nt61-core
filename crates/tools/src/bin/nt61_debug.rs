@@ -79,6 +79,8 @@ impl ImageManifest {
 struct Event {
     line: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     guest: Option<String>,
     #[serde(flatten)]
     kind: EventKind,
@@ -88,16 +90,63 @@ struct Event {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum EventKind {
     Loading,
+    Image {
+        pe_machine: u16,
+        guest_abi: String,
+        host_arch: String,
+        backend: String,
+    },
+    Context {
+        pe_machine: u16,
+        guest_abi: String,
+        host_arch: String,
+        backend: String,
+        pid: u32,
+        tid: u32,
+    },
     Running,
-    Translation { native: u64, interpreted: u64 },
-    Exit { code: u32 },
-    LoadFailure { ntstatus: u32, detail: String },
-    ExecutionFault { ntstatus: u32, detail: String },
+    Progress {
+        retired: u64,
+        pc: u64,
+        threads: Option<(u32, u32, u32)>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tid: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        module: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rva: Option<u64>,
+    },
+    Translation {
+        native: u64,
+        interpreted: u64,
+    },
+    Exit {
+        code: u32,
+    },
+    LoadFailure {
+        ntstatus: u32,
+        detail: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        missing_import: Option<String>,
+    },
+    ExecutionFault {
+        ntstatus: u32,
+        detail: String,
+    },
     BudgetExceeded,
-    FaultDetails { detail: String },
-    DelayLoadFault { dll: String, symbol: String },
-    KernelPanic { detail: String },
-    NativeHandoffUnavailable { detail: String },
+    FaultDetails {
+        detail: String,
+    },
+    DelayLoadFault {
+        dll: String,
+        symbol: String,
+    },
+    KernelPanic {
+        detail: String,
+    },
+    NativeHandoffUnavailable {
+        detail: String,
+    },
 }
 
 #[derive(Default, Serialize)]
@@ -135,8 +184,16 @@ fn guest_path(value: &str) -> Option<String> {
 }
 
 fn parse_event(line: &str, line_number: usize) -> Option<Event> {
+    let (line, run) = if line.starts_with("[PE] ") {
+        line.rsplit_once(" [run=")
+            .and_then(|(record, suffix)| Some((record, Some(suffix.strip_suffix(']')?.parse().ok()?))))
+            .unwrap_or((line, None))
+    } else {
+        (line, None)
+    };
     let event = |path: &str, kind: EventKind| Event {
         line: line_number,
+        run,
         guest: guest_path(path),
         kind,
     };
@@ -160,8 +217,72 @@ fn parse_event(line: &str, line_number: usize) -> Option<Event> {
     if let Some(path) = record.strip_prefix("Loading ") {
         return Some(event(path, EventKind::Loading));
     }
+    if let Some(record) = record.strip_prefix("Image ") {
+        let (path, fields) = record.split_once(": pe_machine=")?;
+        let (machine, fields) = fields.split_once(" guest_abi=")?;
+        let (abi, fields) = fields.split_once(" host_arch=")?;
+        let (host_arch, backend) = fields.split_once(" backend=")?;
+        return Some(event(path, EventKind::Image {
+            pe_machine: u16::from_str_radix(machine, 16).ok()?,
+            guest_abi: abi.into(),
+            host_arch: host_arch.into(),
+            backend: backend.into(),
+        }));
+    }
+    if let Some(record) = record.strip_prefix("Context ") {
+        let (path, fields) = record.split_once(": pe_machine=")?;
+        let (machine, fields) = fields.split_once(" guest_abi=")?;
+        let (abi, fields) = fields.split_once(" host_arch=")?;
+        let (host_arch, fields) = fields.split_once(" backend=")?;
+        let (backend, fields) = fields.split_once(" pid=")?;
+        let (pid, tid) = fields.split_once(" tid=")?;
+        return Some(event(
+            path,
+            EventKind::Context {
+                pe_machine: u16::from_str_radix(machine, 16).ok()?,
+                guest_abi: abi.into(),
+                host_arch: host_arch.into(),
+                backend: backend.into(),
+                pid: pid.parse().ok()?,
+                tid: tid.parse().ok()?,
+            },
+        ));
+    }
     if let Some(path) = record.strip_prefix("Running ") {
         return Some(event(path, EventKind::Running));
+    }
+    if let Some(record) = record.strip_prefix("Progress ") {
+        let (path, counters) = record.split_once(": retired=")?;
+        let (retired, pc) = counters.split_once(" pc=0x")?;
+        let (pc, tid, module, rva) = match pc.split_once(" tid=") {
+            Some((pc, location)) => match location.split_once(" module=") {
+                Some((tid, module)) => {
+                    let (module, rva) = module.rsplit_once(" rva=0x")?;
+                    (pc, Some(tid.parse().ok()?), Some(module.into()), Some(u64::from_str_radix(rva, 16).ok()?))
+                }
+                None => (pc, Some(location.parse().ok()?), None, None),
+            },
+            None => (pc, None, None, None),
+        };
+        let (pc, threads) = match pc.split_once(" runnable=") {
+            Some((pc, counts)) => {
+                let (runnable, counts) = counts.split_once(" waiting=")?;
+                let (waiting, suspended) = counts.split_once(" suspended=")?;
+                (pc, Some((runnable.parse().ok()?, waiting.parse().ok()?, suspended.parse().ok()?)))
+            }
+            None => (pc, None),
+        };
+        return Some(event(
+            path,
+            EventKind::Progress {
+                retired: retired.parse().ok()?,
+                pc: u64::from_str_radix(pc, 16).ok()?,
+                threads,
+                tid,
+                module,
+                rva,
+            },
+        ));
     }
     if let Some(record) = record.strip_prefix("Translation ") {
         let (path, counters) = record.split_once(": native=")?;
@@ -227,7 +348,28 @@ fn parse_event(line: &str, line_number: usize) -> Option<Event> {
     let kind = if fault {
         EventKind::ExecutionFault { ntstatus, detail }
     } else {
-        EventKind::LoadFailure { ntstatus, detail }
+        let missing_import = detail
+            .strip_prefix("guest DLL ")
+            .and_then(|record| record.split_once(" has no export "))
+            .and_then(|(dll, symbol)| {
+                if let Some(name) = symbol
+                    .strip_prefix("Name(\"")
+                    .and_then(|name| name.strip_suffix("\")"))
+                {
+                    return Some(format!("{dll}!{name}"));
+                }
+                let ordinal = symbol
+                    .strip_prefix("Ordinal(")?
+                    .strip_suffix(')')?
+                    .parse::<u16>()
+                    .ok()?;
+                Some(format!("{dll}!#{ordinal}"))
+            });
+        EventKind::LoadFailure {
+            ntstatus,
+            detail,
+            missing_import,
+        }
     };
     Some(event(path, kind))
 }
@@ -280,17 +422,15 @@ fn inspect(mut input: impl BufRead) -> io::Result<Report> {
 impl Report {
     fn latest_guest_records<'a>(&'a self, path: &'a str) -> impl Iterator<Item = &'a EventKind> {
         let path = path.replace('/', "\\");
-        self.events
-            .iter()
-            .rev()
-            .filter(move |event| {
-                event
-                    .guest
-                    .as_ref()
-                    .is_some_and(|guest| path.eq_ignore_ascii_case(&guest.replace('/', "\\")))
-            })
+        let matches_path = move |event: &&Event| {
+            event.guest.as_ref().is_some_and(|guest| path.eq_ignore_ascii_case(&guest.replace('/', "\\")))
+        };
+        let records = self.events.iter().rev().filter(matches_path);
+        let latest = records.clone().find(|event| event.kind == EventKind::Loading);
+        records
+            .take_while(move |event| latest.is_none_or(|start| event.line > start.line))
+            .filter(move |event| latest.is_none_or(|start| event.run == start.run))
             .map(|event| &event.kind)
-            .take_while(|kind| **kind != EventKind::Loading)
     }
 
     fn check(&mut self, args: &Args) {
@@ -367,7 +507,26 @@ impl Report {
             write!(out, "{}: ", event.line)?;
             match &event.kind {
                 EventKind::Loading => writeln!(out, "{guest} loading")?,
+                EventKind::Image { pe_machine, guest_abi, host_arch, backend } => writeln!(
+                    out, "{guest} machine={pe_machine:04X} abi={guest_abi} host={host_arch} backend={backend}"
+                )?,
+                EventKind::Context { pe_machine, guest_abi, host_arch, backend, pid, tid } => writeln!(
+                    out, "{guest} machine={pe_machine:04X} abi={guest_abi} host={host_arch} backend={backend} pid={pid} tid={tid}"
+                )?,
                 EventKind::Running => writeln!(out, "{guest} running")?,
+                EventKind::Progress { retired, pc, threads, tid, module, rva } => {
+                    write!(out, "{guest} retired={retired} pc=0x{pc:X}")?;
+                    if let Some((runnable, waiting, suspended)) = threads {
+                        write!(out, " runnable={runnable} waiting={waiting} suspended={suspended}")?;
+                    }
+                    if let Some(tid) = tid {
+                        write!(out, " tid={tid}")?;
+                    }
+                    if let (Some(module), Some(rva)) = (module, rva) {
+                        write!(out, " module={module} rva=0x{rva:X}")?;
+                    }
+                    writeln!(out)?;
+                }
                 EventKind::Translation {
                     native,
                     interpreted,
@@ -376,7 +535,7 @@ impl Report {
                     "{guest} translated native={native} interpreted={interpreted}"
                 )?,
                 EventKind::Exit { code } => writeln!(out, "{guest} exited {code}")?,
-                EventKind::LoadFailure { ntstatus, detail } => {
+                EventKind::LoadFailure { ntstatus, detail, .. } => {
                     writeln!(out, "{guest} could not load (0x{ntstatus:08X}): {detail}")?
                 }
                 EventKind::ExecutionFault { ntstatus, detail } => {
@@ -501,10 +660,7 @@ impl RuntimeLibraries {
     }
 }
 
-fn check_imports(
-    path: &Path,
-    runtime: &Path,
-) -> Result<ImportReport, Box<dyn std::error::Error>> {
+fn check_imports(path: &Path, runtime: &Path) -> Result<ImportReport, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let image = pe_read::parse(&bytes).ok_or_else(|| format!("{}: invalid PE", path.display()))?;
     let mut report = ImportReport {
@@ -527,7 +683,9 @@ fn check_imports(
             if entry.file_type()?.is_dir() {
                 continue;
             }
-            if let Some(name) = entry.file_name().to_str()
+            if let Some(name) = entry
+                .file_name()
+                .to_str()
                 .filter(|name| name.contains('.'))
                 .and_then(module_name)
             {
