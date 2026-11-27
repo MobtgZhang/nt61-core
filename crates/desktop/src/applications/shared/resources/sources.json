@@ -160,7 +160,7 @@
       "source": "notepad.svg",
       "author": "NT61 contributors",
       "license": "MIT",
-      "generator": "scripts/generate-notepad-icon.py",
+      "generator": "scripts/generate-application-icons.py --app notepad",
       "sizes": [
         16,
         24,
@@ -176,7 +176,7 @@
       "source": "wordpad.svg",
       "author": "NT61 contributors",
       "license": "MIT",
-      "generator": "scripts/generate-wordpad-icon.py",
+      "generator": "scripts/generate-application-icons.py --app wordpad",
       "sizes": [
         16,
         24,
