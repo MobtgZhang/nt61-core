@@ -128,6 +128,7 @@ pub enum SimdWidth {
     ScalarF32,
     /// Scalar double-precision (lower f64).
     ScalarF64,
+    LowQword,
     /// 128-bit integer (packed i8/i16/i32/i64 lanes).
     PackedI128,
 }

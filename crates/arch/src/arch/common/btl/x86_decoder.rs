@@ -505,6 +505,9 @@ impl<'a> Decoder<'a> {
                     let index = self.fetch()?;
                     Some(IROp::SimdExtractWord { dst: X86Reg::from_modrm((raw >> 3) & 7, self.rex_r), src: X86Xmm::from_modrm(raw & 7, self.rex_b), index })
                 }
+                0x7e if self.has_f3 && !self.has_66 && !self.has_f2 => {
+                    self.decode_simd_mov(SimdWidth::LowQword)
+                }
                 0x7e if self.has_66 && !self.has_f2 && !self.has_f3 => {
                     let raw = self.peek()?;
                     let (_, mut dst, _) = self.decode_modrm()?;

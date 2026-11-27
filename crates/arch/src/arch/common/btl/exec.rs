@@ -1356,7 +1356,7 @@ fn execute_one(
             if n == 16 {
                 s.xmm[dst as usize] = v
             } else {
-                if matches!(src, SimdSrc::Mem(_)) {
+                if width == SimdWidth::LowQword || matches!(src, SimdSrc::Mem(_)) {
                     s.xmm[dst as usize] = [0; 16]
                 }
                 s.xmm[dst as usize][..n].copy_from_slice(&v[..n]);
@@ -1540,7 +1540,7 @@ fn push(s: &mut GuestState, m: &mut dyn GuestMemory, i: &IrInst, v: u64) -> Opti
 fn simd_size(w: SimdWidth) -> usize {
     match w {
         SimdWidth::ScalarF32 => 4,
-        SimdWidth::ScalarF64 => 8,
+        SimdWidth::ScalarF64 | SimdWidth::LowQword => 8,
         _ => 16,
     }
 }
@@ -1594,6 +1594,33 @@ mod tests {
         let mut out = [IrInst::empty(); 16];
         let n = decode_block(bytes, base, &mut out);
         out[..n].to_vec()
+    }
+
+    #[test]
+    fn movq_load_reads_eight_bytes_and_clears_upper_xmm_bits() {
+        let instructions = decode(&[0xf3, 0x44, 0x0f, 0x7e, 0x00, 0xf3, 0x45, 0x0f, 0x7e, 0xc8], 0x1000);
+        let mut state = GuestState::new();
+        state.rip = 0x1000;
+        state.set_reg(X86Reg::Rax, 0x1ff8);
+        state.xmm[8] = [0xa5; 16];
+        state.xmm[9] = [0x5a; 16];
+        let mut backing = [0u8; 0x2000];
+        let data = 0x1234_5678_9abc_def0u64.to_le_bytes();
+        backing[0x1ff8..].copy_from_slice(&data);
+        let mut memory = test_support::flat_memory(&mut backing);
+        let outcome = execute_block(&instructions, &mut state, &mut memory, &mut NopHook);
+        let mut expected = [0; 16];
+        expected[..8].copy_from_slice(&data);
+        assert_eq!(outcome, ExecOutcome::Retired { next_rip: 0x100a });
+        assert_eq!(state.xmm[8], expected);
+        assert_eq!(state.xmm[9], expected);
+
+        state.rip = 0x1000;
+        state.set_reg(X86Reg::Rax, 0x1ff9);
+        state.xmm[8] = [0xa5; 16];
+        let outcome = execute_block(&instructions, &mut state, &mut memory, &mut NopHook);
+        assert!(matches!(outcome, ExecOutcome::MemoryFault { guest_va: 0x1000 }));
+        assert_eq!(state.xmm[8], [0xa5; 16]);
     }
 
     #[test]
