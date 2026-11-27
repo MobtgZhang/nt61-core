@@ -30,7 +30,7 @@ fn current_directory(image: &mut GuestImage) -> Result<String, ApiError> {
 
 // The bounded initial matcher accepts literal names, '*' and '*.*'. Other
 // DOS expressions require the volume's $UpCase/wildcard implementation.
-fn matches(pattern: &[u16], name: &[u16]) -> Result<bool, ApiError> {
+pub(super) fn matches(pattern: &[u16], name: &[u16]) -> Result<bool, ApiError> {
     let star=b'*' as u16;
     let pattern=if pattern==[star,b'.' as u16,star] {&[b'*' as u16][..]} else {pattern};
     if pattern.iter().any(|v|matches!(*v,0x3f|0x3c|0x3e|0x22)) { return Err(120u32.into()); }

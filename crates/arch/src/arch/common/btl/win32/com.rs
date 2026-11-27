@@ -22,6 +22,7 @@ pub(super) struct ThreadState {
 struct Apartment {
     sta: bool,
     references: u32,
+    ole_references: u32,
     context: u64,
 }
 
@@ -43,8 +44,9 @@ pub(super) fn cleanup_thread(image: &mut GuestImage) {
 
 pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Result<u64, ApiError> {
     match name {
-        "CoInitialize" | "CoInitializeEx" => {
-            let flags = if name == "CoInitialize" { 2 } else { a[1] as u32 };
+        "CoInitialize" | "CoInitializeEx" | "OleInitialize" => {
+            let ole = name == "OleInitialize";
+            let flags = if name == "CoInitializeEx" { a[1] as u32 } else { 2 };
             if a[0] != 0 || flags & !0x0e != 0 { return Ok(0x80070057); }
             let sta = flags & 2 != 0;
             if let Some(apartment) = image.win32.local.com.apartment.as_mut() {
@@ -53,7 +55,9 @@ pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Result<u6
                     return Ok(0x8007000e);
                 };
                 apartment.references = count;
-                return Ok(1);
+                let already_initialized = !ole || apartment.ole_references > 0;
+                apartment.ole_references += u32::from(ole);
+                return Ok(u64::from(already_initialized));
             }
             let existing_mta = if sta { None } else { image.win32.com.mta.as_mut() };
             let context = if let Some(mta) = existing_mta {
@@ -72,11 +76,19 @@ pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Result<u6
                 }
                 context
             };
-            image.win32.local.com.apartment = Some(Apartment { sta, references: 1, context });
+            image.win32.local.com.apartment = Some(Apartment {
+                sta, references: 1, ole_references: u32::from(ole), context,
+            });
             Ok(0)
         }
-        "CoUninitialize" => {
+        "CoUninitialize" | "OleUninitialize" => {
             if let Some(apartment) = image.win32.local.com.apartment.as_mut() {
+                if name == "OleUninitialize" {
+                    if apartment.ole_references == 0 { return Ok(0); }
+                    apartment.ole_references -= 1;
+                } else if apartment.references == apartment.ole_references {
+                    return Ok(0);
+                }
                 if apartment.references > 1 { apartment.references -= 1; }
                 else { cleanup_thread(image); }
             }
@@ -93,6 +105,7 @@ pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Result<u6
             put(&mut image.memory, a[0], token, width).map_err(|_| ApiError::MemoryFault)?;
             Ok(0)
         }
+        "IIDFromString" => iid_from_string(&mut image.memory, a[0], a[1]),
         "SysAllocString" => {
             if a[0] == 0 { return Ok(0); }
             let units = wide_z_bytes(&mut image.memory, a[0])?;
@@ -125,6 +138,80 @@ pub(super) fn invoke(image: &mut GuestImage, name: &str, a: &[u64]) -> Result<u6
         "VariantClear" => clear_variant(image, a[0]),
         _ => Err(ApiError::Unsupported),
     }
+}
+
+fn iid_from_string(memory: &mut dyn GuestMemory, input: u64, output: u64) -> Result<u64, ApiError> {
+    const E_INVALIDARG: u64 = 0x8007_0057;
+    const CO_E_IIDSTRING: u64 = 0x8004_01f4;
+
+    if output == 0 {
+        return Ok(E_INVALIDARG);
+    }
+    let mut iid = [0; 16];
+    let (status, written) = if input == 0 {
+        (0, iid.len())
+    } else {
+        let mut text = [0u16; 38];
+        for (index, unit) in text.iter_mut().enumerate() {
+            let address = input.checked_add(2 * index as u64).ok_or(ApiError::MemoryFault)?;
+            *unit = word(memory, address, 2).map_err(|_| ApiError::MemoryFault)? as u16;
+            if *unit == 0 {
+                return Ok(E_INVALIDARG);
+            }
+        }
+        let end = input.checked_add(76).ok_or(ApiError::MemoryFault)?;
+        if word(memory, end, 2).map_err(|_| ApiError::MemoryFault)? != 0 {
+            return Ok(E_INVALIDARG);
+        }
+        if text[0] != u16::from(b'{') {
+            return Ok(CO_E_IIDSTRING);
+        }
+        let written = parse_iid_fields(&text, &mut iid);
+        let status = if written == iid.len() && text[37] == u16::from(b'}') {
+            0
+        } else {
+            CO_E_IIDSTRING
+        };
+        (status, written)
+    };
+    if written != 0 && !memory.write_virt(output, &iid[..written]) {
+        return Err(ApiError::MemoryFault);
+    }
+    Ok(status)
+}
+
+fn parse_iid_fields(text: &[u16; 38], iid: &mut [u8; 16]) -> usize {
+    let mut written = 0;
+    for (start, end, hyphen) in [
+        (1, 9, true), (10, 14, true), (15, 19, true), (20, 22, false),
+        (22, 24, true), (25, 27, false), (27, 29, false), (29, 31, false),
+        (31, 33, false), (33, 35, false), (35, 37, false),
+    ] {
+        let mut field = 0u32;
+        let mut complete = true;
+        for &unit in &text[start..end] {
+            let digit = match unit {
+                0x30..=0x39 => unit - 0x30,
+                0x41..=0x46 => unit - 0x41 + 10,
+                0x61..=0x66 => unit - 0x61 + 10,
+                _ => {
+                    complete = false;
+                    break;
+                }
+            };
+            field = (field << 4) | u32::from(digit);
+        }
+        complete &= !hyphen || text[end] == u16::from(b'-');
+        if complete || written == 0 {
+            let width = (end - start) / 2;
+            iid[written..written + width].copy_from_slice(&field.to_le_bytes()[..width]);
+            written += width;
+        }
+        if !complete {
+            break;
+        }
+    }
+    written
 }
 
 fn clear_variant(image: &mut GuestImage, variant: u64) -> Result<u64, ApiError> {

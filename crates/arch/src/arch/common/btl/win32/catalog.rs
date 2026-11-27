@@ -234,6 +234,16 @@ pub const APIS: &[Api] = &[
     Api { id: 4160, dll: "kernel32.dll", name: "OpenSemaphoreA", arguments: 3, x86_arguments: 3, cdecl: false },
     Api { id: 4161, dll: "kernel32.dll", name: "OpenSemaphoreW", arguments: 3, x86_arguments: 3, cdecl: false },
     Api { id: 4162, dll: "kernel32.dll", name: "RemoveDirectoryA", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4163, dll: "advapi32.dll", name: "GetFileSecurityW", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4164, dll: "advapi32.dll", name: "SetFileSecurityW", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4165, dll: "shell32.dll", name: "SHGetSpecialFolderLocation", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 4166, dll: "shell32.dll", name: "SHGetPathFromIDListW", arguments: 2, x86_arguments: 2, cdecl: false },
+    Api { id: 4167, dll: "shell32.dll", name: "SHFileOperationW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4168, dll: "shell32.dll", name: "SHBrowseForFolderW", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4169, dll: "shell32.dll", name: "SHGetFileInfoW", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 4170, dll: "ole32.dll", name: "OleInitialize", arguments: 1, x86_arguments: 1, cdecl: false },
+    Api { id: 4171, dll: "ole32.dll", name: "OleUninitialize", arguments: 0, x86_arguments: 0, cdecl: false },
+    Api { id: 4172, dll: "ole32.dll", name: "IIDFromString", arguments: 2, x86_arguments: 2, cdecl: false },
     // Process/thread token gateway used by the SP1 Kernel32 API-set
     // processthreads contract. These entries define ABI only: token handling
     // remains explicitly unsupported until a guest-owned token backend exists.
@@ -2501,6 +2511,8 @@ pub const APIS: &[Api] = &[
     },
     Api { id: 1062, dll: "ntdll.dll", name: "RtlRunOnceBeginInitialize", arguments: 3, x86_arguments: 3, cdecl: false },
     Api { id: 1063, dll: "ntdll.dll", name: "RtlRunOnceComplete", arguments: 3, x86_arguments: 3, cdecl: false },
+    Api { id: 1064, dll: "ntdll.dll", name: "NtQuerySecurityObject", arguments: 5, x86_arguments: 5, cdecl: false },
+    Api { id: 1065, dll: "ntdll.dll", name: "NtSetSecurityObject", arguments: 3, x86_arguments: 3, cdecl: false },
     Api { id: 324, dll: "kernel32.dll", name: "InitOnceInitialize", arguments: 1, x86_arguments: 1, cdecl: false },
     Api { id: 325, dll: "kernel32.dll", name: "InitOnceBeginInitialize", arguments: 4, x86_arguments: 4, cdecl: false },
     Api { id: 326, dll: "kernel32.dll", name: "InitOnceComplete", arguments: 3, x86_arguments: 3, cdecl: false },
@@ -4669,9 +4681,17 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
     } else if dll.eq_ignore_ascii_case("winspool.drv") {
         (U, "Printer backend unavailable; declared entries return errors without opening a printer or returning driver data")
     } else if dll.eq_ignore_ascii_case("shell32.dll") {
-        (H, "Current-user RoamingAppData, LocalAppData and Profile paths from the provisioned environment; default flags verify through mounted-volume directories, DONT_VERIFY supported; other tokens, flags and registry folder redirection unsupported")
+        match name {
+            "SHGetFileInfoW" => (H, "Checks mounted-volume path metadata in the guest file view and writes ABI-width SHFILEINFOW fields; supports no flags and the filesystem display-name and supplied-attributes flags; icon, PIDL, association and type metadata queries are unsupported"),
+            "SHBrowseForFolderW" => (H, "Folder picker with Desktop, Computer, profile shortcuts and mounted-volume folders; supports a path field, selection callbacks and guest-owned PIDLs; full Shell namespace and reparse traversal unsupported"),
+            _ => (H, "Current-user RoamingAppData, LocalAppData and Profile paths from the provisioned environment; default flags verify through mounted-volume directories, DONT_VERIFY supported; other tokens, flags and registry folder redirection unsupported"),
+        }
     } else if dll.eq_ignore_ascii_case("ole32.dll") {
         match name {
+            "OleInitialize" | "OleUninitialize" =>
+                (L, "Per-thread OLE STA reference counting and balanced COM apartment initialization; clipboard, drag and drop and compound-document services are unsupported"),
+            "IIDFromString" =>
+                (L, "Converts braced UTF-16 interface IDs to Windows GUID layout; distinguishes invalid lengths and syntax and preserves LastError"),
             "CoInitialize" | "CoInitializeEx" | "CoUninitialize" | "CoGetContextToken" =>
                 (L, "SP1 apartment initialization flags, per-thread mode/refcount and balanced cleanup; checked opaque context token shared by MTA participants and private to STA; preserves Win32 LastError; context interfaces, COM activation, RPC, marshalling and message pumping unsupported"),
             _ => (L, "Checked process-owned COM task allocator, including zero-length allocation and reallocation ownership/copy semantics; 1 MiB per allocation bound; preserves Win32 LastError; COM activation and interfaces unsupported"),
@@ -4718,6 +4738,7 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
             | "NtDelayExecution" | "NtYieldExecution" | "NtQuerySystemTime"
             | "NtQueryPerformanceCounter" | "NtReadFile" | "NtWriteFile"
             | "NtCreateFile" | "NtAllocateVirtualMemory" | "NtQueryInformationProcess"
+            | "NtQuerySecurityObject" | "NtSetSecurityObject"
             | "NtOpenProcess" | "NtWaitForSingleObject" =>
                 (H, "Guest ABI arguments forwarded to GuestServices; backend determines operation support and NTSTATUS"),
             "RtlInitUnicodeString" => (L, "Guest UNICODE_STRING initialization with checked UTF-16 source and 16-bit lengths"),
@@ -4802,6 +4823,8 @@ pub fn support(dll: &str, name: &str) -> RuntimeSupport {
         else if (3600..=3615).contains(&find(dll,name).unwrap().id) {(H,"PostScript printer DC, document/page lifecycle and basic text/vector drawing; no display DC, bitmap driver or physical printer")}else{(U,"No runtime handler")}
     } else if dll.eq_ignore_ascii_case("advapi32.dll") {
         match name {
+            "GetFileSecurityW" | "SetFileSecurityW" =>
+                (H, "Mounted NTFS descriptor access under the launcher identity and guest file view; DACL updates only"),
             "OpenProcessToken" | "GetTokenInformation" | "AdjustTokenPrivileges" =>
                 (L, "Process-local unelevated primary token for the current-process pseudo-handle; token type, elevation and restricted privilege state; no host authorization changes"),
             "RegisterEventSourceW" | "RegisterEventSourceA" | "DeregisterEventSource" | "ReportEventW" | "ReportEventA" =>

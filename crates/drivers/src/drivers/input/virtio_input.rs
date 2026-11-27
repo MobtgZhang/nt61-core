@@ -640,6 +640,7 @@ fn translate_key(code: u16) -> &'static [u8] {
             }
         }
         14 => b"\x08",
+        15 if use_shift => b"\x1b[Z",
         15 => b"\t",
         16 => {
             if letter_upper {

@@ -30,6 +30,7 @@ pub const CTRL_HOME:u8=0x96;
 pub const CTRL_END:u8=0x97;
 pub const BACK:u8=0x98;
 pub const FORWARD:u8=0x99;
+pub const SHIFT_TAB: u8 = 0x9a;
 pub const ALT_FILE:u8=0xA0;
 pub const ALT_EDIT:u8=0xA1;
 pub const ALT_FORMAT:u8=0xA2;
@@ -66,6 +67,7 @@ impl Decoder {
             b"\x1b[1;5H"=>Some(CTRL_HOME),b"\x1b[1;5F"=>Some(CTRL_END),
             b"\x1b[1;3D" => Some(BACK),
             b"\x1b[1;3C" => Some(FORWARD),
+            b"\x1b[Z" => Some(SHIFT_TAB),
             b"\x1b[A" => Some(UP),
             b"\x1b[B" => Some(DOWN),
             b"\x1b[C" => Some(RIGHT),

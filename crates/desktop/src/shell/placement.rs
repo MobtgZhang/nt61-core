@@ -64,7 +64,7 @@ impl WindowState {
 
 impl ShellModel {
     pub(super) fn toggle_window_maximize(&mut self, id: u32, width: u32, height: u32) {
-        if let Some(window) = self.taskbar.windows.iter_mut().find(|w| w.id == id) {
+        if let Some(window) = self.taskbar.windows.iter_mut().find(|w| w.id == id && !w.folder_picker) {
             if window.maximized {
                 window.restore_normal_placement();
             } else {
@@ -75,7 +75,7 @@ impl ShellModel {
 
     pub fn window_shortcut(&mut self, shortcut: WindowShortcut) {
         let Some(id) = self.selected_window else { return };
-        let Some(window) = self.taskbar.windows.iter_mut().find(|w| w.id == id && !w.minimized) else {
+        let Some(window) = self.taskbar.windows.iter_mut().find(|w| w.id == id && !w.minimized && !w.folder_picker) else {
             return;
         };
         match shortcut {

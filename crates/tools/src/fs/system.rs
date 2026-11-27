@@ -67,7 +67,9 @@ const SYSTEM_STRUCTURE: &[(&str, bool)] = &[
     ("Program Files", true),
     ("Program Files (x86)", true),
     ("ProgramData", true),
+    ("ProgramData/Microsoft/Windows/Start Menu/Programs", true),
     ("Users", true),
+    ("Users/Public/Desktop", true),
     ("Users/Administrator", true),
     ("Users/Administrator/Desktop", true),
     ("Users/Administrator/Documents", true),
@@ -79,6 +81,7 @@ const SYSTEM_STRUCTURE: &[(&str, bool)] = &[
     ("Users/Administrator/AppData/Local", true),
     ("Users/Administrator/AppData/Local/Temp", true),
     ("Users/Administrator/AppData/Roaming", true),
+    ("Users/Administrator/AppData/Roaming/Microsoft/Windows/Start Menu/Programs", true),
 ];
 
 // =====================================================================

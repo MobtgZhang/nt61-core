@@ -1,7 +1,8 @@
 //! Hierarchical common control with stable item handles and visible-row input.
-use super::common::*;
+use super::{common::*, PointerAction};
+use crate::applications::shared::scrollbar::Scrollbar;
 use crate::graphics::{Rect, Surface};
-use alloc::{string::String, vec::Vec};
+use alloc::{rc::Rc, string::String, vec::Vec};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeItem {
@@ -25,6 +26,8 @@ pub struct TreeView {
     selected: Option<u64>,
     offset: usize,
     next_id: u64,
+    folder_icons: Option<Rc<[Option<crate::png::Image>; 6]>>,
+    scroll_grab: Option<i32>,
 }
 
 impl TreeView {
@@ -38,7 +41,21 @@ impl TreeView {
             selected: None,
             offset: 0,
             next_id: 1,
+            folder_icons: None,
+            scroll_grab: None,
         }
+    }
+    pub fn for_folder_picker(id: u32) -> Self {
+        let mut tree = Self::new(id);
+        tree.folder_icons = Some(Rc::new([
+            include_bytes!("../../assets/folder-picker/folder.png").as_slice(),
+            include_bytes!("../../assets/folder-picker/user-desktop.png").as_slice(),
+            include_bytes!("../../assets/folder-picker/computer.png").as_slice(),
+            include_bytes!("../../assets/folder-picker/drive-harddisk.png").as_slice(),
+            include_bytes!("../../assets/folder-picker/user-home.png").as_slice(),
+            include_bytes!("../../assets/folder-picker/x-office-address-book.png").as_slice(),
+        ].map(|bytes| crate::png::decode_png(bytes).ok())));
+        tree
     }
     pub fn items(&self) -> &[TreeItem] {
         &self.items
@@ -210,6 +227,65 @@ impl TreeView {
                 .saturating_sub(visible_rows.max(1)),
         );
     }
+    pub fn rows_in(bounds: Rect) -> usize {
+        (bounds.height / ROW_HEIGHT).max(1) as usize
+    }
+
+    pub(crate) fn folder_rows_in(bounds: Rect) -> usize {
+        (bounds.height.saturating_sub(2) / ROW_HEIGHT).max(1) as usize
+    }
+
+    fn folder_bounds(&self, bounds: Rect) -> (Rect, Option<Scrollbar>) {
+        let inner = Rect::new(bounds.x + 1, bounds.y + 1,
+            bounds.width.saturating_sub(2), bounds.height.saturating_sub(2));
+        if inner.width <= 16 {
+            return (inner, None);
+        }
+        let content = Rect::new(inner.x, inner.y, inner.width - 16, inner.height);
+        let track = Rect::new(inner.x + content.width as i32, inner.y, 16, inner.height);
+        let scrollbar = Scrollbar::new(track, self.visible_items().len(), Self::folder_rows_in(bounds), self.offset);
+        (if scrollbar.is_some() { content } else { inner }, scrollbar)
+    }
+
+    pub(crate) fn folder_pointer(
+        &mut self,
+        bounds: Rect,
+        x: i32,
+        y: i32,
+        action: PointerAction,
+        double_click: bool,
+    ) -> Option<CommonNotification> {
+        if matches!(action, PointerAction::Up | PointerAction::Cancel) {
+            self.scroll_grab = None;
+            return None;
+        }
+        if self.scroll_grab.is_none() && action != PointerAction::Down {
+            return None;
+        }
+        let (content, scrollbar) = self.folder_bounds(bounds);
+        if let Some(grab) = self.scroll_grab {
+            if let Some(bar) = scrollbar {
+                self.offset = bar.drag_offset(y, grab);
+            }
+            return None;
+        }
+        if let Some(bar) = scrollbar.filter(|bar| bar.bounds.contains(x, y)) {
+            let page = Self::folder_rows_in(bounds);
+            if let Some(down) = bar.arrow(y) {
+                self.scroll(if down { 1 } else { -1 }, page);
+            } else if bar.thumb.contains(x, y) {
+                self.scroll_grab = Some(y - bar.thumb.y);
+            } else {
+                self.scroll(if y < bar.thumb.y { -(page as i32) } else { page as i32 }, page);
+            }
+            return None;
+        }
+        let event = self.click(content, x, y, double_click);
+        if matches!(event, Some(CommonNotification::Expanded { expanded: false, .. })) {
+            self.scroll(0, Self::folder_rows_in(bounds));
+        }
+        event
+    }
     pub fn key(&mut self, key: CommonKey, visible_rows: usize) -> Option<CommonNotification> {
         if !self.enabled {
             return None;
@@ -326,6 +402,24 @@ impl TreeView {
         bounds: Rect,
         text: &F,
     ) {
+        self.draw_items(frame, bounds, self.focused, false, text);
+        border(frame, bounds, BORDER);
+    }
+
+    pub fn draw_folders<F: Fn(&mut Surface, &str, Rect, u32)>(
+        &self, frame: &mut Surface, bounds: Rect, focused: bool, text: &F,
+    ) {
+        let (content, scrollbar) = self.folder_bounds(bounds);
+        self.draw_items(frame, content, focused, true, text);
+        if let Some(bar) = scrollbar {
+            bar.draw(frame, false, self.scroll_grab.is_some());
+        }
+        border(frame, bounds, BORDER);
+    }
+
+    fn draw_items<F: Fn(&mut Surface, &str, Rect, u32)>(
+        &self, frame: &mut Surface, bounds: Rect, focused: bool, folders: bool, text: &F,
+    ) {
         let old_clip = frame.drawing_bounds();
         frame.set_draw_clip(Some(
             old_clip
@@ -346,11 +440,20 @@ impl TreeView {
             let y = bounds.y + row as i32 * ROW_HEIGHT as i32;
             let x = bounds.x.saturating_add(((*depth).min(1024) as i32) * 18);
             let selected = self.selected == Some(*id);
+            let inset = if self.check_boxes { 40 } else if folders { 39 } else { 20 };
+            let right = i64::from(bounds.x) + i64::from(bounds.width);
+            let width = (right - i64::from(x) - inset).clamp(0, i64::from(u32::MAX)) as u32;
             if selected {
                 fill(
                     frame,
-                    Rect::new(bounds.x, y, bounds.width, ROW_HEIGHT),
-                    if self.focused && self.enabled {
+                    if folders {
+                        Rect::new(x + inset as i32 - 2, y + 2, (item.text.chars().count() as u32 * 8 + 6).min(width), ROW_HEIGHT - 4)
+                    } else {
+                        Rect::new(bounds.x, y, bounds.width, ROW_HEIGHT)
+                    },
+                    if folders && focused && self.enabled {
+                        0xffd5eaf6
+                    } else if focused && self.enabled {
                         SELECTED
                     } else {
                         INACTIVE
@@ -359,12 +462,20 @@ impl TreeView {
             }
             let color = if !self.enabled {
                 DISABLED
-            } else if selected && self.focused {
+            } else if selected && focused && !folders {
                 0xffffffff
             } else {
                 INK
             };
-            if self.has_children(*id) {
+            if folders && self.has_children(*id) {
+                for step in 0..4 {
+                    if item.expanded {
+                        frame.fill_rect(x + 4 + step, y + 9 + step, 7 - step as u32 * 2, 1, 0xff53636f);
+                    } else {
+                        frame.fill_rect(x + 6 + step, y + 7 + step, 1, 7 - step as u32 * 2, 0xff53636f);
+                    }
+                }
+            } else if self.has_children(*id) {
                 // Windows 7's compact boxed expansion glyph.
                 let r = Rect::new(x + 4, y + 7, 9, 9);
                 fill(frame, r, 0xffffffff);
@@ -374,7 +485,16 @@ impl TreeView {
                     frame.fill_rect(x + 8, y + 9, 1, 5, INK);
                 }
             }
-            let inset = if self.check_boxes { 40 } else { 20 };
+            if let Some(image) = self.folder_icons.as_ref().and_then(|icons| {
+                icons.get(item.data as usize).and_then(Option::as_ref)
+            }) {
+                for (index, rgba) in image.pixels.chunks_exact(4).enumerate() {
+                    let column = x + 19 + (index % image.width as usize) as i32;
+                    let row = y + 3 + (index / image.width as usize) as i32;
+                    let color = u32::from_be_bytes([rgba[3], rgba[0], rgba[1], rgba[2]]);
+                    frame.blend_pixel(column as u32, row as u32, color);
+                }
+            }
             if self.check_boxes {
                 check_box(
                     frame,
@@ -383,8 +503,6 @@ impl TreeView {
                     self.enabled,
                 );
             }
-            let right = i64::from(bounds.x) + i64::from(bounds.width);
-            let width = (right - i64::from(x) - inset).clamp(0, i64::from(u32::MAX)) as u32;
             label(
                 frame,
                 text,
@@ -394,7 +512,6 @@ impl TreeView {
                 color,
             );
         }
-        border(frame, bounds, BORDER);
         restore_clip(frame, old_clip);
     }
 }

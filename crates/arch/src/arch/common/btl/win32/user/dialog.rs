@@ -198,7 +198,7 @@ impl Modal {
     }
 }
 
-fn create_window(
+pub(super) fn create_window(
     image: &mut GuestImage,
     services: &mut dyn GuestServices,
     mut request: w::Packet,
@@ -237,7 +237,7 @@ fn create_window(
     Ok(hwnd)
 }
 
-fn window_request(parent: u32, kind: u32, id: u32, style: u32, rect: [i16; 4]) -> w::Packet {
+pub(super) fn window_request(parent: u32, kind: u32, id: u32, style: u32, rect: [i16; 4]) -> w::Packet {
     let mut request = packet(1, 0);
     request.values[6] = parent;
     request.values[7] = kind;
@@ -254,7 +254,7 @@ fn window_request(parent: u32, kind: u32, id: u32, style: u32, rect: [i16; 4]) -
     request
 }
 
-fn remove(
+pub(super) fn remove(
     image: &mut GuestImage,
     services: &mut dyn GuestServices,
     hwnd: u32,
@@ -274,10 +274,16 @@ fn trampoline(image: &mut GuestImage) -> Result<u64, ApiError> {
     if let Some(address) = image.win32.user.dialog_trampoline {
         return Ok(address);
     }
+    let address = create_trampoline(image, GATEWAY)?;
+    image.win32.user.dialog_trampoline = Some(address);
+    Ok(address)
+}
+
+pub(super) fn create_trampoline(image: &mut GuestImage, gateway: u32) -> Result<u64, ApiError> {
     let address = allocate(image, 0, 16, READ | WRITE | EXECUTE)?;
     let mut code = [0; 7];
     code[0] = 0xb8;
-    code[1..5].copy_from_slice(&(catalog::GATEWAY_BASE | GATEWAY).to_le_bytes());
+    code[1..5].copy_from_slice(&(catalog::GATEWAY_BASE | gateway).to_le_bytes());
     code[5..].copy_from_slice(if image.thread.context.mode == DecodeMode::X86 {
         &[0xcd, 0x2e]
     } else {
@@ -286,7 +292,6 @@ fn trampoline(image: &mut GuestImage) -> Result<u64, ApiError> {
     if !image.memory.write_virt(address, &code) {
         return Err(NOACCESS.into());
     }
-    image.win32.user.dialog_trampoline = Some(address);
     Ok(address)
 }
 

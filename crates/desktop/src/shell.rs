@@ -293,6 +293,8 @@ pub struct WindowState {
     pub kind: WindowKind,
     pub restore_geometry: Option<(i32, i32, i32, i32)>,
     pub snapped: Option<SnapSide>,
+    pub folder_picker: bool,
+    pub(crate) folder_picker_minimum: Option<(i32, i32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -343,6 +345,8 @@ impl TaskbarState {
             kind,
             restore_geometry: None,
             snapped: None,
+            folder_picker: false,
+            folder_picker_minimum: None,
         });
     }
 
@@ -380,6 +384,8 @@ impl TaskbarState {
                 kind: WindowKind::Generic,
                 restore_geometry: None,
                 snapped: None,
+                folder_picker: false,
+                folder_picker_minimum: None,
             });
         }
     }
@@ -2251,6 +2257,21 @@ impl ShellModel {
                 if next.2<660 {if next.0!=drag.geometry.0 {next.0=drag.geometry.0+drag.geometry.2-660;} next.2=660;}
                 if next.3<520 {if next.1!=drag.geometry.1 {next.1=drag.geometry.1+drag.geometry.3-520;} next.3=520;}
             }
+            if let Some((width, height)) = window.folder_picker_minimum {
+                if next.2 < width && next.0 != drag.geometry.0 {
+                    next.0 = drag.geometry.0 + drag.geometry.2 - width;
+                }
+                if next.3 < height && next.1 != drag.geometry.1 {
+                    next.1 = drag.geometry.1 + drag.geometry.3 - height;
+                }
+                next.2 = next.2.max(width);
+                next.3 = next.3.max(height);
+                if let Some(scene) = self.applications.iter_mut().find(|app| app.window_id == window_id)
+                    .and_then(|app| app.guest_window.as_mut())
+                {
+                    scene.resize_folder_picker(next.2 - previous.2, next.3 - previous.3);
+                }
+            }
             (window.x, window.y, window.width, window.height) = next;
             window.snapped = None;
             window.restore_geometry = None;
@@ -2281,7 +2302,9 @@ impl ShellModel {
             }
             window.x = cursor_x.saturating_sub(self.drag_offset.0);
             window.y = cursor_y.saturating_sub(self.drag_offset.1);
-            self.drag_snap = placement::DragSnap::at(cursor_x, cursor_y, self.viewport);
+            if !window.folder_picker {
+                self.drag_snap = placement::DragSnap::at(cursor_x, cursor_y, self.viewport);
+            }
         }
         previous != (window.x, window.y, window.width, window.height)
     }
@@ -2672,7 +2695,7 @@ impl ShellModel {
             .taskbar
             .windows
             .iter_mut()
-            .find(|window| window.id == id)
+            .find(|window| window.id == id && !window.folder_picker)
         {
             window.remember_normal_placement();
             window.maximized = false;

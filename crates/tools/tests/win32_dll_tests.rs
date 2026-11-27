@@ -551,6 +551,16 @@ fn guest_runtime_catalog_preserves_bitness_calling_convention_and_stable_service
                         assert_eq!(image.exports_by_name[api.name], image.exports_by_ordinal[&ordinal]);
                     }
                 }
+                if *name == "shell32.dll" {
+                    let ordinal = match api.name {
+                        "SHBrowseForFolderW" => Some(323),
+                        "SHGetFileInfoW" => Some(367),
+                        _ => None,
+                    };
+                    if let Some(ordinal) = ordinal {
+                        assert_eq!(image.exports_by_name[api.name], image.exports_by_ordinal[&ordinal]);
+                    }
+                }
                 let rva = *image.exports_by_name.get(api.name).unwrap();
                 let offset = (rva - section.virtual_address + section.pointer_to_raw_data) as usize;
                 let code = &bytes[offset..offset + 16];

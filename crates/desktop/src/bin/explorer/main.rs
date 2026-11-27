@@ -1457,14 +1457,14 @@ impl Shell {
             );
             aero::window_border(frame, bounds, 6);
             let application = self.model.application(window.id);
-            if let Some(app) = application {
+            if let Some(app) = application.filter(|_| !window.folder_picker) {
                 nt61_desktop::applications::icons::draw(
                     frame,
                     app.id,
                     nt61_desktop::graphics::Rect::new(window.x + 8, window.y + 7, 16, 16),
                 );
             }
-            if application.is_none() {
+            if application.is_none() && !window.folder_picker {
                 let name = match window.kind {
                     nt61_desktop::shell::WindowKind::Computer
                     | nt61_desktop::shell::WindowKind::System => "Computer",
@@ -1476,9 +1476,9 @@ impl Shell {
                     nt61_desktop::graphics::Rect::new(window.x + 8, window.y + 7, 16, 16),
                 );
             }
-            let title_x = window.x + 30;
+            let title_x = window.x + if window.folder_picker { 8 } else { 30 };
             let title_y = window.y + 7;
-            let title_width = width.saturating_sub(if application.is_some() { 140 } else { 120 });
+            let title_width = width.saturating_sub(if window.folder_picker { 62 } else if application.is_some() { 140 } else { 120 });
             if self.model.control_browser(window.id).is_some() {
                 if let Ok(font)=self.model.fonts.get(nt61_desktop::control_browser::paint::FONT) {
                     nt61_desktop::control_browser::paint::label(&font,frame,&window.title,
@@ -1523,12 +1523,25 @@ impl Shell {
                 ])
                 .enumerate()
             {
+                if bounds.width == 0 {
+                    continue;
+                }
                 aero::window_control_button(
                     frame,
                     bounds,
                     kind,
                     self.hovered_caption == Some((window.id, index as u8)),
                 );
+            }
+            if window.folder_picker && window.resize_edge_at(window.x + window.width - 2, window.y + window.height - 2).is_some() {
+                for row in 0..3 {
+                    for column in 0..=row {
+                        let x = body.x + body.width as i32 - 4 - column * 4;
+                        let y = body.y + body.height as i32 - 12 + row * 4;
+                        frame.fill_rect(x + 1, y + 1, 2, 2, 0xffffffff);
+                        frame.fill_rect(x, y, 2, 2, 0xff7894a7);
+                    }
+                }
             }
         }
     }

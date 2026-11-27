@@ -42,6 +42,7 @@ struct Control {
     model: Model,
     visible: bool,
     enabled: bool,
+    folder_tree: bool,
     previous:u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,8 +58,10 @@ pub struct Scene {
     enabled: bool,
     close_enabled: bool,
     dialog: bool,
+    folder_picker: bool,
     body:Rect,
     capture:Option<u32>,
+    folder_click: Option<(u32, u64, i32, i32)>,
 }
 fn scalar(p: &mut w::Packet, value: u64) {
     p.values[20] = value as u32;
@@ -68,6 +71,35 @@ fn value(p: &w::Packet, index: usize) -> u64 {
     p.values[index] as u64 | ((p.values[index + 1] as u64) << 32)
 }
 impl Scene {
+    pub(crate) fn resize_folder_picker(&mut self, width_delta: i32, height_delta: i32) {
+        for control in &mut self.controls {
+            match &mut control.model {
+                Model::Tree(tree) => {
+                    control.rect.width = control.rect.width.saturating_add_signed(width_delta);
+                    control.rect.height = control.rect.height.saturating_add_signed(height_delta);
+                    tree.scroll(0, TreeView::folder_rows_in(control.rect));
+                }
+                Model::Edit { .. } => {
+                    control.rect.width = control.rect.width.saturating_add_signed(width_delta);
+                    control.rect.y += height_delta;
+                }
+                Model::Button(_) => {
+                    control.rect.y += height_delta;
+                    if matches!(control.id, w::FOLDER_PICKER_OK | w::FOLDER_PICKER_CANCEL) {
+                        control.rect.x += width_delta;
+                    }
+                }
+                Model::Text(_) if control.id == w::FOLDER_PICKER_PATH_LABEL => {
+                    control.rect.y += height_delta;
+                }
+                Model::Text(_) => {
+                    control.rect.width = control.rect.width.saturating_add_signed(width_delta);
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn captures_pointer(&self)->bool{self.capture.is_some()||self.controls.iter().any(|c|matches!(&c.model,Model::Combo{combo,..}if combo.popup().is_open()))}
     fn contains(&self, hwnd: u32) -> bool {
         self.hwnd == hwnd || self.controls.iter().any(|c| c.hwnd == hwnd)
@@ -91,6 +123,24 @@ impl Scene {
         }
     }
     fn notify(&mut self, hwnd: u32, id: u32, notification: CommonNotification) {
+        if let Some(control) = self.controls.iter_mut().find(|c| c.hwnd == hwnd && c.folder_tree) {
+            let Model::Tree(tree) = &control.model else { return; };
+            let selected = tree.selected().unwrap_or(0);
+            let previous = core::mem::replace(&mut control.previous, selected);
+            if selected != previous {
+                self.event(self.hwnd, w::FOLDER_TREE_SELECTED, selected, u64::from(hwnd));
+            }
+            match notification {
+                CommonNotification::Expanded { item, expanded: true, .. } => {
+                    self.event(self.hwnd, w::FOLDER_TREE_EXPANDED, item, u64::from(hwnd));
+                }
+                CommonNotification::Activated { item, .. } => {
+                    self.event(self.hwnd, w::FOLDER_TREE_ACTIVATED, item, u64::from(hwnd));
+                }
+                _ => {}
+            }
+            return;
+        }
         let mut detail=[0u32;8];
         if let Some(c)=self.controls.iter_mut().find(|c|c.hwnd==hwnd){match &c.model{
             Model::List(v)=>{let item=match notification{CommonNotification::SelectionChanged{item,..}|CommonNotification::Activated{item,..}|CommonNotification::Checked{item,..}=>item,_=>0};if let Some(i)=v.rows().iter().position(|r|r.id==item){detail[0]=i as u32;detail[1]=v.rows()[i].data as u32;detail[2]=(v.rows()[i].data as u64>>32)as u32;detail[3]=if v.selected().any(|r|r.id==item){2}else{0};}},
@@ -165,16 +215,28 @@ impl Scene {
             let r = Self::bounds(c, body);
             match &c.model {
                 Model::List(v) => v.draw(frame, r, text),
+                Model::Tree(v) if c.folder_tree => {
+                    v.draw_folders(frame, r, self.focus == Some(c.hwnd), text);
+                }
                 Model::Tree(v) => v.draw(frame, r, text),
                 Model::Bar(v) => v.draw(frame, r, text),
                 Model::Combo { combo, .. } => combo.draw(frame, r, text),
                 Model::Text(s) => text(frame, s, r, 0xff000000),
                 Model::Edit { contents, .. } => {
                     frame.fill_rect(r.x, r.y, r.width, r.height, 0xffffffff);
+                    let folder_edit = self.folder_picker;
+                    let focused = self.focus == Some(c.hwnd);
+                    if folder_edit {
+                        frame.stroke_rounded_rect(r, 2, 1, if focused { 0xff367eac } else { 0xffaabac5 });
+                    }
                     if let Some(edit_clip) = clip.intersection(&r) {
                         frame.set_draw_clip(Some(edit_clip));
                         let mut y = r.y + 3;
-                        for line in contents.text.split('\n') {
+                        let start = if folder_edit && focused {
+                            contents.cursor.saturating_sub(r.width.saturating_sub(12) as usize / 8)
+                        } else { 0 };
+                        let offset = contents.text.char_indices().nth(start).map_or(contents.text.len(), |(offset, _)| offset);
+                        for line in contents.text[offset..].split('\n') {
                             if y >= r.y + r.height as i32 {
                                 break;
                             }
@@ -183,10 +245,22 @@ impl Scene {
                                 0xff000000);
                             y += 20;
                         }
+                        if folder_edit && focused {
+                            let caret = r.x + 4 + contents.cursor.saturating_sub(start) as i32 * 8;
+                            frame.fill_rect(caret, r.y + 4, 1, r.height.saturating_sub(8), 0xff244a63);
+                        }
                         frame.set_draw_clip(Some(clip));
                     }
                 }
                 Model::Button(s) => {
+                    if self.folder_picker {
+                        let default = c.enabled && (self.focus == Some(c.hwnd) || c.id == w::FOLDER_PICKER_OK);
+                        frame.fill_rect(r.x + 1, r.y + 1, r.width - 2, r.height - 2, if c.enabled { 0xfff7fafc } else { 0xffeeeeee });
+                        frame.stroke_rounded_rect(r, 3, if default { 2 } else { 1 }, if default { 0xff367eac } else { 0xffa5adb4 });
+                        let inset = (r.width.saturating_sub(s.chars().count() as u32 * 8) / 2).max(4);
+                        text(frame, s, Rect::new(r.x + inset as i32, r.y + 3, r.width - inset, r.height - 3), if c.enabled { 0xff101820 } else { 0xff777777 });
+                        continue;
+                    }
                     crate::compositor::aero::menu_item(frame, r, true);
                     text(
                         frame,
@@ -197,7 +271,7 @@ impl Scene {
                             r.width.saturating_sub(12),
                             r.height.saturating_sub(8),
                         ),
-                        0xff000000,
+                        if c.enabled { 0xff000000 } else { 0xff777777 },
                     );
                 }
             }
@@ -209,7 +283,7 @@ impl Scene {
         }
         frame.set_draw_clip(Some(old));
     }
-    pub fn pointer(&mut self, body: Rect, x: i32, y: i32, down: bool, held: bool) {
+    pub fn pointer(&mut self, body: Rect, x: i32, y: i32, down: bool, held: bool, now: u64) {
         if !self.enabled { return; }
         self.body=body;
         let release = !down && !held;
@@ -221,7 +295,7 @@ impl Scene {
         let target = popup.or(capture).or_else(|| {
             self.controls
                 .iter()
-                .rposition(|c| c.visible && c.enabled && Self::bounds(c, body).contains(x, y))
+                .rposition(|c| c.visible && c.enabled && (!self.folder_picker || !matches!(c.model, Model::Text(_))) && Self::bounds(c, body).contains(x, y))
         });
         let Some(index) = target else {
             return;
@@ -233,6 +307,19 @@ impl Scene {
             self.capture=Some(hwnd);
             self.focus = Some(hwnd);
         }
+        let double_click = down && c.folder_tree && self.folder_click.is_some_and(|(last, time, px, py)| {
+            last == hwnd && now.saturating_sub(time) <= 500 && x.abs_diff(px) <= 4 && y.abs_diff(py) <= 4
+        });
+        if down {
+            self.folder_click = (c.folder_tree && !double_click).then_some((hwnd, now, x, y));
+        }
+        let action = if down {
+            PointerAction::Down
+        } else if release {
+            PointerAction::Up
+        } else {
+            PointerAction::Move
+        };
         let notification = match &mut c.model {
             Model::List(v) => {
                 if down {
@@ -241,25 +328,9 @@ impl Scene {
                     None
                 }
             }
-            Model::Tree(v) => {
-                if down {
-                    v.click(r, x, y, false)
-                } else {
-                    None
-                }
-            }
-            Model::Bar(v) => v.pointer(
-                if down {
-                    PointerAction::Down
-                } else if release {
-                    PointerAction::Up
-                } else {
-                    PointerAction::Move
-                },
-                r,
-                x,
-                y,
-            ),
+            Model::Tree(v) if c.folder_tree => v.folder_pointer(r, x, y, action, double_click),
+            Model::Tree(v) if down => v.click(r, x, y, false),
+            Model::Bar(v) => v.pointer(action, r, x, y),
             Model::Combo { combo, .. } => {
                 if matches!(combo.pointer(x, y, down, r, body), PopupResult::Selected(_)) {
                     self.event(self.hwnd, 0x111, (id | 0x10000) as u64, hwnd as u64);
@@ -267,7 +338,7 @@ impl Scene {
                 None
             }
             Model::Button(_) => {
-                if down {
+                if (down && !self.folder_picker) || (self.folder_picker && release && capture.is_some() && r.contains(x, y)) {
                     Some(CommonNotification::Command {
                         control: id,
                         command: id,
@@ -282,6 +353,15 @@ impl Scene {
         if let Some(n) = notification {
             self.notify(hwnd, id, n);
         }
+    }
+    pub fn wheel(&mut self, body: Rect, x: i32, y: i32, delta: i32) -> bool {
+        if !self.enabled { return false; }
+        let Some(control) = self.controls.iter_mut().find(|c| {
+            c.folder_tree && c.enabled && c.visible && Self::bounds(c, body).contains(x, y)
+        }) else { return false; };
+        let Model::Tree(tree) = &mut control.model else { return false; };
+        tree.scroll(delta.saturating_mul(-3), TreeView::folder_rows_in(control.rect));
+        true
     }
     pub fn key(&mut self, key: u8) {
         use super::explorer::input;
@@ -301,10 +381,23 @@ impl Scene {
         };
         if key==27{for c in &mut self.controls{if let Model::Combo{combo,..}=&mut c.model{if combo.popup().is_open(){combo.close();return;}}}}
         if self.dialog && key == 27 {
-            self.event(self.hwnd, 0x111, 2, 0);
+            self.event(self.hwnd, 0x111, u64::from(w::FOLDER_PICKER_CANCEL), 0);
             return;
         }
-        if key == 9 {
+        if key == 9 || (key == input::SHIFT_TAB && self.folder_picker) {
+            if self.folder_picker {
+                let controls = self.controls.iter().filter(|c| {
+                    c.visible && c.enabled && !matches!(c.model, Model::Text(_))
+                });
+                self.focus = if key == input::SHIFT_TAB {
+                    controls.clone().rev().skip_while(|c| Some(c.hwnd) != self.focus)
+                        .nth(1).or_else(|| controls.last())
+                } else {
+                    controls.clone().skip_while(|c| Some(c.hwnd) != self.focus)
+                        .nth(1).or_else(|| controls.into_iter().next())
+                }.map(|c| c.hwnd);
+                return;
+            }
             let next = self
                 .controls
                 .iter()
@@ -323,12 +416,16 @@ impl Scene {
         {
             let c = &mut self.controls[index];
             let (hwnd, id) = (c.hwnd, c.id);
+            if self.folder_picker && key == 13 && matches!(c.model, Model::Edit { .. }) {
+                self.event(self.hwnd, 0x111, u64::from(w::FOLDER_PICKER_OK), 0);
+                return;
+            }
             if let Model::Edit { contents, multiline, read_only, modified } = &mut c.model {
                 let changed = match key {
                     input::LEFT => { contents.move_cursor_left(); false }
                     input::RIGHT => { contents.move_cursor_right(); false }
-                    input::CTRL_HOME => { contents.cursor = 0; false }
-                    input::CTRL_END => { contents.cursor = contents.text.chars().count(); false }
+                    input::HOME | input::CTRL_HOME => { contents.cursor = 0; false }
+                    input::END | input::CTRL_END => { contents.cursor = contents.text.chars().count(); false }
                     8 | 127 if !*read_only => contents.backspace(),
                     input::DELETE if !*read_only && contents.move_cursor_right() => contents.backspace(),
                     13 if *multiline && !*read_only && contents.text.len() + 2 < w::EMPTY.text[0].len() => {
@@ -344,7 +441,12 @@ impl Scene {
                 };
                 if changed {
                     *modified = true;
-                    self.event(self.hwnd, 0x0111, u64::from((id & 0xffff) | 0x0300_0000), u64::from(hwnd));
+                    if self.folder_picker {
+                        let nonempty = !contents.text.is_empty();
+                        self.event(self.hwnd, w::FOLDER_PATH_CHANGED, u64::from(nonempty), u64::from(hwnd));
+                    } else {
+                        self.event(self.hwnd, 0x0111, u64::from((id & 0xffff) | 0x0300_0000), u64::from(hwnd));
+                    }
                 }
                 return;
             }
@@ -352,7 +454,18 @@ impl Scene {
                 let anchor=Self::bounds(c,self.body);
                 let n = match &mut c.model {
                     Model::List(v) => v.key(key, Modifiers::default(), 10),
-                    Model::Tree(v) => v.key(key, 10),
+                    Model::Tree(v) if c.folder_tree => {
+                        let rows = TreeView::folder_rows_in(anchor);
+                        let event = v.key(key, rows);
+                        if matches!(event, Some(CommonNotification::Expanded { expanded: false, .. })) {
+                            v.scroll(0, rows);
+                        }
+                        event
+                    }
+                    Model::Tree(v) => v.key(key, TreeView::rows_in(anchor)),
+                    Model::Button(_) if self.folder_picker && matches!(key, CommonKey::Enter | CommonKey::Space) => {
+                        Some(CommonNotification::Command { control: id, command: id })
+                    }
                     Model::Bar(v) => v.key(key),
                     Model::Combo { combo, .. } => {
                         let k = match key {
@@ -478,12 +591,20 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
         }
         let id = shell.launch_application(super::AppId::Notepad);
         let dialog = p.values[23] != 0;
+        let folder_picker = p.values[23] == w::FOLDER_PICKER_WINDOW;
         if let Some(win) = shell.taskbar.windows.iter_mut().find(|v| v.id == id) {
             win.title = p.string(0).unwrap_or("").into();
             if p.values[13] != 0x8000_0000 { win.x = p.values[13] as i32; }
             if p.values[14] != 0x8000_0000 { win.y = p.values[14] as i32; }
             win.width = p.values[15].clamp(160, 1920) as i32;
             win.height = p.values[16].clamp(100, 1080) as i32;
+            if folder_picker {
+                win.x = ((shell.viewport.0 as i32 - win.width) / 2).max(0);
+                win.y = ((shell.viewport.1 as i32 - win.height) / 2).max(0);
+                win.folder_picker = true;
+                win.folder_picker_minimum = (p.values[18] & 0x0004_0000 != 0)
+                    .then_some((win.width, win.height));
+            }
             if dialog && p.values[18] & 0x10000000 == 0 { win.minimized = true; }
         }
         let body=shell.application_body(id).unwrap_or(Rect::new(0,0,640,480));
@@ -504,7 +625,8 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
             enabled: p.values[18] & 0x08000000 == 0,
             close_enabled: true,
             dialog,
-            body,capture:None,
+            folder_picker,
+            body,capture:None,folder_click:None,
         });
         scalar(p, hwnd as u64);
         return;
@@ -767,6 +889,7 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
                 Model::List(list)
             }
             2 => Model::Tree(TreeView::new(id)),
+            w::FOLDER_TREE_CONTROL => Model::Tree(TreeView::for_folder_picker(id)),
             3 => Model::Bar(Toolbar::new(id)),
             4 => Model::Combo {
                 items: Vec::new(),
@@ -796,6 +919,7 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
             model,
             visible: p.values[18] & 0x10000000 != 0,
             enabled: p.values[18] & 0x8000000 == 0,
+            folder_tree: p.values[7] == w::FOLDER_TREE_CONTROL,
             previous:0,
         });
         scalar(p, hwnd as u64);
@@ -838,7 +962,7 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
             Model::Text(s) | Model::Button(s) => *s = p.string(0).unwrap_or("").into(),
             Model::Edit { contents, modified, .. } => {
                 contents.text = p.string(0).unwrap_or("").into();
-                contents.cursor = 0;
+                contents.cursor = if control.id == 101 { contents.text.chars().count() } else { 0 };
                 *modified = false;
             }
             _ => {
@@ -936,14 +1060,22 @@ pub fn execute(shell: &mut ShellModel, p: &mut w::Packet) {
             }
             0x1102 => {
                 v.expand(lp, wp & 2 != 0);
+                if control.folder_tree && wp & 2 == 0 {
+                    v.scroll(0, TreeView::folder_rows_in(control.rect));
+                }
                 1
             }
             0x1105 => v.items().len() as u64,
             0x110a => v.selected().unwrap_or(0),
             0x110b => {
                 v.select(lp);
+                if control.folder_tree {
+                    v.ensure_visible(lp, TreeView::folder_rows_in(control.rect));
+                    control.previous = v.selected().unwrap_or(0);
+                }
                 1
             }
+            w::FOLDER_TREE_SET_EXPANDABLE if control.folder_tree => u64::from(v.set_has_children(lp, wp != 0)),
             0x110d | 0x113f => u64::from(v.set_text(lp, &text)),
             _ => {
                 p.values[19] = 120;
@@ -1323,5 +1455,88 @@ mod tests {
  fn dropdown_keyboard_uses_real_body_and_escape_captures_first(){
     let mut shell=ShellModel::new(Theme::aero());call(&mut shell,1,100,0,0,0,0,0,"");call(&mut shell,1,101,100,4,0,0,0,"");call(&mut shell,3,101,0,0,0x143,0,0,"One");call(&mut shell,3,101,0,0,0x143,0,0,"Two");
     let scene=shell.applications[0].guest_window.as_mut().unwrap();scene.key(9);scene.key(13);assert!(scene.captures_pointer());scene.key(27);assert!(!scene.captures_pointer());assert!(scene.events.is_empty());
+ }
+
+ #[test]
+ fn folder_picker_preserves_tree_selection_and_skips_disabled_controls() {
+    use super::super::explorer::input;
+    let mut shell = ShellModel::new(Theme::aero());
+    let mut window = w::EMPTY;
+    window.values[4] = 1;
+    window.values[5] = 100;
+    window.values[15] = 357;
+    window.values[16] = 358;
+    window.values[18] = 0x1000_0000;
+    window.values[23] = 2;
+    window.values[63] = 41;
+    execute(&mut shell, &mut window);
+    call(&mut shell, 1, 101, 100, 5, 0, 0, 0, "Select a folder");
+    call(&mut shell, 1, 102, 100, w::FOLDER_TREE_CONTROL, 0, 0, 0, "");
+    call(&mut shell, 1, 103, 100, 6, 0, 0, 0, "OK");
+    call(&mut shell, 1, 104, 100, 6, 0, 0, 0, "Cancel");
+    call(&mut shell, w::ENABLE_WINDOW, 103, 0, 0, 0, 0, 0, "");
+    let disk = value(&call(&mut shell, 3, 102, 0, 0, 0x1132, 0, 0, "Local Disk (C:)"), 20);
+    call(&mut shell, 3, 102, 0, 0, w::FOLDER_TREE_SET_EXPANDABLE, 1, disk, "");
+    call(&mut shell, 3, 102, 0, 0, 0x110b, 9, disk, "");
+    let scene = shell.applications[0].guest_window.as_mut().unwrap();
+    scene.key(9);
+    assert_eq!(scene.focus, Some(102));
+    scene.key(input::RIGHT);
+    assert_eq!(scene.events.len(), 1);
+    assert_eq!(scene.events[0].values[8], w::FOLDER_TREE_EXPANDED);
+    assert_eq!(value(&scene.events[0], 9), disk);
+    let child = value(&call(&mut shell, 3, 102, 0, 0, 0x1132, disk, 0, "Windows"), 20);
+    let scene = shell.applications[0].guest_window.as_mut().unwrap();
+    scene.key(input::RIGHT);
+    assert_eq!(scene.events[1].values[8], w::FOLDER_TREE_SELECTED);
+    assert_eq!(value(&scene.events[1], 9), child);
+    scene.key(input::LEFT);
+    assert_eq!(value(&scene.events[2], 9), disk);
+    scene.key(9);
+    assert_eq!(scene.focus, Some(104));
+    scene.key(27);
+    assert_eq!(scene.events.last().unwrap().values[8..10], [0x111, 2]);
+ }
+
+ #[test]
+ fn folder_picker_resize_keeps_tree_and_action_buttons_anchored() {
+    let mut shell = ShellModel::new(Theme::aero());
+    let mut window = w::EMPTY;
+    window.values[4] = 1;
+    window.values[5] = 100;
+    window.values[15] = 535;
+    window.values[16] = 496;
+    window.values[18] = 0x1004_0000;
+    window.values[23] = w::FOLDER_PICKER_WINDOW;
+    window.values[63] = 41;
+    execute(&mut shell, &mut window);
+    call(&mut shell, 1, 101, 100, w::FOLDER_TREE_CONTROL, 0, 0, 0, "");
+    call(&mut shell, 1, 102, 100, 6, 0, 0, 0, "OK");
+    let application = &mut shell.applications[0];
+    let window_id = application.window_id;
+    let scene = application.guest_window.as_mut().unwrap();
+    scene.controls[0].rect = Rect::new(16, 55, 491, 323);
+    let Model::Tree(tree) = &mut scene.controls[0].model else { panic!("expected folder tree") };
+    for _ in 0..20 {
+        tree.insert(None, "Folder", 0).unwrap();
+    }
+    tree.scroll(20, TreeView::folder_rows_in(Rect::new(16, 55, 491, 323)));
+    assert_eq!(tree.offset(), 7);
+    scene.controls[1].id = w::FOLDER_PICKER_OK;
+    scene.controls[1].rect = Rect::new(337, 425, 81, 24);
+    let frame = &shell.taskbar.windows[0];
+    let group = frame.caption_control_group();
+    assert_eq!(group.width, 44);
+    assert_eq!(frame.caption_control_at(group.x - 12, group.y + 5), None);
+    assert_eq!(frame.caption_control_at(group.x + 12, group.y + 5), Some(2));
+    let (right, bottom) = (frame.x + frame.width - 8, frame.y + frame.height - 8);
+    assert!(shell.begin_window_drag(window_id, right, bottom));
+    assert!(shell.drag_window_to(right + 64, bottom + 80));
+    shell.release_window_drag();
+    let scene = shell.application(window_id).unwrap().guest_window.as_ref().unwrap();
+    assert_eq!(scene.controls[0].rect, Rect::new(16, 55, 555, 403));
+    let Model::Tree(tree) = &scene.controls[0].model else { panic!("expected folder tree") };
+    assert_eq!(tree.offset(), 4);
+    assert_eq!(scene.controls[1].rect, Rect::new(401, 505, 81, 24));
  }
 }

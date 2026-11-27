@@ -4,6 +4,8 @@ use crate::arch::common::btl::{dialog_wire as w, ir::X86Reg};
 
 #[path = "user/dialog.rs"]
 mod dialog;
+#[path = "user/browse.rs"]
+pub(super) mod browse;
 #[path = "user/resource_handles.rs"]
 mod resource_handles;
 #[path = "user/system_menu.rs"]
@@ -69,6 +71,7 @@ pub(super) enum Completion {
     DialogInit { hwnd: u32, focus: u32, show: bool, modal: bool },
     DialogMessage { close: bool, notification: Option<u64> },
     DialogDestroy { hwnd: u32, procedure: u64, final_message: bool },
+    BrowseFolder { hwnd: u32, pidl: u64 },
     RunOnce { address: u64, output: u64, native: bool },
     Print { handle: u64, job: u64 },
     EnumFont(font_enum::Enumeration),
@@ -86,6 +89,7 @@ pub(super) struct State {
     messages: Vec<(u32, Message)>,
     trampoline: Option<u64>,
     dialog_trampoline: Option<u64>,
+    browse_trampoline: Option<u64>,
     notifications:Vec<u64>,
     resources: resource_handles::State,
     registered_messages: Vec<String>,
@@ -100,6 +104,7 @@ pub(super) struct ThreadState {
     active_window: u32,
     focus_root: u32,
     modals: Vec<dialog::Modal>,
+    folders: Vec<browse::Folder>,
 }
 impl ThreadState {
     pub(super) fn calling_print_callback(&self, handle: u64) -> bool {
@@ -121,6 +126,7 @@ impl State {
             messages: Vec::new(),
             trampoline: None,
             dialog_trampoline: None,
+            browse_trampoline: None,
             notifications:Vec::new(),
             resources: resource_handles::State::default(),
             registered_messages: Vec::new(),
@@ -274,6 +280,9 @@ pub(super) fn callback_return(image:&mut GuestImage,services:&mut dyn GuestServi
         Completion::DialogDestroy { hwnd, procedure, final_message } => {
             return dialog::destroy_complete(image, services, hwnd, procedure, final_message).map_err(|_| failure());
         }
+        Completion::BrowseFolder { hwnd, pidl } => {
+            return browse::callback_complete(image, services, hwnd, pidl).map_err(|_| failure());
+        }
         Completion::RunOnce{address,output,native}=>super::runonce::callback_complete(image,address,output,native,result).map_err(|error| match error {
             super::ApiError::Unsupported => StopReason::UnsupportedApi { id: if native { 1048 } else { 139 } },
             _ => failure(),
@@ -306,6 +315,124 @@ fn queue(image: &mut GuestImage, message: Message) -> Result<(), ApiError> {
     state.messages.push((owner, message));
     Ok(())
 }
+fn receive_message(
+    image: &mut GuestImage,
+    services: &mut dyn GuestServices,
+    a: &[u64],
+    peek: bool,
+) -> Result<u64, ApiError> {
+    let x86 = image.thread.context.mode == DecodeMode::X86;
+    let width = if x86 { 4 } else { 8 };
+    if a[2] != 0 || a[3] != 0 {
+        return Err(ApiError::Unsupported);
+    }
+    if !image.memory.probe_write(a[0], if x86 { 28 } else { 48 }) {
+        return Err(87u32.into());
+    }
+    let mut polled = false;
+    loop {
+        if let Some(index) = image
+            .win32
+            .user
+            .messages
+            .iter()
+            .position(|(owner,m)| *owner == image.thread_id() && (m.message == 0x12 || a[1] == 0 || m.hwnd == a[1]))
+        {
+            let message = image.win32.user.messages[index].1;
+            if !peek || a[4] & 1 != 0 {
+                image.win32.user.messages.remove(index);
+            }
+            message_write(image, a[0], message)?;
+            return Ok(if !peek && message.message == 0x12 {
+                0
+            } else {
+                1
+            });
+        }
+        if polled {
+            let thread = image.thread_id();
+            if let Some(window) = image.win32.user.windows.iter_mut().find(|window| {
+                window.thread_id == thread && window.paint_pending
+                    && (a[1] == 0 || a[1] == u64::from(window.hwnd))
+            }) {
+                if !peek || a[4] & 1 != 0 {
+                    window.paint_pending = false;
+                }
+                let message = Message { hwnd: u64::from(window.hwnd), message: 0x000f, wp: 0, lp: 0 };
+                message_write(image, a[0], message)?;
+                return Ok(1);
+            }
+            return if peek { Ok(0) } else { Err(ApiError::Retry) };
+        }
+        polled = true;
+        let roots: Vec<u32> = image
+            .win32
+            .user
+            .windows
+            .iter()
+            .filter(|w| w.parent == 0 && w.thread_id == image.thread_id() && (a[1] == 0 || a[1] == u64::from(w.hwnd)))
+            .map(|w| w.hwnd)
+            .collect();
+        for root in roots {
+            let mut p = packet(4, root);
+            p.values[9] = 1;
+            let r = send(services, p)?;
+            if r.values[20] == 0 {
+                continue;
+            }
+            let message = r.values[8];
+            let mut lp = r.values[11] as u64 | ((r.values[12] as u64) << 32);
+            if message == 0x4e {
+                if image.win32.user.notifications.len()>=256{return Err(1816u32.into());}
+                let notification = heap_allocate(image, 256)?;
+                image.win32.user.notifications.push(notification);
+                put(&mut image.memory, notification, lp, width)?;
+                put(
+                    &mut image.memory,
+                    notification + width as u64,
+                    r.values[9] as u64,
+                    width,
+                )?;
+                put(
+                    &mut image.memory,
+                    notification + 2 * width as u64,
+                    r.values[22] as u64,
+                    4,
+                )?;
+                let sender=image.win32.user.windows.iter().find(|w|w.hwnd as u64==lp).cloned();
+                let header=if x86{12}else{24};let code=r.values[22]as i32;
+                if sender.as_ref().is_some_and(|w|w.kind==1){
+                    // NMLISTVIEW/NMITEMACTIVATE share this prefix.
+                    put(&mut image.memory,notification+header,if code == -108{u32::MAX as u64}else{r.values[24]as u64},4)?;
+                    put(&mut image.memory,notification+header+4,if code == -108{r.values[23]as u64}else{0},4)?;
+                    put(&mut image.memory,notification+header+8,r.values[27]as u64,4)?;
+                    put(&mut image.memory,notification+header+16,8,4)?;
+                    put(&mut image.memory,notification+if x86{40}else{56},r.values[25]as u64|((r.values[26]as u64)<<32),width)?;
+                }else if let Some(sender)=sender.filter(|w|w.kind==2){
+                    let code=if !sender.wide{match code{-451=>-402,-455=>-406,v=>v}}else{code};
+                    put(&mut image.memory,notification+2*width as u64,code as u32 as u64,4)?;
+                    // NMTREEVIEW action and complete old/new TVITEM records.
+                    put(&mut image.memory,notification+header,if matches!(code,-455|-406){2}else{1},4)?;
+                    let first=if x86{16}else{32};let item_size=if x86{40}else{56};
+                    for(offset,handle,data,state)in [(first,r.values[28],r.values[29]as u64|((r.values[30]as u64)<<32),0),(first+item_size,r.values[24],r.values[25]as u64|((r.values[26]as u64)<<32),r.values[27])]{
+                        let item=notification+offset;put(&mut image.memory,item,0x1c,4)?;put(&mut image.memory,item+if x86{4}else{8},handle as u64,width)?;put(&mut image.memory,item+if x86{8}else{16},state as u64,4)?;put(&mut image.memory,item+if x86{36}else{48},data,width)?;
+                    }
+                }else if code == -710{put(&mut image.memory,notification+header,r.values[23]as u64,4)?;}
+                lp = notification;
+            }
+            queue(
+                image,
+                Message {
+                    hwnd: r.values[5] as u64,
+                    message,
+                    wp: r.values[9] as u64 | ((r.values[10] as u64) << 32),
+                    lp,
+                },
+            )?;
+        }
+    }
+}
+
 pub(super) fn invoke(
     image: &mut GuestImage,
     name: &str,
@@ -865,115 +992,7 @@ pub(super) fn invoke(
             Ok(0)
         }
         "GetMessageW" | "GetMessageA" | "PeekMessageW" | "PeekMessageA" => {
-            if a[2] != 0 || a[3] != 0 {
-                return Err(ApiError::Unsupported);
-            }
-            let peek = name.starts_with("Peek");
-            if !image.memory.probe_write(a[0], if x86 { 28 } else { 48 }) {
-                return Err(87u32.into());
-            }
-            let mut polled = false;
-            loop {
-                if let Some(index) = image
-                    .win32
-                    .user
-                    .messages
-                    .iter()
-                    .position(|(owner,m)| *owner == image.thread_id() && (m.message == 0x12 || a[1] == 0 || m.hwnd == a[1]))
-                {
-                    let message = image.win32.user.messages[index].1;
-                    if !peek || a[4] & 1 != 0 {
-                        image.win32.user.messages.remove(index);
-                    }
-                    message_write(image, a[0], message)?;
-                    return Ok(if !peek && message.message == 0x12 {
-                        0
-                    } else {
-                        1
-                    });
-                }
-                if polled {
-                    let thread = image.thread_id();
-                    if let Some(window) = image.win32.user.windows.iter_mut().find(|window| {
-                        window.thread_id == thread && window.paint_pending
-                            && (a[1] == 0 || a[1] == u64::from(window.hwnd))
-                    }) {
-                        if !peek || a[4] & 1 != 0 {
-                            window.paint_pending = false;
-                        }
-                        let message = Message { hwnd: u64::from(window.hwnd), message: 0x000f, wp: 0, lp: 0 };
-                        message_write(image, a[0], message)?;
-                        return Ok(1);
-                    }
-                    return if peek { Ok(0) } else { Err(ApiError::Retry) };
-                }
-                polled = true;
-                let roots: Vec<u32> = image
-                    .win32
-                    .user
-                    .windows
-                    .iter()
-                    .filter(|w| w.parent == 0 && w.thread_id == image.thread_id() && (a[1] == 0 || a[1] == u64::from(w.hwnd)))
-                    .map(|w| w.hwnd)
-                    .collect();
-                for root in roots {
-                    let mut p = packet(4, root);
-                    p.values[9] = 1;
-                    let r = send(services, p)?;
-                    if r.values[20] == 0 {
-                        continue;
-                    }
-                    let message = r.values[8];
-                    let mut lp = r.values[11] as u64 | ((r.values[12] as u64) << 32);
-                    if message == 0x4e {
-                        if image.win32.user.notifications.len()>=256{return Err(1816u32.into());}
-                        let notification = heap_allocate(image, 256)?;
-                        image.win32.user.notifications.push(notification);
-                        put(&mut image.memory, notification, lp, width)?;
-                        put(
-                            &mut image.memory,
-                            notification + width as u64,
-                            r.values[9] as u64,
-                            width,
-                        )?;
-                        put(
-                            &mut image.memory,
-                            notification + 2 * width as u64,
-                            r.values[22] as u64,
-                            4,
-                        )?;
-                        let sender=image.win32.user.windows.iter().find(|w|w.hwnd as u64==lp).cloned();
-                        let header=if x86{12}else{24};let code=r.values[22]as i32;
-                        if sender.as_ref().is_some_and(|w|w.kind==1){
-                            // NMLISTVIEW/NMITEMACTIVATE share this prefix.
-                            put(&mut image.memory,notification+header,if code == -108{u32::MAX as u64}else{r.values[24]as u64},4)?;
-                            put(&mut image.memory,notification+header+4,if code == -108{r.values[23]as u64}else{0},4)?;
-                            put(&mut image.memory,notification+header+8,r.values[27]as u64,4)?;
-                            put(&mut image.memory,notification+header+16,8,4)?;
-                            put(&mut image.memory,notification+if x86{40}else{56},r.values[25]as u64|((r.values[26]as u64)<<32),width)?;
-                        }else if let Some(sender)=sender.filter(|w|w.kind==2){
-                            let code=if !sender.wide{match code{-451=>-402,-455=>-406,v=>v}}else{code};
-                            put(&mut image.memory,notification+2*width as u64,code as u32 as u64,4)?;
-                            // NMTREEVIEW action and complete old/new TVITEM records.
-                            put(&mut image.memory,notification+header,if matches!(code,-455|-406){2}else{1},4)?;
-                            let first=if x86{16}else{32};let item_size=if x86{40}else{56};
-                            for(offset,handle,data,state)in [(first,r.values[28],r.values[29]as u64|((r.values[30]as u64)<<32),0),(first+item_size,r.values[24],r.values[25]as u64|((r.values[26]as u64)<<32),r.values[27])]{
-                                let item=notification+offset;put(&mut image.memory,item,0x1c,4)?;put(&mut image.memory,item+if x86{4}else{8},handle as u64,width)?;put(&mut image.memory,item+if x86{8}else{16},state as u64,4)?;put(&mut image.memory,item+if x86{36}else{48},data,width)?;
-                            }
-                        }else if code == -710{put(&mut image.memory,notification+header,r.values[23]as u64,4)?;}
-                        lp = notification;
-                    }
-                    queue(
-                        image,
-                        Message {
-                            hwnd: r.values[5] as u64,
-                            message,
-                            wp: r.values[9] as u64 | ((r.values[10] as u64) << 32),
-                            lp,
-                        },
-                    )?;
-                }
-            }
+            receive_message(image, services, a, name.starts_with("Peek"))
         }
         "DispatchMessageW" | "DispatchMessageA" => {
             let message = message_read(image, a[0])?;

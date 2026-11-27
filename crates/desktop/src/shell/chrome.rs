@@ -74,16 +74,15 @@ impl WindowState {
     pub fn caption_control_group(&self) -> Rect {
         // The close button ends at the inner right frame. The group attaches
         // to the top frame, rather than floating at the title text baseline.
-        Rect::new(
-            self.x + self.width - FRAME_BORDER - 102,
-            self.y + 1,
-            102,
-            20,
-        )
+        let width = if self.folder_picker { 44 } else { 102 };
+        Rect::new(self.x + self.width - FRAME_BORDER - width as i32, self.y + 1, width, 20)
     }
 
     pub fn caption_controls(&self) -> [Rect; 3] {
         let b = self.caption_control_group();
+        if self.folder_picker {
+            return [Rect::new(b.x, b.y, 0, 0), Rect::new(b.x, b.y, 0, 0), b];
+        }
         [
             Rect::new(b.x, b.y, 29, b.height),
             Rect::new(b.x + 29, b.y, 29, b.height),
@@ -97,13 +96,14 @@ impl WindowState {
         }
         self.caption_controls()
             .iter()
-            .position(|b| b.contains(x, y))
+            .position(|b| b.width != 0 && b.contains(x, y))
             .map(|i| i as u8)
     }
 
     pub fn resize_edge_at(&self, x: i32, y: i32) -> Option<ResizeEdge> {
         if self.minimized
             || self.maximized
+            || (self.folder_picker && self.folder_picker_minimum.is_none())
             || !self.bounds().contains(x, y)
             || self.caption_control_at(x, y).is_some()
         {
@@ -112,6 +112,9 @@ impl WindowState {
         let local_x = x - self.x;
         let local_y = y - self.y;
         let left = local_x < FRAME_BORDER;
+        if self.folder_picker && local_x >= self.width - 17 && local_y >= self.height - 17 {
+            return Some(ResizeEdge::BottomRight);
+        }
         let right = local_x >= self.width - FRAME_BORDER;
         let top = local_y < FRAME_BORDER;
         let bottom = local_y >= self.height - FRAME_BORDER;

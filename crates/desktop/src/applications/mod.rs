@@ -31,7 +31,7 @@ pub mod task_manager;
 pub mod resource_monitor;
 pub mod view;
 pub mod wordpad;
-mod shared {
+pub(crate) mod shared {
     pub mod scrollbar;
     pub mod toolbar;
 }

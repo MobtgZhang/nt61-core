@@ -813,6 +813,8 @@ fn nt_service(name: &str) -> Option<Service> {
         "NtReadFile" | "ReadFile" => Service::ReadFile,
         "NtWriteFile" | "WriteFile" => Service::WriteFile,
         "NtCreateFile" | "CreateFile" => Service::CreateFile,
+        "NtQuerySecurityObject" | "QuerySecurityObject" => Service::QuerySecurityObject,
+        "NtSetSecurityObject" | "SetSecurityObject" => Service::SetSecurityObject,
         "NtAllocateVirtualMemory" | "AllocateVirtualMemory" => Service::AllocateVirtualMemory,
         "NtQueryInformationProcess" | "QueryInformationProcess" => Service::QueryInformationProcess,
         "NtOpenProcess" | "OpenProcess" => Service::OpenProcess,
@@ -835,6 +837,7 @@ pub fn dispatch(
     let id = number & 0xffff;
     if id==user::CALLBACK_RETURN{return user::callback_return(image,services);}
     if id == user::DIALOG_GATEWAY { return user::poll_dialog(image, services); }
+    if id == user::browse::GATEWAY { return user::browse::poll(image, services); }
     let api = catalog::resolve(id).ok_or(StopReason::UnsupportedApi { id })?;
     image.win32.last_api = Some(id);
     let abi = if image.thread.context.mode == DecodeMode::X86 {
@@ -853,6 +856,9 @@ pub fn dispatch(
         })?;
     image.win32.last_arguments.clear();
     image.win32.last_arguments.extend_from_slice(&a[..count]);
+    if api.dll == "shell32.dll" && api.name == "SHBrowseForFolderW" {
+        return Ok(user::browse::start(image, services, a[0]));
+    }
     if matches!(api.name, "ExitProcess" | "NtTerminateProcess" | "TerminateProcess")
         || (api.dll == "msvcrt.dll" && matches!(api.name, "exit" | "_exit" | "_amsg_exit" | "abort"))
     {
@@ -897,7 +903,12 @@ pub fn dispatch(
             _ => {}
         }
     }
-    match invoke(image, api, &a, services) {
+    let folder_message = if api.dll == "user32.dll" && matches!(api.name, "SendMessageA" | "SendMessageW") {
+        user::browse::send_message(image, services, &a)
+    } else {
+        None
+    };
+    match folder_message.unwrap_or_else(|| invoke(image, api, &a, services)) {
         Ok(v) => {
             if let Some((procedure,args))=image.win32.local.user.callback.take(){
                 user::enter_callback(image,procedure,args).map_err(|_|StopReason::DataFault{pc:image.thread.context.rip})?;
@@ -1103,7 +1114,8 @@ fn invoke(
         return Err(ApiError::Hresult(0x80004001, "WER out-of-process backend unavailable"));
     }
     if api.dll == "oleaut32.dll" || (api.dll == "ole32.dll" && matches!(api.name,
-        "CoInitialize" | "CoInitializeEx" | "CoUninitialize" | "CoGetContextToken")) {
+        "CoInitialize" | "CoInitializeEx" | "CoUninitialize" | "CoGetContextToken"
+            | "OleInitialize" | "OleUninitialize" | "IIDFromString")) {
         return com::invoke(image, api.name, a);
     }
     if matches!(api.dll, "shell32.dll" | "ole32.dll" | "shlwapi.dll") {
@@ -1277,6 +1289,9 @@ fn invoke(
         return eventlog::invoke(image, api.name, a, services);
     }
     if api.dll == "advapi32.dll" {
+        if matches!(api.name, "GetFileSecurityW" | "SetFileSecurityW") {
+            return advapi::file_security(image, api.name, a, services);
+        }
         if let Some(result) = advapi::token::invoke(image, api.name, a) {
             return result.map_err(ApiError::Windows);
         }
@@ -2347,7 +2362,7 @@ fn invoke(
             if a[6] != 0 {
                 return Err(120.into());
             }
-            if access & !(0xc000_0000 | 0x0012_019f) != 0 || share & !7 != 0 {
+            if share & !7 != 0 {
                 return Err(5.into());
             }
             if flags & !(0x0000_00a0 | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED) != 0
@@ -2710,11 +2725,16 @@ pub(super) fn status_error(s: u32) -> u32 {
         0xc0000035 => 183,
         0xc000003a => 3,
         0xc0000043 => 32,
+        0xc0000023 => 122,
         0xc0000054 | 0xc0000055 => 33,
+        0xc0000061 => 1314,
+        0xc0000079 => 1338,
         0xc000007e => 158,
         0xc0000101 => 145,
         0xc0000103 => 267,
         0xc00000ba => 5,
+        0xc00000a2 => 19,
+        0xc00000a5 => 1346,
         0xc0000011 => 38,
         0xc0000185 => 1117,
         0xc0000002 | 0xc00000bb => 120,

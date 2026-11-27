@@ -553,6 +553,7 @@ impl ShellModel {
         }
         let env = self.application_environment();
         if let Some(app) = self.applications.iter_mut().find(|a| a.window_id == id) {
+            if let Some(scene) = &mut app.guest_window { return scene.wheel(body, x, y, delta); }
             if app.id == AppId::TaskManager { return super::task_manager::wheel(app,body,&env,delta); }
             if let Some(dialog) = &mut app.dialog { return dialog.wheel(body, delta); }
             if app.common_dialog.is_some() { return super::common_dialogs::wheel(app, body, delta); }
@@ -588,8 +589,13 @@ impl ShellModel {
             }
             return changed;
         }
-        if let Some(scene)=self.applications.iter_mut().find(|a|a.window_id==id).and_then(|a|a.guest_window.as_mut()) {
-            scene.pointer(body,x,y,down,held);return true;
+        if let Some(app) = self.applications.iter_mut().find(|app| app.window_id == id) {
+            if let Some(scene) = app.guest_window.as_mut() {
+                if !right {
+                    scene.pointer(body, x, y, down, held, app.input_time);
+                }
+                return true;
+            }
         }
         let dialog_capture = self.applications.iter().find(|app| app.window_id == id)
             .is_some_and(|app| (matches!(&app.state,AppState::PhotoViewer(v) if v.captures_pointer()) || matches!(&app.state,AppState::DeviceManager(m) if m.captures_pointer())) || app.manager.scroll_grab.is_some() || app.dialog.as_ref().is_some_and(|d| d.captures_pointer()) || super::common_dialogs::captures_pointer(app) || app.guest_window.as_ref().is_some_and(|s|s.captures_pointer()));

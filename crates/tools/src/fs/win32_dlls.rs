@@ -234,10 +234,14 @@ pub const DWMAPI_EXPORTS: &[(&str, u32)] = &[
 /// The `shell32.dll` surface.
 pub const SHELL32_EXPORTS: &[(&str, u32)] = &[
     ("ExtractIconExW", 293),
+    ("SHBrowseForFolderW", 323),
     ("SHChangeNotify", 324),
+    ("SHFileOperationW", 355),
     ("SHGetFileInfoW", 367),
     ("SHGetFolderPathW", 373),
     ("SHGetKnownFolderPath", 382),
+    ("SHGetPathFromIDListW", 390),
+    ("SHGetSpecialFolderLocation", 395),
     ("SHParseDisplayName", 408),
     ("ShellExecuteExW", 436),
     ("Shell_NotifyIconW", 444),
@@ -251,6 +255,9 @@ pub const OLE32_EXPORTS: &[(&str, u32)] = &[
     ("CoTaskMemAlloc", 117),
     ("CoTaskMemFree", 118),
     ("CoUninitialize", 122),
+    ("IIDFromString", 260),
+    ("OleInitialize", 360),
+    ("OleUninitialize", 383),
     ("StringFromCLSID", 437),
 ];
 
@@ -1269,6 +1276,17 @@ mod architecture_tests {
             let image = build_runtime_dll("api-ms-win-core-profile-l1-1-0.dll", x64).expect("profile facade");
             let parsed = super::super::pe_read::parse(&image).expect("valid profile PE");
             assert!(parsed.exports_by_name.contains_key("QueryPerformanceFrequency"));
+        }
+    }
+
+    #[test]
+    fn ole_exports_keep_sp1_ordinals() {
+        for (x64, initialize, uninitialize, iid) in [(false, 308, 331, 208), (true, 360, 383, 260)] {
+            let bytes = build_runtime_dll("ole32.dll", x64).unwrap();
+            let library = super::super::pe_read::parse(&bytes).unwrap();
+            for (name, ordinal) in [("OleInitialize", initialize), ("OleUninitialize", uninitialize), ("IIDFromString", iid)] {
+                assert_eq!(library.exports_by_ordinal[&ordinal], library.exports_by_name[name]);
+            }
         }
     }
 
