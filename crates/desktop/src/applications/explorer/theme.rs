@@ -77,6 +77,7 @@ pub fn large_icon(frame: &mut Surface, name: &str, at: Rect) {
     draw(frame, pixels, (48, 48), at);
 }
 
+#[cfg(nt61_system_logo)]
 pub fn system_logo(frame: &mut Surface, at: Rect) {
     draw(frame, asset!("system-logo"), (157, 151), at);
 }

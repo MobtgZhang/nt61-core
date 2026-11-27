@@ -117,6 +117,7 @@ pub fn draw_scrolled(
     line(f, strings::WINDOWS_7_SP1_COMPATIBLE_SYSTEM, 112, TEXT);
     line(f, strings::VERSION_6_1_7601_SERVICE_PACK_1, 136, TEXT);
     if w >= 300 {
+        #[cfg(nt61_system_logo)]
         theme::system_logo(f, Rect::new(x + w as i32 - 128, b.y + 68, 120, 116));
     }
     let label_width = 166.min(w / 2);

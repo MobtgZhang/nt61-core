@@ -268,7 +268,7 @@ fn init_gicv3() {
 
 /// Acknowledge and end-of-interrupt the highest-priority pending
 /// interrupt.
-pub fn handle_irq() -> u64 {
+pub fn handle_irq() -> Option<u64> {
     let info = soc::current_soc();
     match info.interrupt_controller {
         soc::InterruptController::GICv2 => {
@@ -282,7 +282,7 @@ pub fn handle_irq() -> u64 {
                 unsafe {
                     write_volatile((GICV2_CPU_BASE + gicc::EOIR as u64) as *mut u32, iar);
                 }
-                return irq as u64;
+                return Some(irq as u64);
             }
         }
         soc::InterruptController::GICv3 | soc::InterruptController::GICv4 => {
@@ -293,17 +293,17 @@ pub fn handle_irq() -> u64 {
             let irq = iar & 0xFFFFFF;
             if irq >= 1020 {
                 // Spurious or no pending interrupt: do not EOI.
-                return 0;
+                return None;
             }
             dispatch_irq(irq);
             unsafe {
                 asm!("msr ICC_EOIR1_EL1, {}", in(reg) iar, options(nostack));
             };
-            return irq;
+            return Some(irq);
         }
         soc::InterruptController::None => {}
     }
-    0
+    None
 }
 
 /// Counters for instrumentation.
@@ -318,7 +318,7 @@ pub fn dispatch_irq(irq: u64) {
     if irq == UART_IRQ as u64 {
         crate::hal::common::keyboard_unified::serial_rx_irq();
     } else if irq == super::timer::VIRTUAL_TIMER_IRQ as u64 {
-        super::timer::acknowledge();
+        super::timer::mask_irq();
     }
 }
 

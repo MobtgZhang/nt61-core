@@ -1,4 +1,11 @@
 //! Checked byte ranges used before installing user page-table leaves.
+#[cfg(any(target_arch = "aarch64", test))]
+pub const AARCH64_BOOTSTRAP_MMIO: [(u64, u64); 3] = [
+    (0x0800_0000, 0x1_0000),
+    (0x0801_0000, 0x1_0000),
+    (0x0900_0000, 0x1000),
+];
+
 pub fn page_extent(base: u64, size: u64) -> Option<(u64, u64)> {
     if size == 0 {
         return Some((base, base));

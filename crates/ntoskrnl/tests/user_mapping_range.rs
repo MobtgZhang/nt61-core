@@ -25,6 +25,15 @@ fn explorer_cannot_replace_the_running_loongarch_stack() {
 }
 
 #[test]
+fn explorer_bss_cannot_replace_aarch64_bootstrap_mmio() {
+    let reserved = &policy::AARCH64_BOOTSTRAP_MMIO;
+    assert!(!policy::available(0x001f_0000, 0x0804_2000, reserved));
+    assert!(!policy::available(0x0801_000c, 4, reserved));
+    assert!(!policy::available(0x0900_0000, 4, reserved));
+    assert!(policy::available(0x0003_ffff_0000, 0x0804_2000, reserved));
+}
+
+#[test]
 fn adjacent_ranges_and_zero_sizes_do_not_overlap() {
     assert!(policy::available(0x1000, 0x1000, &[(0x2000, 0x1000)]));
     assert!(policy::available(0x3000, 0x1000, &[(0x2000, 0x1000)]));

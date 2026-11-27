@@ -44,18 +44,26 @@ pub fn start_clock() {
         return;
     }
     COUNTS_PER_TICK.store(counts, Ordering::Relaxed);
-    acknowledge();
-    unsafe { asm!("msr CNTV_CTL_EL0, {enable}", "isb", enable = in(reg) 1u64, options(nostack)) };
+    arm_next_tick();
 }
 
-/// Acknowledge the timer interrupt and re-arm for the next tick.
-pub fn acknowledge() {
+/// Clear the timer IRQ line before the interrupt controller signals EOI.
+pub fn mask_irq() {
+    unsafe {
+        asm!("msr CNTV_CTL_EL0, {control}", "isb", control = in(reg) 3u64, options(nostack));
+    }
+}
+
+/// Arm the timer after clock work so overdue ticks cannot starve interrupted code.
+pub fn arm_next_tick() {
     let counts = COUNTS_PER_TICK.load(Ordering::Relaxed);
     unsafe {
         asm!(
             "msr CNTV_TVAL_EL0, {counts}",
+            "msr CNTV_CTL_EL0, {control}",
             "isb",
             counts = in(reg) counts,
+            control = in(reg) 1u64,
             options(nostack),
         );
     }

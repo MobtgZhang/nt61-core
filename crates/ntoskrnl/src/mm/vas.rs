@@ -59,6 +59,18 @@ pub fn user_mapping_available(base: u64, size: u64) -> bool {
     if !user_mapping_range::user_extent(base, size, limit) {
         return false;
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !user_mapping_range::available(base, size, &user_mapping_range::AARCH64_BOOTSTRAP_MMIO) {
+            return false;
+        }
+        let hardware = crate::arch::common::device_tree::hardware();
+        let discovered = [hardware.gicd, hardware.gicc, hardware.uart, hardware.pci_ecam]
+            .map(|range| range.map_or((0, 0), |range| (range.base, range.size)));
+        if !user_mapping_range::available(base, size, &discovered) {
+            return false;
+        }
+    }
     let image = crate::arch::kernel_image_range();
     let heap = crate::mm::heap::KERNEL_HEAP.configured_region()
         .map_or((0, 0), |(base, size)| (base as u64, size as u64));

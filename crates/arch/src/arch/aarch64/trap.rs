@@ -324,22 +324,16 @@ fn handle_irq(from_user: bool) {
     let percpu = crate::arch::common::percpu::get_current();
     percpu.interrupt_count = percpu.interrupt_count.wrapping_add(1);
 
-    // The actual GIC ack/eoi is performed by
-    // `crate::hal::aarch64::apic::handle_irq()` once the GIC driver is
-    // initialised. For the bootstrap, we just acknowledge the IRQ
-    // source here.
-    let irq = crate::hal::aarch64::apic::handle_irq();
+    let Some(irq) = crate::hal::aarch64::apic::handle_irq() else {
+        return;
+    };
     if irq == crate::hal::aarch64::arch_timer::VIRTUAL_TIMER_IRQ as u64 {
         crate::ke::timer::tick();
         crate::ke::scheduler::tick_with_mode(from_user);
         crate::ke::psss::psss_tick();
+        crate::hal::aarch64::arch_timer::arm_next_tick();
         crate::ke::scheduler::dispatch_pending_reschedule();
-    } else if irq < 16 {
-        // SGIs (0-15) are the cross-core communication range. The
-        // only SGI the kernel sends today is the TLB shootdown
-        // (`gic::SGI_TLB_SHOOTDOWN`); the handler is payload-free and
-        // flushes the local TLB regardless of the exact SGI id, so
-        // any SGI in the range can be routed there.
+    } else if irq == crate::arch::aarch64::gic::SGI_TLB_SHOOTDOWN as u64 {
         crate::ke::tlb_shootdown::handle_shootdown_interrupt();
     }
 }
