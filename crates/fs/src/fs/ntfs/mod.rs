@@ -320,6 +320,7 @@ impl Default for NtfsData {
 /// NTFS file handle
 pub struct NtfsHandle {
     pub mft_record: u64,
+    pub(crate) security_target: Option<security_target::FileSecurityTarget>,
     pub current_position: u64,
     pub is_directory: bool,
     pub file_size: u64,
@@ -330,6 +331,7 @@ impl NtfsHandle {
     pub fn new(record: u64, is_dir: bool, size: u64, name: &[u16]) -> Self {
         Self {
             mft_record: record,
+            security_target: None,
             current_position: 0,
             is_directory: is_dir,
             file_size: size,
@@ -1448,8 +1450,8 @@ pub fn parse_run_list(run_list: &[u8], output: &mut [(u64, u64)]) -> usize {
 ///
 /// The on-disk encoding stores each run's start cluster as a signed
 /// delta from the previous run (or from LCN 0 for the first run), so
-/// the encoder picks the smallest byte width that can represent the
-/// run length (unsigned) and the start delta (two's complement).
+/// the encoder picks the smallest signed byte width that can represent
+/// the positive run length and the start delta (two's complement).
 /// The caller is responsible for appending the terminating zero byte
 /// expected after the final run.
 pub fn encode_run_list(runs: &[(u64, u64)]) -> alloc::vec::Vec<u8> {
@@ -1462,7 +1464,7 @@ pub fn encode_run_list(runs: &[(u64, u64)]) -> alloc::vec::Vec<u8> {
         let delta: i64 = (start as i64).wrapping_sub(prev);
         let length_size = {
             let bits = 64 - length.leading_zeros() as usize;
-            bits.div_ceil(8).max(1)
+            (bits + 1).div_ceil(8).min(8)
         };
         let mut offset_size = 1usize;
         while offset_size < 8 {
@@ -2151,6 +2153,9 @@ pub fn get_file_by_record(ntfs: &NtfsFileSystem, record_num: u64) -> Option<Ntfs
 
     Some(NtfsHandle {
         mft_record: record_num,
+        security_target: security_target::FileSecurityTarget::from_record(
+            &ntfs.ntfs_data, record_num, &record,
+        ),
         current_position: 0,
         is_directory,
         file_size,
@@ -4017,6 +4022,17 @@ pub fn file_attributes(ntfs: &NtfsFileSystem, number: u64) -> Result<u32, NTSTAT
     Ok(u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap()))
 }
 
+pub(super) fn check_directory_component(ntfs: &NtfsFileSystem, number: u64) -> Result<(), NTSTATUS> {
+    let record = read_mft_record(&ntfs.ntfs_data, number).ok_or(STATUS_UNSUCCESSFUL)?;
+    if standard_security::has_reparse_point(&record).ok_or(STATUS_UNSUCCESSFUL)? {
+        return Err(0xc000_00bbu32 as NTSTATUS);
+    }
+    if record[0x16] & 2 == 0 {
+        return Err(0xc000_003au32 as NTSTATUS);
+    }
+    Ok(())
+}
+
 pub(super) fn file_basic_information(ntfs: &NtfsFileSystem, number: u64) -> Result<(u32, [u64; 3]), NTSTATUS> {
     let record = read_mft_record(&ntfs.ntfs_data, number).ok_or(STATUS_UNSUCCESSFUL)?;
     let value = parse_attribute(&record, AttributeHeader::TYPE_STANDARD_INFO)
@@ -5481,6 +5497,8 @@ pub mod reparse_tags {
 /// Security descriptor support.
 mod nonresident_stream;
 pub mod security;
+pub(crate) mod security_target;
+pub(crate) mod relative_security_descriptor;
 
 /// Check if an MFT record has a reparse point.
 pub fn has_reparse_point(record: &[u8]) -> bool {

@@ -21,11 +21,10 @@ use super::status::{
     STATUS_DEVICE_NOT_READY, STATUS_EAS_NOT_SUPPORTED, STATUS_EA_LIST_INCONSISTENT,
     STATUS_EA_TOO_LARGE, STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_DEVICE_REQUEST,
     STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER, STATUS_NOT_A_DIRECTORY, STATUS_NO_MEMORY,
-    STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION,
+    STATUS_OBJECT_NAME_INVALID, STATUS_OBJECT_PATH_NOT_FOUND,
     STATUS_SUCCESS,
 };
 use super::types::{IoStatusBlock, UnicodeString, HANDLE, NTSTATUS, PVOID};
-use crate::ke::sync::Spinlock;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr;
@@ -105,88 +104,6 @@ const FILE_SHARE_VALID_FLAGS: u32 = 0x0000_0007;
 /// IoCreateFile wires a FILE_OBJECT into the driver's stack location.
 fn file_object_of(target: u64) -> *mut crate::io::FileObject {
     target as *mut crate::io::FileObject
-}
-
-/// One entry in the share-access table: every successfully opened File
-/// handle records its normalized name, desired access and share mode so
-/// later opens of the same name can be arbitrated (wdm.h share modes,
-/// enforced by the I/O manager in NT).
-struct ShareEntry {
-    identity: u64,
-    path: Vec<u16>,
-    access: u32,
-    share: u32,
-}
-
-static SHARE_TABLE: Spinlock<Vec<ShareEntry>> = Spinlock::new(Vec::new());
-
-/// Case-insensitive wide-string comparison, the OBJ_CASE_INSENSITIVE
-/// rule the object manager applies to file names.
-fn path_equal_ignorecase(a: &[u16], b: &[u16]) -> bool {
-    const fn lower(c: u16) -> u16 {
-        if c >= b'A' as u16 && c <= b'Z' as u16 {
-            c + 32
-        } else {
-            c
-        }
-    }
-    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| lower(*x) == lower(*y))
-}
-
-/// Windows share-access arbitration (wdm.h RtlCheckShareAccess classes,
-/// the read/write/delete classes NTFS arbitrates on Windows 7). An open
-/// conflicts when either side requires a sharing mode the other did not
-/// grant: reads/execute need FILE_SHARE_READ, writes need
-/// FILE_SHARE_WRITE, and DELETE needs FILE_SHARE_DELETE.
-fn share_conflicts(existing_access: u32, existing_share: u32, access: u32, share: u32) -> bool {
-    const READ_BITS: u32 = 0x0000_0001 | 0x0000_0020; // FILE_READ_DATA | FILE_EXECUTE
-    const WRITE_BITS: u32 = 0x0000_0002 | 0x0000_0004; // FILE_WRITE_DATA | FILE_APPEND_DATA
-    const DELETE_BIT: u32 = 0x0001_0000; // DELETE
-    const SHARE_READ: u32 = 0x0000_0001;
-    const SHARE_WRITE: u32 = 0x0000_0002;
-    const SHARE_DELETE: u32 = 0x0000_0004;
-
-    let denied = |a_access: u32, b_share: u32, bits: u32, share_bit: u32| {
-        (a_access & bits) != 0 && (b_share & share_bit) == 0
-    };
-    denied(existing_access, share, READ_BITS, SHARE_READ)
-        || denied(access, existing_share, READ_BITS, SHARE_READ)
-        || denied(existing_access, share, WRITE_BITS, SHARE_WRITE)
-        || denied(access, existing_share, WRITE_BITS, SHARE_WRITE)
-        || denied(existing_access, share, DELETE_BIT, SHARE_DELETE)
-        || denied(access, existing_share, DELETE_BIT, SHARE_DELETE)
-}
-
-/// Check a new open of `path_u16` against every existing open with the
-/// same name. Returns false (STATUS_SHARING_VIOLATION) on conflict.
-fn check_share_access(path_u16: &[u16], access: u32, share: u32) -> bool {
-    let table = SHARE_TABLE.lock();
-    for entry in table.iter() {
-        if path_equal_ignorecase(&entry.path, path_u16)
-            && share_conflicts(entry.access, entry.share, access, share)
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn record_share_entry(handle: HANDLE, path: Vec<u16>, access: u32, share: u32) {
-    let Some(object) = lookup_handle(handle) else {
-        return;
-    };
-    SHARE_TABLE.lock().push(ShareEntry {
-        identity: object.identity,
-        path,
-        access,
-        share,
-    });
-}
-
-fn remove_share_entry(identity: u64) {
-    SHARE_TABLE
-        .lock()
-        .retain(|entry| entry.identity != identity);
 }
 
 /// Resolve a File handle to the NtfsHandle FCB the CREATE IRP produced,
@@ -432,6 +349,22 @@ pub(crate) fn reference_file(handle: HANDLE) -> Result<FileHandleReference, NTST
     unsafe { handles::reference_file_handle(handle, retire_file) }
 }
 
+pub(crate) fn reference_file_with_access(handle: HANDLE, access: u32) -> Result<FileHandleReference, NTSTATUS> {
+    unsafe { handles::reference_file_handle_with_access(handle, access, retire_file) }
+}
+
+pub(crate) fn pinned_ntfs_security_target(
+    reference: &FileHandleReference,
+) -> Result<crate::fs::ntfs::security_target::FileSecurityTarget, NTSTATUS> {
+    let fcb = file_fcb_of(reference.entry()).ok_or(super::status::STATUS_NOT_SUPPORTED)?;
+    unsafe { (*fcb).security_target }.ok_or(super::status::STATUS_NOT_SUPPORTED)
+}
+
+pub(crate) fn current_file_process() -> Option<u64> {
+    unsafe { crate::arch::common::percpu::get_current_process().as_ref() }
+        .map(|process| process.unique_process_id_full)
+}
+
 unsafe fn retire_file(entry: HandleEntry) {
     // SAFETY: the handle table transferred its final reference to this path.
     unsafe {
@@ -445,9 +378,10 @@ unsafe fn retire_file(entry: HandleEntry) {
 unsafe fn cleanup_file(entry: HandleEntry) {
     // SAFETY: allocation registered this callback for its owned FILE_OBJECT.
     unsafe {
-        let _ = file_teardown_irp(file_object_of(entry.target), crate::io::major::IRP_MJ_CLEANUP);
+        let file_object = file_object_of(entry.target);
+        let _ = file_teardown_irp(file_object, crate::io::major::IRP_MJ_CLEANUP);
+        drop((*file_object).file_share_lease.take());
     }
-    remove_share_entry(entry.identity);
 }
 
 /// Roll back a successful CREATE before publishing its handle. Failed CREATEs
@@ -470,7 +404,7 @@ unsafe fn dispose_open_file(file_object: *mut crate::io::FileObject) {
 /// kernel memory.
 fn file_open_common(
     desired_access: u32,
-    _object_attributes: &super::types::ObjectAttributes,
+    object_attributes: &super::types::ObjectAttributes,
     name_chars: &[u16],
     share_access: u32,
     create_disposition: u32,
@@ -480,8 +414,11 @@ fn file_open_common(
         if share_access & !FILE_SHARE_VALID_FLAGS != 0 {
             return (STATUS_INVALID_PARAMETER, None, 0);
         }
-        if !check_file_access(name_chars, desired_access) {
+        let Some(process) = current_file_process() else {
             return (STATUS_ACCESS_DENIED, None, 0);
+        };
+        if !object_attributes.root_directory.is_null() || !object_attributes.security_descriptor.is_null() {
+            return (super::status::STATUS_NOT_SUPPORTED, None, 0);
         }
         // wdm.h create dispositions run FILE_SUPERSEDE..FILE_OVERWRITE_IF
         // (0..=5); anything else is a parameter error.
@@ -500,7 +437,9 @@ fn file_open_common(
             && path.as_bytes()[3] == b'?'
             && path.as_bytes()[4] == b'\\';
         let path = if strip {
-            String::from(&path[4..])
+            String::from(&path[5..])
+        } else if let Some(rest) = path.strip_prefix("\\??\\") {
+            String::from(rest)
         } else {
             path
         };
@@ -522,14 +461,6 @@ fn file_open_common(
         };
         let device = binding.device_ptr();
 
-        // Share-mode arbitration against other opens of the same name.
-        // FILE_CREATE on a not-yet-existing name cannot conflict: a
-        // collision is reported instead (STATUS_OBJECT_NAME_COLLISION).
-        if create_disposition != 0x2 && !check_share_access(&path_u16, desired_access, share_access)
-        {
-            return (STATUS_SHARING_VIOLATION, None, 0);
-        }
-
         // Caller-owned FileObject carrying the name; the CREATE IRP hands
         // it to the driver, which fills in the device wiring and the FCB.
         let name_storage = crate::mm::pool::allocate(
@@ -550,6 +481,8 @@ fn file_open_common(
         {
             core::ptr::write(file_object, crate::io::FileObject::new());
             (*file_object).bind_device(binding);
+            (*file_object).native_file_access = Some(desired_access);
+            (*file_object).native_file_share = share_access;
             core::ptr::copy_nonoverlapping(path_u16.as_ptr(), name_storage, path_u16.len());
             *name_storage.add(path_u16.len()) = 0;
             (*file_object).file_name = crate::io::UnicodeString {
@@ -618,14 +551,17 @@ fn file_open_common(
 
         // SAFETY: transfer storage only on successful publication; all file
         // pins use retire_file, and cleanup_file preserves the payload.
-        let handle = handles::alloc_file_handle(file_object as u64, cleanup_file, retire_file);
+        let Some(granted) = (*file_object).native_file_access.take() else {
+            dispose_open_file(file_object);
+            return (super::status::STATUS_NOT_SUPPORTED, None, 0);
+        };
+        let handle = handles::alloc_authorized_file_handle(file_object as u64, granted, Some(process), cleanup_file, retire_file);
         if handle.is_null() {
             {
                 dispose_open_file(file_object)
             };
             return (STATUS_NO_MEMORY, None, 0);
         }
-        record_share_entry(handle, path_u16, desired_access, share_access);
         (status, Some(handle), information)
     }
 }
@@ -1612,7 +1548,7 @@ fn read_file_common(
     };
     match entry.kind {
         HandleKind::File => {
-            let reference = match reference_file(file_handle) {
+            let reference = match reference_file_with_access(file_handle, 1) {
                 Ok(reference) => reference,
                 Err(status) => return (status, 0),
             };
@@ -1682,7 +1618,7 @@ fn write_file_common(
     };
     match entry.kind {
         HandleKind::File => {
-            let reference = match reference_file(file_handle) {
+            let reference = match reference_file_with_access(file_handle, 2) {
                 Ok(reference) => reference,
                 Err(status) => return (status, 0),
             };

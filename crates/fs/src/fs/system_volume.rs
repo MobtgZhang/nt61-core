@@ -4,9 +4,9 @@
 //! directory tree. Writes affect the kernel's system-volume mirror. Flushing
 //! that mirror to the host block device is a separate storage-layer operation.
 use super::{fat32, ntfs, FsType};
-use crate::arch::common::btl::io::{FileLockKey, FileRangeLocks};
+use crate::arch::common::btl::io::{FileLockKey, FileRangeLocks, FileShareLease, OpenedFile};
 use alloc::{string::String, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const INVALID: u32 = 0xC000_000D;
 const NOT_FOUND: u32 = 0xC000_0034;
@@ -17,10 +17,58 @@ const ACCESS_DENIED: u32 = 0xC000_0022;
 const SHARING_VIOLATION: u32 = 0xC000_0043;
 const MUTABLE_FILE_ATTRIBUTES: u32 = 0x3127;
 static BUSY: AtomicBool = AtomicBool::new(false);
-static GUEST_OPENS: spin::Mutex<Vec<(u64, usize)>> = spin::Mutex::new(Vec::new());
+static GUEST_OPENS: spin::Mutex<Vec<GuestFileOpen>> = spin::Mutex::new(Vec::new());
 static GUEST_FILE_LOCKS: spin::Mutex<FileRangeLocks> = spin::Mutex::new(FileRangeLocks::new());
+static SHARE_OPENS: spin::Mutex<Vec<ShareOpen>> = spin::Mutex::new(Vec::new());
+static NEXT_SHARE_OPEN: AtomicU64 = AtomicU64::new(1);
 #[path = "volume_lock.rs"]
 mod volume_lock;
+
+struct GuestFileOpen {
+    record: u64,
+    target: Option<ntfs::security_target::FileSecurityTarget>,
+    references: usize,
+}
+
+struct ShareOpen {
+    id: u64,
+    target: ntfs::security_target::FileSecurityTarget,
+    access: u32,
+    share: u32,
+}
+
+fn share_access_classes(granted: u32) -> u32 {
+    u32::from(granted & 0x21 != 0)
+        | (u32::from(granted & 6 != 0) << 1)
+        | (u32::from(granted & 0x1_0000 != 0) << 2)
+}
+
+fn release_share_open(id: u64) {
+    let mut opens = SHARE_OPENS.lock();
+    if let Some(index) = opens.iter().position(|open| open.id == id) {
+        opens.swap_remove(index);
+    }
+}
+
+fn reserve_share_open(
+    target: ntfs::security_target::FileSecurityTarget,
+    granted: u32,
+    share: u32,
+) -> Result<FileShareLease, u32> {
+    let access = share_access_classes(granted);
+    let mut opens = SHARE_OPENS.lock();
+    if access != 0 && opens.iter().any(|open| {
+        open.target == target && open.access != 0
+            && (access & !open.share != 0 || open.access & !share != 0)
+    }) {
+        return Err(SHARING_VIOLATION);
+    }
+    opens.try_reserve(1).map_err(|_| 0xc000_0017u32)?;
+    let id = NEXT_SHARE_OPEN.try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| 0xc000_011fu32)?;
+    opens.push(ShareOpen { id, target, access, share });
+    Ok(FileShareLease::new(id, release_share_open))
+}
 
 /// Persist pending NTFS system-volume mutations to its identified boot disk.
 /// Returns an error for unsupported/ambiguous media or a short write.
@@ -53,16 +101,32 @@ pub struct Entry { pub name: String, pub directory: bool, pub size: u64 }
 
 /// Full mounted NTFS directory metadata for Win32 enumeration. Other volume
 /// formats must supply their own timestamp/attribute conversion before use.
-pub fn directory_metadata(path: &str) -> Result<Vec<ntfs::DirectoryEntry>, u32> {
+pub(crate) fn directory_metadata(
+    path: &str,
+    authorize: impl FnOnce(&[u8], u32) -> Result<u32, u32>,
+) -> Result<Vec<ntfs::DirectoryEntry>, u32> {
+    const FILE_LIST_DIRECTORY: u32 = 1;
     let path = normalize(path)?;
     let _guard = VolumeGuard::acquire()?;
     if super::detect_system_partition_type() != FsType::Ntfs { return Err(UNSUPPORTED); }
     let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
-    let record = if path == "C:\\" { 5 } else {
-        ntfs::open_file(fs, &utf16(&path), None)
-            .filter(|handle| handle.is_directory).ok_or(0xc000003au32)?.mft_record
-    };
+    let record = authorize_ntfs_directory(fs, &path, FILE_LIST_DIRECTORY, authorize)?;
     ntfs::list_directory_checked(fs, record).map_err(|status| status as u32)
+}
+
+fn authorize_ntfs_directory(
+    fs: &ntfs::NtfsFileSystem,
+    path: &str,
+    access: u32,
+    authorize: impl FnOnce(&[u8], u32) -> Result<u32, u32>,
+) -> Result<u64, u32> {
+    let record = ntfs_directory_record(fs, path)?;
+    let file = ntfs::get_file_by_record(fs, record).ok_or(IO_ERROR)?;
+    let target = file.security_target.ok_or(UNSUPPORTED)?;
+    let descriptor = ntfs::security::read_security_target_descriptor(&fs.ntfs_data, target)
+        .map_err(|status| status as u32)?;
+    authorize(&descriptor, access)?;
+    Ok(record)
 }
 
 /// Canonical absolute system-volume path. Reject other drives and traversal
@@ -245,13 +309,133 @@ fn ntfs_file(fs: &ntfs::NtfsFileSystem, path: &str) -> Result<ntfs::NtfsHandle, 
     ntfs::get_file_by_record(fs, record).ok_or(IO_ERROR)
 }
 
+pub(crate) fn open_native_file(
+    path: &str,
+    disposition: u32,
+    options: u32,
+    authorize: impl Fn(&[u8], u32) -> Result<u32, u32>,
+    desired: u32,
+    share: u32,
+) -> Result<(ntfs::NtfsHandle, usize, u32, FileShareLease), u32> {
+    let path = normalize(path)?;
+    let _guard = VolumeGuard::acquire()?;
+    if super::detect_system_partition_type() != FsType::Ntfs {
+        return Err(UNSUPPORTED);
+    }
+    let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+    open_ntfs_file(fs, &path, disposition, options, authorize, desired, share, false, None)
+}
+
+fn open_ntfs_file(
+    fs: &mut ntfs::NtfsFileSystem,
+    path: &str,
+    disposition: u32,
+    options: u32,
+    authorize: impl Fn(&[u8], u32) -> Result<u32, u32>,
+    desired: u32,
+    share: u32,
+    guest_overwrite: bool,
+    copy_contents: Option<&[u8]>,
+) -> Result<(ntfs::NtfsHandle, usize, u32, FileShareLease), u32> {
+    if share & !7 != 0 {
+        return Err(INVALID);
+    }
+    if options & 0x1000 != 0 || disposition == 0 {
+        return Err(UNSUPPORTED);
+    }
+    let wants_directory = options & 1 != 0;
+    let non_directory = options & 0x40 != 0;
+    if wants_directory && non_directory {
+        return Err(INVALID);
+    }
+    let descriptor = |file: &ntfs::NtfsHandle| -> Result<Vec<u8>, u32> {
+        let target = file.security_target.ok_or(UNSUPPORTED)?;
+        ntfs::security::read_security_target_descriptor(&fs.ntfs_data, target)
+            .map_err(|status| status as u32)
+    };
+    match ntfs_file(fs, path) {
+        Ok(file) => {
+            if disposition == 2 {
+                return Err(0xc000_0035);
+            }
+            if wants_directory && !file.is_directory {
+                return Err(0xc000_0103);
+            }
+            if file.is_directory && (non_directory || matches!(disposition, 4 | 5)) {
+                return Err(0xc000_00ba);
+            }
+            let granted = authorize(&descriptor(&file)?, desired)?;
+            if !file.is_directory && (granted & 6 != 0 || copy_contents.is_some()) {
+                let attributes = ntfs::file_attributes(fs, file.mft_record).map_err(|status| status as u32)?;
+                if copy_contents.is_some() && attributes & 0x400 != 0 { return Err(UNSUPPORTED); }
+                if granted & 6 != 0 && attributes & 1 != 0 { return Err(ACCESS_DENIED); }
+            }
+            if matches!(disposition, 4 | 5) {
+                if !guest_overwrite { return Err(UNSUPPORTED); }
+                if granted & 2 == 0 {
+                    return Err(ACCESS_DENIED);
+                }
+                reject_open_file(file.mft_record)?;
+                GUEST_FILE_LOCKS.lock().check(FileLockKey { record: file.mft_record, owner: 0 }, 0, u64::MAX)?;
+                let lease = reserve_share_open(file.security_target.ok_or(UNSUPPORTED)?, granted, share)?;
+                ntfs::replace_file_contents(fs, &utf16(path), copy_contents.unwrap_or_default())
+                    .map_err(|status| status as u32)?;
+                return Ok((file, 3, granted, lease));
+            }
+            let lease = reserve_share_open(file.security_target.ok_or(UNSUPPORTED)?, granted, share)?;
+            Ok((file, 1, granted, lease))
+        }
+        Err(NOT_FOUND) if matches!(disposition, 2 | 3 | 5) => {
+            let (parent, _) = parent_leaf(path)?;
+            let parent = ntfs_file(fs, parent)?;
+            if !parent.is_directory {
+                return Err(PATH_NOT_FOUND);
+            }
+            authorize(&descriptor(&parent)?, if wants_directory { 4 } else { 2 })?;
+            let default = ntfs::security::default_sds_entry(ntfs::security::DEFAULT_SECURITY_ID);
+            if ntfs::security::read_default_descriptor_bytes(&fs.ntfs_data).as_deref()
+                != Some(default.as_slice())
+            {
+                return Err(UNSUPPORTED);
+            }
+            let granted = authorize(&default, desired)?;
+            SHARE_OPENS.lock().try_reserve(1).map_err(|_| 0xc000_0017u32)?;
+            let units = utf16(path);
+            let created = if wants_directory {
+                ntfs::create_directory(fs, &units)
+            } else {
+                ntfs::create_file(fs, &units, &[])
+            }.map_err(|status| status as u32)?;
+            let file = ntfs::get_file_by_record(fs, created.mft_record).ok_or(IO_ERROR)?;
+            let lease = reserve_share_open(file.security_target.ok_or(UNSUPPORTED)?, granted, share)?;
+            if let Some(contents) = copy_contents.filter(|contents| !contents.is_empty()) {
+                if let Err(status) = ntfs::replace_file_contents(fs, &units, contents) {
+                    if ntfs::delete_file(fs, &units).is_err() { return Err(IO_ERROR); }
+                    return Err(status as u32);
+                }
+            }
+            Ok((file, 2, granted, lease))
+        }
+        Err(status) => Err(status),
+    }
+}
+
+pub(crate) fn read_file_security(target: ntfs::security_target::FileSecurityTarget) -> Result<Vec<u8>, u32> {
+    let _guard = VolumeGuard::acquire()?;
+    if super::detect_system_partition_type() != FsType::Ntfs {
+        return Err(UNSUPPORTED);
+    }
+    let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+    ntfs::security::read_security_target_descriptor(&fs.ntfs_data, target)
+        .map_err(|status| status as u32)
+}
+
 /// Kernel-only storage boundary. `prepare` must authorize the effective
 /// caller and merge the selected fields; it must not reenter the volume.
 pub(crate) fn update_file_security(
-    path: &str,
+    target: ntfs::security_target::FileSecurityTarget,
     prepare: impl FnOnce(&[u8]) -> Result<Vec<u8>, u32>,
 ) -> Result<(), u32> {
-    let path = normalize(path)?;
     let _guard = VolumeGuard::acquire()?;
     if super::detect_system_partition_type() != FsType::Ntfs || !super::sys_ramdisk_is_mounted() {
         return Err(UNSUPPORTED);
@@ -260,22 +444,26 @@ pub(crate) fn update_file_security(
     if fs.ntfs_data.device_id.is_some() {
         return Err(UNSUPPORTED);
     }
-    let file = ntfs_file(fs, &path)?;
-    if ntfs::file_attributes(fs, file.mft_record).map_err(|status| status as u32)? & 0x400 != 0 {
-        return Err(UNSUPPORTED);
-    }
     ntfs::security::update_file_security_descriptor(
         fs,
-        file.mft_record,
+        target,
         |current| prepare(current).map_err(|status| status as _),
         || super::system_mirror::flush().map_err(|status| status as _),
     ).map_err(|status| status as u32)
 }
 
 fn ntfs_directory_record(fs: &ntfs::NtfsFileSystem, path: &str) -> Result<u64, u32> {
-    if path == "C:\\" { return Ok(5); }
-    ntfs::open_file(fs, &utf16(path), None)
-        .filter(|handle| handle.is_directory).map(|handle| handle.mft_record).ok_or(PATH_NOT_FOUND)
+    let relative = path.strip_prefix("C:\\").ok_or(INVALID)?;
+    let mut record = ntfs::system_records::ROOT_DIRECTORY;
+    for component in relative.split_terminator('\\') {
+        let name: Vec<u16> = component.encode_utf16().collect();
+        if name.len() > 255 || component.contains(':') {
+            return Err(INVALID);
+        }
+        record = ntfs::find_file_in_directory(fs, record, &name).ok_or(PATH_NOT_FOUND)?;
+        ntfs::check_directory_component(fs, record).map_err(|status| status as u32)?;
+    }
+    Ok(record)
 }
 
 pub fn file_basic_information(path: &str) -> Result<(u32, [u64; 3], u64), u32> {
@@ -311,55 +499,82 @@ pub fn set_file_times(path: &str, times: [Option<u64>; 3]) -> Result<(), u32> {
     ntfs::set_file_times(fs, handle.mft_record, times).map_err(|status| status as u32)
 }
 
-pub fn open_guest_file(path: &str, disposition: u32, writable: bool, allow_directory: bool) -> Result<(u64, bool, Option<u64>), u32> {
+pub(crate) fn commit_guest_file_copy(
+    path: &str,
+    overwrite: bool,
+    contents: &[u8],
+    authorize: impl Fn(&[u8], u32) -> Result<u32, u32>,
+) -> Result<(), u32> {
     let path = normalize(path)?;
-    if super::detect_system_partition_type() != FsType::Ntfs {
-        if disposition != 1 || writable || allow_directory { return Err(UNSUPPORTED); }
-        return file_size(&path).map(|_| (1, false, None));
-    }
     let _guard = VolumeGuard::acquire()?;
+    if super::detect_system_partition_type() != FsType::Ntfs { return Err(UNSUPPORTED); }
+    let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+    let disposition = if overwrite { 5 } else { 2 };
+    open_ntfs_file(fs, &path, disposition, 0x60, authorize, 2, 0, true, Some(contents))?;
+    Ok(())
+}
+
+pub(crate) fn open_guest_file(
+    path: &str,
+    disposition: u32,
+    options: u32,
+    authorize: impl Fn(&[u8], u32) -> Result<u32, u32>,
+    desired: u32,
+    share: u32,
+) -> Result<OpenedFile, u32> {
+    let path = normalize(path)?;
+    let _guard = VolumeGuard::acquire()?;
+    let filesystem = super::detect_system_partition_type();
+    if filesystem != FsType::Ntfs {
+        let granted = crate::libs::ntdll::access_check::map_file_access(desired);
+        if disposition != 1 || options & 0x41 != 0x40 || share & !7 != 0
+            || granted & !0x0012_0089 != 0
+        {
+            return Err(UNSUPPORTED);
+        }
+        file_size_locked(&path, filesystem)?;
+        return Ok(OpenedFile { information: 1, directory: false, identity: None, granted, share: None });
+    }
     let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
     GUEST_OPENS.lock().try_reserve(1).map_err(|_| 0xC000_0017u32)?;
-    let (information, handle) = match ntfs_file(fs, &path) {
-        Ok(handle) => {
-            if disposition == 2 { return Err(0xC000_0035); }
-            if handle.is_directory {
-                if disposition != 1 || !allow_directory { return Err(0xC000_00BA); }
-                (1, handle)
-            } else {
-                if writable && ntfs::file_attributes(fs, handle.mft_record).map_err(|status| status as u32)? & 1 != 0 {
-                    return Err(ACCESS_DENIED);
-                }
-                let information = if matches!(disposition, 4 | 5) {
-                    if !writable { return Err(ACCESS_DENIED); }
-                    GUEST_FILE_LOCKS.lock().check(FileLockKey { record: handle.mft_record, owner: 0 }, 0, u64::MAX)?;
-                    ntfs::replace_file_contents(fs, &utf16(&path), &[]).map_err(|status| status as u32)?;
-                    3
-                } else { 1 };
-                (information, handle)
-            }
-        }
-        Err(NOT_FOUND) if matches!(disposition, 2 | 3 | 5) => {
-            let handle = ntfs::create_file(fs, &utf16(&path), &[]).map_err(|status| status as u32)?;
-            (2, handle)
-        }
-        Err(status) => return Err(status),
-    };
+    let (handle, information, granted, lease) = open_ntfs_file(fs, &path, disposition, options, authorize, desired, share, true, None)?;
     let record = handle.mft_record;
     let mut opens = GUEST_OPENS.lock();
-    if let Some((_, count)) = opens.iter_mut().find(|(identity, _)| *identity == record) {
-        *count += 1;
+    if let Some(open) = opens.iter_mut().find(|open| open.record == record) {
+        if open.target != handle.security_target {
+            return Err(SHARING_VIOLATION);
+        }
+        open.references += 1;
     } else {
-        opens.push((record, 1));
+        opens.push(GuestFileOpen { record, target: handle.security_target, references: 1 });
     }
-    Ok((information, handle.is_directory, Some(record)))
+    Ok(OpenedFile {
+        information: information as u64,
+        directory: handle.is_directory,
+        identity: Some(record),
+        granted,
+        share: Some(lease),
+    })
+}
+
+pub(crate) fn guest_file_security_target(record: u64) -> Result<ntfs::security_target::FileSecurityTarget, u32> {
+    GUEST_OPENS.lock().iter().find(|open| open.record == record)
+        .and_then(|open| open.target)
+        .ok_or(0xc000_0008)
+}
+
+pub(crate) fn retain_guest_file(record: u64) -> Result<(), u32> {
+    let mut opens = GUEST_OPENS.lock();
+    let open = opens.iter_mut().find(|open| open.record == record).ok_or(0xc000_0008u32)?;
+    open.references += 1;
+    Ok(())
 }
 
 pub fn close_guest_file(record: u64) {
     let mut opens = GUEST_OPENS.lock();
-    if let Some(index) = opens.iter().position(|(identity, _)| *identity == record) {
-        opens[index].1 -= 1;
-        if opens[index].1 == 0 { opens.swap_remove(index); }
+    if let Some(index) = opens.iter().position(|open| open.record == record) {
+        opens[index].references -= 1;
+        if opens[index].references == 0 { opens.swap_remove(index); }
     }
 }
 
@@ -372,8 +587,10 @@ pub fn release_guest_file_range_locks(key: FileLockKey) {
     GUEST_FILE_LOCKS.lock().release(key);
 }
 
-fn reject_open_guest_file(record: u64) -> Result<(), u32> {
-    if GUEST_OPENS.lock().iter().any(|(identity, _)| *identity == record) {
+fn reject_open_file(record: u64) -> Result<(), u32> {
+    if GUEST_OPENS.lock().iter().any(|open| open.record == record)
+        || SHARE_OPENS.lock().iter().any(|open| open.target.record() == record)
+    {
         return Err(SHARING_VIOLATION);
     }
     Ok(())
@@ -388,7 +605,7 @@ pub fn delete_guest_file(path: &str) -> Result<(), u32> {
     let attributes = ntfs::file_attributes(fs, handle.mft_record).map_err(|status| status as u32)?;
     if handle.is_directory || attributes & 1 != 0 { return Err(ACCESS_DENIED); }
     if attributes & 0x400 != 0 { return Err(UNSUPPORTED); }
-    reject_open_guest_file(handle.mft_record)?;
+    reject_open_file(handle.mft_record)?;
     ntfs::delete_file(fs, &utf16(&path)).map_err(|status| status as u32)
 }
 
@@ -403,7 +620,7 @@ pub fn remove_guest_directory(path: &str) -> Result<(), u32> {
     if !handle.is_directory { return Err(0xc0000103); }
     let attributes = ntfs::file_attributes(fs, handle.mft_record).map_err(|status| status as u32)?;
     if attributes & 0x400 != 0 { return Err(UNSUPPORTED); }
-    reject_open_guest_file(handle.mft_record)?;
+    reject_open_file(handle.mft_record)?;
     ntfs::delete_directory(fs, &utf16(&path)).map_err(|status| status as u32)
 }
 
@@ -418,7 +635,7 @@ pub fn move_guest_file(source: &str, destination: &str) -> Result<(), u32> {
     let handle = ntfs_file(fs, &source)?;
     let attributes = ntfs::file_attributes(fs, handle.mft_record).map_err(|status| status as u32)?;
     if handle.is_directory || attributes & 0x400 != 0 { return Err(UNSUPPORTED); }
-    reject_open_guest_file(handle.mft_record)?;
+    reject_open_file(handle.mft_record)?;
     let parent = ntfs_directory_record(fs, source_parent)?;
     let destination_parent = ntfs_directory_record(fs, destination_parent)?;
     if parent != destination_parent { return Err(UNSUPPORTED); }
@@ -448,11 +665,17 @@ enum FileAccess {
 }
 
 impl FileAccess {
-    fn validate(self, record: u64, offset: u64, length: usize) -> Result<(), u32> {
+    fn file(self, fs: &ntfs::NtfsFileSystem, path: &str) -> Result<ntfs::NtfsHandle, u32> {
+        let record = match self {
+            Self::ByPath => return ntfs_file(fs, &normalize(path)?),
+            Self::Mapped(record) | Self::Open(FileLockKey { record, .. }) => record,
+        };
+        let target = guest_file_security_target(record)?;
+        ntfs::get_file_by_record(fs, record).filter(|file| file.security_target == Some(target)).ok_or(0xc000_0008)
+    }
+
+    fn check_range(self, offset: u64, length: usize) -> Result<(), u32> {
         match self {
-            Self::Mapped(expected) | Self::Open(FileLockKey { record: expected, .. }) if record != expected => {
-                Err(0xc000_0008)
-            }
             Self::Open(key) => GUEST_FILE_LOCKS.lock().check(key, offset, length as u64),
             _ => Ok(()),
         }
@@ -462,12 +685,11 @@ impl FileAccess {
 fn write_file_range(path: &str, access: FileAccess, offset: u64, bytes: &[u8]) -> Result<usize, u32> {
     let end = offset.checked_add(bytes.len() as u64).ok_or(INVALID)?;
     if bytes.len() > 65536 { return Err(INVALID); }
-    let path = normalize(path)?;
     let _guard = VolumeGuard::acquire()?;
     if super::detect_system_partition_type() != FsType::Ntfs { return Err(UNSUPPORTED); }
     let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
-    let mut handle = ntfs_file(fs, &path)?;
-    access.validate(handle.mft_record, offset, bytes.len())?;
+    let mut handle = access.file(fs, path)?;
+    access.check_range(offset, bytes.len())?;
     if matches!(access, FileAccess::Mapped(_)) && end > handle.file_size { return Err(0xc000_0011); }
     if handle.is_directory { return Err(ACCESS_DENIED); }
     if bytes.is_empty() { return Ok(0); }
@@ -479,15 +701,29 @@ fn write_file_range(path: &str, access: FileAccess, offset: u64, bytes: &[u8]) -
 pub fn file_size(path: &str) -> Result<u64, u32> {
     let path = normalize(path)?;
     let _guard = VolumeGuard::acquire()?;
-    match super::detect_system_partition_type() {
+    file_size_locked(&path, super::detect_system_partition_type())
+}
+
+pub(crate) fn open_file_size(path: &str, identity: Option<u64>) -> Result<u64, u32> {
+    let Some(record) = identity else { return file_size(path); };
+    let _guard = VolumeGuard::acquire()?;
+    if super::detect_system_partition_type() != FsType::Ntfs { return Err(UNSUPPORTED); }
+    let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+    let file = FileAccess::Mapped(record).file(fs, path)?;
+    if file.is_directory { return Err(ACCESS_DENIED); }
+    Ok(file.file_size)
+}
+
+fn file_size_locked(path: &str, filesystem: FsType) -> Result<u64, u32> {
+    match filesystem {
         FsType::Ntfs => {
             let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
-            ntfs::open_file(fs, &utf16(&path), None).filter(|handle| !handle.is_directory)
+            ntfs::open_file(fs, &utf16(path), None).filter(|handle| !handle.is_directory)
                 .map(|handle| handle.file_size).ok_or(NOT_FOUND)
         }
         FsType::Fat32 => {
             let fs = fat32::get_mounted_fs().ok_or(NOT_FOUND)?;
-            fat32::find_file_at_path(fs, &path).filter(|entry| !entry.is_directory())
+            fat32::find_file_at_path(fs, path).filter(|entry| !entry.is_directory())
                 .map(|entry| u64::from(entry.file_size())).ok_or(NOT_FOUND)
         }
         FsType::Ext2 | FsType::Ext3 | FsType::Ext4 => {
@@ -495,7 +731,7 @@ pub fn file_size(path: &str) -> Result<u64, u32> {
             unsafe { super::ext2::open_file(fs, path.as_bytes()) }.filter(|handle| !handle.is_directory)
                 .map(|handle| handle.file_size).ok_or(NOT_FOUND)
         }
-        FsType::Refs => refs_file_extent(&path).map(|(_, size)| size),
+        FsType::Refs => refs_file_extent(path).map(|(_, size)| size),
         _ => Err(UNSUPPORTED),
     }
 }
@@ -515,19 +751,20 @@ pub fn read_open_file(path: &str, key: Option<FileLockKey>, offset: u64, length:
 
 fn read_file_range(path: &str, access: FileAccess, offset: u64, length: usize) -> Result<Vec<u8>, u32> {
     if length>65536{return Err(INVALID);}
-    let path=normalize(path)?;
+    let tracked = !matches!(access, FileAccess::ByPath);
+    let normalized = if tracked { None } else { Some(normalize(path)?) };
+    let path = normalized.as_deref().unwrap_or(path);
     let _guard=VolumeGuard::acquire()?;
     let mut bytes=alloc::vec![0;length];
     if length==0{return Ok(bytes);}
     let fs_type = super::detect_system_partition_type();
-    let tracked = !matches!(access, FileAccess::ByPath);
     if tracked && fs_type != FsType::Ntfs { return Err(UNSUPPORTED); }
     let count=match fs_type {
         FsType::Ntfs if tracked => {
             let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
-            let mut handle = ntfs_file(fs, &path)?;
+            let mut handle = access.file(fs, path)?;
             if handle.is_directory { return Err(ACCESS_DENIED); }
-            access.validate(handle.mft_record, offset, length)?;
+            access.check_range(offset, length)?;
             handle.current_position = offset;
             ntfs::read_file(fs, &mut handle, &mut bytes).map_err(|status| status as u32)?
         },
@@ -643,10 +880,31 @@ pub fn write(path:&str,data:&[u8])->Result<(),u32>{
 }
 
 pub fn mkdir(path:&str)->Result<(),u32>{
+    mkdir_inner(path, None::<fn(&[u8], u32) -> Result<u32, u32>>)
+}
+
+pub(crate) fn mkdir_authorized(
+    path: &str,
+    authorize: impl FnOnce(&[u8], u32) -> Result<u32, u32>,
+) -> Result<(), u32> {
+    mkdir_inner(path, Some(authorize))
+}
+
+fn mkdir_inner(
+    path: &str,
+    authorize: Option<impl FnOnce(&[u8], u32) -> Result<u32, u32>>,
+) -> Result<(), u32> {
     let path=normalize(path)?; let (parent,leaf)=parent_leaf(&path)?;
     let _guard=VolumeGuard::acquire()?;
     match super::detect_system_partition_type(){
-        FsType::Ntfs=>ntfs::create_directory(ntfs::get_mounted_fs().ok_or(NOT_FOUND)?,&utf16(&path)).map(|_|()).map_err(|e|e as u32),
+        FsType::Ntfs => {
+            const FILE_ADD_SUBDIRECTORY: u32 = 4;
+            let fs = ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
+            if let Some(authorize) = authorize {
+                authorize_ntfs_directory(fs, parent, FILE_ADD_SUBDIRECTORY, authorize)?;
+            }
+            ntfs::create_directory(fs, &utf16(&path)).map(|_| ()).map_err(|e| e as u32)
+        }
         FsType::Fat32=>{
             let fs=fat32::get_mounted_fs().ok_or(NOT_FOUND)?;
             let parent=fat_directory(fs,parent)?;
@@ -671,7 +929,7 @@ pub fn remove(path:&str)->Result<(),u32>{
         FsType::Ntfs=>{
             let fs=ntfs::get_mounted_fs().ok_or(NOT_FOUND)?;
             let path=utf16(&path);let handle=ntfs::open_file(fs,&path,None).ok_or(NOT_FOUND)?;
-            reject_open_guest_file(handle.mft_record)?;
+            reject_open_file(handle.mft_record)?;
             if handle.is_directory{ntfs::delete_directory(fs,&path)}else{ntfs::delete_file(fs,&path)}.map_err(|e|e as u32)
         },
         FsType::Fat32=>{

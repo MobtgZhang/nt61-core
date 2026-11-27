@@ -2,6 +2,13 @@
 //! a host. Memory probes and the clock are supplied by the host fixture.
 #![allow(dead_code, non_camel_case_types)]
 extern crate alloc;
+#[path = "../../fs/src/fs/ntfs/relative_security_descriptor.rs"]
+pub mod relative_security_descriptor;
+pub mod fs {
+    pub mod ntfs {
+        pub(crate) use crate::relative_security_descriptor;
+    }
+}
 #[path = "native_sync/legacy_service_cases.rs"]
 mod legacy_service_cases;
 #[path = "native_sync/file_pin_cases.rs"]

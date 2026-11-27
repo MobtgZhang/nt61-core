@@ -2,6 +2,12 @@
 mod handles;
 pub(crate) use handles::*;
 pub(crate) use handles::namespace::{directory_entries, symbolic_link_target, set_object_permanent};
+std::thread_local! {
+    pub(crate) static FILE_PROCESS: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+}
+pub(crate) fn current_file_process() -> Option<u64> {
+    FILE_PROCESS.with(core::cell::Cell::get)
+}
 pub unsafe extern "C" fn nt_close(handle: super::types::HANDLE) -> i32 {
     close_handle(handle).map_or_else(|status| status, |_| 0)
 }

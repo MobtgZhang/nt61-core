@@ -600,7 +600,7 @@ pub(super) fn descriptor(image: &mut GuestImage, p: u64) -> Result<Descriptor, u
         relative,
     })
 }
-fn relative_sd(d: &Descriptor) -> Vec<u8> {
+pub(super) fn relative_sd(d: &Descriptor) -> Vec<u8> {
     let mut b = vec![1, d.rm, 0, 0];
     b[2..4].copy_from_slice(&(d.control | 0x8000).to_le_bytes());
     b.resize(20, 0);

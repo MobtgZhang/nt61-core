@@ -10,12 +10,15 @@
 //
 //! Each file/directory has a SecurityId that indexes into these structures.
 use crate::libs::ntdll::types::NTSTATUS;
+use super::security_target::FileSecurityTarget;
 
 #[path = "secure_stream.rs"]
 mod secure_stream;
+#[path = "bootstrap_security.rs"]
+mod bootstrap_security;
 
 /// Shared descriptor used by newly created files, referenced by STANDARD_INFORMATION.
-pub const DEFAULT_SECURITY_ID: u32 = 256;
+pub use bootstrap_security::DEFAULT_SECURITY_ID;
 
 /// Maximum number of security descriptors in the cache.
 const MAX_SECURITY_DESCRIPTORS: usize = 256;
@@ -145,12 +148,14 @@ impl NtfsSecurityDescriptor {
     /// create a new security descriptor with default permissions.
     pub fn new_default() -> Self {
         let mut owner = [0u8; 64];
-        owner[..16].copy_from_slice(&[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0]);
+        owner[..16].copy_from_slice(&bootstrap_security::ADMINISTRATORS);
+        let mut dacl = [0; 512];
+        dacl[..bootstrap_security::DACL_LENGTH].copy_from_slice(&bootstrap_security::default_dacl());
         Self {
             id: DEFAULT_SECURITY_ID,
             owner, owner_size: 16,
             group: owner, group_size: 16,
-            dacl: Self::default_dacl(), dacl_size: 72,
+            dacl, dacl_size: bootstrap_security::DACL_LENGTH as u32,
             sacl: [0; 512], sacl_size: 0, hash: 0,
         }
     }
@@ -170,29 +175,6 @@ impl NtfsSecurityDescriptor {
         sd.owner_size = sid.len() as u32;
         sd.calculate_hash();
         sd
-    }
-
-    /// SYSTEM and Administrators full access; Everyone read/execute.
-    fn default_dacl() -> [u8; 512] {
-        let mut acl = [0u8; 512];
-        acl[0] = 2;
-        acl[2..4].copy_from_slice(&72u16.to_le_bytes());
-        acl[4..6].copy_from_slice(&3u16.to_le_bytes());
-        let sids: [&[u8]; 3] = [
-            &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0],
-            &[1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0],
-            &[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0],
-        ];
-        let mut at = 8;
-        for (i, sid) in sids.iter().enumerate() {
-            let size = 8 + sid.len();
-            acl[at + 2..at + 4].copy_from_slice(&(size as u16).to_le_bytes());
-            let mask: u32 = if i == 2 { 0x1200A9 } else { 0x1F01FF };
-            acl[at + 4..at + 8].copy_from_slice(&mask.to_le_bytes());
-            acl[at + 8..at + size].copy_from_slice(sid);
-            at += size;
-        }
-        acl
     }
 
     /// Calculate hash for quick comparison.
@@ -676,11 +658,42 @@ pub fn read_file_security_descriptor(
     descriptor_for_record(ntfs, &record)
 }
 
+pub(crate) fn read_default_descriptor_bytes(ntfs: &super::NtfsData) -> Option<alloc::vec::Vec<u8>> {
+    read_descriptor_bytes(ntfs, DEFAULT_SECURITY_ID)
+}
+
 fn descriptor_for_record(ntfs: &super::NtfsData, record: &[u8]) -> Option<alloc::vec::Vec<u8>> {
     if let Some(id) = super::standard_security::security_id(record) {
         return read_descriptor_bytes(ntfs, id);
     }
     Some(super::standard_security::inline_descriptor(record)?.to_vec())
+}
+
+fn read_security_target_record(
+    ntfs: &super::NtfsData,
+    target: FileSecurityTarget,
+) -> Result<super::MftRecordBuffer, NTSTATUS> {
+    let io_error = super::STATUS_UNSUCCESSFUL;
+    let record = super::read_mft_record(ntfs, target.record).ok_or(io_error)?;
+    if !target.matches(ntfs, &record) {
+        return Err(0xc0000008u32 as NTSTATUS);
+    }
+    if super::standard_security::has_reparse_point(&record).ok_or(io_error)? {
+        return Err(0xc00000bbu32 as NTSTATUS);
+    }
+    Ok(record)
+}
+
+pub(crate) fn read_security_target_descriptor(
+    ntfs: &super::NtfsData,
+    target: FileSecurityTarget,
+) -> Result<alloc::vec::Vec<u8>, NTSTATUS> {
+    let record = read_security_target_record(ntfs, target)?;
+    let descriptor = descriptor_for_record(ntfs, &record).ok_or(super::STATUS_UNSUCCESSFUL)?;
+    if !valid_stored_descriptor(&descriptor) {
+        return Err(0xc0000079u32 as NTSTATUS);
+    }
+    Ok(descriptor)
 }
 
 /// Associate an existing, validated descriptor with one user file record.
@@ -708,17 +721,21 @@ pub fn associate_file_security_id(
 /// descriptor while holding the same volume guard used for both writes.
 pub(crate) fn update_file_security_descriptor(
     fs: &super::NtfsFileSystem,
-    file_record: u64,
+    target: FileSecurityTarget,
     prepare: impl FnOnce(&[u8]) -> Result<alloc::vec::Vec<u8>, NTSTATUS>,
     mut persist: impl FnMut() -> Result<(), NTSTATUS>,
 ) -> Result<(), NTSTATUS> {
+    let file_record = target.record;
     if file_record < super::system_records::FIRST_USER_RECORD {
         return Err(0xc00000bbu32 as NTSTATUS);
     }
     let ntfs = &fs.ntfs_data;
     let io_error = super::STATUS_UNSUCCESSFUL;
-    let original = super::read_mft_record(ntfs, file_record).ok_or(io_error)?;
+    let original = read_security_target_record(ntfs, target)?;
     let old_descriptor = descriptor_for_record(ntfs, &original).ok_or(io_error)?;
+    if !valid_stored_descriptor(&old_descriptor) {
+        return Err(0xc0000079u32 as NTSTATUS);
+    }
     let descriptor = prepare(&old_descriptor)?;
     if descriptor == old_descriptor {
         return persist();
@@ -801,34 +818,7 @@ pub(super) fn intern_security_descriptor(
 }
 
 fn valid_stored_descriptor(descriptor: &[u8]) -> bool {
-    let Some(header) = descriptor.get(..20) else { return false };
-    let control = u16::from_le_bytes([header[2], header[3]]);
-    if header[0] != 1 || control & 0x8000 == 0 || descriptor.len() > 131072 {
-        return false;
-    }
-    for field in [4, 8, 12, 16] {
-        let offset = u32::from_le_bytes(header[field..field + 4].try_into().unwrap()) as usize;
-        if offset == 0 { continue; }
-        if offset < 20 || !offset.is_multiple_of(4) { return false; }
-        let Some(component) = descriptor.get(offset..) else { return false };
-        if field < 12 {
-            if component.first() != Some(&1) { return false; }
-            continue;
-        }
-        let present = if field == 12 { 0x10 } else { 4 };
-        let Some(acl) = component.get(..8) else { return false };
-        if control & present == 0 || !matches!(acl[0], 2 | 3 | 4) { return false; }
-        let size = usize::from(u16::from_le_bytes([acl[2], acl[3]]));
-        let Some(mut entries) = component.get(8..size) else { return false };
-        for _ in 0..u16::from_le_bytes([acl[4], acl[5]]) {
-            let Some(ace) = entries.get(..4) else { return false };
-            let length = usize::from(u16::from_le_bytes([ace[2], ace[3]]));
-            if length < 4 || !length.is_multiple_of(4) { return false; }
-            let Some(remaining) = entries.get(length..) else { return false };
-            entries = remaining;
-        }
-    }
-    true
+    super::relative_security_descriptor::RelativeDescriptor::parse(descriptor).is_some()
 }
 
 /// Parse the self-relative security descriptor stored inside a `$SDS`
@@ -964,6 +954,9 @@ pub fn update_secure_sds(
     if parse_sds_descriptor(security_id, descriptor).is_none() {
 
         return Err(super::STATUS_UNSUCCESSFUL);
+    }
+    if let Some(stored) = read_descriptor_bytes(&ntfs.ntfs_data, security_id) {
+        return if stored == descriptor { Ok(()) } else { Err(super::STATUS_UNSUCCESSFUL) };
     }
     let record = match super::read_mft_record(&ntfs.ntfs_data, super::system_records::SECURE) {
         Some(record) => record.to_vec(),

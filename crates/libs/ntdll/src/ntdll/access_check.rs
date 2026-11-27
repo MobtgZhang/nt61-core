@@ -73,6 +73,90 @@ impl GenericMapping {
     }
 }
 
+pub(crate) const FILE_MAPPING: GenericMapping = GenericMapping {
+    generic_read: 0x0012_0089,
+    generic_write: 0x0012_0116,
+    generic_execute: 0x0012_00a0,
+    generic_all: 0x001f_01ff,
+};
+
+pub(crate) fn map_file_access(desired: u32) -> u32 {
+    FILE_MAPPING.map(desired)
+}
+
+pub(crate) fn check_file_descriptor(
+    bytes: &[u8],
+    token: &Token,
+    desired: u32,
+) -> Result<u32, NTSTATUS> {
+    use crate::fs::ntfs::relative_security_descriptor::RelativeDescriptor;
+
+    if token.flags & crate::se::token::TOKEN_WRITE_RESTRICTED != 0 {
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+    let descriptor = RelativeDescriptor::parse(bytes).ok_or(STATUS_INVALID_SECURITY_DESCR)?;
+    let (integrity, policy) = file_integrity(descriptor.components[2])?;
+    let desired = map_file_access(desired);
+    if desired & !(FILE_MAPPING.generic_all | ACCESS_SYSTEM_SECURITY | MAXIMUM_ALLOWED) != 0 {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    let mut prohibited = 0;
+    if token.integrity_level_rid < integrity {
+        if policy & 1 != 0 {
+            prohibited |= 0x000d_0156;
+        }
+        if policy & 2 != 0 {
+            prohibited |= 0x0002_0089;
+        }
+        if policy & 4 != 0 {
+            prohibited |= 0x0000_0020;
+        }
+        if desired & prohibited != 0 {
+            return Err(STATUS_ACCESS_DENIED);
+        }
+    }
+    let descriptor = capture::descriptor(capture::Memory::Trusted(bytes))?;
+    let decision = evaluate::evaluate(&descriptor, token, desired, &FILE_MAPPING)?;
+    if decision.status != STATUS_SUCCESS {
+        return Err(decision.status);
+    }
+    let granted = decision.granted & !prohibited;
+    if granted == 0 && desired & MAXIMUM_ALLOWED != 0 {
+        return Err(STATUS_ACCESS_DENIED);
+    }
+    Ok(granted)
+}
+
+fn file_integrity(sacl: Option<&[u8]>) -> Result<(u32, u32), NTSTATUS> {
+    let mut label = None;
+    if let Some(acl) = sacl {
+        let mut offset = 8;
+        for _ in 0..u16::from_le_bytes([acl[4], acl[5]]) {
+            let size = u16::from_le_bytes([acl[offset + 2], acl[offset + 3]]) as usize;
+            let ace = &acl[offset..offset + size];
+            offset += size;
+            if ace[1] & 8 != 0 {
+                continue;
+            }
+            match ace[0] {
+                2 | 3 | 7 | 8 => continue,
+                0x11 => {}
+                _ => return Err(STATUS_NOT_SUPPORTED),
+            }
+            if label.is_some() || ace.len() != 20 || ace[8..16] != [1, 1, 0, 0, 0, 0, 0, 16] {
+                return Err(STATUS_INVALID_SECURITY_DESCR);
+            }
+            let policy = u32::from_le_bytes(ace[4..8].try_into().unwrap());
+            let rid = u32::from_le_bytes(ace[16..20].try_into().unwrap());
+            if policy & !7 != 0 {
+                return Err(STATUS_NOT_SUPPORTED);
+            }
+            label = Some((rid, policy));
+        }
+    }
+    Ok(label.unwrap_or((0x2000, 1)))
+}
+
 /// Access denial is a successfully executed check with a failing access status.
 #[derive(Clone, Copy)]
 pub struct AccessDecision {

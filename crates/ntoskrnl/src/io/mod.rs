@@ -460,6 +460,9 @@ pub struct FileObject {
     pub file_name: UnicodeString,
     pub current_byte_offset: u64,
     pub flags: u32,
+    pub(crate) native_file_access: Option<u32>,
+    pub(crate) native_file_share: u32,
+    pub(crate) file_share_lease: Option<crate::arch::common::btl::io::FileShareLease>,
     // Private source ABI extension. Retain the registered owner and original
     // device until the file and all pending I/O references have been released.
     device_binding: Option<file_device_binding::FileDeviceBinding>,
@@ -478,6 +481,9 @@ impl FileObject {
             file_name: UnicodeString::new(),
             current_byte_offset: 0,
             flags: 0,
+            native_file_access: None,
+            native_file_share: 0,
+            file_share_lease: None,
             device_binding: None,
             teardown_requests: file_lifecycle::Requests::new(),
             request_lock: file_request_lock::FileRequestLock::new(),
@@ -1562,7 +1568,45 @@ unsafe extern "C" fn fs_create_dispatch(device: *mut DeviceObject, irp: *mut Irp
     // IoStatusBlock.Information for NtCreateFile: FILE_OPENED (0x01)
     // and FILE_CREATED (0x02) — wdm.h FILE_CREATE* result codes.
     let mut information: usize = 0x01;
-    if let Some(path) = requested_path {
+    if let Some(desired) = (*file_obj_ptr).native_file_access.take() {
+        let result = requested_path.as_deref().ok_or(STATUS_INVALID_PARAMETER).and_then(|path| {
+            let subject = crate::se::refmon::SecuritySubjectContext::capture();
+            use crate::libs::ntdll::status::{STATUS_ACCESS_DENIED, STATUS_BAD_IMPERSONATION_LEVEL};
+            use crate::se::token::ImpersonationLevel;
+            if !subject.client_token.is_null() && matches!(subject.impersonation_level,
+                ImpersonationLevel::SecurityAnonymous | ImpersonationLevel::SecurityIdentification)
+            {
+                return Err(STATUS_BAD_IMPERSONATION_LEVEL);
+            }
+            let token = subject.effective_token().as_ref().ok_or(STATUS_ACCESS_DENIED)?;
+            let create = (*stack).parameters.create;
+            crate::fs::system_volume::open_native_file(path, create.disposition, create.options,
+                |descriptor, access| crate::libs::ntdll::access_check::check_file_descriptor(descriptor, token, access)
+                    .map_err(|status| status as u32), desired, (*file_obj_ptr).native_file_share)
+                .map_err(|status| status as i32)
+        });
+        match result {
+            Ok((handle, opened, granted, lease)) => {
+                let context = pool::allocate(
+                    pool::PoolType::NonPaged,
+                    core::mem::size_of::<crate::fs::ntfs::NtfsHandle>(),
+                ) as *mut crate::fs::ntfs::NtfsHandle;
+                if context.is_null() {
+                    status = STATUS_NO_MEMORY as u32;
+                } else {
+                    core::ptr::write(context, handle);
+                    (*file_obj_ptr).fcb = context.cast();
+                    (*file_obj_ptr).native_file_access = Some(granted);
+                    (*file_obj_ptr).file_share_lease = Some(lease);
+                    information = opened;
+                }
+            }
+            Err(error) => {
+                status = error as u32;
+                information = 0;
+            }
+        }
+    } else if let Some(path) = requested_path {
         let disposition = if !stack.is_null() {
             (*stack).parameters.create.disposition
         } else {

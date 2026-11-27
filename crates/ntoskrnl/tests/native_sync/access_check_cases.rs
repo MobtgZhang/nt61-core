@@ -210,6 +210,28 @@ fn owners_get_read_control_and_write_dac_without_acl_grants() {
 }
 
 #[test]
+fn owner_rights_aces_control_the_owners_implicit_rights() {
+    let _guard = state_guard();
+    let mut token = token();
+    let user = token.user;
+    let other = sid::well_known(WellKnownSid::World);
+    let owner_rights = sid::with_subs([0, 0, 0, 0, 0, 3], 4, 0, 0, 0, 0, 0, 0, 0);
+    let handle = handle(&mut token, 8);
+    let acl_bytes = acl(&[(1, 0, WRITE_DAC, owner_rights), (0, 0, READ_CONTROL, owner_rights)]);
+    let owned = descriptor(&user, Some(&acl_bytes), true);
+    let unowned = descriptor(&other, Some(&acl_bytes), true);
+    assert_eq!((call(&owned, handle, MAXIMUM).1, call(&owned, handle, MAXIMUM).2), (READ_CONTROL, STATUS_SUCCESS));
+    assert_eq!(call(&owned, handle, WRITE_DAC).2, STATUS_ACCESS_DENIED);
+    assert_eq!(call(&unowned, handle, READ_CONTROL).2, STATUS_ACCESS_DENIED);
+
+    let acl_bytes = acl(&[(1, 8, WRITE_DAC, owner_rights)]);
+    let owned = descriptor(&user, Some(&acl_bytes), true);
+    let (_, granted, status, _) = call(&owned, handle, READ_CONTROL | WRITE_DAC);
+    assert_eq!((granted, status), (READ_CONTROL | WRITE_DAC, STATUS_SUCCESS));
+    assert!(free_handle(handle));
+}
+
+#[test]
 fn restricted_access_requires_both_sid_sets_and_intersects_maximum_access() {
     let _guard = state_guard();
     let mut token = token();

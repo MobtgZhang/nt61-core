@@ -10,6 +10,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 #[path = "io/file_ranges.rs"]
 mod file_ranges;
 pub use file_ranges::{FileLockKey, FileRangeLocks};
+#[cfg(not(test))]
+use crate::fs::ntfs::relative_security_descriptor;
+#[cfg(test)]
+#[path = "../../../../../fs/src/fs/ntfs/relative_security_descriptor.rs"]
+mod relative_security_descriptor;
 
 static NEXT_FILE_OWNER: AtomicU64 = AtomicU64::new(1);
 const INVALID_PARAMETER: u32 = 0xc000_000d;
@@ -17,11 +22,38 @@ const INVALID_HANDLE: u32 = 0xc000_0008;
 const ACCESS_DENIED: u32 = 0xc000_0022;
 const EOF: u32 = 0xc000_0011;
 const MAX_IO: usize = 65536;
-const FILE_WRITE_ATTRIBUTES: u64 = 0x100;
-const GENERIC_WRITE: u64 = 0x4000_0000;
+const MAX_FILE_COPY: u64 = 64 * 1024 * 1024;
+const FILE_READ_DATA: u32 = 1;
+const FILE_WRITE_DATA: u32 = 2;
+const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
 pub const STD_INPUT: u64 = 0x10;
 pub const STD_OUTPUT: u64 = 0x14;
 pub const STD_ERROR: u64 = 0x18;
+
+pub struct OpenedFile {
+    pub information: u64,
+    pub directory: bool,
+    pub identity: Option<u64>,
+    pub granted: u32,
+    pub share: Option<FileShareLease>,
+}
+
+pub struct FileShareLease {
+    id: u64,
+    release: fn(u64),
+}
+
+impl FileShareLease {
+    pub fn new(id: u64, release: fn(u64)) -> Self {
+        Self { id, release }
+    }
+}
+
+impl Drop for FileShareLease {
+    fn drop(&mut self) {
+        (self.release)(self.id);
+    }
+}
 
 /// Host operations receive owned, validated values rather than guest pointers.
 pub trait IoHost {
@@ -61,6 +93,12 @@ pub trait IoHost {
         Err(nt61::STATUS_NOT_IMPLEMENTED)
     }
     fn file_attributes(&mut self, _path: &str) -> Result<u32, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn query_file_security(&mut self, _path: &str, _information: u32) -> Result<Vec<u8>, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn set_file_security(&mut self, _path: &str, _information: u32, _descriptor: &[u8]) -> Result<(), u32> {
         Err(nt61::STATUS_NOT_IMPLEMENTED)
     }
     fn file_basic_information(&mut self, _path: &str) -> Result<nt61::FileBasicInformation, u32> {
@@ -124,6 +162,33 @@ pub trait IoHost {
         let (information, directory) = self.open_file(path, disposition, writable, directory)?;
         Ok((information, directory, None))
     }
+    fn open_file_with_access(&mut self, path: &str, disposition: u32, options: u32, desired: u32, _share: u32) -> Result<OpenedFile, u32> {
+        let mut granted = desired & 0x0012_019f;
+        if desired & 0x8000_0000 != 0 { granted |= 0x0012_0089; }
+        if desired & 0x4000_0000 != 0 { granted |= 0x0012_0116; }
+        if desired & !(0xc000_0000 | 0x0012_019f) != 0 { return Err(ACCESS_DENIED); }
+        let write = granted & FILE_WRITE_DATA != 0;
+        if matches!(disposition, 4 | 5) && !write { return Err(ACCESS_DENIED); }
+        let (information, directory, identity) = self.open_tracked_file(path, disposition, write, options & 0x4040 == 0x4000)?;
+        Ok(OpenedFile { information, directory, identity, granted, share: None })
+    }
+    fn retain_open_file(&mut self, path: &str, identity: Option<u64>, writable: bool) -> Result<(), u32> {
+        let (_, directory, retained) = self.open_tracked_file(path, 1, writable, false)?;
+        if directory || retained != identity {
+            if let Some(record) = retained { self.close_tracked_file(record); }
+            return Err(INVALID_HANDLE);
+        }
+        Ok(())
+    }
+    fn query_open_file_security(&mut self, _record: u64, _granted: u32, _information: u32) -> Result<Vec<u8>, u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn check_set_open_file_security(&mut self, _record: u64, _granted: u32, _information: u32) -> Result<(), u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
+    fn set_open_file_security(&mut self, _record: u64, _information: u32, _descriptor: &[u8]) -> Result<(), u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
     fn close_tracked_file(&mut self, _identity: u64) {}
     fn set_file_range_lock(&mut self, _key: FileLockKey, _offset: u64, _length: u64, _lock: bool) -> Result<(), u32> {
         Err(nt61::STATUS_NOT_IMPLEMENTED)
@@ -144,9 +209,15 @@ pub trait IoHost {
     fn write_open_file(&mut self, path: &str, _key: Option<FileLockKey>, offset: u64, bytes: &[u8]) -> Result<usize, u32> {
         self.write_at(path, offset, bytes)
     }
+    fn commit_file_copy(&mut self, _path: &str, _overwrite: bool, _contents: &[u8]) -> Result<(), u32> {
+        Err(nt61::STATUS_NOT_IMPLEMENTED)
+    }
     fn read_mapped_file(&mut self, path: &str, identity: Option<u64>, offset: u64, length: usize) -> Result<Vec<u8>, u32> {
         if identity.is_some() { return Err(nt61::STATUS_NOT_IMPLEMENTED); }
         self.read_at(path, offset, length)
+    }
+    fn open_file_size(&mut self, path: &str, _identity: Option<u64>) -> Result<u64, u32> {
+        self.file_size(path)
     }
     fn write_mapped_file(&mut self, _path: &str, _identity: Option<u64>, _offset: u64, _bytes: &[u8]) -> Result<usize, u32> {
         Err(nt61::STATUS_NOT_IMPLEMENTED)
@@ -168,13 +239,15 @@ struct File {
     inheritable: bool,
     path: String,
     position: u64,
-    readable: bool,
-    writable: bool,
-    write_attributes: bool,
+    granted: u32,
+    _share: Option<FileShareLease>,
     directory: bool,
     overlapped: bool,
 }
 impl File {
+    fn allows(&self, access: u32) -> bool {
+        self.granted & access == access
+    }
     fn lock_key(&self) -> Option<FileLockKey> {
         self.identity.map(|record| FileLockKey { record, owner: self.owner })
     }
@@ -283,20 +356,12 @@ impl<H: IoHost> IoServices<H> {
                 if !(1..=5).contains(&a[7]) || a[4] != 0 || a[9] != 0 || a[10] != 0 {
                     return Err(nt61::STATUS_NOT_IMPLEMENTED);
                 }
-                if a[1] & !(0xc000_0000 | 0x0012_019f) != 0 {
-                    return Err(ACCESS_DENIED);
-                }
-                if a[8] & !0x0000_4074 != 0 || a[8] & 0x30 == 0x30 || a[6] & !7 != 0 {
+                if a[8] & !0x0000_4075 != 0 || a[8] & 0x30 == 0x30 || a[6] & !7 != 0 {
                     return Err(nt61::STATUS_NOT_IMPLEMENTED);
                 }
                 let overlapped = a[8] & 0x30 == 0;
                 if overlapped && a[8] & 0x40 == 0 {
                     return Err(nt61::STATUS_NOT_IMPLEMENTED);
-                }
-                let readable = a[1] & 0x8000_0001 != 0;
-                let can_write = a[1] & 0x4000_0002 != 0;
-                if matches!(a[7], 4 | 5) && !can_write {
-                    return Err(ACCESS_DENIED);
                 }
                 writable(m, a[0], width)?;
                 writable(m, a[3], width * 2)?;
@@ -344,7 +409,9 @@ impl<H: IoHost> IoServices<H> {
                 self.files.try_reserve(1).map_err(|_| 0xc000_0017u32)?;
                 let owner = NEXT_FILE_OWNER.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
                     .map_err(|_| 0xc000_011fu32)?;
-                let (information, directory, identity) = self.host.open_tracked_file(&path, a[7] as u32, can_write, a[8] & 0x4040 == 0x4000)?;
+                let OpenedFile { information, directory, identity, granted, share } = self.host.open_file_with_access(
+                    &path, a[7] as u32, a[8] as u32, a[1] as u32, a[6] as u32,
+                )?;
                 if let Err(status) = put(m, a[0], handle, width).and_then(|_| iosb(m, a[3], width, 0, information)) {
                     if let Some(identity) = identity { self.host.close_tracked_file(identity); }
                     return Err(status);
@@ -356,13 +423,39 @@ impl<H: IoHost> IoServices<H> {
                     inheritable: attributes & 2 != 0,
                     path,
                     position: 0,
-                    readable,
-                    writable: can_write,
-                    write_attributes: a[1] & (GENERIC_WRITE | FILE_WRITE_ATTRIBUTES) != 0,
+                    granted,
+                    _share: share,
                     directory,
                     overlapped,
                 });
                 self.next_handle = next;
+                Ok(0)
+            }
+            Service::QuerySecurityObject | Service::SetSecurityObject => {
+                let file = self.files.iter().find(|file| file.handle == a[0]).ok_or(INVALID_HANDLE)?;
+                let record = file.identity.ok_or(nt61::STATUS_NOT_IMPLEMENTED)?;
+                let information = a[1] as u32;
+                if service == Service::QuerySecurityObject {
+                    let descriptor = self.host.query_open_file_security(record, file.granted, information)?;
+                    put(m, a[4], descriptor.len() as u64, 4)?;
+                    if (a[3] as u32 as usize) < descriptor.len() { return Err(0xc000_0023); }
+                    writable(m, a[2], descriptor.len())?;
+                    if !m.write_virt(a[2], &descriptor) { return Err(nt61::STATUS_ACCESS_VIOLATION); }
+                } else {
+                    self.host.check_set_open_file_security(record, file.granted, information)?;
+                    if information != 0 {
+                        let descriptor = relative_security_descriptor::capture(
+                            a[2], width,
+                            |bytes, address| {
+                                if m.read_virt(address, bytes) == bytes.len() { Ok(()) }
+                                else { Err(nt61::STATUS_ACCESS_VIOLATION as i32) }
+                            },
+                            0xc000_0079u32 as i32,
+                            0xc000_0017u32 as i32,
+                        ).map_err(|status| status as u32)?;
+                        self.host.set_open_file_security(record, information, &descriptor)?;
+                    }
+                }
                 Ok(0)
             }
             Service::Close => {
@@ -418,8 +511,8 @@ impl<H: IoHost> IoServices<H> {
                     .iter_mut()
                     .find(|f| f.handle == a[0])
                     .ok_or(INVALID_HANDLE)?;
-                if file.directory || (service == Service::WriteFile && !file.writable)
-                    || (service == Service::ReadFile && !file.readable) {
+                let required = if service == Service::WriteFile { FILE_WRITE_DATA } else { FILE_READ_DATA };
+                if file.directory || !file.allows(required) {
                     return Err(ACCESS_DENIED);
                 }
                 let offset = if a[7] == 0 {
@@ -501,7 +594,7 @@ impl<H: IoHost> Drop for IoServices<H> {
 impl<H: IoHost> GuestServices for IoServices<H> {
     fn set_file_range_lock(&mut self, handle: u64, offset: u64, length: u64, lock: bool) -> Result<(), u32> {
         let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
-        if file.directory || !(file.readable || file.writable) { return Err(ACCESS_DENIED); }
+        if file.directory || file.granted & (FILE_READ_DATA | FILE_WRITE_DATA) == 0 { return Err(ACCESS_DENIED); }
         let key = file.lock_key().ok_or(nt61::STATUS_NOT_IMPLEMENTED)?;
         self.host.set_file_range_lock(key, offset, length, lock)
     }
@@ -511,7 +604,7 @@ impl<H: IoHost> GuestServices for IoServices<H> {
     }
     fn flush_file_buffers(&mut self, handle: u64) -> Result<(), u32> {
         let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
-        if file.directory || !file.writable { return Err(ACCESS_DENIED); }
+        if file.directory || !file.allows(FILE_WRITE_DATA) { return Err(ACCESS_DENIED); }
         self.host.flush_file_buffers()
     }
     fn retain_file_mapping(&mut self, file: Option<u64>, writable: bool) -> Result<(u64, u64), u32> {
@@ -519,18 +612,14 @@ impl<H: IoHost> GuestServices for IoServices<H> {
         let next = mapping.checked_add(4).filter(|next| *next <= u64::from(u32::MAX)).ok_or(0xc000_0017u32)?;
         let size = if let Some(handle) = file {
             let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
-            if file.directory || !file.readable || (writable && !file.writable) { return Err(ACCESS_DENIED); }
+            if file.directory || !file.allows(FILE_READ_DATA) || (writable && !file.allows(FILE_WRITE_DATA)) { return Err(ACCESS_DENIED); }
             if self.mapped_files.iter().any(|other| (writable || other.writable)
                 && (file.path.eq_ignore_ascii_case(&other.path) || (file.identity.is_some() && file.identity == other.identity))) {
                 return Err(0xc000_0043);
             }
-            let size = self.host.file_size(&file.path)?;
-            let (_, directory, identity) = self.host.open_tracked_file(&file.path, 1, writable, false)?;
-            if directory || identity != file.identity {
-                if let Some(id) = identity { self.host.close_tracked_file(id); }
-                return Err(INVALID_HANDLE);
-            }
-            self.mapped_files.push(MappedFile { mapping, path: file.path.clone(), identity, writable });
+            let size = self.host.open_file_size(&file.path, file.identity)?;
+            self.host.retain_open_file(&file.path, file.identity, writable)?;
+            self.mapped_files.push(MappedFile { mapping, path: file.path.clone(), identity: file.identity, writable });
             size
         } else { 0 };
         self.next_handle = next;
@@ -803,6 +892,14 @@ impl<H: IoHost> GuestServices for IoServices<H> {
         let path = guest_file_path(abi, path, self.fs_redirection)?;
         self.host.file_attributes(&path)
     }
+    fn query_file_security(&mut self, abi: GuestAbi, path: &str, information: u32) -> Result<Vec<u8>, u32> {
+        let path = guest_file_path(abi, path, self.fs_redirection)?;
+        self.host.query_file_security(&path, information)
+    }
+    fn set_file_security(&mut self, abi: GuestAbi, path: &str, information: u32, descriptor: &[u8]) -> Result<(), u32> {
+        let path = guest_file_path(abi, path, self.fs_redirection)?;
+        self.host.set_file_security(&path, information, descriptor)
+    }
     fn file_basic_information(&mut self, abi: GuestAbi, path: &str) -> Result<nt61::FileBasicInformation, u32> {
         let path = guest_file_path(abi, path, self.fs_redirection)?;
         self.host.file_basic_information(&path)
@@ -824,9 +921,47 @@ impl<H: IoHost> GuestServices for IoServices<H> {
         let destination = guest_file_path(abi, destination, self.fs_redirection)?;
         self.host.move_file(&source, &destination)
     }
+    fn copy_file(&mut self, abi: GuestAbi, source: &str, destination: &str, overwrite: bool) -> Result<(), u32> {
+        let source = guest_file_path(abi, source, self.fs_redirection)?;
+        let destination = guest_file_path(abi, destination, self.fs_redirection)?;
+        if source.eq_ignore_ascii_case(&destination) {
+            return Err(0xc000_00d4);
+        }
+        let owner = NEXT_FILE_OWNER.try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .map_err(|_| 0xc000_011fu32)?;
+        let input = self.host.open_file_with_access(&source, 1, 0x60, FILE_READ_DATA, 1)?;
+        let result = (|| {
+            if input.directory || input.granted & FILE_READ_DATA == 0 {
+                return Err(ACCESS_DENIED);
+            }
+            let record = input.identity.ok_or(nt61::STATUS_NOT_IMPLEMENTED)?;
+            let source_key = Some(FileLockKey { record, owner });
+            let size = self.host.open_file_size(&source, input.identity)?;
+            if size > MAX_FILE_COPY {
+                return Err(nt61::STATUS_NOT_IMPLEMENTED);
+            }
+            let mut contents = Vec::new();
+            contents.try_reserve_exact(size as usize).map_err(|_| 0xc000_0017u32)?;
+            let mut offset = 0;
+            while offset < size {
+                let expected = (size - offset).min(MAX_IO as u64) as usize;
+                let bytes = self.host.read_open_file(&source, source_key, offset, expected)?;
+                if bytes.len() != expected {
+                    return Err(0xc000_0185);
+                }
+                contents.extend_from_slice(&bytes);
+                offset += expected as u64;
+            }
+            self.host.commit_file_copy(&destination, overwrite, &contents)
+        })();
+        if let Some(record) = input.identity {
+            self.host.close_tracked_file(record);
+        }
+        result
+    }
     fn set_file_times(&mut self, handle: u64, times: [Option<u64>; 3]) -> Result<(), u32> {
         let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
-        if !file.write_attributes {
+        if !file.allows(FILE_WRITE_ATTRIBUTES) {
             return Err(ACCESS_DENIED);
         }
         if times == [None; 3] {
@@ -866,7 +1001,7 @@ impl<H: IoHost> GuestServices for IoServices<H> {
     }
     fn file_size(&mut self, handle: u64) -> Result<u64, u32> {
         let file = self.files.iter().find(|file| file.handle == handle).ok_or(INVALID_HANDLE)?;
-        self.host.file_size(&file.path)
+        self.host.open_file_size(&file.path, file.identity)
     }
     fn seek_file(&mut self, handle: u64, distance: i64, origin: u32, limit: u64) -> Result<u64, nt61::FileSeekError> {
         use nt61::FileSeekError::{NegativePosition, PositionTooLarge, SetStatus, Status};
@@ -875,8 +1010,8 @@ impl<H: IoHost> GuestServices for IoServices<H> {
             0 => 0,
             1 => self.files[file_index.ok_or(Status(INVALID_HANDLE))?].position,
             2 => {
-                let path = &self.files[file_index.ok_or(Status(INVALID_HANDLE))?].path;
-                self.host.file_size(path).map_err(Status)?
+                let file = &self.files[file_index.ok_or(Status(INVALID_HANDLE))?];
+                self.host.open_file_size(&file.path, file.identity).map_err(Status)?
             }
             _ => return Err(Status(INVALID_PARAMETER)),
         };

@@ -17,6 +17,7 @@ struct StandardInformation {
     value_length: usize,
     used: usize,
     has_attribute_list: bool,
+    has_reparse_attribute: bool,
     inline_security: Option<(usize, usize)>,
 }
 
@@ -47,12 +48,14 @@ fn locate(record: &[u8]) -> Option<StandardInformation> {
 
     let mut found = None;
     let mut has_attribute_list = false;
+    let mut has_reparse_attribute = false;
     let mut inline_security = None;
     loop {
         let kind = u32::from_le_bytes(used_record.get(offset..offset + 4)?.try_into().ok()?);
         if kind == u32::MAX {
             let mut info: StandardInformation = found?;
             info.has_attribute_list = has_attribute_list;
+            info.has_reparse_attribute = has_reparse_attribute;
             info.inline_security = inline_security;
             return Some(info);
         }
@@ -82,6 +85,7 @@ fn locate(record: &[u8]) -> Option<StandardInformation> {
                 value_length,
                 used,
                 has_attribute_list: false,
+                has_reparse_attribute: false,
                 inline_security: None,
             });
         } else if kind == 0x20 {
@@ -92,6 +96,8 @@ fn locate(record: &[u8]) -> Option<StandardInformation> {
             }
             inline_value(attr)?;
             inline_security = Some((offset, end));
+        } else if kind == 0xc0 {
+            has_reparse_attribute = true;
         }
         offset = end;
     }
@@ -114,6 +120,12 @@ pub(super) fn security_id(record: &[u8]) -> Option<u32> {
     let offset = info.value + ID_OFFSET;
     let id = u32::from_le_bytes(record[offset..offset + 4].try_into().ok()?);
     (id != 0).then_some(id)
+}
+
+pub(super) fn has_reparse_point(record: &[u8]) -> Option<bool> {
+    let info = locate(record)?;
+    let flags = u32::from_le_bytes(record[info.value + 32..info.value + 36].try_into().ok()?);
+    Some(info.has_reparse_attribute || flags & 0x0400 != 0)
 }
 
 pub(super) fn set_security_id(record: &mut [u8], id: u32) -> Option<()> {
@@ -204,6 +216,18 @@ mod tests {
         assert_eq!(security_id(&record), Some(257));
         assert_eq!(&record[..132], &original[..132]);
         assert_eq!(&record[136..], &original[136..]);
+    }
+
+    #[test]
+    fn identifies_reparse_records_from_either_metadata_field() {
+        let mut record = resident_record(72, 0x80);
+        record[112..116].fill(0);
+        assert_eq!(has_reparse_point(&record), Some(false));
+        record[112..116].copy_from_slice(&0x400u32.to_le_bytes());
+        assert_eq!(has_reparse_point(&record), Some(true));
+        record[112..116].fill(0);
+        record[152..156].copy_from_slice(&0xc0u32.to_le_bytes());
+        assert_eq!(has_reparse_point(&record), Some(true));
     }
 
     #[test]

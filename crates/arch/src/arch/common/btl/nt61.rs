@@ -28,6 +28,8 @@ pub enum Service {
     ReadFile,
     WriteFile,
     CreateFile,
+    QuerySecurityObject,
+    SetSecurityObject,
     AllocateVirtualMemory,
     QueryInformationProcess,
     OpenProcess,
@@ -43,9 +45,9 @@ impl Service {
             | Self::DelayExecution
             | Self::QueryPerformanceCounter => 2,
             Self::YieldExecution => 0,
-            Self::WaitForSingleObject => 3,
+            Self::WaitForSingleObject | Self::SetSecurityObject => 3,
             Self::OpenProcess => 4,
-            Self::QueryInformationProcess => 5,
+            Self::QueryInformationProcess | Self::QuerySecurityObject => 5,
             Self::AllocateVirtualMemory => 6,
             Self::ReadFile | Self::WriteFile => 9,
             Self::CreateFile => 11,
@@ -68,6 +70,8 @@ pub fn resolve(abi: GuestAbi, number: u32) -> Option<Service> {
         (GuestAbi::X86_32, 0x111) | (GuestAbi::X86_64, 3) => ReadFile,
         (GuestAbi::X86_32, 0x18c) | (GuestAbi::X86_64, 5) => WriteFile,
         (GuestAbi::X86_32, 0x42) | (GuestAbi::X86_64, 0x52) => CreateFile,
+        (GuestAbi::X86_32, 256) | (GuestAbi::X86_64, 295) => QuerySecurityObject,
+        (GuestAbi::X86_32, 347) | (GuestAbi::X86_64, 361) => SetSecurityObject,
         (GuestAbi::X86_32, 0x13) | (GuestAbi::X86_64, 0x15) => AllocateVirtualMemory,
         (GuestAbi::X86_32, 0xea) | (GuestAbi::X86_64, 0x16) => QueryInformationProcess,
         (GuestAbi::X86_32, 0xbe) | (GuestAbi::X86_64, 0x23) => OpenProcess,
@@ -284,6 +288,12 @@ pub trait GuestServices {
     fn file_attributes(&mut self, _abi: GuestAbi, _path: &str) -> Result<u32, u32> {
         Err(STATUS_NOT_IMPLEMENTED)
     }
+    fn query_file_security(&mut self, _abi: GuestAbi, _path: &str, _information: u32) -> Result<alloc::vec::Vec<u8>, u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn set_file_security(&mut self, _abi: GuestAbi, _path: &str, _information: u32, _descriptor: &[u8]) -> Result<(), u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
     fn file_basic_information(&mut self, _abi: GuestAbi, _path: &str) -> Result<FileBasicInformation, u32> {
         Err(STATUS_NOT_IMPLEMENTED)
     }
@@ -295,6 +305,9 @@ pub trait GuestServices {
         Err(STATUS_NOT_IMPLEMENTED)
     }
     fn move_file(&mut self, _abi: GuestAbi, _source: &str, _destination: &str) -> Result<(), u32> {
+        Err(STATUS_NOT_IMPLEMENTED)
+    }
+    fn copy_file(&mut self, _abi: GuestAbi, _source: &str, _destination: &str, _overwrite: bool) -> Result<(), u32> {
         Err(STATUS_NOT_IMPLEMENTED)
     }
     fn set_file_times(&mut self, _handle: u64, _times: [Option<u64>; 3]) -> Result<(), u32> {

@@ -27,6 +27,10 @@
 use crate::error::{BuildError, Result};
 use crate::fs::backend::{DirEntry, FsBackend};
 
+#[path = "../../../fs/src/fs/ntfs/bootstrap_security.rs"]
+mod bootstrap_security;
+use bootstrap_security::{default_dacl, sds_hash, ADMINISTRATORS, DEFAULT_SECURITY_ID};
+
 /// NTFS file or directory entry
 #[derive(Debug, Clone)]
 pub struct NtfsEntry {
@@ -93,7 +97,11 @@ pub const INDEX_ENTRY_HEADER_SIZE: u16 = 16;
 pub const INDEX_ENTRY_FLAG_END: u16 = 0x0002;
 pub const RESIDENT_ATTRIBUTE_HEADER_SIZE: usize = 24;
 pub const FILE_NAME_MINIMUM_LENGTH: usize = 66;
-const STANDARD_INFORMATION_VALUE_LENGTH: usize = 48;
+const STANDARD_INFORMATION_VALUE_LENGTH: usize = 72;
+const SECURE_RECORD: usize = 9;
+const FIRST_USER_RECORD: usize = 32;
+const SDS_MIRROR_OFFSET: usize = 256 * 1024;
+const SDS_CAPACITY: usize = 2 * SDS_MIRROR_OFFSET;
 
 // =====================================================================
 // NTFS Structures
@@ -241,6 +249,9 @@ pub struct NtfsImage {
     /// entries are updated in place; only entries absent from this map are
     /// appended when a parsed image is written back.
     original_record_numbers: std::collections::HashMap<String, u64>,
+    original_security_ids: std::collections::HashMap<u64, u32>,
+    original_sds_extent: Option<(u64, u64)>,
+    unsupported_original_security: bool,
     /// Original bytes from which this image was parsed. Used to preserve
     /// existing file data when finalizing (rebuilding) a modified image.
     original_bytes: Option<Vec<u8>>,
@@ -292,7 +303,8 @@ fn build_attr_header(attr_type: u32, value_length: u32) -> Vec<u8> {
 
 /// Fill the 32-bit length field at offset 4 of `attr` with the
 /// total attribute length (header + value).
-fn fill_attr_length(attr: &mut [u8]) {
+fn fill_attr_length(attr: &mut Vec<u8>) {
+    attr.resize(attr.len().next_multiple_of(8), 0);
     let total = attr.len() as u32;
     attr[4..8].copy_from_slice(&total.to_le_bytes());
 }
@@ -307,7 +319,7 @@ fn fill_attr_length(attr: &mut [u8]) {
 /// bit set, reserve another byte so a positive LCN remains positive.
 fn encode_single_run(cluster_count: u64, lcn_delta: u64) -> Vec<u8> {
     let cc_bytes = cluster_count.to_le_bytes();
-    let cc_len = bytes_needed_u64(cluster_count);
+    let cc_len = signed_bytes_needed_u64(cluster_count);
     let lcn_bytes = lcn_delta.to_le_bytes();
     let lcn_len = signed_bytes_needed_u64(lcn_delta);
     let header = ((lcn_len as u8) << 4) | (cc_len as u8);
@@ -463,6 +475,9 @@ impl NtfsImage {
 
         let mut total_seen = 0;
         let mut file_records_found = 0;
+        let mut original_security_ids = std::collections::HashMap::new();
+        let mut original_sds_extent = None;
+        let mut unsupported_original_security = false;
         for rec_idx in 0..max_records {
             let rec_off = mft_byte_offset + rec_idx * mft_record_size as usize;
             if rec_off + mft_record_size as usize > data.len() {
@@ -508,6 +523,11 @@ impl NtfsImage {
             if flags & 0x01 == 0 {
                 continue; // not in use
             }
+            if rec_idx == SECURE_RECORD {
+                original_sds_extent = Self::sds_extent(&rec, first_attr_offset, u64::from(cluster_size));
+                unsupported_original_security |= original_sds_extent.is_none();
+                continue;
+            }
             let mut attr_off = first_attr_offset;
             let mut file_name: Option<String> = None;
             let mut parent_ref: u32 = 5;
@@ -536,6 +556,23 @@ impl NtfsImage {
                 }
                 let resident = rec[attr_off + 8];
                 match attr_type {
+                    ATTR_TYPE_STANDARD_INFORMATION if rec_idx == 5 || rec_idx >= 16 => {
+                        let attr = &rec[attr_off..attr_off + attr_len];
+                        let value_len = u32::from_le_bytes(attr[16..20].try_into().unwrap()) as usize;
+                        let start = usize::from(u16::from_le_bytes(attr[20..22].try_into().unwrap()));
+                        let value = attr.get(start..).and_then(|value| value.get(..value_len));
+                        match value.filter(|_| resident == 0 && start >= RESIDENT_ATTRIBUTE_HEADER_SIZE) {
+                            Some(value) if value.len() == STANDARD_INFORMATION_VALUE_LENGTH => {
+                                let id = u32::from_le_bytes(value[52..56].try_into().unwrap());
+                                if id < DEFAULT_SECURITY_ID || original_security_ids.insert(rec_idx as u64, id).is_some() {
+                                    unsupported_original_security = true;
+                                }
+                            }
+                            Some(value) if value.len() == 48 => {}
+                            _ => unsupported_original_security = true,
+                        }
+                    }
+                    0x50 if rec_idx == 5 || rec_idx >= 16 => unsupported_original_security = true,
                     0x30 => {
                         if resident == 0 {
                             // Resident attribute header (24 bytes total):
@@ -754,6 +791,9 @@ impl NtfsImage {
             data_cluster_assignments: std::collections::HashMap::new(),
             directory_indexes: std::collections::HashMap::new(),
             original_record_numbers,
+            original_security_ids,
+            original_sds_extent,
+            unsupported_original_security,
             // Store original bytes so finalize() can preserve existing data.
             original_bytes: Some(data.to_vec()),
         })
@@ -840,6 +880,9 @@ impl NtfsImage {
             data_cluster_assignments: std::collections::HashMap::new(),
             directory_indexes: std::collections::HashMap::new(),
             original_record_numbers: std::collections::HashMap::new(),
+            original_security_ids: std::collections::HashMap::new(),
+            original_sds_extent: None,
+            unsupported_original_security: false,
             // No original bytes for newly created images.
             original_bytes: None,
         })
@@ -1053,10 +1096,12 @@ impl NtfsImage {
     }
 
     /// Build standard information attribute
-    fn build_standard_info(&self, is_dir: bool) -> Vec<u8> {
+    fn build_standard_info(&self, is_dir: bool, record_num: u64) -> Vec<u8> {
         let mut value = [0u8; STANDARD_INFORMATION_VALUE_LENGTH];
         let attributes = if is_dir { 0x10u32 } else { 0x20u32 };
         value[32..36].copy_from_slice(&attributes.to_le_bytes());
+        let security_id = self.original_security_ids.get(&record_num).copied().unwrap_or(DEFAULT_SECURITY_ID);
+        value[52..56].copy_from_slice(&security_id.to_le_bytes());
         let mut data = build_attr_header(ATTR_TYPE_STANDARD_INFORMATION, value.len() as u32);
         data.extend_from_slice(&value);
         fill_attr_length(&mut data);
@@ -1079,19 +1124,15 @@ impl NtfsImage {
     /// cluster ranges starting at `data_cluster_cursor`. Real NTFS
     /// uses a bitmap-driven free-space manager; that's overkill for
     /// the build tool's static layout.
-    fn allocate_data_clusters(&mut self, byte_count: usize) -> (u64, u64) {
+    fn allocate_data_clusters(&mut self, byte_count: usize) -> Result<(u64, u64)> {
         let cluster_size = self.sectors_per_cluster as u64 * self.sector_size as u64;
         let clusters_needed = (byte_count as u64).div_ceil(cluster_size);
         let start = self.data_cluster_cursor;
-        self.data_cluster_cursor += clusters_needed;
         let max_clusters = self.total_sectors / self.sectors_per_cluster as u64;
-        if self.data_cluster_cursor > max_clusters {
-            panic!(
-                "NtfsImage: out of cluster space for non-resident data (cursor={}, max={})",
-                self.data_cluster_cursor, max_clusters,
-            );
-        }
-        (start, clusters_needed)
+        let end = start.checked_add(clusters_needed).filter(|end| *end < max_clusters)
+            .ok_or_else(|| BuildError::NtfsError("Not enough space for non-resident data".into()))?;
+        self.data_cluster_cursor = end;
+        Ok((start, clusters_needed))
     }
 
     /// Build a non-resident `$DATA` attribute that points to
@@ -1277,14 +1318,14 @@ impl NtfsImage {
 
     /// Promote separators into a resident root, storing sorted leaves in
     /// standard 4 KiB INDX records with per-sector update sequence protection.
-    fn prepare_directory_index(&mut self, path: &str, children: &[(u64, String)], records: &std::collections::HashMap<String, u64>) {
+    fn prepare_directory_index(&mut self, path: &str, children: &[(u64, String)], records: &std::collections::HashMap<String, u64>) -> Result<()> {
         let refs: Vec<_> = children.iter().filter_map(|(rn, p)| self.entries.iter()
             .find(|e| e.path.trim_start_matches('\\') == p).map(|e| (*rn, e))).collect();
         let mut entries = self.index_entries(Some(&refs));
         let parent_ref = records.get(path).copied().unwrap_or(5) | (1u64 << 48);
         for entry in &mut entries { entry[16..24].copy_from_slice(&parent_ref.to_le_bytes()); }
         // Reserve space for FILE/USA, STANDARD_INFORMATION, FILE_NAME, and END.
-        if entries.iter().map(Vec::len).sum::<usize>() + 16 <= 2800 { return; }
+        if entries.iter().map(Vec::len).sum::<usize>() + 16 <= 2800 { return Ok(()); }
         let cluster_size = self.sectors_per_cluster as usize * 512;
         let vcn_stride = if cluster_size <= 4096 { 4096 / cluster_size } else { 8 };
         let mut allocation = Vec::new();
@@ -1308,8 +1349,9 @@ impl NtfsImage {
         root_entries.extend(Self::index_end(Some(vcn)));
         let root = Self::index_root(&root_entries, true);
         assert!(root.len() <= 2800, "directory index requires another B-tree level: {path}");
-        let clusters = self.allocate_data_clusters(allocation.len());
+        let clusters = self.allocate_data_clusters(allocation.len())?;
         self.directory_indexes.insert(path.to_owned(), DirectoryIndex { root, allocation, clusters });
+        Ok(())
     }
 
     fn index_leaf(entries: &[u8], vcn: u64) -> Vec<u8> {
@@ -1346,6 +1388,99 @@ impl NtfsImage {
         attr
     }
 
+    fn sds_extent(record: &[u8], mut offset: usize, cluster_size: u64) -> Option<(u64, u64)> {
+        while let Some(header) = record.get(offset..offset + 24) {
+            let kind = u32::from_le_bytes(header[..4].try_into().ok()?);
+            let length = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
+            if length < 24 || !length.is_multiple_of(8) {
+                return None;
+            }
+            let attribute = record.get(offset..offset + length)?;
+            if kind == ATTR_TYPE_DATA && header[8..12] == [1, 4, 64, 0]
+                && attribute.get(64..72)? == b"$\0S\0D\0S\0"
+            {
+                let clusters = (SDS_CAPACITY as u64).div_ceil(cluster_size);
+                if u64::from_le_bytes(attribute[40..48].try_into().ok()?) != clusters * cluster_size
+                    || attribute[32..34] != 72u16.to_le_bytes()
+                {
+                    return None;
+                }
+                let pairs = attribute.get(72..)?;
+                let run = *pairs.first()?;
+                let count_len = usize::from(run & 0xf);
+                let start_len = usize::from(run >> 4);
+                if !(1..=8).contains(&count_len) || !(1..=8).contains(&start_len) {
+                    return None;
+                }
+                let count = pairs.get(1..1 + count_len)?;
+                let offset = pairs.get(1 + count_len..1 + count_len + start_len)?;
+                let mut address = [0; 8];
+                address[..start_len].copy_from_slice(offset);
+                let start = u64::from_le_bytes(address);
+                if start == 0 || start > i64::MAX as u64
+                    || start_len != signed_bytes_needed_u64(start)
+                    || ![bytes_needed_u64(clusters), signed_bytes_needed_u64(clusters)].contains(&count_len)
+                    || count != &clusters.to_le_bytes()[..count_len]
+                    || pairs.get(1 + count_len + start_len) != Some(&0)
+                {
+                    return None;
+                }
+                return Some((start, clusters));
+            }
+            offset += length;
+        }
+        None
+    }
+
+    fn security_index(name: &[u8; 8], header: &[u8], by_hash: bool) -> Vec<u8> {
+        let key_length = if by_hash { 8 } else { 4 };
+        let entry_length = if by_hash { 48 } else { 40 };
+        let mut value = vec![0; 32 + entry_length + 16];
+        let collation: u32 = if by_hash { 0x12 } else { 0x10 };
+        value[4..8].copy_from_slice(&collation.to_le_bytes());
+        value[8..12].copy_from_slice(&4096u32.to_le_bytes());
+        value[12] = 1;
+        value[16..20].copy_from_slice(&16u32.to_le_bytes());
+        let index_size = (value.len() - 16) as u32;
+        value[20..24].copy_from_slice(&index_size.to_le_bytes());
+        value[24..28].copy_from_slice(&index_size.to_le_bytes());
+        let entry = &mut value[32..32 + entry_length];
+        let data_offset = 16 + key_length;
+        entry[..2].copy_from_slice(&(data_offset as u16).to_le_bytes());
+        entry[2..4].copy_from_slice(&20u16.to_le_bytes());
+        entry[8..10].copy_from_slice(&(entry_length as u16).to_le_bytes());
+        entry[10..12].copy_from_slice(&(key_length as u16).to_le_bytes());
+        entry[16..data_offset].copy_from_slice(&header[8 - key_length..8]);
+        entry[data_offset..data_offset + 20].copy_from_slice(header);
+        if by_hash {
+            entry[44..48].copy_from_slice(&0x0049_0049u32.to_le_bytes());
+        }
+        let end = 32 + entry_length;
+        value[end + 8..end + 10].copy_from_slice(&16u16.to_le_bytes());
+        value[end + 12..end + 14].copy_from_slice(&2u16.to_le_bytes());
+        let mut attr = build_attr_header(ATTR_TYPE_INDEX_ROOT, value.len() as u32);
+        attr[9] = 4;
+        attr[10..12].copy_from_slice(&24u16.to_le_bytes());
+        attr[20..22].copy_from_slice(&32u16.to_le_bytes());
+        attr.extend_from_slice(name);
+        attr.extend_from_slice(&value);
+        fill_attr_length(&mut attr);
+        attr
+    }
+
+    fn build_secure_record(&self, stream: (u64, u64), entry: &[u8]) -> Vec<u8> {
+        let mut attributes = self.build_non_resident_data_attr_sized((SDS_MIRROR_OFFSET + entry.len()) as u64, stream);
+        attributes.splice(64..64, *b"$\0S\0D\0S\0");
+        attributes[9] = 4;
+        attributes[10..12].copy_from_slice(&64u16.to_le_bytes());
+        attributes[32..34].copy_from_slice(&72u16.to_le_bytes());
+        fill_attr_length(&mut attributes);
+        attributes.extend(Self::security_index(b"$\0S\0D\0H\0", &entry[..20], true));
+        attributes.extend(Self::security_index(b"$\0S\0I\0I\0", &entry[..20], false));
+        self.build_mft_record_with_data(&NtfsEntry::new_file("$Secure", Vec::new()), SECURE_RECORD as u64,
+            Some(5), None, Some(&attributes))
+    }
+
     /// Finalize the NTFS image, treating it as a standalone volume
     /// (`hidden_sectors = 0`). Equivalent to `finalize_with_offset(0)`.
     pub fn finalize(&mut self) -> Result<Vec<u8>> {
@@ -1370,6 +1505,11 @@ impl NtfsImage {
     /// - Files larger than `MAX_RESIDENT_DATA_SIZE` bytes use a non-resident DATA
     ///   attribute. All other data is stored resident inside the MFT record.
     pub fn finalize_with_offset(&mut self, partition_offset_bytes: usize) -> Result<Vec<u8>> {
+        if self.unsupported_original_security
+            || (self.original_sds_extent.is_none() && !self.original_security_ids.is_empty())
+        {
+            return Err(BuildError::NtfsError("Cannot preserve the input volume's security layout".into()));
+        }
         // `hidden_sectors` is the starting LBA of the partition; convert
         // the byte offset to a sector count. Only the low 32 bits are
         // representable in the NTFS BPB.
@@ -1428,15 +1568,8 @@ impl NtfsImage {
         // For parsed images (original_bytes is Some), we need to find where to
         // insert new records. The original image has existing records at indices
         // that we should NOT overwrite. We'll find the first available record slot.
-        let first_new_slot = if self.original_bytes.is_some() {
-            // Reserved metadata slots need not contain FILE records. A scan
-            // stopping at the first gap can overwrite installed user records
-            // after several edits. Preserve every parsed file identity.
-            self.original_record_numbers.values().copied().max().unwrap_or(15).max(15)
-                as usize + 1
-        } else {
-            16 // Reserve NTFS metadata records, including the root at record 5.
-        };
+        let first_new_slot = self.original_record_numbers.values().copied().max()
+            .map_or(FIRST_USER_RECORD, |last| (last as usize + 1).max(FIRST_USER_RECORD));
 
         // --- Build synthetic $MFT entry for record 0 ---
         // This entry has the path "$MFT" so the kernel's verify_record sees
@@ -1513,18 +1646,63 @@ impl NtfsImage {
         // runtime reads this capacity from $MFT::$DATA, rather than guessing a
         // fixed record limit or scanning into ordinary file content.
         let mft_records = (highest_record + 1 + 1024).next_multiple_of(1024);
-        let mft_clusters = (mft_records * self.mft_record_size as u64)
-            .div_ceil(cluster_size as u64);
+        let clusters_for_records = |records: u64| {
+            (records * self.mft_record_size as u64).div_ceil(u64::from(cluster_size))
+        };
+        let mut mft_clusters = clusters_for_records(mft_records);
+        if let Some((start, _)) = self.original_sds_extent {
+            let available = start.saturating_sub(self.mft_cluster);
+            if clusters_for_records(highest_record + 1) > available {
+                return Err(BuildError::NtfsError("MFT records overlap the existing $SDS allocation".into()));
+            }
+            mft_clusters = mft_clusters.min(available);
+        }
         let mft_end = self.mft_cluster + mft_clusters;
-        if mft_end >= self.total_sectors / self.sectors_per_cluster as u64 {
+        let total_clusters = self.total_sectors / self.sectors_per_cluster as u64;
+        if mft_end >= total_clusters {
             return Err(BuildError::NtfsError("MFT reserve exceeds volume capacity".into()));
         }
         self.data_cluster_assignments.insert("$MFT".into(), (self.mft_cluster, mft_clusters));
         self.data_cluster_cursor = self.data_cluster_cursor.max(mft_end);
+        if let Some((start, count)) = self.original_sds_extent {
+            let original_clusters = self.original_bytes.as_ref().map_or(0, |bytes| bytes.len() as u64 / u64::from(cluster_size));
+            let Some(end) = start.checked_add(count).filter(|end| {
+                start >= mft_end && *end < total_clusters && *end <= original_clusters
+            }) else {
+                return Err(BuildError::NtfsError("Cannot preserve the existing $SDS allocation".into()));
+            };
+            self.data_cluster_cursor = self.data_cluster_cursor.max(end);
+        } else {
+            let store_clusters = (SDS_CAPACITY as u64).div_ceil(u64::from(cluster_size));
+            if self.data_cluster_cursor + store_clusters >= total_clusters {
+                return Err(BuildError::NtfsError("Not enough space for $Secure".into()));
+            }
+            let stream = self.allocate_data_clusters(SDS_CAPACITY)?;
+            let mut descriptor = vec![0; 20];
+            descriptor[0] = 1;
+            descriptor[2..4].copy_from_slice(&0x8004u16.to_le_bytes());
+            for (field, component) in [(4, ADMINISTRATORS.as_slice()), (8, ADMINISTRATORS.as_slice()), (16, &default_dacl())] {
+                let offset = descriptor.len() as u32;
+                descriptor[field..field + 4].copy_from_slice(&offset.to_le_bytes());
+                descriptor.extend_from_slice(component);
+            }
+            let mut entry = vec![0; 20];
+            entry[..4].copy_from_slice(&sds_hash(&descriptor).to_le_bytes());
+            entry[4..8].copy_from_slice(&DEFAULT_SECURITY_ID.to_le_bytes());
+            entry[16..20].copy_from_slice(&((20 + descriptor.len()) as u32).to_le_bytes());
+            entry.extend_from_slice(&descriptor);
+            let secure_record = self.build_secure_record(stream, &entry);
+            let secure_offset = mft_cluster_byte_offset + SECURE_RECORD * mft_record_size;
+            image[secure_offset..secure_offset + mft_record_size].copy_from_slice(&secure_record);
+            let primary = stream.0 as usize * cluster_size as usize;
+            for offset in [primary, primary + SDS_MIRROR_OFFSET] {
+                image[offset..offset + entry.len()].copy_from_slice(&entry);
+            }
+        }
         self.directory_indexes.clear();
         for (path, children) in &child_map {
             let key = if path.is_empty() { "C:\\" } else { path.as_str() };
-            self.prepare_directory_index(key, children, &record_assignment);
+            self.prepare_directory_index(key, children, &record_assignment)?;
         }
 
         // --- Pre-allocate cluster ranges for non-resident files ---
@@ -1538,15 +1716,14 @@ impl NtfsImage {
             .map(|(path, _, _, data_len)| (path.clone(), *data_len))
             .collect();
         for (path, len) in non_resident {
-            let assignment = self.allocate_data_clusters(len);
+            let assignment = self.allocate_data_clusters(len)?;
             self.data_cluster_assignments.insert(path, assignment);
         }
 
         // Runtime file growth allocates clusters through metadata record 6.
         // Include the bitmap's own allocation before marking used clusters.
-        let total_clusters = self.total_sectors / self.sectors_per_cluster as u64;
         let bitmap_len = (total_clusters.div_ceil(8) as usize).next_multiple_of(8);
-        let bitmap_clusters = self.allocate_data_clusters(bitmap_len);
+        let bitmap_clusters = self.allocate_data_clusters(bitmap_len)?;
         self.data_cluster_assignments.insert("$Bitmap".to_string(), bitmap_clusters);
         let mut bitmap = vec![0u8; bitmap_len];
         for cluster in 0..self.data_cluster_cursor {
@@ -1772,9 +1949,10 @@ impl NtfsImage {
 
     fn uses_nonresident_data(&self, path: &str, data_len: usize) -> bool {
         let leaf = path.rsplit('\\').next().unwrap_or(path);
-        let metadata = self.mft_attributes_offset() + 3 * RESIDENT_ATTRIBUTE_HEADER_SIZE
-            + STANDARD_INFORMATION_VALUE_LENGTH + FILE_NAME_MINIMUM_LENGTH
-            + 2 * leaf.encode_utf16().count() + 8;
+        let name_size = RESIDENT_ATTRIBUTE_HEADER_SIZE + FILE_NAME_MINIMUM_LENGTH
+            + 2 * leaf.encode_utf16().count();
+        let metadata = self.mft_attributes_offset() + 2 * RESIDENT_ATTRIBUTE_HEADER_SIZE
+            + STANDARD_INFORMATION_VALUE_LENGTH + name_size.next_multiple_of(8) + 8;
         let capacity = (self.mft_record_size as usize).saturating_sub(metadata);
         data_len > capacity.min(Self::MAX_RESIDENT_DATA_SIZE)
     }
@@ -1790,6 +1968,17 @@ impl NtfsImage {
         record_num: u64,
         parent_ref: Option<u64>,
         children: Option<&[(u64, &NtfsEntry)]>,
+    ) -> Vec<u8> {
+        self.build_mft_record_with_data(entry, record_num, parent_ref, children, None)
+    }
+
+    fn build_mft_record_with_data(
+        &self,
+        entry: &NtfsEntry,
+        record_num: u64,
+        parent_ref: Option<u64>,
+        children: Option<&[(u64, &NtfsEntry)]>,
+        stream_attributes: Option<&[u8]>,
     ) -> Vec<u8> {
         let mft_record_size = self.mft_record_size as usize;
         let sectors_per_record = mft_record_size / 512;
@@ -1813,7 +2002,6 @@ impl NtfsImage {
         let used_size_offset = 24;
         header[28..32].copy_from_slice(&(mft_record_size as u32).to_le_bytes()); // 0x1C: allocated_size
                                                                                  // header[32..40] = base_mft_record = 0 (already 0)
-                                                                                 // header[40..44] = next_attribute_id + padding = 0 (already 0)
                                                                                  // record_number is u32 at offset 0x2C (bytes 44..48)
         header[44..48].copy_from_slice(&(record_num as u32).to_le_bytes());
 
@@ -1823,7 +2011,7 @@ impl NtfsImage {
 
         // --- Attributes start here (offset 48) ---
         // 1. $STANDARD_INFORMATION
-        let std_info = self.build_standard_info(entry.is_dir);
+        let std_info = self.build_standard_info(entry.is_dir, record_num);
         record.extend_from_slice(&std_info);
 
         // 2. $FILE_NAME
@@ -1850,7 +2038,9 @@ impl NtfsImage {
         // support the boot manager only ever sees the first 700 bytes of
         // a PE file, which truncates winload.efi mid-header and makes
         // LoadImage fail with EFI_UNSUPPORTED.
-        if !entry.is_dir {
+        if let Some(attributes) = stream_attributes {
+            record.extend_from_slice(attributes);
+        } else if !entry.is_dir {
             if record_num == 0 && entry.path == "$MFT" {
                 let clusters = self.data_cluster_assignments["$MFT"];
                 let bytes = clusters.1 * self.sectors_per_cluster as u64 * self.sector_size as u64;
@@ -1863,6 +2053,16 @@ impl NtfsImage {
                 record.extend_from_slice(&data_attr);
             }
         }
+
+        let mut attr_offset = attributes_offset;
+        let mut attr_id = 0u16;
+        while attr_offset < record.len() {
+            let length = u32::from_le_bytes(record[attr_offset + 4..attr_offset + 8].try_into().unwrap());
+            record[attr_offset + 14..attr_offset + 16].copy_from_slice(&attr_id.to_le_bytes());
+            attr_offset += length as usize;
+            attr_id += 1;
+        }
+        record[40..42].copy_from_slice(&attr_id.to_le_bytes());
 
         // 5. End marker
         record.extend_from_slice(&Self::build_end_marker());
@@ -2159,7 +2359,7 @@ mod tests {
         let record_size = volume.mft_record_size() as usize;
         let bytes = volume.finalize().unwrap();
         let mft_base = u64::from_le_bytes(bytes[48..56].try_into().unwrap()) as usize * 4096;
-        for (record_number, attributes) in [(5, 0x10u32), (16, 0x20)] {
+        for (record_number, attributes) in [(5, 0x10u32), (FIRST_USER_RECORD, 0x20)] {
             let start = mft_base + record_number * record_size;
             let record = &bytes[start..start + record_size];
             assert_eq!(&record[..4], b"FILE");
@@ -2169,9 +2369,52 @@ mod tests {
             let length = u32::from_le_bytes(attribute[16..20].try_into().unwrap()) as usize;
             let offset = u16::from_le_bytes(attribute[20..22].try_into().unwrap()) as usize;
             let value = &attribute[offset..offset + length];
-            assert_eq!(value.len(), 48);
+            assert_eq!(value.len(), STANDARD_INFORMATION_VALUE_LENGTH);
             assert_eq!(u32::from_le_bytes(value[32..36].try_into().unwrap()), attributes);
+            assert_eq!(u32::from_le_bytes(value[52..56].try_into().unwrap()), DEFAULT_SECURITY_ID);
         }
+    }
+
+    #[test]
+    fn rebuild_preserves_security_stream_and_file_bindings() {
+        let mut volume = NtfsImage::new(16, 4096).unwrap();
+        volume.write_file("target.bin", b"target").unwrap();
+        volume.write_file("sibling.bin", b"sibling").unwrap();
+        let mut image = volume.finalize().unwrap();
+        let parsed = NtfsImage::from_bytes(&image).unwrap();
+        let (start, count) = parsed.original_sds_extent.unwrap();
+        let stream_start = start as usize * 4096;
+        let stream_end = stream_start + count as usize * 4096;
+        let entry_len = u32::from_le_bytes(image[stream_start + 16..stream_start + 20].try_into().unwrap()) as usize;
+        let entry = &image[stream_start..stream_start + entry_len];
+        assert_eq!(entry, &image[stream_start + SDS_MIRROR_OFFSET..stream_start + SDS_MIRROR_OFFSET + entry_len]);
+        assert_eq!(u32::from_le_bytes(entry[..4].try_into().unwrap()), sds_hash(&entry[20..]));
+
+        let mft = parsed.mft_cluster as usize * 4096;
+        let record_size = parsed.mft_record_size as usize;
+        let secure = &image[mft + SECURE_RECORD * record_size..][..record_size];
+        assert_eq!(u16::from_le_bytes(secure[40..42].try_into().unwrap()), 5);
+        let mut offset = parsed.mft_attributes_offset();
+        for instance in 0..5u16 {
+            let header = &secure[offset..offset + 16];
+            assert_eq!(u16::from_le_bytes(header[14..16].try_into().unwrap()), instance);
+            let length = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+            assert!(length > 0 && length.is_multiple_of(8));
+            offset += length;
+        }
+
+        image[stream_end - 1] = 0x5a;
+        let mut reopened = NtfsImage::from_bytes(&image).unwrap();
+        let original_ids = reopened.original_security_ids.clone();
+        reopened.write_file("new.bin", b"new").unwrap();
+        let rebuilt = reopened.finalize().unwrap();
+        assert_eq!(rebuilt[stream_start..stream_end], image[stream_start..stream_end]);
+        let parsed = NtfsImage::from_bytes(&rebuilt).unwrap();
+        for (record, security_id) in original_ids {
+            assert_eq!(parsed.original_security_ids.get(&record), Some(&security_id));
+        }
+        assert_eq!(parsed.read_file_path("target.bin").unwrap(), b"target");
+        assert_eq!(parsed.read_file_path("sibling.bin").unwrap(), b"sibling");
     }
 
     #[test]
@@ -2212,9 +2455,12 @@ mod tests {
     }
 
     #[test]
-    fn single_data_run_has_explicit_terminator_and_positive_signed_offset() {
+    fn single_data_run_has_explicit_terminator_and_positive_signed_values() {
         assert_eq!(encode_single_run(4, 0xbba2), [0x31, 4, 0xa2, 0xbb, 0, 0]);
         assert_eq!(encode_single_run(1, 10), [0x11, 1, 10, 0]);
+        assert_eq!(encode_single_run(127, 10), [0x11, 127, 10, 0]);
+        assert_eq!(encode_single_run(128, 10), [0x12, 128, 0, 10, 0]);
+        assert_eq!(encode_single_run(32768, 10), [0x13, 0, 128, 0, 10, 0]);
     }
 
     #[test]
@@ -2259,7 +2505,7 @@ mod tests {
             volume.write_file(&format!("assets-{:02}/asset-{i:04}.cur", i / 100), b"cursor").unwrap();
         }
         volume.write_file("document.bmp", &vec![0x5a; 12000]).unwrap();
-        let installed_records = 16 + volume.entries.len();
+        let installed_records = FIRST_USER_RECORD + volume.entries.len();
         let bytes = volume.finalize().unwrap();
         let (start, clusters) = volume.data_cluster_assignments["$MFT"];
         let record_size = volume.mft_record_size as usize;
@@ -2376,6 +2622,32 @@ mod tests {
         for i in 0..160 {
             assert_eq!(parsed.read_file_path(&format!("Windows/System32/file{i:03}.exe")).unwrap(), vec![i as u8; 1025]);
         }
+    }
+
+    #[test]
+    fn repack_uses_existing_mft_reserve_before_sds() {
+        let mut image = NtfsImage::new(16, 4096).unwrap();
+        image.write_file("original", b"original").unwrap();
+        let mut parsed = NtfsImage::from_bytes(&image.finalize().unwrap()).unwrap();
+        let extent = parsed.original_sds_extent.unwrap();
+        let capacity = (extent.0 - parsed.mft_cluster) * 4096 / parsed.mft_record_size as u64;
+        assert!(capacity >= 2048);
+        for directory in 0..capacity.div_ceil(64) {
+            parsed.create_dir(&format!("added{directory:03}")).unwrap();
+        }
+        for index in 0..1024 {
+            parsed.write_file(&format!("added{:03}/file{index:04}", index / 64), b"new").unwrap();
+        }
+        let output = parsed.finalize().unwrap();
+        let repacked = NtfsImage::from_bytes(&output).unwrap();
+        assert_eq!(repacked.original_sds_extent, Some(extent));
+        assert_eq!(repacked.read_file_path("original").unwrap(), b"original");
+        assert_eq!(repacked.read_file_path("added015/file1023").unwrap(), b"new");
+
+        for index in 1024..capacity {
+            parsed.write_file(&format!("added{:03}/file{index:04}", index / 64), b"new").unwrap();
+        }
+        assert!(parsed.finalize().unwrap_err().to_string().contains("overlap the existing $SDS"));
     }
 
     #[test]

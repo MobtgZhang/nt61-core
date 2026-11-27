@@ -46,13 +46,7 @@ fn resident_value(attr: &[u8]) -> Option<&[u8]> {
     attr.get(start..start.checked_add(size)?)
 }
 
-pub fn hash(descriptor: &[u8]) -> u32 {
-    descriptor.chunks(4).fold(0u32, |sum, bytes| {
-        let mut word = [0; 4];
-        word[..bytes.len()].copy_from_slice(bytes);
-        sum.rotate_left(3).wrapping_add(u32::from_le_bytes(word))
-    })
-}
+pub use super::bootstrap_security::sds_hash as hash;
 
 /// NTFS SDS length includes its 20-byte header; entries are 16-byte aligned.
 pub fn entry(id: u32, offset: u64, descriptor: &[u8]) -> Option<Vec<u8>> {

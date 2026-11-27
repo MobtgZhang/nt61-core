@@ -5,6 +5,9 @@ use super::*;
 use crate::se::{sid::sid, token};
 use alloc::vec::Vec;
 
+const OWNER_RIGHTS_SID: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
+const INHERIT_ONLY_ACE: u8 = 8;
+
 fn same_sid(bytes: &[u8], value: &sid) -> bool {
     value.is_valid()
         && bytes.len() == value.size()
@@ -69,7 +72,13 @@ fn pass(
         result.granted |= WRITE_OWNER;
         result.use_privilege(9);
     }
-    if !restricting && owner(&descriptor.owner, token) {
+    let is_owner = !restricting && owner(&descriptor.owner, token);
+    let has_owner_rights_ace = descriptor.dacl.as_ref().is_some_and(|aces| {
+        aces.iter().any(|ace| {
+            ace.flags & INHERIT_ONLY_ACE == 0 && ace.sid.as_slice() == OWNER_RIGHTS_SID
+        })
+    });
+    if is_owner && !has_owner_rights_ace {
         result.granted |= (if maximum { u32::MAX } else { explicit }) & (READ_CONTROL | WRITE_DAC);
     }
     let Some(aces) = &descriptor.dacl else {
@@ -83,9 +92,9 @@ fn pass(
     let collect_maximum = maximum || result_list;
     let mut stopped_on_deny = false;
     for ace in aces {
-        if ace.flags & 8 != 0 {
+        if ace.flags & INHERIT_ONLY_ACE != 0 {
             continue;
-        } // INHERIT_ONLY_ACE
+        }
         let mask = mapping.map(ace.mask) & !(ACCESS_SYSTEM_SECURITY | MAXIMUM_ALLOWED);
         let deny = matches!(ace.kind, 1 | 6);
         let index = if let Some(guid) = &ace.object_type {
@@ -111,7 +120,12 @@ fn pass(
         } else {
             &ace.sid
         };
-        if !matches_token(identity, token, deny, restricting) {
+        let matches = if ace.sid.as_slice() == OWNER_RIGHTS_SID {
+            is_owner
+        } else {
+            matches_token(identity, token, deny, restricting)
+        };
+        if !matches {
             continue;
         }
         if collect_maximum {

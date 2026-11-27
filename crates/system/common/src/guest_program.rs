@@ -3,15 +3,20 @@
 //! process (GUI dispatch, SEH and guest thread creation
 //! remain separate). Normal imports link only to checked guest DLL code.
 use crate::arch::common::btl::{
-    io::{guest_file_path, FileLockKey, IoHost, IoServices},
+    io::{guest_file_path, FileLockKey, IoHost, IoServices, OpenedFile},
+    ir::DecodeMode,
     nt61::{ChildProcess, ChildRequest, DcExtent, FileBasicInformation, SocketKind, VolumeAllocation},
     pe::{GuestImage, ImageRunResult},
     runtime::StopReason,
 };
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
+use crate::ps::impersonation::ImpersonationReference;
+use core::fmt::Display;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 struct VolumeIo {
+    attempt: GuestAttempt,
+    identity: Option<ImpersonationReference>,
     output: fn(&[u8]),
     desktop_client: u32,
     desktop_windows:bool,
@@ -19,6 +24,8 @@ struct VolumeIo {
 }
 
 struct ChildJob {
+    attempt: GuestAttempt,
+    path: String,
     image: GuestImage,
     services: IoServices<VolumeIo>,
     exit: Arc<AtomicU64>,
@@ -27,6 +34,35 @@ struct ChildJob {
 }
 
 static ACTIVE_CHILDREN: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, Copy)]
+struct GuestAttempt(u64);
+
+impl GuestAttempt {
+    fn start(path: &str) -> Self {
+        static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
+        let attempt = Self(NEXT_ATTEMPT.fetch_add(1, Ordering::Relaxed));
+        attempt.log(format_args!("Loading {path}"));
+        attempt
+    }
+
+    fn log(self, event: impl Display) {
+        crate::hal::serial::write_string_always(&format!("[PE] {event} [run={}]\r\n", self.0));
+    }
+}
+
+fn report_progress_periodically(
+    last: &mut u64,
+    attempt: GuestAttempt,
+    path: &str,
+    image: &GuestImage,
+) {
+    let now = crate::ke::time::get_interrupt_time();
+    if now.saturating_sub(*last) >= 20_000_000 {
+        *last = now;
+        report_guest_progress(attempt, path, image);
+    }
+}
 
 struct ChildSlot;
 
@@ -47,10 +83,16 @@ impl Drop for ChildSlot {
 
 extern "C" fn run_child(context: u64) -> ! {
     let mut job = unsafe { Box::from_raw(context as *mut ChildJob) };
+    let attempt = job.attempt;
+    report_guest_context(attempt, &job.path, &job.image);
+    attempt.log(format_args!("Running {}", job.path));
     let mut publisher = crate::mm::jit_code::KernelPublisher;
     let mut jit = crate::arch::common::btl::runtime::jit::Jit::new(&mut publisher);
     let mut status = 0xc000_0044;
+    let mut finished = false;
+    let mut last_progress = crate::ke::time::get_interrupt_time();
     for _ in 0..16384 {
+        report_progress_periodically(&mut last_progress, attempt, &job.path, &job.image);
         let result = job.image.run_with_jit(8192, &mut job.services, &mut jit);
         if let Some(code) = job.image.primary_thread_exit_code() {
             job.thread_exit.store(u64::from(code), Ordering::Release);
@@ -59,13 +101,22 @@ extern "C" fn run_child(context: u64) -> ! {
             ImageRunResult::Yielded => crate::ke::scheduler::yield_(),
             ImageRunResult::Exited(code) => {
                 status = code;
+                attempt.log(format_args!("Guest exited {}: {code}", job.path));
+                finished = true;
                 break;
             }
-            ImageRunResult::Fault(_) => {
+            ImageRunResult::Fault(reason) => {
                 status = 0xc000_0142;
+                attempt.log(format_args!(
+                    "Guest execution fault in {}: {reason:?}; NTSTATUS 0x{status:08X}.", job.path,
+                ));
+                finished = true;
                 break;
             }
         }
+    }
+    if !finished {
+        attempt.log(format_args!("Guest instruction budget exceeded in {}; child invocation stopped.", job.path));
     }
     drop(jit);
     let exit = Arc::clone(&job.exit);
@@ -79,14 +130,40 @@ extern "C" fn run_child(context: u64) -> ! {
 }
 
 impl VolumeIo {
-    fn new(path: &str, directory: &str, output: fn(&[u8])) -> Self {
+    fn new(attempt: GuestAttempt, path: &str, directory: &str, output: fn(&[u8]),
+        identity: Option<ImpersonationReference>) -> Self {
         static NEXT_DESKTOP_CLIENT: AtomicU32 = AtomicU32::new(1);
         Self {
+            attempt,
+            identity,
             output,
             desktop_client: NEXT_DESKTOP_CLIENT.fetch_add(1, Ordering::Relaxed),
             desktop_windows: false,
             application_directory: path.rsplit_once('\\').map_or(directory, |(parent, _)| parent).into(),
         }
+    }
+
+    fn file_identity(&self) -> Result<&crate::se::token::Token, u32> {
+        use crate::libs::ntdll::status::{STATUS_ACCESS_DENIED, STATUS_BAD_IMPERSONATION_LEVEL};
+        use crate::se::token::ImpersonationLevel;
+
+        let identity = self.identity.as_ref().ok_or(STATUS_ACCESS_DENIED as u32)?;
+        if matches!(identity.level, ImpersonationLevel::SecurityAnonymous | ImpersonationLevel::SecurityIdentification) {
+            return Err(STATUS_BAD_IMPERSONATION_LEVEL as u32);
+        }
+        Ok(identity.token.token())
+    }
+
+    fn open_security_target(&self, path: &str, desired: u32) -> Result<(
+        crate::fs::ntfs::security_target::FileSecurityTarget,
+        crate::arch::common::btl::io::FileShareLease,
+    ), u32> {
+        use crate::libs::ntdll::status::STATUS_NOT_SUPPORTED;
+        let token = self.file_identity()?;
+        let (file, _, _, lease) = crate::fs::system_volume::open_native_file(path, 1, 0,
+            |descriptor, access| crate::libs::ntdll::access_check::check_file_descriptor(descriptor, token, access)
+                .map_err(|status| status as u32), desired, 7)?;
+        Ok((file.security_target.ok_or(STATUS_NOT_SUPPORTED as u32)?, lease))
     }
 
     fn resolve_child(&self, request: &ChildRequest) -> Result<String, u32> {
@@ -199,6 +276,8 @@ impl IoHost for VolumeIo {
             return Err(267);
         }
         let path = self.resolve_child(&request)?;
+        let attempt = GuestAttempt::start(&path);
+        self.attempt.log(format_args!("Child run={}", attempt.0));
         let command_line = request.command_line.as_deref().filter(|line| !line.is_empty());
         let default_line;
         let command_line = match command_line {
@@ -207,21 +286,29 @@ impl IoHost for VolumeIo {
         };
         let mut image = crate::userspace::loader::load_translated_image_with_environment(
             &path, command_line, &directory, request.environment.as_deref(),
+            |machine, magic| report_guest_pe(attempt, &path, machine, magic),
         )
         .map_err(|error| {
-            crate::boot_println!("[BTL process] cannot load {path}: {error}");
-            file_launch_error(error.ntstatus())
+            let status = error.ntstatus();
+            attempt.log(format_args!(
+                "Cannot execute {path}: {error}; NTSTATUS 0x{status:08X}.",
+            ));
+            file_launch_error(status)
         })?;
-        image.assign_process_identity().map_err(|_| 89u32)?;
+        image.assign_process_identity().map_err(|_| {
+            attempt.log(format_args!("Cannot execute {path}: process identity allocation failed; NTSTATUS 0xC000009A."));
+            89u32
+        })?;
         let id = image.process_id();
         let thread_id = image.thread_id();
         let exit = Arc::new(AtomicU64::new(u64::MAX));
         let thread_exit = Arc::new(AtomicU64::new(u64::MAX));
-        let services = IoServices::new(Self::new(&path, &directory, self.output));
-        let job = Box::into_raw(Box::new(ChildJob { image, services, exit: Arc::clone(&exit), thread_exit: Arc::clone(&thread_exit), _slot: slot }));
+        let services = IoServices::new(Self::new(attempt, &path, &directory, self.output, self.identity.clone()));
+        let job = Box::into_raw(Box::new(ChildJob { attempt, path, image, services, exit: Arc::clone(&exit), thread_exit: Arc::clone(&thread_exit), _slot: slot }));
         let worker = crate::ps::thread::ps_create_system_thread(run_child as *const () as u64, job as u64);
         if !worker.success {
-            drop(unsafe { Box::from_raw(job) });
+            let job = unsafe { Box::from_raw(job) };
+            attempt.log(format_args!("Cannot execute {}: child worker allocation failed; NTSTATUS 0xC000009A.", job.path));
             return Err(8);
         }
         Ok(ChildProcess { process_id: id, thread_id, exit, thread_exit })
@@ -381,7 +468,11 @@ impl IoHost for VolumeIo {
         if status < 0 { Err(status as u32) } else { Ok(()) }
     }
     fn create_directory(&mut self, path: &str) -> Result<(), u32> {
-        crate::fs::system_volume::mkdir(path)
+        let token = self.file_identity()?;
+        crate::fs::system_volume::mkdir_authorized(path, |descriptor, access| {
+            crate::libs::ntdll::access_check::check_file_descriptor(descriptor, token, access)
+                .map_err(|status| status as u32)
+        })
     }
     fn file_attributes(&mut self, path: &str) -> Result<u32, u32> {
         crate::fs::system_volume::file_attributes(path)
@@ -397,7 +488,12 @@ impl IoHost for VolumeIo {
         crate::fs::system_volume::set_file_times(path, times)
     }
     fn directory_entries(&mut self, path: &str) -> Result<Vec<crate::arch::common::btl::nt61::DirectoryEntry>, u32> {
-        Ok(crate::fs::system_volume::directory_metadata(path)?.into_iter().map(|entry| {
+        let token = self.file_identity()?;
+        let entries = crate::fs::system_volume::directory_metadata(path, |descriptor, access| {
+            crate::libs::ntdll::access_check::check_file_descriptor(descriptor, token, access)
+                .map_err(|status| status as u32)
+        })?;
+        Ok(entries.into_iter().map(|entry| {
             crate::arch::common::btl::nt61::DirectoryEntry {
                 name: entry.name, attributes: entry.file_attributes,
                 size: entry.file_size, creation_time: entry.creation_time,
@@ -528,8 +624,61 @@ impl IoHost for VolumeIo {
         // loading its complete contents or opening directories as files.
         crate::fs::system_volume::read_at(path, 0, 1).map(|_| ())
     }
-    fn open_tracked_file(&mut self, path: &str, disposition: u32, writable: bool, allow_directory: bool) -> Result<(u64, bool, Option<u64>), u32> {
-        crate::fs::system_volume::open_guest_file(path, disposition, writable, allow_directory)
+    fn open_file_with_access(&mut self, path: &str, disposition: u32, mut options: u32, desired: u32, share: u32) -> Result<OpenedFile, u32> {
+        let token = self.file_identity()?;
+        if options & (0x4000 | 1) == 0 { options |= 0x40; }
+        crate::fs::system_volume::open_guest_file(
+            path, disposition, options,
+            |descriptor, access| crate::libs::ntdll::access_check::check_file_descriptor(descriptor, token, access)
+                .map_err(|status| status as u32), desired, share,
+        )
+    }
+    fn commit_file_copy(&mut self, path: &str, overwrite: bool, contents: &[u8]) -> Result<(), u32> {
+        let token = self.file_identity()?;
+        crate::fs::system_volume::commit_guest_file_copy(path, overwrite, contents, |descriptor, access| {
+            crate::libs::ntdll::access_check::check_file_descriptor(descriptor, token, access)
+                .map_err(|status| status as u32)
+        })
+    }
+    fn retain_open_file(&mut self, _path: &str, identity: Option<u64>, _writable: bool) -> Result<(), u32> {
+        identity.map_or(Ok(()), crate::fs::system_volume::retain_guest_file)
+    }
+    fn open_file_size(&mut self, path: &str, identity: Option<u64>) -> Result<u64, u32> {
+        crate::fs::system_volume::open_file_size(path, identity)
+    }
+    fn query_open_file_security(&mut self, record: u64, granted: u32, information: u32) -> Result<Vec<u8>, u32> {
+        use crate::libs::ntdll::security::file_object;
+
+        let required = file_object::query_access(information).map_err(|status| status as u32)?;
+        if granted & required != required { return Err(0xc000_0022); }
+        let target = crate::fs::system_volume::guest_file_security_target(record)?;
+        file_object::query(target, information).map_err(|status| status as u32)
+    }
+    fn check_set_open_file_security(&mut self, record: u64, granted: u32, information: u32) -> Result<(), u32> {
+        use crate::libs::ntdll::security::file_object;
+
+        let required = file_object::set_access(information).map_err(|status| status as u32)?;
+        if granted & required != required { return Err(0xc000_0022); }
+        crate::fs::system_volume::guest_file_security_target(record)?;
+        Ok(())
+    }
+    fn set_open_file_security(&mut self, record: u64, information: u32, descriptor: &[u8]) -> Result<(), u32> {
+        let target = crate::fs::system_volume::guest_file_security_target(record)?;
+        crate::libs::ntdll::security::file_object::set(target, information, descriptor).map_err(|status| status as u32)
+    }
+    fn query_file_security(&mut self, path: &str, information: u32) -> Result<Vec<u8>, u32> {
+        use crate::libs::ntdll::security::file_object;
+
+        let access = file_object::query_access(information).map_err(|status| status as u32)?;
+        let (target, _lease) = self.open_security_target(path, access)?;
+        file_object::query(target, information).map_err(|status| status as u32)
+    }
+    fn set_file_security(&mut self, path: &str, information: u32, descriptor: &[u8]) -> Result<(), u32> {
+        use crate::libs::ntdll::security::file_object;
+
+        let access = file_object::set_access(information).map_err(|status| status as u32)?;
+        let (target, _lease) = self.open_security_target(path, access)?;
+        file_object::set(target, information, descriptor).map_err(|status| status as u32)
     }
     fn close_tracked_file(&mut self, identity: u64) {
         crate::fs::system_volume::close_guest_file(identity);
@@ -643,53 +792,55 @@ pub fn try_execute(
             output(b"The file is not a valid Windows executable.\r\n");
             return Some(193);
         }
-        crate::hal::serial::write_string_always(&format!("[PE] Loading {candidate}\r\n"));
+        let attempt = GuestAttempt::start(&candidate);
         let mut image =
-            match crate::userspace::loader::load_translated_image(&candidate, line, directory) {
+            match crate::userspace::loader::load_translated_image(&candidate, line, directory,
+                |machine, magic| report_guest_pe(attempt, &candidate, machine, magic)) {
                 Ok(image) => image,
                 Err(error) => {
                     let status = error.ntstatus();
                     let diagnostic = format!(
-                        "Cannot execute {candidate}: {error}; NTSTATUS 0x{status:08X}.\r\n"
+                        "Cannot execute {candidate}: {error}; NTSTATUS 0x{status:08X}."
                     );
-                    crate::hal::serial::write_string_always("[PE] ");
-                    crate::hal::serial::write_string_always(&diagnostic);
+                    attempt.log(&diagnostic);
                     output(diagnostic.as_bytes());
+                    output(b"\r\n");
                     return Some(status);
                 }
             };
-        crate::hal::serial::write_string_always(&format!("[PE] Running {candidate}\r\n"));
         if image.assign_process_identity().is_err() {
+            attempt.log(format_args!(
+                "Cannot execute {candidate}: process identity allocation failed; NTSTATUS 0xC000009A."
+            ));
             return Some(0xc000_009a);
         }
-        let mut services = IoServices::new(VolumeIo::new(&candidate, directory, output));
+        report_guest_context(attempt, &candidate, &image);
+        attempt.log(format_args!("Running {candidate}"));
+        let identity = crate::ps::process::get_current_thread_token().snapshot_for_worker().ok();
+        let mut services = IoServices::new(VolumeIo::new(attempt, &candidate, directory, output, identity));
         // Bounded maintenance/desktop console execution. Every quantum lets
         // runnable kernel/desktop threads proceed; no global BTL lock is held.
         // Large SFX installers need more than 8M instructions just to inspect
         // their embedded archive. Keep a finite 128M-instruction cap and
         // retain a scheduler yield after every 8192-instruction quantum.
         let execution_started = crate::ke::time::get_interrupt_time();
+        let mut last_progress = execution_started;
         let mut run_elapsed = 0u64;
         let mut publisher = crate::mm::jit_code::KernelPublisher;
         let mut jit = crate::arch::common::btl::runtime::jit::Jit::new(&mut publisher);
         for quantum in 0..16384 {
-            if quantum != 0 && quantum % 128 == 0 {
-                crate::hal::serial::write_string_always(&format!(
-                    "[PE] Progress {candidate}: retired={} pc=0x{:X}\r\n",
-                    image.retired(), image.thread.context.rip,
-                ));
-            }
+            report_progress_periodically(&mut last_progress, attempt, &candidate, &image);
             let run_started = crate::ke::time::get_interrupt_time();
             let result = image.run_with_jit(8192, &mut services, &mut jit);
             run_elapsed = run_elapsed.saturating_add(
                 crate::ke::time::get_interrupt_time().saturating_sub(run_started));
             if !matches!(result, ImageRunResult::Yielded) {
-                crate::hal::serial::write_string_always(&format!(
-                    "[PE] Translation {candidate}: native={} interpreted={}\r\n",
+                attempt.log(format_args!(
+                    "Translation {candidate}: native={} interpreted={}",
                     jit.retired(), image.retired().saturating_sub(jit.retired()),
                 ));
-                crate::hal::serial::write_string_always(&format!(
-                    "[PE] Timing {candidate}: run_elapsed_ms={} wall_elapsed_ms={} batches={}\r\n",
+                attempt.log(format_args!(
+                    "Timing {candidate}: run_elapsed_ms={} wall_elapsed_ms={} batches={}",
                     run_elapsed / 10_000,
                     crate::ke::time::get_interrupt_time().saturating_sub(execution_started) / 10_000,
                     quantum + 1,
@@ -697,16 +848,13 @@ pub fn try_execute(
             }
             match result {
                 ImageRunResult::Exited(code) => {
-                    crate::hal::serial::write_string_always(&format!("[PE] Guest exited {candidate}: {code}\r\n"));
+                    attempt.log(format_args!("Guest exited {candidate}: {code}"));
                     if code != 0 {
-                        crate::hal::serial::write_string_always(&format!(
-                            "[PE] Exit context {candidate}: {:?}\r\n", image.win32.exit_context,
-                        ));
-                        for (id, error, detail) in &image.win32.failures {
+                        for (id, error, _) in &image.win32.failures {
                             let name = crate::arch::common::btl::pe::win32::catalog::resolve(*id)
                                 .map_or("unknown", |api| api.name);
-                            crate::hal::serial::write_string_always(&format!(
-                                "[PE] Recent API failure {name} ({id}): {error} {detail}\r\n",
+                            attempt.log(format_args!(
+                                "Recent API failure {name} ({id}): {error}",
                             ));
                         }
                     }
@@ -716,13 +864,6 @@ pub fn try_execute(
                     crate::ke::scheduler::yield_();
                 }
                 ImageRunResult::Fault(reason) => {
-                    use crate::arch::common::btl::memory::GuestMemory;
-                    let mut bytes = [0; 15];
-                    let mut count = 0;
-                    while count < bytes.len() && image.memory.fetch_virt(
-                        image.thread.context.rip.wrapping_add(count as u64),
-                        &mut bytes[count..count + 1],
-                    ) == 1 { count += 1; }
                     let status = match reason {
                         StopReason::DataFault { .. } | StopReason::InstructionFault { .. } => 0xc0000005,
                         StopReason::DivideError { .. } => 0xc0000094,
@@ -746,28 +887,72 @@ pub fn try_execute(
                         .map(|api| format!("{}!{}", api.dll, api.name))
                         .unwrap_or_default();
                     let diagnostic = format!(
-                        "Guest execution fault in {candidate}: {reason:?}; API {api}; NTSTATUS 0x{status:08X}.\r\n"
+                        "Guest execution fault in {candidate}: {reason:?}; API {api}; NTSTATUS 0x{status:08X}."
                     );
-                    crate::hal::serial::write_string_always("[PE] ");
-                    crate::hal::serial::write_string_always(&diagnostic);
+                    attempt.log(&diagnostic);
                     output(diagnostic.as_bytes());
+                    output(b"\r\n");
                     if let Some((dll, symbol)) = crate::arch::common::btl::pe::win32::delay_load_fault(&mut image) {
-                        crate::hal::serial::write_string_always(&format!(
-                            "[PE] Delay-load fault in {candidate}: {dll}!{symbol}\r\n"
+                        attempt.log(format_args!(
+                            "Delay-load fault in {candidate}: {dll}!{symbol}"
                         ));
                     }
-                    crate::hal::serial::write_string_always(&format!(
-                        "[PE] Fault details: retired={} bytes={:02X?} last_api_arguments={:X?} recent_api_failures={:?}\r\n",
-                        image.retired(), &bytes[..count], image.win32.last_arguments, image.win32.failures,
-                    ));
+                    report_guest_progress(attempt, &candidate, &image);
                     return Some(status);
                 }
             }
         }
-        let diagnostic = format!("[PE] Guest instruction budget exceeded in {candidate}; console invocation stopped.\r\n");
-        crate::hal::serial::write_string_always(&diagnostic);
+        let diagnostic = format!("Guest instruction budget exceeded in {candidate}; console invocation stopped.");
+        report_guest_progress(attempt, &candidate, &image);
+        attempt.log(&diagnostic);
+        output(b"[PE] ");
         output(diagnostic.as_bytes());
+        output(b"\r\n");
         return Some(1460);
     }
     None
+}
+
+fn report_guest_pe(attempt: GuestAttempt, path: &str, machine: u16, magic: u16) {
+    let abi = match magic { 0x10b => "pe32", 0x20b => "pe32plus", _ => "unknown" };
+    attempt.log(format_args!(
+        "Image {path}: pe_machine={machine:04X} guest_abi={abi} host_arch={} backend=btl",
+        host_arch(),
+    ));
+}
+
+fn report_guest_context(attempt: GuestAttempt, path: &str, image: &GuestImage) {
+    let (machine, abi) = match image.thread.context.mode {
+        DecodeMode::X86 => (0x014c, "pe32"),
+        DecodeMode::X64 => (0x8664, "pe32plus"),
+    };
+    attempt.log(format_args!(
+        "Context {path}: pe_machine={machine:04X} guest_abi={abi} host_arch={} backend=btl pid={} tid={}",
+        host_arch(), image.process_id(), image.thread_id(),
+    ));
+}
+
+fn report_guest_progress(attempt: GuestAttempt, path: &str, image: &GuestImage) {
+    let (runnable, waiting, suspended) = image.thread_counts();
+    let location = image.mapped_instruction_location()
+        .map(|(module, rva)| format!(" module={module} rva=0x{rva:X}"))
+        .unwrap_or_default();
+    attempt.log(format_args!(
+        "Progress {path}: retired={} pc=0x{:X} runnable={runnable} waiting={waiting} suspended={suspended} tid={}{location}",
+        image.retired(), image.thread.context.rip, image.thread_id(),
+    ));
+}
+
+fn host_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "loongarch64") {
+        "loongarch64"
+    } else if cfg!(target_arch = "riscv64") {
+        "riscv64"
+    } else {
+        "unknown"
+    }
 }

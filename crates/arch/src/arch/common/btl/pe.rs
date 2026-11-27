@@ -253,6 +253,22 @@ pub enum ImageRunResult {
 impl GuestImage {
     pub fn process_id(&self) -> u32 { self.process_id }
 
+    pub fn mapped_instruction_location(&self) -> Option<(&str, u64)> {
+        let pc = self.thread.context.rip;
+        let (module, rva) = self.module_metadata.iter().find_map(|module| {
+            let rva = pc.checked_sub(module.base)?;
+            (rva < module.size as u64).then_some((module, rva))
+        })?;
+        let name = if module.base == self.image_base {
+            "<main>"
+        } else {
+            self.win32.modules.iter()
+                .find(|(_, base)| *base == module.base)?
+                .0.as_str()
+        };
+        Some((name, rva))
+    }
+
     pub fn assign_process_identity(&mut self) -> Result<(), LoadError> {
         use core::sync::atomic::{AtomicU32, Ordering};
         static NEXT_PROCESS_ID: AtomicU32 = AtomicU32::new(2);

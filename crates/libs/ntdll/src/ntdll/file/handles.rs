@@ -80,6 +80,13 @@ struct HandleSlot {
     object: usize,
     flags: u8,
     access: u32,
+    process: Option<u64>,
+}
+
+impl HandleSlot {
+    fn visible(&self) -> bool {
+        self.process.is_none() || self.process == super::current_file_process()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -150,16 +157,29 @@ pub(crate) fn alloc_handle(kind: HandleKind, target: u64) -> HANDLE {
 /// # Safety
 /// `target` transfers one owned file payload. `cleanup` must keep its storage
 /// alive; `retire` must destroy it. Every file pin must use the same `retire`.
+#[cfg(test)]
 pub(crate) unsafe fn alloc_file_handle(
     target: u64,
     cleanup: unsafe fn(HandleEntry),
     retire: unsafe fn(HandleEntry),
 ) -> HANDLE {
+    unsafe { alloc_authorized_file_handle(target, u32::MAX, None, cleanup, retire) }
+}
+
+pub(crate) unsafe fn alloc_authorized_file_handle(
+    target: u64,
+    access: u32,
+    process: Option<u64>,
+    cleanup: unsafe fn(HandleEntry),
+    retire: unsafe fn(HandleEntry),
+) -> HANDLE {
     let mut table = HANDLE_TABLE.lock();
-    let Ok(handle) = table.allocate(HandleKind::File, target, DispatcherState::None, u32::MAX, 0) else {
+    let Ok(handle) = table.allocate(HandleKind::File, target, DispatcherState::None, access, 0) else {
         return ptr::null_mut();
     };
-    let index = table.slots[decode_handle(handle)].expect("allocated slot").object;
+    let slot = table.slots[decode_handle(handle)].as_mut().expect("allocated slot");
+    slot.process = process;
+    let index = slot.object;
     table.objects[index].as_mut().expect("allocated object").file_lifecycle =
         Some(FileLifecycle { cleanup, retire });
     handle
@@ -265,6 +285,7 @@ impl HandleTable {
             object,
             flags,
             access,
+            process: None,
         });
         if kind == HandleKind::Timer {
             self.timers[object / 64] |= 1 << (object % 64);
@@ -286,6 +307,7 @@ impl HandleTable {
             object,
             flags,
             access,
+            process: None,
         });
         Ok(encode_handle(slot))
     }
@@ -546,6 +568,7 @@ pub(crate) fn handle_flags(handle: HANDLE) -> Result<u8, NTSTATUS> {
         .slots
         .get(decode_handle(handle))
         .and_then(|slot| *slot)
+        .filter(HandleSlot::visible)
         .map(|slot| slot.flags)
         .ok_or(STATUS_INVALID_HANDLE)
 }
@@ -650,6 +673,7 @@ pub(crate) fn update_handle_flags(handle: HANDLE, mask: u8, flags: u8) -> Result
         .slots
         .get_mut(decode_handle(handle))
         .and_then(Option::as_mut)
+        .filter(|slot| slot.visible())
         .ok_or(STATUS_INVALID_HANDLE)?;
     slot.flags = (slot.flags & !(mask & 3)) | (flags & mask & 3);
     Ok(())
@@ -662,6 +686,7 @@ fn remove_handle(handle: HANDLE, protect: bool) -> Result<(HandleEntry, bool), N
         .slots
         .get(index)
         .and_then(|slot| *slot)
+        .filter(HandleSlot::visible)
         .ok_or(STATUS_INVALID_HANDLE)?;
     if protect && slot.flags & 2 != 0 {
         return Err(super::super::status::STATUS_HANDLE_NOT_CLOSABLE);
@@ -749,7 +774,8 @@ pub(crate) fn lookup_handle(handle: HANDLE) -> Option<HandleEntry> {
     let slot = table
         .slots
         .get(decode_handle(handle))
-        .and_then(|slot| *slot)?;
+        .and_then(|slot| *slot)
+        .filter(HandleSlot::visible)?;
     table.objects[slot.object].map(|object| object.entry)
 }
 
@@ -818,7 +844,7 @@ pub(crate) unsafe fn reference_file_handle_with_access(
     use super::super::status::{STATUS_ACCESS_DENIED, STATUS_INSUFFICIENT_RESOURCES, STATUS_OBJECT_TYPE_MISMATCH};
     let mut table = HANDLE_TABLE.lock();
     let slot = table.slots.get(decode_handle(handle))
-        .and_then(|slot| *slot).ok_or(STATUS_INVALID_HANDLE)?;
+        .and_then(|slot| *slot).filter(HandleSlot::visible).ok_or(STATUS_INVALID_HANDLE)?;
     let object = table.objects[slot.object].as_mut().ok_or(STATUS_INVALID_HANDLE)?;
     if object.entry.kind != HandleKind::File {
         return Err(STATUS_OBJECT_TYPE_MISMATCH);

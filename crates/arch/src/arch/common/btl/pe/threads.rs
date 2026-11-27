@@ -102,6 +102,10 @@ struct Info {
     return_sp: u64,
 }
 impl Info {
+    fn runnable(&self) -> bool {
+        self.suspended == 0 && self.exit.is_none() && self.wait.is_none()
+    }
+
     fn effective_priority(&self, class: PriorityClass) -> i32 {
         (class.effective_priority(self.priority) + i32::from(self.wait_boost)).min(15)
     }
@@ -612,6 +616,26 @@ impl GuestImage {
     pub fn retired(&self) -> u64 {
         self.threads.parked.iter().fold(self.thread.retired.saturating_add(self.threads.completed_retired), |sum,t| sum.saturating_add(t.thread.retired))
     }
+
+    pub fn thread_counts(&self) -> (usize, usize, usize) {
+        let mut runnable = 0;
+        let mut waiting = 0;
+        let mut suspended = 0;
+        for thread in core::iter::once(&self.threads.current)
+            .chain(self.threads.parked.iter().map(|thread| &thread.info))
+            .filter(|thread| thread.exit.is_none())
+        {
+            if thread.runnable() {
+                runnable += 1;
+            } else if thread.suspended != 0 {
+                suspended += 1;
+            } else {
+                waiting += 1;
+            }
+        }
+        (runnable, waiting, suspended)
+    }
+
     pub(super) fn has_other_threads(&self) -> bool { self.threads.parked.iter().any(|t| t.info.exit.is_none()) }
     pub(super) fn active_notification_in(&self, modules: &[u64]) -> bool {
         core::iter::once(&self.startup).chain(self.threads.parked.iter().map(|thread| &thread.startup))
@@ -785,7 +809,7 @@ impl GuestImage {
                 }
             }
         }
-        let runnable = |t: &Info| t.suspended == 0 && t.exit.is_none() && t.wait.is_none();
+        let runnable = Info::runnable;
         if self.pending_library.is_some() {
             if self.threads.slice == 0 { self.threads.slice = 4096; }
             return Ok(runnable(&self.threads.current));

@@ -4,6 +4,7 @@
 //! state. Security data operations do not grant host or kernel permissions.
 
 use super::super::GuestImage;
+use super::{directory, process, put, status_error, ApiError, GuestAbi, GuestMemory, GuestServices, NOACCESS};
 
 #[path = "advapi/absolute.rs"]
 mod absolute;
@@ -19,6 +20,50 @@ mod service;
 mod text;
 #[path = "advapi/token.rs"]
 pub(super) mod token;
+
+pub(super) fn file_security(
+    image: &mut GuestImage,
+    name: &str,
+    args: &[u64],
+    services: &mut dyn GuestServices,
+) -> Result<u64, ApiError> {
+    let abi = match image.thread.context.mode {
+        super::DecodeMode::X86 => GuestAbi::X86_32,
+        super::DecodeMode::X64 => GuestAbi::X86_64,
+    };
+    let path = process::process_string(&mut image.memory, args[0], true)?.ok_or(87u32)?;
+    if path.is_empty() {
+        return Err(123u32.into());
+    }
+    let path = directory::path(image, &path)?;
+    let information = args[1] as u32;
+    if information == 0 {
+        return Err(5u32.into());
+    }
+    if name == "SetFileSecurityW" {
+        if args[2] == 0 {
+            return Err(NOACCESS.into());
+        }
+        let descriptor = security::descriptor(image, args[2])?;
+        let bytes = security::relative_sd(&descriptor);
+        services.set_file_security(abi, &path, information, &bytes).map_err(status_error)?;
+    } else {
+        let bytes = services.query_file_security(abi, &path, information).map_err(status_error)?;
+        let capacity = args[3] as u32 as usize;
+        if capacity < bytes.len() {
+            put(&mut image.memory, args[4], bytes.len() as u64, 4)?;
+            return Err(122u32.into());
+        }
+        if !image.memory.probe_write(args[4], 4) || !image.memory.probe_write(args[2], bytes.len()) {
+            return Err(NOACCESS.into());
+        }
+        if !image.memory.write_virt(args[2], &bytes) {
+            return Err(NOACCESS.into());
+        }
+        put(&mut image.memory, args[4], bytes.len() as u64, 4)?;
+    }
+    Ok(1)
+}
 
 pub(super) struct State {
     registry: registry::State,

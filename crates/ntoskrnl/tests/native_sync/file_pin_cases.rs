@@ -15,6 +15,32 @@ unsafe fn cleanup(entry: ntdll::file::HandleEntry) {
 }
 
 #[test]
+fn granted_file_access_and_process_ownership_are_enforced_at_reference_and_close() {
+    let _guard = state_guard();
+    RETIRED.store(0, Ordering::Relaxed);
+    CLEANED.store(0, Ordering::Relaxed);
+    let payload = Box::into_raw(Box::new(0x1234usize)) as u64;
+    let read_control = 0x0002_0000;
+    let write_dac = 0x0004_0000;
+    ntdll::file::FILE_PROCESS.with(|process| process.set(Some(30)));
+    let handle = unsafe {
+        ntdll::file::alloc_authorized_file_handle(payload, read_control, Some(30), cleanup, retire)
+    };
+    let reference = unsafe { ntdll::file::reference_file_handle_with_access(handle, read_control, retire) }.unwrap();
+    assert!(matches!(unsafe { ntdll::file::reference_file_handle_with_access(handle, write_dac, retire) }, Err(STATUS_ACCESS_DENIED)));
+    ntdll::file::FILE_PROCESS.with(|process| process.set(Some(31)));
+    assert!(ntdll::file::lookup_handle(handle).is_none());
+    assert!(matches!(unsafe { ntdll::file::reference_file_handle_with_access(handle, 0, retire) }, Err(STATUS_INVALID_HANDLE)));
+    assert!(matches!(ntdll::file::close_handle(handle), Err(STATUS_INVALID_HANDLE)));
+    ntdll::file::FILE_PROCESS.with(|process| process.set(Some(30)));
+    ntdll::file::close_handle(handle).unwrap();
+    assert_eq!(CLEANED.load(Ordering::Relaxed), 1);
+    drop(reference);
+    assert_eq!(RETIRED.load(Ordering::Relaxed), 1);
+    ntdll::file::FILE_PROCESS.with(|process| process.set(None));
+}
+
+#[test]
 fn last_file_handle_cleans_up_before_outstanding_reference_closes() {
     let _guard = state_guard();
     RETIRED.store(0, Ordering::Relaxed);

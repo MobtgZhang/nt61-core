@@ -16,10 +16,9 @@
 use super::file::{alloc_handle, lookup_handle, HandleKind};
 use super::status::{
     STATUS_BUFFER_TOO_SMALL, STATUS_INVALID_HANDLE,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, STATUS_NO_TOKEN, STATUS_SUCCESS,
+    STATUS_INVALID_PARAMETER, STATUS_NO_TOKEN, STATUS_SUCCESS,
 };
 use super::types::{HANDLE, NTSTATUS};
-use core::ptr;
 
 use crate::mm::user_copy::{
     copy_from_user, copy_to_user, probe_user_read, probe_user_write, write_user_object,
@@ -177,11 +176,13 @@ pub fn nt_open_thread_token_kernel(
     STATUS_NO_TOKEN
 }
 
+#[path = "security/file_object.rs"]
+pub(crate) mod file_object;
 pub use super::token_duplicate::{nt_duplicate_token, nt_duplicate_token_kernel, SecurityQualityOfService};
 
 /// # Safety
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// Raw addresses designate caller memory and are accessed through user copy.
 pub unsafe extern "C" fn nt_query_security_object(
     handle: HANDLE,
     security_information: u32,
@@ -189,160 +190,63 @@ pub unsafe extern "C" fn nt_query_security_object(
     length: u32,
     length_needed: *mut u32,
 ) -> NTSTATUS {
-    if handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    if !length_needed.is_null()
-        && probe_user_write(length_needed as u64, core::mem::size_of::<u32>()).is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-    if !security_descriptor.is_null()
-        && length >= core::mem::size_of::<SecurityDescriptor>() as u32
-        && probe_user_write(
-            security_descriptor as u64,
-            core::mem::size_of::<SecurityDescriptor>(),
-        )
-        .is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let _entry = match lookup_handle(handle) {
-        Some(e) => e,
-        _ => return STATUS_INVALID_HANDLE,
+    use super::status::STATUS_ACCESS_VIOLATION;
+    let descriptor = match nt_query_security_object_kernel(handle, security_information) {
+        Ok(descriptor) => descriptor,
+        Err(status) => return status,
     };
-
-    let needed = core::mem::size_of::<SecurityDescriptor>() as u32;
-
-    let mut kernel_descriptor = SecurityDescriptor {
-        revision: 1,
-        sbz1: 0,
-        control: 0,
-        owner: ptr::null_mut(),
-        group: ptr::null_mut(),
-        sacl: ptr::null_mut(),
-        dacl: ptr::null_mut(),
-    };
-    let mut kernel_length_needed = needed;
-    let status = nt_query_security_object_kernel(
-        handle,
-        security_information,
-        if security_descriptor.is_null() || length < needed {
-            None
-        } else {
-            Some(&mut kernel_descriptor)
-        },
-        length,
-        &mut kernel_length_needed,
-    );
-
-    if !length_needed.is_null()
-        && write_user_object(length_needed as u64, &kernel_length_needed).is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
+    let needed = descriptor.len() as u32;
+    if write_user_object(length_needed as u64, &needed).is_err() {
+        return STATUS_ACCESS_VIOLATION;
     }
-    if !security_descriptor.is_null() && length >= needed {
-        let descriptor_bytes = core::slice::from_raw_parts(
-            &kernel_descriptor as *const SecurityDescriptor as *const u8,
-            needed as usize,
-        );
-        if copy_to_user(security_descriptor as u64, descriptor_bytes).is_err() {
-            return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-        }
-    }
-
-    status
-}
-
-/// Trusted-kernel entry point for `nt_query_security_object`.
-pub fn nt_query_security_object_kernel(
-    handle: HANDLE,
-    security_information: u32,
-    security_descriptor: Option<&mut SecurityDescriptor>,
-    length: u32,
-    length_needed: &mut u32,
-) -> NTSTATUS {
-    if handle.is_null() {
-        return STATUS_INVALID_HANDLE;
-    }
-
-    let _entry = match lookup_handle(handle) {
-        Some(e) => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    let _ = security_information;
-    let needed = core::mem::size_of::<SecurityDescriptor>() as u32;
-    *length_needed = needed;
-
-    if security_descriptor.is_none() || length < needed {
+    if length < needed {
         return STATUS_BUFFER_TOO_SMALL;
     }
+    copy_to_user(security_descriptor as u64, &descriptor).err().unwrap_or(STATUS_SUCCESS)
+}
 
-    if let Some(security_descriptor) = security_descriptor {
-        *security_descriptor = SecurityDescriptor {
-            revision: 1,
-            sbz1: 0,
-            control: 0,
-            owner: ptr::null_mut(),
-            group: ptr::null_mut(),
-            sacl: ptr::null_mut(),
-            dacl: ptr::null_mut(),
-        };
-    }
-
-    STATUS_SUCCESS
+pub fn nt_query_security_object_kernel(handle: HANDLE, information: u32) -> Result<alloc::vec::Vec<u8>, NTSTATUS> {
+    let reference = super::file::reference_file_with_access(handle, file_object::query_access(information)?)?;
+    let target = super::file::pinned_ntfs_security_target(&reference)?;
+    file_object::query(target, information)
 }
 
 /// # Safety
 ///
-/// Caller must ensure every raw-pointer argument is valid and that the accessed memory obeys the kernel aliasing and lifetime rules.
+/// The descriptor and its fields designate caller memory and are captured through user copy.
 pub unsafe extern "C" fn nt_set_security_object(
     handle: HANDLE,
-    security_information: u32,
+    information: u32,
     security_descriptor: *const SecurityDescriptor,
 ) -> NTSTATUS {
-    if handle.is_null() || security_descriptor.is_null() {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    if probe_user_read(
-        security_descriptor as u64,
-        core::mem::size_of::<SecurityDescriptor>(),
-    )
-    .is_err()
-    {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    let mut kernel_descriptor = alloc::vec![0u8; core::mem::size_of::<SecurityDescriptor>()];
-    if copy_from_user(&mut kernel_descriptor, security_descriptor as u64).is_err() {
-        return crate::libs::ntdll::status::STATUS_ACCESS_VIOLATION;
-    }
-
-    nt_set_security_object_kernel(handle, security_information, Some(&kernel_descriptor))
+    let result = (|| {
+        let reference = super::file::reference_file_with_access(handle, file_object::set_access(information)?)?;
+        if information == 0 {
+            return Ok(());
+        }
+        let target = super::file::pinned_ntfs_security_target(&reference)?;
+        let descriptor = crate::fs::ntfs::relative_security_descriptor::capture(
+            security_descriptor as u64,
+            core::mem::size_of::<usize>(),
+            copy_from_user,
+            file_object::STATUS_INVALID_SECURITY_DESCR,
+            super::status::STATUS_NO_MEMORY,
+        )?;
+        file_object::set(target, information, &descriptor)
+    })();
+    result.err().unwrap_or(STATUS_SUCCESS)
 }
 
-/// Trusted-kernel entry point for `nt_set_security_object`.
-pub fn nt_set_security_object_kernel(
-    handle: HANDLE,
-    security_information: u32,
-    security_descriptor: Option<&[u8]>,
-) -> NTSTATUS {
-    if handle.is_null() || security_descriptor.is_none() {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    let _entry = match lookup_handle(handle) {
-        Some(e) => e,
-        _ => return STATUS_INVALID_HANDLE,
-    };
-
-    let _ = security_information;
-
-    STATUS_NOT_SUPPORTED
+pub fn nt_set_security_object_kernel(handle: HANDLE, information: u32, descriptor: &[u8]) -> NTSTATUS {
+    let result = (|| {
+        let reference = super::file::reference_file_with_access(handle, file_object::set_access(information)?)?;
+        if information == 0 {
+            return Ok(());
+        }
+        let target = super::file::pinned_ntfs_security_target(&reference)?;
+        file_object::set(target, information, descriptor)
+    })();
+    result.err().unwrap_or(STATUS_SUCCESS)
 }
 
 /// # Safety
